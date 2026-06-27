@@ -1,6 +1,6 @@
 import * as jose from 'jose';
 
-const JWKS_URL = 'https://www.googleapis.com/service_accounts/v1/jwk/securetoken-system@system.gserviceaccount.com';
+const JWKS_URL = 'https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com';
 const JWKS = jose.createRemoteJWKSet(new URL(JWKS_URL));
 
 /**
