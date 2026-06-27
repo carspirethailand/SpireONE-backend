@@ -25,8 +25,8 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "spireone_db",
-      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+      "database_name": "spireone",
+      "database_id": "bf9b1815-2ef6-4463-8b35-6b97717b5d9a"
     }
   ]
 }
