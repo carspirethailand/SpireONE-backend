@@ -43,9 +43,11 @@ export default {
           return jsonResponse({ error: 'FIREBASE_PROJECT_ID environment variable is not configured' }, 500);
         }
 
-        const payload = await verifyFirebaseToken(token, projectId);
-        if (!payload) {
-          return jsonResponse({ error: 'Invalid authentication token' }, 401);
+        let payload;
+        try {
+          payload = await verifyFirebaseToken(token, projectId);
+        } catch (authErr) {
+          return jsonResponse({ error: 'Invalid authentication token: ' + authErr.message }, 401);
         }
 
         // Get optional body parameters for displayName/photo if token does not contain them
@@ -106,9 +108,11 @@ export default {
           return jsonResponse({ error: 'FIREBASE_PROJECT_ID environment variable is not configured' }, 500);
         }
 
-        const payload = await verifyFirebaseToken(token, projectId);
-        if (!payload) {
-          return jsonResponse({ error: 'Invalid authentication token' }, 401);
+        let payload;
+        try {
+          payload = await verifyFirebaseToken(token, projectId);
+        } catch (authErr) {
+          return jsonResponse({ error: 'Invalid authentication token: ' + authErr.message }, 401);
         }
 
         const email = payload.email;

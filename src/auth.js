@@ -10,16 +10,14 @@ const JWKS = jose.createRemoteJWKSet(new URL(JWKS_URL));
  * @returns {Promise<object|null>} The parsed JWT payload if valid, otherwise null.
  */
 export async function verifyFirebaseToken(token, firebaseProjectId) {
-  if (!token) return null;
-  
-  try {
-    const { payload } = await jose.jwtVerify(token, JWKS, {
-      issuer: `https://securetoken.google.com/${firebaseProjectId}`,
-      audience: firebaseProjectId,
-    });
-    return payload;
-  } catch (err) {
-    console.error('Firebase token verification error:', err);
-    return null;
+  if (!token) {
+    throw new Error('Token is empty');
   }
+  
+  const { payload } = await jose.jwtVerify(token, JWKS, {
+    issuer: `https://securetoken.google.com/${firebaseProjectId}`,
+    audience: firebaseProjectId,
+    clockTolerance: 120, // 2 minutes clock skew tolerance
+  });
+  return payload;
 }
