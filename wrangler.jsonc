@@ -18,5 +18,15 @@
       "persist": true,
       "head_sampling_rate": 1
     }
-  }
+  },
+  "vars": {
+    "FIREBASE_PROJECT_ID": "sp1p-82396"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "spireone_db",
+      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+    }
+  ]
 }
