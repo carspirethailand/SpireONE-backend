@@ -21,7 +21,6 @@
   },
   "vars": {
     "FIREBASE_PROJECT_ID": "sp1p-82396",
-    "GEMINI_KEY": "AQ.Ab8RN6Kd7HKrJQTIuwaFQuQWcYiuUKCpNGkluIZ01JstSob2NQ",
     "GEMINI_MODEL": "gemini-2.5-flash"
   },
   "triggers": {
