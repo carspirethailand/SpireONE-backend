@@ -20,7 +20,14 @@
     }
   },
   "vars": {
-    "FIREBASE_PROJECT_ID": "sp1p-82396"
+    "FIREBASE_PROJECT_ID": "sp1p-82396",
+    "GEMINI_KEY": "AIzaSyB1P_3zw1f27UqavxyW4WW_yhFWWUJAo8c",
+    "GEMINI_MODEL": "gemini-2.5-flash"
+  },
+  "triggers": {
+    "crons": [
+      "0 17 * * *"
+    ]
   },
   "d1_databases": [
     {

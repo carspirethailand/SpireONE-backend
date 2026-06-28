@@ -28,6 +28,93 @@ async function getAuthenticatedUser(request, env) {
   return await verifyFirebaseToken(token, projectId);
 }
 
+/**
+ * Calls Gemini with Search tool enabled to fetch and summarize car news.
+ * @param {object} env - Cloudflare Worker env
+ * @returns {Promise<Array>} Array of news items
+ */
+async function getGeminiNews(env) {
+  const geminiKey = env.GEMINI_KEY;
+  if (!geminiKey) {
+    throw new Error('GEMINI_KEY environment variable is not configured');
+  }
+  const model = env.GEMINI_MODEL || "gemini-2.5-flash";
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
+
+  const prompt = "ค้นเว็บข่าว/บทความเกี่ยวกับรถยนต์ล่าสุดวันนี้ในไทย สรุปข่าวสารที่น่าสนใจออกมา 5 ข่าว ตอบเป็น JSON array เท่านั้น ห้ามเขียนคำนำหรือสรุปอื่นๆ โดยในแต่ละข่าวต้องมีฟิลด์ดังนี้:\n1. title: พาดหัวข่าว\n2. shortDescription: อธิบายข่าวโดยสรุปย่อสั้น (1-2 ประโยค)\n3. fullDescription: เนื้อข่าวโดยสรุป ไม่เกิน 6 บรรทัด\n4. type: ประเภทของข่าว เช่น เทคโนโลยี, เคล็ดลับ, ข่าวเด่น\n\nตัวอย่าง JSON:\n[\n  {\n    \"title\": \"พาดหัวข่าว\",\n    \"shortDescription\": \"สรุปสั้น...\",\n    \"fullDescription\": \"เนื้อข่าวสรุปไม่เกิน 6 บรรทัด...\",\n    \"type\": \"ข่าวเด่น\"\n  }\n]";
+
+  const body = {
+    contents: [{ parts: [{ text: prompt }] }],
+    tools: [{ google_search: {} }],
+    generationConfig: {
+      temperature: 0.4
+    }
+  };
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+
+  if (!res.ok) {
+    throw new Error(`Gemini API error: ${res.status} ${await res.text()}`);
+  }
+
+  const data = await res.json();
+  const text = ((data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [])
+    .map(p => p.text || "")
+    .join("")
+    .trim();
+
+  let s = text.replace(/```json/gi, "").replace(/```/g, "").trim();
+  const m = s.match(/[\[{][\s\S]*[\]}]/);
+  if (m) s = m[0];
+  
+  const parsed = JSON.parse(s);
+  if (!Array.isArray(parsed)) {
+    throw new Error('Gemini response is not a JSON array');
+  }
+  return parsed;
+}
+
+/**
+ * Triggers news fetch from Gemini and batch-saves it to Cloudflare D1.
+ * @param {object} env - Cloudflare Worker env
+ * @returns {Promise<void>}
+ */
+async function fetchAndSaveNews(env) {
+  if (!env.DB) {
+    throw new Error('D1 Database connection is not configured');
+  }
+
+  const newsList = await getGeminiNews(env);
+  if (Array.isArray(newsList) && newsList.length > 0) {
+    await env.DB.prepare("DELETE FROM magazine").run();
+
+    const stmt = env.DB.prepare(`
+      INSERT INTO magazine (title, short_description, full_description, type, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+
+    const now = Date.now();
+    const batch = newsList.map(n => 
+      stmt.bind(
+        n.title || "",
+        n.shortDescription || n.short_description || "",
+        n.fullDescription || n.full_description || "",
+        n.type || "ข่าวเด่น",
+        now
+      )
+    );
+
+    await env.DB.batch(batch);
+  } else {
+    throw new Error('Fetched news array is empty or invalid');
+  }
+}
+
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -250,6 +337,51 @@ export default {
       }
     }
 
+    // Route: GET /api/magazine
+    if (url.pathname === '/api/magazine' && request.method === 'GET') {
+      try {
+        if (!env.DB) {
+          return jsonResponse({ error: 'D1 Database connection is not configured' }, 500);
+        }
+
+        const { results } = await env.DB.prepare(`
+          SELECT * FROM magazine ORDER BY id ASC
+        `).all();
+
+        return jsonResponse(results);
+      } catch (err) {
+        return jsonResponse({ error: err.message }, 500);
+      }
+    }
+
+    // Route: POST /api/magazine/sync
+    if (url.pathname === '/api/magazine/sync' && request.method === 'POST') {
+      try {
+        let payload;
+        try {
+          payload = await getAuthenticatedUser(request, env);
+        } catch (authErr) {
+          return jsonResponse({ error: 'Invalid authentication token: ' + authErr.message }, 401);
+        }
+
+        const email = payload.email;
+        const isAdmin = ADMINS.includes(email.toLowerCase());
+        if (!isAdmin) {
+          return jsonResponse({ error: 'Forbidden: Admin access required' }, 403);
+        }
+
+        await fetchAndSaveNews(env);
+
+        return jsonResponse({ success: true, message: 'Magazine news synchronized successfully' });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, 500);
+      }
+    }
+
     return jsonResponse({ error: 'Not Found' }, 404);
+  },
+
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(fetchAndSaveNews(env));
   }
 };
