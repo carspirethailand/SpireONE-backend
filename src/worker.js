@@ -35,6 +35,8 @@ async function getAuthenticatedUser(request, env) {
  */
 async function getGeminiNews(env) {
   const geminiKey = env.GEMINI_KEY;
+  console.log("DEBUG: GEMINI_KEY value:", JSON.stringify(geminiKey));
+  console.log("DEBUG: GEMINI_KEY length:", geminiKey ? geminiKey.length : 0);
   if (!geminiKey) {
     throw new Error('GEMINI_KEY environment variable is not configured');
   }
