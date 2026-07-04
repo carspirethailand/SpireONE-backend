@@ -166,6 +166,143 @@ async function getGemmaDiagnosis(env, carInfo, symptoms) {
 }
 
 /**
+ * Calls Gemini to handle open-ended conversational chat.
+ * @param {object} env - Cloudflare Worker env
+ * @param {object} carInfo - { make, model, year, mileage }
+ * @param {Array} messages - Conversation history
+ * @returns {Promise<string>} Open-ended chat text response
+ */
+async function getGeminiChatResponse(env, carInfo, messages) {
+  const geminiKey = env.GEMINI_KEY;
+  if (!geminiKey) {
+    throw new Error('GEMINI_KEY environment variable is not configured');
+  }
+  const model = env.GEMINI_MODEL || "gemini-2.5-flash";
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
+
+  const carContext = (carInfo.make || carInfo.model) 
+    ? `\nรถของผู้ใช้: ${carInfo.make || ''} ${carInfo.model || ''} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` 
+    : '';
+
+  const systemPrompt = `คุณคือ SpireONE ผู้ช่วย AI ดูแลรถยนต์ พูดจาเป็นกันเองอบอุ่นเหมือนเพื่อนช่างมืออาชีพ ตอบเป็นภาษาไทยเป็นหลัก (หรือสลับภาษาตามที่คู่สนทนาพิมพ์มา). ช่วยวินิจฉัยอาการรถ ให้คำแนะนำเป็นขั้นตอน ประเมินค่าใช้จ่ายคร่าวๆ และตอบคำถามเรื่องรถทุกอย่าง. ถ้ามีรูป/วิดีโอ/เสียงแนบมา ให้วิเคราะห์จากสื่อนั้นจริงๆ. ตอบกระชับ อ่านง่าย ใช้หัวข้อย่อย (ขึ้นต้นด้วย "- ") เมื่อเหมาะสม. ย้ำเสมอว่าเป็นการประเมินเบื้องต้น ควรให้ช่างตรวจจริงเพื่อความปลอดภัย.${carContext}`;
+
+  const hasMedia = messages.some(m => m.atts && m.atts.some(a => a.b64));
+  const contents = messages.slice(-12).map(m => {
+    const parts = [];
+    if (m.text) {
+      parts.push({ text: m.text });
+    }
+    if (m.atts && Array.isArray(m.atts)) {
+      m.atts.forEach(a => {
+        if (a.b64 && a.mime) {
+          parts.push({
+            inline_data: {
+              mime_type: a.mime,
+              data: a.b64
+            }
+          });
+        }
+      });
+    }
+    if (parts.length === 0) {
+      parts.push({ text: "" });
+    }
+    return {
+      role: m.role === "user" ? "user" : "model",
+      parts
+    };
+  });
+
+  const body = {
+    contents,
+    systemInstruction: { parts: [{ text: systemPrompt }] },
+    generationConfig: { temperature: 0.5 }
+  };
+
+  if (!hasMedia) {
+    body.tools = [{ google_search: {} }];
+  }
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+
+  if (!res.ok) {
+    throw new Error(`Gemini Chat API error: ${res.status} ${await res.text()}`);
+  }
+
+  const data = await res.json();
+  const candidate = (data.candidates && data.candidates[0]) || {};
+  return ((candidate.content && candidate.content.parts) || [])
+    .map(p => p.text || "")
+    .join("")
+    .trim();
+}
+
+/**
+ * Calls Gemini to summarize a conversation log.
+ * @param {object} env - Cloudflare Worker env
+ * @param {Array} messages - Conversation history
+ * @returns {Promise<object>} Structured summary data
+ */
+async function getGeminiSummary(env, messages) {
+  const geminiKey = env.GEMINI_KEY;
+  if (!geminiKey) {
+    throw new Error('GEMINI_KEY environment variable is not configured');
+  }
+  const model = env.GEMINI_MODEL || "gemini-2.5-flash";
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
+
+  const convo = messages.slice(-14)
+    .map(m => (m.role === "user" ? "USER: " : "AI: ") + (m.text || ""))
+    .join("\n");
+
+  const prompt = `จากบทสนทนาวินิจฉัยรถต่อไปนี้ สรุปผลเป็น JSON เท่านั้น ห้ามมีข้อความอื่น:
+{
+  "symptom": "อาการหลักโดยย่อ",
+  "causes": ["สาเหตุที่เป็นไปได้ เรียงจากน่าจะเป็นมากสุด 2-4 ข้อ"],
+  "urgency": "low หรือ medium หรือ high",
+  "cost": "ช่วงค่าซ่อมโดยประมาณ (ระบุสกุลเงินบาท)",
+  "advice": "คำแนะนำขั้นตอนถัดไป 1-2 ประโยค"
+}
+เขียนค่าทุกฟิลด์เป็นภาษาไทย
+
+บทสนทนา:
+${convo}`;
+
+  const body = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: { temperature: 0.3 }
+  };
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+
+  if (!res.ok) {
+    throw new Error(`Gemini Summary API error: ${res.status} ${await res.text()}`);
+  }
+
+  const data = await res.json();
+  const candidate = (data.candidates && data.candidates[0]) || {};
+  const text = ((candidate.content && candidate.content.parts) || [])
+    .map(p => p.text || "")
+    .join("")
+    .trim();
+
+  let s = text.replace(/```json/gi, "").replace(/```/g, "").trim();
+  const m = s.match(/[\[{][\s\S]*[\]}]/);
+  if (m) s = m[0];
+
+  return JSON.parse(s);
+}
+
+
+/**
  * Triggers news fetch from Gemini and batch-saves it to Cloudflare D1.
  * @param {object} env - Cloudflare Worker env
  * @returns {Promise<void>}
@@ -427,14 +564,17 @@ export default {
     // Route: POST /api/diagnose
     if (url.pathname === '/api/diagnose' && request.method === 'POST') {
       try {
-        let payload;
-        try {
-          payload = await getAuthenticatedUser(request, env);
-        } catch (authErr) {
-          return jsonResponse({ error: 'Invalid authentication token: ' + authErr.message }, 401);
+        let uid = null;
+        const authHeader = request.headers.get('Authorization');
+        if (authHeader && authHeader.startsWith('Bearer ')) {
+          try {
+            const payload = await getAuthenticatedUser(request, env);
+            uid = payload.sub;
+          } catch (authErr) {
+            console.warn("Optional auth failed:", authErr.message);
+          }
         }
 
-        const uid = payload.sub;
         if (!env.DB) {
           return jsonResponse({ error: 'D1 Database connection is not configured' }, 500);
         }
@@ -446,36 +586,57 @@ export default {
           return jsonResponse({ error: 'Invalid JSON request body' }, 400);
         }
 
-        const { carId, symptoms } = bodyData;
-        if (!symptoms || !symptoms.trim()) {
-          return jsonResponse({ error: 'Missing required field: symptoms' }, 400);
-        }
+        const { mode, carId, symptoms, messages } = bodyData;
+        const currentMode = mode || "diagnose";
 
-        let carInfo;
-        if (carId) {
+        let carInfo = { make: '', model: '', year: '', mileage: '' };
+        if (carId && uid) {
           const car = await env.DB.prepare(`
             SELECT make, model, year, mileage FROM cars WHERE id = ? AND uid = ?
           `).bind(carId, uid).first();
 
-          if (!car) {
-            return jsonResponse({ error: 'Car not found or unauthorized' }, 404);
+          if (car) {
+            carInfo = car;
           }
-          carInfo = car;
-        } else {
-          const { make, model, year, mileage } = bodyData;
-          if (!make || !model) {
-            return jsonResponse({ error: 'Missing required fields: make, model (or provide carId)' }, 400);
-          }
-          carInfo = { make, model, year: year || '', mileage: mileage || '' };
         }
 
-        const diagnosis = await getGemmaDiagnosis(env, carInfo, symptoms.trim());
+        if (!carInfo.make) {
+          carInfo.make = bodyData.make || '';
+          carInfo.model = bodyData.model || '';
+          carInfo.year = bodyData.year != null ? String(bodyData.year) : '';
+          carInfo.mileage = bodyData.mileage != null ? String(bodyData.mileage) : '';
+        }
 
-        return jsonResponse({
-          carInfo,
-          diagnosis,
-          created_at: Date.now()
-        });
+        if (currentMode === "diagnose") {
+          const symptomsText = symptoms || (messages && messages.length && messages[messages.length - 1].text) || '';
+          if (!symptomsText || !symptomsText.trim()) {
+            return jsonResponse({ error: 'Missing required field: symptoms' }, 400);
+          }
+          const diagnosis = await getGemmaDiagnosis(env, carInfo, symptomsText.trim());
+          return jsonResponse({
+            carInfo,
+            diagnosis,
+            created_at: Date.now()
+          });
+        } 
+        
+        else if (currentMode === "chat") {
+          if (!messages || !Array.isArray(messages)) {
+            return jsonResponse({ error: 'Missing or invalid messages array' }, 400);
+          }
+          const text = await getGeminiChatResponse(env, carInfo, messages);
+          return jsonResponse({ text });
+        } 
+        
+        else if (currentMode === "summarize") {
+          if (!messages || !Array.isArray(messages)) {
+            return jsonResponse({ error: 'Missing or invalid messages array' }, 400);
+          }
+          const summary = await getGeminiSummary(env, messages);
+          return jsonResponse({ summary });
+        }
+
+        return jsonResponse({ error: 'Unsupported mode: ' + currentMode }, 400);
       } catch (err) {
         return jsonResponse({ error: err.message }, 500);
       }
