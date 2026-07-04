@@ -22,7 +22,11 @@
   "vars": {
     "FIREBASE_PROJECT_ID": "sp1p-82396",
     "GEMINI_MODEL": "gemini-2.5-flash",
+    "GEMINI_BASE_URL": "https://generativelanguage.googleapis.com",
     "GEMMA_MODEL": "gemma-3-27b-it"
+  },
+  "placement": {
+    "mode": "smart"
   },
   "triggers": {
     "crons": [

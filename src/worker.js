@@ -41,7 +41,8 @@ async function getGeminiNews(env) {
     throw new Error('GEMINI_KEY environment variable is not configured');
   }
   const model = env.GEMINI_MODEL || "gemini-2.5-flash";
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
+  const baseUrl = env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com";
+  const url = `${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`;
 
   const prompt = `ค้นเว็บหาข่าวและบทความเกี่ยวกับรถยนต์ล่าสุดในไทยวันนี้ โดยใช้ข้อมูลจากแหล่งข่าวที่น่าเชื่อถือ ทั้งข่าวไทยและต่างประเทศ เช่น Car And Driver, Top Gear, autolifethailand, headlightmag, motorexpo, thairath, prachatai, manager ฯลฯ สรุปออกมา 10-20 ข่าว/บทความที่น่าสนใจที่สุด
 
@@ -111,7 +112,8 @@ async function getGemmaDiagnosis(env, carInfo, symptoms) {
     throw new Error('GEMINI_KEY environment variable is not configured');
   }
   const model = env.GEMMA_MODEL || "gemma-3-27b-it";
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
+  const baseUrl = env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com";
+  const url = `${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`;
 
   const prompt = `คุณเป็นผู้เชี่ยวชาญด้านการวินิจฉัยปัญหารถยนต์ กรุณาวิเคราะห์อาการต่อไปนี้แล้วให้การวินิจฉัยเบื้องต้น
 
@@ -178,7 +180,8 @@ async function getGeminiChatResponse(env, carInfo, messages) {
     throw new Error('GEMINI_KEY environment variable is not configured');
   }
   const model = env.GEMINI_MODEL || "gemini-2.5-flash";
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
+  const baseUrl = env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com";
+  const url = `${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`;
 
   const carContext = (carInfo.make || carInfo.model) 
     ? `\nรถของผู้ใช้: ${carInfo.make || ''} ${carInfo.model || ''} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` 
@@ -253,7 +256,8 @@ async function getGeminiSummary(env, messages) {
     throw new Error('GEMINI_KEY environment variable is not configured');
   }
   const model = env.GEMINI_MODEL || "gemini-2.5-flash";
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
+  const baseUrl = env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com";
+  const url = `${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`;
 
   const convo = messages.slice(-14)
     .map(m => (m.role === "user" ? "USER: " : "AI: ") + (m.text || ""))
