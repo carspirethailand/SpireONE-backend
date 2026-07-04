@@ -108,6 +108,60 @@ Deletes a car record. The API verifies that the car belongs to the authenticated
 
 ---
 
+## AI Diagnosis Endpoints
+
+### 1. Diagnose Car Problem
+Sends a free-text symptom description to the Gemma AI model (`gemma-3-27b-it`) and returns a structured preliminary diagnosis.
+
+* **URL**: `/api/diagnose`
+* **Method**: `POST`
+* **Headers**:
+  * `Authorization: Bearer <ID_TOKEN>`
+  * `Content-Type: application/json`
+* **Request Body**:
+  ```json
+  {
+    "carId": "c17373822292",    // Optional. If provided, car specs are looked up from the user's saved cars.
+    "make": "Toyota",            // Required if carId is omitted.
+    "model": "Fortuner",         // Required if carId is omitted.
+    "year": "2020",              // Optional.
+    "mileage": "150000",         // Optional.
+    "symptoms": "เครื่องยนต์มีเสียงดังตอนสตาร์ท และมีควันขาวออกจากท่อไอเสีย"  // Required.
+  }
+  ```
+* **Response (Success `200 OK`)**:
+  ```json
+  {
+    "carInfo": {
+      "make": "Toyota",
+      "model": "Fortuner",
+      "year": "2020",
+      "mileage": "150000"
+    },
+    "diagnosis": {
+      "summary": "สรุปอาการและแนวโน้มปัญหาโดยย่อ",
+      "possibleCauses": [
+        { "cause": "แบตเตอรี่เสื่อม", "likelihood": "สูง", "explanation": "..." }
+      ],
+      "severity": "ปานกลาง",
+      "recommendedAction": "คำแนะนำว่าควรทำอย่างไรต่อไป",
+      "shouldVisitMechanic": true,
+      "disclaimer": "นี่เป็นการวินิจฉัยเบื้องต้นจาก AI ไม่ใช่การวินิจฉัยของช่างผู้เชี่ยวชาญ"
+    },
+    "created_at": 1719593123456
+  }
+  ```
+* **Response (Error)**:
+  * `400 Bad Request`: Missing `symptoms`, or missing `make`/`model` when `carId` is not provided, or invalid JSON body.
+    ```json
+    { "error": "Missing required field: symptoms" }
+    ```
+  * `401 Unauthorized`: JWT is expired, missing, or signature verification failed.
+  * `404 Not Found`: `carId` does not exist or does not belong to the requesting user.
+  * `500 Internal Server Error`: Gemma API call failed or D1 connection failure.
+
+---
+
 ## Magazine Endpoints
 
 ### 1. Retrieve Daily Summarized News

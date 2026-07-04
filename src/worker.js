@@ -99,6 +99,73 @@ async function getGeminiNews(env) {
 }
 
 /**
+ * Calls the Gemma model to diagnose a car problem from a symptom description.
+ * @param {object} env - Cloudflare Worker env
+ * @param {object} carInfo - { make, model, year, mileage }
+ * @param {string} symptoms - Free-text description of the car's symptoms
+ * @returns {Promise<object>} Structured diagnosis object
+ */
+async function getGemmaDiagnosis(env, carInfo, symptoms) {
+  const geminiKey = env.GEMINI_KEY;
+  if (!geminiKey) {
+    throw new Error('GEMINI_KEY environment variable is not configured');
+  }
+  const model = env.GEMMA_MODEL || "gemma-3-27b-it";
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
+
+  const prompt = `คุณเป็นผู้เชี่ยวชาญด้านการวินิจฉัยปัญหารถยนต์ กรุณาวิเคราะห์อาการต่อไปนี้แล้วให้การวินิจฉัยเบื้องต้น
+
+ข้อมูลรถ: ยี่ห้อ ${carInfo.make || 'ไม่ระบุ'} รุ่น ${carInfo.model || 'ไม่ระบุ'} ปี ${carInfo.year || 'ไม่ระบุ'} เลขไมล์ ${carInfo.mileage || 'ไม่ระบุ'} กิโลเมตร
+
+อาการที่พบ: ${symptoms}
+
+ตอบเป็น JSON object เท่านั้น ห้ามเขียนคำนำ คำอธิบาย หรือ markdown ใดๆ นอกจาก JSON โดยมีโครงสร้างดังนี้:
+{
+  "summary": "สรุปอาการและแนวโน้มปัญหาโดยย่อ 1-2 ประโยค",
+  "possibleCauses": [
+    { "cause": "ชื่อสาเหตุที่เป็นไปได้", "likelihood": "สูง หรือ กลาง หรือ ต่ำ", "explanation": "คำอธิบายสั้นๆ ว่าทำไมถึงเป็นไปได้" }
+  ],
+  "severity": "ต่ำ หรือ ปานกลาง หรือ สูง หรือ ฉุกเฉิน",
+  "recommendedAction": "คำแนะนำว่าควรทำอย่างไรต่อไป",
+  "shouldVisitMechanic": true หรือ false,
+  "disclaimer": "คำเตือนว่านี่เป็นการวินิจฉัยเบื้องต้นจาก AI ไม่ใช่การวินิจฉัยของช่างผู้เชี่ยวชาญ"
+}`;
+
+  const body = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: {
+      temperature: 0.3
+    }
+  };
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+
+  if (!res.ok) {
+    throw new Error(`Gemma API error: ${res.status} ${await res.text()}`);
+  }
+
+  const data = await res.json();
+  const text = ((data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [])
+    .map(p => p.text || "")
+    .join("")
+    .trim();
+
+  let s = text.replace(/```json/gi, "").replace(/```/g, "").trim();
+  const m = s.match(/[\[{][\s\S]*[\]}]/);
+  if (m) s = m[0];
+
+  const parsed = JSON.parse(s);
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('Gemma response is not a JSON object');
+  }
+  return parsed;
+}
+
+/**
  * Triggers news fetch from Gemini and batch-saves it to Cloudflare D1.
  * @param {object} env - Cloudflare Worker env
  * @returns {Promise<void>}
@@ -352,6 +419,63 @@ export default {
         }
 
         return jsonResponse({ success: true, message: 'Car removed successfully' });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, 500);
+      }
+    }
+
+    // Route: POST /api/diagnose
+    if (url.pathname === '/api/diagnose' && request.method === 'POST') {
+      try {
+        let payload;
+        try {
+          payload = await getAuthenticatedUser(request, env);
+        } catch (authErr) {
+          return jsonResponse({ error: 'Invalid authentication token: ' + authErr.message }, 401);
+        }
+
+        const uid = payload.sub;
+        if (!env.DB) {
+          return jsonResponse({ error: 'D1 Database connection is not configured' }, 500);
+        }
+
+        let bodyData;
+        try {
+          bodyData = await request.json();
+        } catch (e) {
+          return jsonResponse({ error: 'Invalid JSON request body' }, 400);
+        }
+
+        const { carId, symptoms } = bodyData;
+        if (!symptoms || !symptoms.trim()) {
+          return jsonResponse({ error: 'Missing required field: symptoms' }, 400);
+        }
+
+        let carInfo;
+        if (carId) {
+          const car = await env.DB.prepare(`
+            SELECT make, model, year, mileage FROM cars WHERE id = ? AND uid = ?
+          `).bind(carId, uid).first();
+
+          if (!car) {
+            return jsonResponse({ error: 'Car not found or unauthorized' }, 404);
+          }
+          carInfo = car;
+        } else {
+          const { make, model, year, mileage } = bodyData;
+          if (!make || !model) {
+            return jsonResponse({ error: 'Missing required fields: make, model (or provide carId)' }, 400);
+          }
+          carInfo = { make, model, year: year || '', mileage: mileage || '' };
+        }
+
+        const diagnosis = await getGemmaDiagnosis(env, carInfo, symptoms.trim());
+
+        return jsonResponse({
+          carInfo,
+          diagnosis,
+          created_at: Date.now()
+        });
       } catch (err) {
         return jsonResponse({ error: err.message }, 500);
       }
