@@ -23,7 +23,8 @@
     "FIREBASE_PROJECT_ID": "sp1p-82396",
     "GEMINI_MODEL": "gemini-2.5-flash",
     "GEMINI_BASE_URL": "https://generativelanguage.googleapis.com",
-    "GEMMA_MODEL": "gemma-4-31b-it"
+    "CEREBRAS_MODEL": "gpt-oss-120b",
+    "CEREBRAS_BASE_URL": "https://api.cerebras.ai/v1"
   },
   "placement": {
     "mode": "smart"

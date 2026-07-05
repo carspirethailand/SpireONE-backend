@@ -106,14 +106,14 @@ async function getGeminiNews(env) {
  * @param {string} symptoms - Free-text description of the car's symptoms
  * @returns {Promise<object>} Structured diagnosis object
  */
-async function getGemmaDiagnosis(env, carInfo, symptoms) {
-  const geminiKey = env.GEMINI_KEY;
-  if (!geminiKey) {
-    throw new Error('GEMINI_KEY environment variable is not configured');
+async function getCerebrasDiagnosis(env, carInfo, symptoms) {
+  const cerebrasKey = env.CEREBRAS_API_KEY;
+  if (!cerebrasKey) {
+    throw new Error('CEREBRAS_API_KEY environment variable is not configured');
   }
-  const model = env.GEMMA_MODEL || "gemma-3-27b-it";
-  const baseUrl = env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com";
-  const url = `${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`;
+  const model = env.CEREBRAS_MODEL || "gpt-oss-120b";
+  const baseUrl = env.CEREBRAS_BASE_URL || "https://api.cerebras.ai/v1";
+  const url = `${baseUrl}/chat/completions`;
 
   const prompt = `คุณเป็นผู้เชี่ยวชาญด้านการวินิจฉัยปัญหารถยนต์ กรุณาวิเคราะห์อาการต่อไปนี้แล้วให้การวินิจฉัยเบื้องต้น
 
@@ -134,27 +134,29 @@ async function getGemmaDiagnosis(env, carInfo, symptoms) {
 }`;
 
   const body = {
-    contents: [{ parts: [{ text: prompt }] }],
-    generationConfig: {
-      temperature: 0.3
-    }
+    model,
+    messages: [
+      { role: "system", content: "You are an expert car mechanic. You must output only a valid JSON object matching the requested schema. Do not write any explanations outside the JSON." },
+      { role: "user", content: prompt }
+    ],
+    temperature: 0.3
   };
 
   const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${cerebrasKey}`
+    },
     body: JSON.stringify(body)
   });
 
   if (!res.ok) {
-    throw new Error(`Gemma API error: ${res.status} ${await res.text()}`);
+    throw new Error(`Cerebras API error: ${res.status} ${await res.text()}`);
   }
 
   const data = await res.json();
-  const text = ((data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [])
-    .map(p => p.text || "")
-    .join("")
-    .trim();
+  const text = ((data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "").trim();
 
   let s = text.replace(/```json/gi, "").replace(/```/g, "").trim();
   const m = s.match(/[\[{][\s\S]*[\]}]/);
@@ -162,7 +164,7 @@ async function getGemmaDiagnosis(env, carInfo, symptoms) {
 
   const parsed = JSON.parse(s);
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    throw new Error('Gemma response is not a JSON object');
+    throw new Error('Cerebras response is not a JSON object');
   }
   return parsed;
 }
@@ -616,7 +618,7 @@ export default {
           if (!symptomsText || !symptomsText.trim()) {
             return jsonResponse({ error: 'Missing required field: symptoms' }, 400);
           }
-          const diagnosis = await getGemmaDiagnosis(env, carInfo, symptomsText.trim());
+          const diagnosis = await getCerebrasDiagnosis(env, carInfo, symptomsText.trim());
           return jsonResponse({
             carInfo,
             diagnosis,
