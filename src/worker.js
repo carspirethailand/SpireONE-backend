@@ -687,6 +687,77 @@ export default {
       }
     }
 
+    // Route: POST /api/ai/chat
+    if (url.pathname === '/api/ai/chat' && request.method === 'POST') {
+      try {
+        let payload;
+        try {
+          payload = await getAuthenticatedUser(request, env);
+        } catch (authErr) {
+          return jsonResponse({ error: 'Invalid authentication token: ' + authErr.message }, 401);
+        }
+
+        const uid = payload.sub;
+        
+        let bodyData;
+        try {
+          bodyData = await request.json();
+        } catch (e) {
+          return jsonResponse({ error: 'Invalid JSON request body' }, 400);
+        }
+
+        const { contents, system, search, temp } = bodyData;
+        if (!contents || !Array.isArray(contents)) {
+          return jsonResponse({ error: 'Missing or invalid contents array' }, 400);
+        }
+
+        const geminiKey = env.GEMINI_KEY;
+        if (!geminiKey) {
+          return jsonResponse({ error: 'GEMINI_KEY environment variable is not configured' }, 500);
+        }
+
+        const model = env.GEMINI_MODEL || "gemini-2.5-flash";
+        const baseUrl = env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com";
+        const geminiUrl = `${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`;
+
+        const body = {
+          contents,
+          generationConfig: {
+            temperature: temp != null ? temp : 0.5
+          }
+        };
+
+        if (system) {
+          body.systemInstruction = { parts: [{ text: system }] };
+        }
+
+        if (search) {
+          body.tools = [{ google_search: {} }];
+        }
+
+        const res = await fetch(geminiUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body)
+        });
+
+        if (!res.ok) {
+          return jsonResponse({ error: `Gemini API error: ${res.status} ${await res.text()}` }, res.status);
+        }
+
+        const data = await res.json();
+        const candidate = (data.candidates && data.candidates[0]) || {};
+        const text = ((candidate.content && candidate.content.parts) || [])
+          .map(p => p.text || "")
+          .join("")
+          .trim();
+
+        return jsonResponse({ text });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, 500);
+      }
+    }
+
     return jsonResponse({ error: 'Not Found' }, 404);
   },
 
