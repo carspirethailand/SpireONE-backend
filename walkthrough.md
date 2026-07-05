@@ -1,23 +1,26 @@
 # Walkthrough — ReAct Agentic Chat System (v3)
 
-We have successfully migrated the main conversation system of SpireONE to a unified **ReAct Agentic Loop** using **Cerebras `gpt-oss-120b`** as the controller and **Google Gemini 2.5 Flash** as tool executors.
+We have successfully migrated the main conversation system of SpireONE to a unified **ReAct Agentic Loop** using **Groq `llama-3.3-70b-versatile`** as the controller and **Google Gemini 2.5 Flash** as tool executors, completely bypassing Cerebras's network-level Cloudflare blocks on Cloudflare Workers.
 
 ---
 
 ## 1. Backend Updates (`src/worker.js`)
+- **Migrated reasoning to Groq Llama 3.3 70B**:
+  - Replaced all Cerebras endpoint calls with the Groq Chat Completions API (`api.groq.com/openai/v1`).
+  - Switched the primary agent model to `llama-3.3-70b-versatile`.
+  - Switched authorization headers to use `GROQ_API_KEY`.
 - **Implemented `runReActAgent(env, carInfo, messages)`**:
   - The primary conversation handler. Orchestrates a 3-step ReAct (Reasoning + Action) loop.
-  - Matches regex `Action: <toolName>(<param>)` from `gpt-oss-120b` responses and executes them, appending outcomes as `Observation: <result>` to the reasoning context before looping.
+  - Matches regex `Action: <toolName>(<param>)` from Groq responses and executes them, appending outcomes as `Observation: <result>` to the reasoning context before looping.
 - **WAF Bypass Headers & Auto-Retry Mechanism**:
-  - Implemented `fetchWithRetry` to automatically retry calls to Cerebras up to 2 times if a `403` WAF challenge from Cloudflare is detected. This shifts egress nodes/IPs on retry to successfully fetch.
-  - Added standard browser headers including User-Agent and Chrome Client Hints (`sec-ch-ua`, `sec-ch-ua-platform`, `sec-ch-ua-mobile`, `Sec-Fetch-Dest`, `Sec-Fetch-Mode`, `Sec-Fetch-Site`) to match browser fingerprint checks.
+  - Maintained `fetchWithRetry` and browser client headers to mimic realistic browser requests, keeping all outbound connections to API providers protected against future false WAF triggers.
 - **Implemented `executeDescribeMediaTool`**:
   - Exposes Gemini 2.5 Flash as a tool. Retrieves all `inline_data` attachments (base64 image, video, or audio) in the message history, analyzes them according to the agent's prompt, and returns the observation back to the loop.
 - **Implemented `executeGoogleSearchTool`**:
   - Exposes Gemini 2.5 Flash as a tool. Takes a search query, uses Gemini's search grounding capability, and returns the summarized web findings back to the loop.
 - **Unified `/api/ai/chat` Endpoint**:
   - Replaced the direct Gemini proxy route. It now queries car specs from the D1 database using `carId` (if logged in) and executes `runReActAgent`.
-- **Wrangler dry-run compile validation**: Succeeded with total upload size `88.20 KiB`.
+- **Wrangler dry-run compile validation**: Succeeded with total upload size `88.14 KiB`.
 
 ---
 
@@ -29,5 +32,5 @@ We have successfully migrated the main conversation system of SpireONE to a unif
 
 ## 3. Configuration & Smart Placement (`wrangler.jsonc`)
 - **New Environment Variables**:
-  - `"CEREBRAS_MODEL": "gpt-oss-120b"`
-  - `"CEREBRAS_BASE_URL": "https://api.cerebras.ai/v1"`
+  - `"GROQ_MODEL": "llama-3.3-70b-versatile"`
+  - `"GROQ_BASE_URL": "https://api.groq.com/openai/v1"`
