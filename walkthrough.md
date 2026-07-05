@@ -1,38 +1,30 @@
-# Walkthrough — Unified Backend AI Invocations
+# Walkthrough — ReAct Agentic Chat System (v3)
 
-We have successfully migrated the primary auto-diagnosis model to the **Cerebras Inference API** using the high-performance **`gpt-oss-120b`** model, integrated seamlessly without disrupting existing frontend layouts or operations.
+We have successfully migrated the main conversation system of SpireONE to a unified **ReAct Agentic Loop** using **Cerebras `gpt-oss-120b`** as the controller and **Google Gemini 2.5 Flash** as tool executors.
 
 ---
 
 ## 1. Backend Updates (`src/worker.js`)
-- **Optional Authentication on `/api/diagnose`**: Refactored the route to authenticate optionally. Guest users can now make requests by supplying car parameters in the body, while signed-in users automatically benefit from saved garage D1 records.
-- **Added `/api/ai/chat` Route**:
-  - Implemented the `POST /api/ai/chat` route to support the frontend's new auth-gated conversational flow.
-  - This route accepts `{ contents, system, search, temp }` and proxies it to Gemini using the secure backend API key.
-- **Implemented `getCerebrasDiagnosis(env, carInfo, symptoms)`**:
-  - Replaced the old Gemma integration.
-  - Generates diagnostic evaluations by querying the Cerebras API for the `gpt-oss-120b` model.
-  - Uses the OpenAI-compatible chat completions payload format.
-- **Unified Route Modes**:
-  - `mode: "diagnose"` (Default): Performs structured **Cerebras gpt-oss-120b** car diagnosis.
-  - `mode: "chat"`: Handles open-ended multi-turn conversational chat with Gemini. Passes inline base64 image, video, and audio buffers securely.
-  - `mode: "summarize"`: Summarizes conversation logs into a clean JSON object for the diagnosis summary card.
-- **Wrangler dry-run compile validation**: Succeeded with total upload size `78.20 KiB`.
+- **Implemented `runReActAgent(env, carInfo, messages)`**:
+  - The primary conversation handler. Orchestrates a 3-step ReAct (Reasoning + Action) loop.
+  - Matches regex `Action: <toolName>(<param>)` from `gpt-oss-120b` responses and executes them, appending outcomes as `Observation: <result>` to the reasoning context before looping.
+- **Implemented `executeDescribeMediaTool`**:
+  - Exposes Gemini 2.5 Flash as a tool. Retrieves all `inline_data` attachments (base64 image, video, or audio) in the message history, analyzes them according to the agent's prompt, and returns the observation back to the loop.
+- **Implemented `executeGoogleSearchTool`**:
+  - Exposes Gemini 2.5 Flash as a tool. Takes a search query, uses Gemini's search grounding capability, and returns the summarized web findings back to the loop.
+- **Unified `/api/ai/chat` Endpoint**:
+  - Replaced the direct Gemini proxy route. It now queries car specs from the D1 database using `carId` (if logged in) and executes `runReActAgent`.
+- **Wrangler dry-run compile validation**: Succeeded with total upload size `86.54 KiB`.
 
 ---
 
-## 2. Configuration & Smart Placement (`wrangler.jsonc`)
-- **Model Upgrade**: Replaced `GEMMA_MODEL` variables with Cerebras settings:
+## 2. Frontend Updates (`chat.html`)
+- **Dynamic Context Injection**: Updated the `gemini` chat runner in `chat.html` to fetch the selected car (`selCar()`) and pass `carId` inside the `/api/ai/chat` body, giving the ReAct agent full vehicle specification context.
+- **Unified Diagnostic Flow**: Chat messages are now processed entirely through the unified `/api/ai/chat` endpoint, using the conversational diagnostic loop.
+
+---
+
+## 3. Configuration & Smart Placement (`wrangler.jsonc`)
+- **New Environment Variables**:
   - `"CEREBRAS_MODEL": "gpt-oss-120b"`
   - `"CEREBRAS_BASE_URL": "https://api.cerebras.ai/v1"`
-- **Smart Placement**: Enabled placement routing mode (`smart`) to run Worker executions close to the D1 database, resolving Google's regional egress IP block.
-- **Configurable Base URL**: Defined `GEMINI_BASE_URL` in project variables to allow easy proxying if required in the future.
-
----
-
-## 3. Frontend Updates (`chat.html` & `index.html`)
-- **Key Removal**: Set `GEMINI_KEY = ""` in both files, preventing direct browser requests to Google API.
-- **Backend API Routing**:
-  - Implemented the `callBackendAI(body)` function in `chat.html` to communicate with `/api/diagnose`.
-  - Redirected `sendMsg()` to call backend with `{ mode: "chat", messages: messages }`.
-  - Redirected `makeSummary()` to call backend with `{ mode: "summarize", messages: messages }`.

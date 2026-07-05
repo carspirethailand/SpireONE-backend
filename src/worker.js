@@ -170,13 +170,134 @@ async function getCerebrasDiagnosis(env, carInfo, symptoms) {
 }
 
 /**
- * Calls Gemini to handle open-ended conversational chat.
+ * Executes a ReAct loop on gpt-oss-120b to solve the user's automotive problem.
  * @param {object} env - Cloudflare Worker env
  * @param {object} carInfo - { make, model, year, mileage }
  * @param {Array} messages - Conversation history
- * @returns {Promise<string>} Open-ended chat text response
+ * @returns {Promise<string>} Final answer text
  */
-async function getGeminiChatResponse(env, carInfo, messages) {
+async function runReActAgent(env, carInfo, messages) {
+  const cerebrasKey = env.CEREBRAS_API_KEY;
+  if (!cerebrasKey) {
+    throw new Error('CEREBRAS_API_KEY environment variable is not configured');
+  }
+  const model = env.CEREBRAS_MODEL || "gpt-oss-120b";
+  const baseUrl = env.CEREBRAS_BASE_URL || "https://api.cerebras.ai/v1";
+  const url = `${baseUrl}/chat/completions`;
+
+  const carContext = (carInfo.make || carInfo.model) 
+    ? `\nรถของผู้ใช้: ${carInfo.make || ''} ${carInfo.model || ''} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` 
+    : '';
+
+  const systemPrompt = `คุณคือ SpireONE ผู้ช่วย AI ดูแลรถยนต์และวิเคราะห์ปัญหารถยนต์ที่ชาญฉลาด ตอบเป็นภาษาไทยเป็นหลัก พูดจาเป็นกันเองและเป็นมืออาชีพ คุณจะควบคุมกระบวนการคิดในการหาคำตอบที่ถูกต้องที่สุดให้ผู้ใช้ โดยเขียนวิเคราะห์กระบวนการใน Thought ก่อนเสมอ
+ข้อมูลรถปัจจุบัน:${carContext}
+
+คุณมีเครื่องมือช่วยเหลือดังต่อไปนี้ที่คุณสามารถระบุสั่งงานได้:
+1. describe_media(prompt): สั่งให้ Gemini ช่วยตรวจดูและอธิบายไฟล์สื่อ (ภาพ, วิดีโอ, เสียง) ที่แนบเข้ามาในประวัติแชต โดยคุณสามารถใส่คำอธิบายเพิ่มเติมใน prompt ได้ตามต้องการ เช่น describe_media("ตรวจสอบจุดรั่วซึมใต้ท้องรถจากภาพถ่าย")
+2. google_search(query): สั่งให้ Gemini ช่วยค้นหาข้อมูลและสรุปข่าวสาร ราคากลาง หรือสเปกทางวิศวกรรมล่าสุดจากเว็บด้วยคำค้น query เช่น google_search("ราคายาง Michelin Primacy 4 ปี 2026")
+
+รูปแบบที่คุณต้องปฏิบัติตามในการตอบสนอง (ตอบแบบ ReAct):
+Thought: [ความคิดหรือเหตุผลของคุณว่าต้องทำอะไรต่อ]
+Action: [เลือกเรียกเครื่องมือเพียง 1 อย่างในแต่ละรอบ เช่น describe_media("...") หรือ google_search("...")]
+Observation: [ระบบหลังบ้านจะนำผลลัพธ์มาแปะให้ตรงนี้เอง ห้ามคุณเขียนขึ้นมาเองเด็ดขาด]
+... (คิดวนซ้ำ Thought/Action/Observation ได้สูงสุด 3 รอบ)
+Thought: [เมื่อได้ข้อมูลครบถ้วนแล้วและต้องการปิดคำตอบ]
+Final Answer: [คำตอบภาษาไทยสรุปอย่างเป็นมืออาชีพที่จะส่งไปให้ผู้ใช้จริง]
+
+สำคัญมาก:
+- ห้ามเขียน Observation หรือข้อมูลหลังคำว่า Observation เองเด็ดขาด!
+- หากมีไฟล์แนบในแชต คุณต้องเรียกใช้ describe_media เสมอเพื่อเอาข้อมูลสังเกตมาคิดวิเคราะห์
+- หากต้องการเช็กราคาสินค้า ข่าว หรือสเปกที่ต้องการความสดใหม่ ให้เรียกใช้ google_search
+- หากข้อมูลพร้อมและไม่ต้องรันเครื่องมือ ให้ข้าม Action และเขียน Final Answer ได้เลย`;
+
+  const chatHistory = messages.map(m => {
+    const o = { role: m.role === "user" ? "user" : "assistant", content: "" };
+    if (m.parts && Array.isArray(m.parts)) {
+      m.parts.forEach(p => {
+        if (p.text) {
+          o.content += p.text;
+        }
+        if (p.inline_data) {
+          o.content += ` [ไฟล์สื่อแนบประเภท: ${p.inline_data.mime_type}]`;
+        }
+      });
+    } else {
+      o.content = m.text || "";
+    }
+    return o;
+  });
+
+  const agentLog = [
+    { role: "system", content: systemPrompt },
+    ...chatHistory
+  ];
+
+  let step = 0;
+  const maxSteps = 3;
+
+  while (step < maxSteps) {
+    step++;
+    
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${cerebrasKey}`
+      },
+      body: JSON.stringify({
+        model,
+        messages: agentLog,
+        temperature: 0.3
+      })
+    });
+
+    if (!res.ok) {
+      throw new Error(`Cerebras ReAct error: ${res.status} ${await res.text()}`);
+    }
+
+    const data = await res.json();
+    const completionText = ((data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "").trim();
+
+    agentLog.push({ role: "assistant", content: completionText });
+
+    const actionMatch = completionText.match(/Action:\s*(\w+)\s*\((["'])(.*?)\2\)/i);
+    
+    if (actionMatch) {
+      const toolName = actionMatch[1].toLowerCase();
+      const toolInput = actionMatch[3];
+      let observation = "";
+
+      try {
+        if (toolName === "describe_media") {
+          observation = await executeDescribeMediaTool(env, messages, toolInput);
+        } else if (toolName === "google_search") {
+          observation = await executeGoogleSearchTool(env, toolInput);
+        } else {
+          observation = `Error: Unknown tool "${toolName}"`;
+        }
+      } catch (toolErr) {
+        observation = `Error running tool: ${toolErr.message}`;
+      }
+
+      agentLog.push({ role: "user", content: `Observation: ${observation}` });
+    } else {
+      const finalAnswerMatch = completionText.match(/Final Answer:\s*([\s\S]+)$/i);
+      if (finalAnswerMatch) {
+        return finalAnswerMatch[1].trim();
+      }
+      return completionText;
+    }
+  }
+
+  const lastText = agentLog[agentLog.length - 1].content;
+  const finalAnswerMatch = lastText.match(/Final Answer:\s*([\s\S]+)$/i);
+  return finalAnswerMatch ? finalAnswerMatch[1].trim() : lastText;
+}
+
+/**
+ * Tool helper to describe media attachments using Gemini.
+ */
+async function executeDescribeMediaTool(env, messages, prompt) {
   const geminiKey = env.GEMINI_KEY;
   if (!geminiKey) {
     throw new Error('GEMINI_KEY environment variable is not configured');
@@ -185,48 +306,32 @@ async function getGeminiChatResponse(env, carInfo, messages) {
   const baseUrl = env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com";
   const url = `${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`;
 
-  const carContext = (carInfo.make || carInfo.model) 
-    ? `\nรถของผู้ใช้: ${carInfo.make || ''} ${carInfo.model || ''} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` 
-    : '';
-
-  const systemPrompt = `คุณคือ SpireONE ผู้ช่วย AI ดูแลรถยนต์ พูดจาเป็นกันเองอบอุ่นเหมือนเพื่อนช่างมืออาชีพ ตอบเป็นภาษาไทยเป็นหลัก (หรือสลับภาษาตามที่คู่สนทนาพิมพ์มา). ช่วยวินิจฉัยอาการรถ ให้คำแนะนำเป็นขั้นตอน ประเมินค่าใช้จ่ายคร่าวๆ และตอบคำถามเรื่องรถทุกอย่าง. ถ้ามีรูป/วิดีโอ/เสียงแนบมา ให้วิเคราะห์จากสื่อนั้นจริงๆ. ตอบกระชับ อ่านง่าย ใช้หัวข้อย่อย (ขึ้นต้นด้วย "- ") เมื่อเหมาะสม. ย้ำเสมอว่าเป็นการประเมินเบื้องต้น ควรให้ช่างตรวจจริงเพื่อความปลอดภัย.${carContext}`;
-
-  const hasMedia = messages.some(m => m.atts && m.atts.some(a => a.b64));
-  const contents = messages.slice(-12).map(m => {
-    const parts = [];
-    if (m.text) {
-      parts.push({ text: m.text });
-    }
-    if (m.atts && Array.isArray(m.atts)) {
-      m.atts.forEach(a => {
-        if (a.b64 && a.mime) {
+  const parts = [];
+  messages.forEach(m => {
+    if (m.parts && Array.isArray(m.parts)) {
+      m.parts.forEach(p => {
+        if (p.inline_data) {
           parts.push({
             inline_data: {
-              mime_type: a.mime,
-              data: a.b64
+              mime_type: p.inline_data.mime_type,
+              data: p.inline_data.data
             }
           });
         }
       });
     }
-    if (parts.length === 0) {
-      parts.push({ text: "" });
-    }
-    return {
-      role: m.role === "user" ? "user" : "model",
-      parts
-    };
   });
 
-  const body = {
-    contents,
-    systemInstruction: { parts: [{ text: systemPrompt }] },
-    generationConfig: { temperature: 0.5 }
-  };
-
-  if (!hasMedia) {
-    body.tools = [{ google_search: {} }];
+  if (parts.length === 0) {
+    return "ไม่มีไฟล์รูปภาพ วิดีโอ หรือข้อความเสียงแนบมาในแชตนี้";
   }
+
+  parts.push({ text: `กรุณาอธิบายไฟล์สื่อตามคำสั่งนี้: ${prompt}\nตอบสั้นกระชับเข้าใจง่าย` });
+
+  const body = {
+    contents: [{ parts }],
+    generationConfig: { temperature: 0.4 }
+  };
 
   const res = await fetch(url, {
     method: "POST",
@@ -235,7 +340,43 @@ async function getGeminiChatResponse(env, carInfo, messages) {
   });
 
   if (!res.ok) {
-    throw new Error(`Gemini Chat API error: ${res.status} ${await res.text()}`);
+    throw new Error(`Media reader error: ${res.status}`);
+  }
+
+  const data = await res.json();
+  const candidate = (data.candidates && data.candidates[0]) || {};
+  return ((candidate.content && candidate.content.parts) || [])
+    .map(p => p.text || "")
+    .join("")
+    .trim();
+}
+
+/**
+ * Tool helper to run Google Search using Gemini.
+ */
+async function executeGoogleSearchTool(env, query) {
+  const geminiKey = env.GEMINI_KEY;
+  if (!geminiKey) {
+    throw new Error('GEMINI_KEY environment variable is not configured');
+  }
+  const model = env.GEMINI_MODEL || "gemini-2.5-flash";
+  const baseUrl = env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com";
+  const url = `${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`;
+
+  const body = {
+    contents: [{ parts: [{ text: `ค้นข้อมูลในอินเทอร์เน็ตเกี่ยวกับหัวข้อนี้ และตอบสรุปสั้นๆ ให้ถูกต้องและกระชับ: ${query}` }] }],
+    tools: [{ google_search: {} }],
+    generationConfig: { temperature: 0.4 }
+  };
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+
+  if (!res.ok) {
+    throw new Error(`Google Search tool error: ${res.status}`);
   }
 
   const data = await res.json();
@@ -708,52 +849,22 @@ export default {
           return jsonResponse({ error: 'Invalid JSON request body' }, 400);
         }
 
-        const { contents, system, search, temp } = bodyData;
+        const { contents, carId } = bodyData;
         if (!contents || !Array.isArray(contents)) {
           return jsonResponse({ error: 'Missing or invalid contents array' }, 400);
         }
 
-        const geminiKey = env.GEMINI_KEY;
-        if (!geminiKey) {
-          return jsonResponse({ error: 'GEMINI_KEY environment variable is not configured' }, 500);
-        }
-
-        const model = env.GEMINI_MODEL || "gemini-2.5-flash";
-        const baseUrl = env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com";
-        const geminiUrl = `${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`;
-
-        const body = {
-          contents,
-          generationConfig: {
-            temperature: temp != null ? temp : 0.5
+        let carInfo = { make: '', model: '', year: '', mileage: '' };
+        if (carId && uid && env.DB) {
+          const car = await env.DB.prepare(`
+            SELECT make, model, year, mileage FROM cars WHERE id = ? AND uid = ?
+          `).bind(carId, uid).first();
+          if (car) {
+            carInfo = car;
           }
-        };
-
-        if (system) {
-          body.systemInstruction = { parts: [{ text: system }] };
         }
 
-        if (search) {
-          body.tools = [{ google_search: {} }];
-        }
-
-        const res = await fetch(geminiUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body)
-        });
-
-        if (!res.ok) {
-          return jsonResponse({ error: `Gemini API error: ${res.status} ${await res.text()}` }, res.status);
-        }
-
-        const data = await res.json();
-        const candidate = (data.candidates && data.candidates[0]) || {};
-        const text = ((candidate.content && candidate.content.parts) || [])
-          .map(p => p.text || "")
-          .join("")
-          .trim();
-
+        const text = await runReActAgent(env, carInfo, contents);
         return jsonResponse({ text });
       } catch (err) {
         return jsonResponse({ error: err.message }, 500);
