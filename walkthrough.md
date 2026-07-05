@@ -8,13 +8,15 @@ We have successfully migrated the main conversation system of SpireONE to a unif
 - **Implemented `runReActAgent(env, carInfo, messages)`**:
   - The primary conversation handler. Orchestrates a 3-step ReAct (Reasoning + Action) loop.
   - Matches regex `Action: <toolName>(<param>)` from `gpt-oss-120b` responses and executes them, appending outcomes as `Observation: <result>` to the reasoning context before looping.
+- **WAF Bypass Headers**:
+  - Added standard browser `User-Agent` and `Accept` headers to outbound Cerebras fetch requests in `getCerebrasDiagnosis` and `runReActAgent`. This prevents Cloudflare's WAF on Cerebras's side from challenging and blocking our Worker requests.
 - **Implemented `executeDescribeMediaTool`**:
   - Exposes Gemini 2.5 Flash as a tool. Retrieves all `inline_data` attachments (base64 image, video, or audio) in the message history, analyzes them according to the agent's prompt, and returns the observation back to the loop.
 - **Implemented `executeGoogleSearchTool`**:
   - Exposes Gemini 2.5 Flash as a tool. Takes a search query, uses Gemini's search grounding capability, and returns the summarized web findings back to the loop.
 - **Unified `/api/ai/chat` Endpoint**:
   - Replaced the direct Gemini proxy route. It now queries car specs from the D1 database using `carId` (if logged in) and executes `runReActAgent`.
-- **Wrangler dry-run compile validation**: Succeeded with total upload size `86.54 KiB`.
+- **Wrangler dry-run compile validation**: Succeeded with total upload size `86.87 KiB`.
 
 ---
 
