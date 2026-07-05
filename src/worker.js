@@ -100,6 +100,32 @@ async function getGeminiNews(env) {
 }
 
 /**
+ * Helper to fetch with retry for bypassing temporary Cloudflare Workers egress WAF blocks.
+ */
+async function fetchWithRetry(url, options, maxRetries = 2) {
+  let lastRes;
+  for (let i = 0; i <= maxRetries; i++) {
+    try {
+      const res = await fetch(url, options);
+      if (res.status === 403) {
+        lastRes = res;
+        const text = await res.clone().text();
+        if (text.includes("Cloudflare") || text.includes("Attention Required")) {
+          console.warn(`Cloudflare WAF block detected on egress. Retry ${i + 1}/${maxRetries}...`);
+          await new Promise(r => setTimeout(r, 400 + Math.random() * 300));
+          continue;
+        }
+      }
+      return res;
+    } catch (err) {
+      if (i === maxRetries) throw err;
+      await new Promise(r => setTimeout(r, 400 + Math.random() * 300));
+    }
+  }
+  return lastRes;
+}
+
+/**
  * Calls the Gemma model to diagnose a car problem from a symptom description.
  * @param {object} env - Cloudflare Worker env
  * @param {object} carInfo - { make, model, year, mileage }
@@ -142,13 +168,19 @@ async function getCerebrasDiagnosis(env, carInfo, symptoms) {
     temperature: 0.3
   };
 
-  const res = await fetch(url, {
+  const res = await fetchWithRetry(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "Authorization": `Bearer ${cerebrasKey}`,
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      "Accept": "application/json"
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      "Accept": "application/json",
+      "sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+      "sec-ch-ua-mobile": "?0",
+      "sec-ch-ua-platform": '"Windows"',
+      "Sec-Fetch-Dest": "empty",
+      "Sec-Fetch-Mode": "cors",
+      "Sec-Fetch-Site": "cross-site"
     },
     body: JSON.stringify(body)
   });
@@ -240,13 +272,19 @@ Final Answer: [คำตอบภาษาไทยสรุปอย่าง�
   while (step < maxSteps) {
     step++;
     
-    const res = await fetch(url, {
+    const res = await fetchWithRetry(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${cerebrasKey}`,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "cross-site"
       },
       body: JSON.stringify({
         model,
