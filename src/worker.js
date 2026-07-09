@@ -150,59 +150,68 @@ async function fetchWithRetry(url, options, maxRetries = 2) {
   return fetch(url, options);
 }
 
-async function callReasoningModel(env, messages) {
-  let key, model, baseUrl;
-  if (env.CEREBRAS_API_KEY) {
-    key = env.CEREBRAS_API_KEY;
-    model = env.CEREBRAS_MODEL || "gpt-oss-120b";
-    baseUrl = env.CEREBRAS_BASE_URL || "https://api.cerebras.ai/v1";
-  } else if (env.GROQ_API_KEY) {
-    key = env.GROQ_API_KEY;
-    model = env.GROQ_MODEL || "llama-3.3-70b-versatile";
-    baseUrl = env.GROQ_BASE_URL || "https://api.groq.com/openai/v1";
-  } else if (env.OPENROUTER_API_KEY) {
-    key = env.OPENROUTER_API_KEY;
-    model = env.OPENROUTER_MODEL || "meta-llama/llama-3.3-70b-instruct";
-    baseUrl = env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1";
-  } else {
-    throw new Error("No reasoning model API key (CEREBRAS_API_KEY, GROQ_API_KEY, or OPENROUTER_API_KEY) is configured");
+async function callWorkersAI(env, messages) {
+  if (!env.AI) {
+    throw new Error("Cloudflare Workers AI binding 'AI' is not configured");
   }
-
-  const url = `${baseUrl}/chat/completions`;
-  const headers = {
-    "Content-Type": "application/json",
-    "Authorization": `Bearer ${key}`,
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "application/json",
-    "sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "cross-site"
-  };
-
-  if (env.OPENROUTER_API_KEY) {
-    headers["HTTP-Referer"] = "https://carspirethailand.com";
-    headers["X-Title"] = "SpireONE";
-  }
-
-  const res = await fetchWithRetry(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      model,
-      messages,
-      temperature: 0.3
-    })
+  const model = env.CF_AI_FALLBACK_MODEL || "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+  
+  const formatted = messages.map(m => {
+    let role = m.role;
+    if (role !== "system" && role !== "user" && role !== "assistant") {
+      role = "user";
+    }
+    return { role, content: m.content || "" };
   });
 
-  if (!res.ok) {
-    throw new Error(`Reasoning model API error: ${res.status} ${await res.text()}`);
+  const response = await env.AI.run(model, { messages: formatted });
+  if (!response || !response.response) {
+    throw new Error("Cloudflare Workers AI returned an empty response");
+  }
+  return response.response.trim();
+}
+
+async function callReasoningModel(env, messages) {
+  if (env.OPENROUTER_API_KEY) {
+    const model = env.OPENROUTER_MODEL || "openai/gpt-oss-120b:free";
+    const baseUrl = env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1";
+    const url = `${baseUrl}/chat/completions`;
+    
+    try {
+      const res = await fetchWithRetry(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
+          "HTTP-Referer": "https://carspirethailand.com",
+          "X-Title": "SpireONE"
+        },
+        body: JSON.stringify({
+          model,
+          messages,
+          temperature: 0.3
+        })
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        const content = ((data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "").trim();
+        if (content) return content;
+      }
+      
+      console.warn(`OpenRouter primary call returned status ${res.status}. Falling back to Cloudflare Workers AI...`);
+    } catch (err) {
+      console.warn(`OpenRouter primary call failed: ${err.message}. Falling back to Cloudflare Workers AI...`);
+    }
+  } else {
+    console.warn("OPENROUTER_API_KEY is not configured. Falling back to Cloudflare Workers AI...");
   }
 
-  const data = await res.json();
-  return ((data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "").trim();
+  try {
+    return await callWorkersAI(env, messages);
+  } catch (err) {
+    throw new Error(`Reasoning failure (OpenRouter failed & Cloudflare Workers AI fallback failed: ${err.message})`);
+  }
 }
 
 async function runReActAgent(env, carInfo, messages) {
