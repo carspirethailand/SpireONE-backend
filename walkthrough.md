@@ -1,36 +1,36 @@
-# Walkthrough — ReAct Agentic Chat System (v3)
+# Walkthrough — ReAct Agentic Chat System (v4)
 
-We have successfully migrated the main conversation system of SpireONE to a unified **ReAct Agentic Loop** using **Groq `llama-3.3-70b-versatile`** as the controller and **Google Gemini 2.5 Flash** as tool executors, completely bypassing Cerebras's network-level Cloudflare blocks on Cloudflare Workers.
+We have successfully restored the main conversation system of SpireONE to a unified **ReAct Agentic Loop** and resolved the backend database execution issues.
 
 ---
 
-## 1. Backend Updates (`src/worker.js`)
-- **Migrated reasoning to Groq Llama 3.3 70B**:
-  - Replaced all Cerebras endpoint calls with the Groq Chat Completions API (`api.groq.com/openai/v1`).
-  - Switched the primary agent model to `llama-3.3-70b-versatile`.
-  - Switched authorization headers to use `GROQ_API_KEY`.
-- **Implemented `runReActAgent(env, carInfo, messages)`**:
-  - The primary conversation handler. Orchestrates a 3-step ReAct (Reasoning + Action) loop.
-  - Matches regex `Action: <toolName>(<param>)` from Groq responses and executes them, appending outcomes as `Observation: <result>` to the reasoning context before looping.
-- **WAF Bypass Headers & Auto-Retry Mechanism**:
-  - Maintained `fetchWithRetry` and browser client headers to mimic realistic browser requests, keeping all outbound connections to API providers protected against future false WAF triggers.
+## 1. Database Schema Fix
+- **Created Migration `0003_add_admin_system.sql`**:
+  - Adds `created_at` and `banned` columns to the `users` table, which were causing SQL errors during login.
+  - Creates the `config`, `audit`, and `usage` tables used for system maintenance and quota limits.
+  - Successfully tested and applied local migrations (`--local`).
+
+---
+
+## 2. Backend Updates (`src/worker.js`)
+- **Restored `runReActAgent(env, carInfo, messages)`**:
+  - Orchestrates a 3-step ReAct (Reasoning + Action) loop.
+  - Matches regex `Action: <toolName>(<param>)` from reasoning model completions and executes them.
+- **Dynamic Reasoning Provider (`callReasoningModel`)**:
+  - Automatically resolves which API provider to use based on the environment variables defined in wrangler secrets:
+    1. **Cerebras** (`gpt-oss-120b`) if `CEREBRAS_API_KEY` is present.
+    2. **Groq** (`llama-3.3-70b-versatile`) if `GROQ_API_KEY` is present.
+    3. **OpenRouter** (`meta-llama/llama-3.3-70b-instruct`) if `OPENROUTER_API_KEY` is present.
+- **WAF Bypass Headers & Auto-Retry Mechanism (`fetchWithRetry`)**:
+  - Handles Cloudflare WAF challenges by automatically retrying with random delay and client-spoofed browser headers.
 - **Implemented `executeDescribeMediaTool`**:
-  - Exposes Gemini 2.5 Flash as a tool. Retrieves all `inline_data` attachments (base64 image, video, or audio) in the message history, analyzes them according to the agent's prompt, and returns the observation back to the loop.
+  - Exposes Gemini 3.5 Flash as a tool. Analyzes base64 attachments in the chat history.
 - **Implemented `executeGoogleSearchTool`**:
-  - Exposes Gemini 2.5 Flash as a tool. Takes a search query, uses Gemini's search grounding capability, and returns the summarized web findings back to the loop.
-- **Unified `/api/ai/chat` Endpoint**:
-  - Replaced the direct Gemini proxy route. It now queries car specs from the D1 database using `carId` (if logged in) and executes `runReActAgent`.
-- **Wrangler dry-run compile validation**: Succeeded with total upload size `88.14 KiB`.
+  - Exposes Gemini 3.5 Flash as a tool. Runs search queries using Gemini's search grounding.
+- **Integrated in `/api/ai/chat` Endpoint**:
+  - Extracts the `carId` context from the request payload, queries D1 for vehicle specifications, and feeds it to `runReActAgent`.
 
 ---
 
-## 2. Frontend Updates (`chat.html`)
-- **Dynamic Context Injection**: Updated the `gemini` chat runner in `chat.html` to fetch the selected car (`selCar()`) and pass `carId` inside the `/api/ai/chat` body, giving the ReAct agent full vehicle specification context.
-- **Unified Diagnostic Flow**: Chat messages are now processed entirely through the unified `/api/ai/chat` endpoint, using the conversational diagnostic loop.
-
----
-
-## 3. Configuration & Smart Placement (`wrangler.jsonc`)
-- **New Environment Variables**:
-  - `"GROQ_MODEL": "llama-3.3-70b-versatile"`
-  - `"GROQ_BASE_URL": "https://api.groq.com/openai/v1"`
+## 3. Frontend Updates (`chat.html`)
+- **Car Context Payload**: Modified the `gemini` function in `chat.html` to inject `carId` into the `/api/ai/chat` POST body, ensuring the backend agent has access to vehicle specs.

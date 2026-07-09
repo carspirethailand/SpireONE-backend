@@ -27,7 +27,13 @@
     "OWNERS": "anapatmaliwong@gmail.com,carspirethailand@gmail.com",
     "AI_DAILY_LIMIT": "60",
     "AI_ANON_DAILY_LIMIT": "15",
-    "ALLOWED_ORIGINS": "*"
+    "ALLOWED_ORIGINS": "*",
+    "CEREBRAS_MODEL": "gpt-oss-120b",
+    "CEREBRAS_BASE_URL": "https://api.cerebras.ai/v1",
+    "GROQ_MODEL": "llama-3.3-70b-versatile",
+    "GROQ_BASE_URL": "https://api.groq.com/openai/v1",
+    "OPENROUTER_MODEL": "meta-llama/llama-3.3-70b-instruct",
+    "OPENROUTER_BASE_URL": "https://openrouter.ai/api/v1"
   },
   "placement": {
     "mode": "smart"

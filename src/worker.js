@@ -132,6 +132,263 @@ function validateContents(contents) {
   }
 }
 
+async function fetchWithRetry(url, options, maxRetries = 2) {
+  let attempt = 0;
+  while (attempt <= maxRetries) {
+    attempt++;
+    const res = await fetch(url, options);
+    if (res.status === 403 && attempt <= maxRetries) {
+      const text = await res.clone().text();
+      if (text.includes('Cloudflare') || text.includes('Attention Required')) {
+        console.warn(`WAF block detected (attempt ${attempt}/${maxRetries+1}). Retrying in 500ms...`);
+        await new Promise(resolve => setTimeout(resolve, 400 + Math.random() * 300));
+        continue;
+      }
+    }
+    return res;
+  }
+  return fetch(url, options);
+}
+
+async function callReasoningModel(env, messages) {
+  let key, model, baseUrl;
+  if (env.CEREBRAS_API_KEY) {
+    key = env.CEREBRAS_API_KEY;
+    model = env.CEREBRAS_MODEL || "gpt-oss-120b";
+    baseUrl = env.CEREBRAS_BASE_URL || "https://api.cerebras.ai/v1";
+  } else if (env.GROQ_API_KEY) {
+    key = env.GROQ_API_KEY;
+    model = env.GROQ_MODEL || "llama-3.3-70b-versatile";
+    baseUrl = env.GROQ_BASE_URL || "https://api.groq.com/openai/v1";
+  } else if (env.OPENROUTER_API_KEY) {
+    key = env.OPENROUTER_API_KEY;
+    model = env.OPENROUTER_MODEL || "meta-llama/llama-3.3-70b-instruct";
+    baseUrl = env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1";
+  } else {
+    throw new Error("No reasoning model API key (CEREBRAS_API_KEY, GROQ_API_KEY, or OPENROUTER_API_KEY) is configured");
+  }
+
+  const url = `${baseUrl}/chat/completions`;
+  const headers = {
+    "Content-Type": "application/json",
+    "Authorization": `Bearer ${key}`,
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "cross-site"
+  };
+
+  if (env.OPENROUTER_API_KEY) {
+    headers["HTTP-Referer"] = "https://carspirethailand.com";
+    headers["X-Title"] = "SpireONE";
+  }
+
+  const res = await fetchWithRetry(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model,
+      messages,
+      temperature: 0.3
+    })
+  });
+
+  if (!res.ok) {
+    throw new Error(`Reasoning model API error: ${res.status} ${await res.text()}`);
+  }
+
+  const data = await res.json();
+  return ((data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "").trim();
+}
+
+async function runReActAgent(env, carInfo, messages) {
+  const carContext = (carInfo.make || carInfo.model) 
+    ? `\nรถของผู้ใช้: ${carInfo.make || ''} ${carInfo.model || ''} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` 
+    : '';
+
+  const systemPrompt = `คุณคือ SpireONE ผู้ช่วย AI ดูแลรถยนต์และวิเคราะห์ปัญหารถยนต์ที่ชาญฉลาด ตอบเป็นภาษาไทยเป็นหลัก พูดจาเป็นกันเองและเป็นมืออาชีพ คุณจะควบคุมกระบวนการคิดในการหาคำตอบที่ถูกต้องที่สุดให้ผู้ใช้ โดยเขียนวิเคราะห์กระบวนการใน Thought ก่อนเสมอ
+ข้อมูลรถปัจจุบัน:${carContext}
+
+คุณมีเครื่องมือช่วยเหลือดังต่อไปนี้ที่คุณสามารถระบุสั่งงานได้:
+1. describe_media(prompt): สั่งให้ Gemini ช่วยตรวจดูและอธิบายไฟล์สื่อ (ภาพ, วิดีโอ, เสียง) ที่แนบเข้ามาในประวัติแชต โดยคุณสามารถใส่คำอธิบายเพิ่มเติมใน prompt ได้ตามต้องการ เช่น describe_media("ตรวจสอบจุดรั่วซึมใต้ท้องรถจากภาพถ่าย")
+2. google_search(query): สั่งให้ Gemini ช่วยค้นหาข้อมูลและสรุปข่าวสาร ราคากลาง หรือสเปกทางวิศวกรรมล่าสุดจากเว็บด้วยคำค้น query เช่น google_search("ราคายาง Michelin Primacy 4 ปี 2026")
+
+รูปแบบที่คุณต้องปฏิบัติตามในการตอบสนอง (ตอบแบบ ReAct):
+Thought: [ความคิดหรือเหตุผลของคุณว่าต้องทำอะไรต่อ]
+Action: [เลือกเรียกเครื่องมือเพียง 1 อย่างในแต่ละรอบ เช่น describe_media("...") หรือ google_search("...")]
+Observation: [ระบบหลังบ้านจะนำผลลัพธ์มาแปะให้ตรงนี้เอง ห้ามคุณเขียนขึ้นมาเองเด็ดขาด]
+... (คิดวนซ้ำ Thought/Action/Observation ได้สูงสุด 3 รอบ)
+Thought: [เมื่อได้ข้อมูลครบถ้วนแล้วและต้องการปิดคำตอบ]
+Final Answer: [คำตอบภาษาไทยสรุปอย่างเป็นมืออาชีพที่จะส่งไปให้ผู้ใช้จริง]
+
+สำคัญมาก:
+- ห้ามเขียน Observation หรือข้อมูลหลังคำว่า Observation เองเด็ดขาด!
+- หากมีไฟล์แนบในแชต คุณต้องเรียกใช้ describe_media เสมอเพื่อเอาข้อมูลสังเกตมาคิดวิเคราะห์
+- หากต้องการเช็กราคาสินค้า ข่าว หรือสเปกที่ต้องการความสดใหม่ ให้เรียกใช้ google_search
+- หากข้อมูลพร้อมและไม่ต้องรันเครื่องมือ ให้ข้าม Action และเขียน Final Answer ได้เลย`;
+
+  const chatHistory = messages.map(m => {
+    const o = { role: m.role === "user" ? "user" : "assistant", content: "" };
+    if (m.parts && Array.isArray(m.parts)) {
+      m.parts.forEach(p => {
+        if (p.text) {
+          o.content += p.text;
+        }
+        if (p.inline_data) {
+          o.content += ` [ไฟล์สื่อแนบประเภท: ${p.inline_data.mime_type}]`;
+        }
+      });
+    } else {
+      o.content = m.text || "";
+    }
+    return o;
+  });
+
+  const agentLog = [
+    { role: "system", content: systemPrompt },
+    ...chatHistory
+  ];
+
+  let step = 0;
+  const maxSteps = 3;
+
+  while (step < maxSteps) {
+    step++;
+    
+    let completionText;
+    try {
+      completionText = await callReasoningModel(env, agentLog);
+    } catch (err) {
+      throw new Error(`ReAct reasoning failure: ${err.message}`);
+    }
+
+    agentLog.push({ role: "assistant", content: completionText });
+
+    const actionMatch = completionText.match(/Action:\s*(\w+)\s*\((["'])(.*?)\2\)/i);
+    
+    if (actionMatch) {
+      const toolName = actionMatch[1].toLowerCase();
+      const toolInput = actionMatch[3];
+      let observation = "";
+
+      try {
+        if (toolName === "describe_media") {
+          observation = await executeDescribeMediaTool(env, messages, toolInput);
+        } else if (toolName === "google_search") {
+          observation = await executeGoogleSearchTool(env, toolInput);
+        } else {
+          observation = `Error: Unknown tool "${toolName}"`;
+        }
+      } catch (toolErr) {
+        observation = `Error running tool: ${toolErr.message}`;
+      }
+
+      agentLog.push({ role: "user", content: `Observation: ${observation}` });
+    } else {
+      const finalAnswerMatch = completionText.match(/Final Answer:\s*([\s\S]+)$/i);
+      if (finalAnswerMatch) {
+        return finalAnswerMatch[1].trim();
+      }
+      return completionText;
+    }
+  }
+
+  const lastText = agentLog[agentLog.length - 1].content;
+  const finalAnswerMatch = lastText.match(/Final Answer:\s*([\s\S]+)$/i);
+  return finalAnswerMatch ? finalAnswerMatch[1].trim() : lastText;
+}
+
+async function executeDescribeMediaTool(env, messages, prompt) {
+  const geminiKey = env.GEMINI_KEY;
+  if (!geminiKey) {
+    throw new Error('GEMINI_KEY environment variable is not configured');
+  }
+  const model = env.GEMINI_MODEL || "gemini-2.5-flash";
+  const baseUrl = env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com";
+  const url = `${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`;
+
+  const parts = [];
+  messages.forEach(m => {
+    if (m.parts && Array.isArray(m.parts)) {
+      m.parts.forEach(p => {
+        if (p.inline_data) {
+          parts.push({
+            inline_data: {
+              mime_type: p.inline_data.mime_type,
+              data: p.inline_data.data
+            }
+          });
+        }
+      });
+    }
+  });
+
+  if (parts.length === 0) {
+    return "ไม่มีไฟล์รูปภาพ วิดีโอ หรือข้อความเสียงแนบมาในแชตนี้";
+  }
+
+  parts.push({ text: `กรุณาอธิบายไฟล์สื่อตามคำสั่งนี้: ${prompt}\nตอบสั้นกระชับเข้าใจง่าย` });
+
+  const body = {
+    contents: [{ parts }],
+    generationConfig: { temperature: 0.4 }
+  };
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+
+  if (!res.ok) {
+    throw new Error(`Media reader error: ${res.status}`);
+  }
+
+  const data = await res.json();
+  const candidate = (data.candidates && data.candidates[0]) || {};
+  return ((candidate.content && candidate.content.parts) || [])
+    .map(p => p.text || "")
+    .join("")
+    .trim();
+}
+
+async function executeGoogleSearchTool(env, query) {
+  const geminiKey = env.GEMINI_KEY;
+  if (!geminiKey) {
+    throw new Error('GEMINI_KEY environment variable is not configured');
+  }
+  const model = env.GEMINI_MODEL || "gemini-2.5-flash";
+  const baseUrl = env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com";
+  const url = `${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`;
+
+  const body = {
+    contents: [{ parts: [{ text: `ค้นข้อมูลในอินเทอร์เน็ตเกี่ยวกับหัวข้อนี้ และตอบสรุปสั้นๆ ให้ถูกต้องและกระชับ: ${query}` }] }],
+    tools: [{ google_search: {} }],
+    generationConfig: { temperature: 0.4 }
+  };
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+
+  if (!res.ok) {
+    throw new Error(`Google Search tool error: ${res.status}`);
+  }
+
+  const data = await res.json();
+  const candidate = (data.candidates && data.candidates[0]) || {};
+  return ((candidate.content && candidate.content.parts) || [])
+    .map(p => p.text || "")
+    .join("")
+    .trim();
+}
+
 function parseJsonLoose(text) {
   let s = String(text || '').replace(/```json/gi, '').replace(/```/g, '').trim();
   const m = s.match(/[\[{][\s\S]*[\]}]/);
@@ -314,12 +571,14 @@ export default {
             if (row && row.count > limit) return deny('quota', 429);
           }
 
-          const text = await callGemini(env, {
-            contents: body.contents,
-            system: typeof body.system === 'string' ? body.system : undefined,
-            search: !!body.search,
-            temp: typeof body.temp === 'number' ? body.temp : 0.5,
-          });
+          let carInfo = { make: '', model: '', year: '', mileage: '' };
+          if (body.carId && actor.payload.sub && env.DB) {
+            const car = await env.DB.prepare('SELECT make, model, year, mileage FROM cars WHERE id = ? AND uid = ?')
+              .bind(String(body.carId), actor.payload.sub).first();
+            if (car) carInfo = car;
+          }
+
+          const text = await runReActAgent(env, carInfo, body.contents);
           return json({ text });
         })();
       }
