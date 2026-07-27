@@ -618,8 +618,20 @@ export default {
             } else {
               console.warn(`[AI Chat] carId ${body.carId} requested but no matching record found in D1 for UID ${actor.payload.sub}`);
             }
-          } else if (!body.carId) {
-            console.log(`[AI Chat] No carId provided in request payload`);
+          }
+          
+          if (!carInfo.make && !carInfo.model) {
+            carInfo = {
+              make: String(body.make || '').slice(0, 60),
+              model: String(body.model || '').slice(0, 60),
+              year: body.year != null ? String(body.year).slice(0, 8) : '',
+              mileage: body.mileage != null ? String(body.mileage).slice(0, 12) : '',
+            };
+            if (carInfo.make || carInfo.model) {
+              console.log(`[AI Chat] Used fallback car details from request body:`, JSON.stringify(carInfo));
+            } else {
+              console.log(`[AI Chat] No car details available from D1 or request body`);
+            }
           }
 
           try {
