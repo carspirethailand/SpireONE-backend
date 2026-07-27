@@ -244,6 +244,8 @@ async function runReActAgent(env, carInfo, messages) {
     ? `\nรถของผู้ใช้: ${carInfo.make || ''} ${carInfo.model || ''} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` 
     : '';
 
+  console.log(`[ReAct Agent] Injected vehicle context: ${carContext ? carContext.trim() : '(None)'}`);
+
   const systemPrompt = `คุณคือ SpireONE ผู้ช่วย AI ดูแลรถยนต์และวิเคราะห์ปัญหารถยนต์ที่ชาญฉลาด ตอบเป็นภาษาไทยเป็นหลัก พูดจาเป็นกันเองและเป็นมืออาชีพ คุณจะควบคุมกระบวนการคิดในการหาคำตอบที่ถูกต้องที่สุดให้ผู้ใช้ โดยเขียนวิเคราะห์กระบวนการใน Thought ก่อนเสมอ
 ข้อมูลรถปัจจุบัน:${carContext}
 
@@ -606,10 +608,18 @@ export default {
           }
 
           let carInfo = { make: '', model: '', year: '', mileage: '' };
+          console.log(`[AI Chat] Received request with carId: ${body.carId || 'None'} for UID: ${actor.payload.sub}`);
           if (body.carId && actor.payload.sub && env.DB) {
             const car = await env.DB.prepare('SELECT make, model, year, mileage FROM cars WHERE id = ? AND uid = ?')
               .bind(String(body.carId), actor.payload.sub).first();
-            if (car) carInfo = car;
+            if (car) {
+              carInfo = car;
+              console.log(`[AI Chat] Car details found in D1:`, JSON.stringify(carInfo));
+            } else {
+              console.warn(`[AI Chat] carId ${body.carId} requested but no matching record found in D1 for UID ${actor.payload.sub}`);
+            }
+          } else if (!body.carId) {
+            console.log(`[AI Chat] No carId provided in request payload`);
           }
 
           try {
