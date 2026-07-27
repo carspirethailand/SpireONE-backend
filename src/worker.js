@@ -172,10 +172,15 @@ async function callWorkersAI(env, messages) {
 }
 
 async function callReasoningModel(env, messages) {
-  if (env.OPENROUTER_API_KEY) {
+  const hasKey = !!env.OPENROUTER_API_KEY;
+  console.log(`[AI Reasoning] OPENROUTER_API_KEY configured: ${hasKey}`);
+
+  if (hasKey) {
     const model = env.OPENROUTER_MODEL || "openai/gpt-oss-120b:free";
     const baseUrl = env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1";
     const url = `${baseUrl}/chat/completions`;
+    
+    console.log(`[OpenRouter] Sending request to model: ${model} at ${url}`);
     
     try {
       const res = await fetchWithRetry(url, {
@@ -193,23 +198,43 @@ async function callReasoningModel(env, messages) {
         })
       });
 
+      console.log(`[OpenRouter] Response HTTP status: ${res.status} ${res.statusText}`);
+
+      const resText = await res.text();
+
       if (res.ok) {
-        const data = await res.json();
+        let data;
+        try {
+          data = JSON.parse(resText);
+        } catch (e) {
+          console.error(`[OpenRouter] Failed to parse JSON response: ${resText}`);
+          throw e;
+        }
+
         const content = ((data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "").trim();
-        if (content) return content;
+        if (content) {
+          console.log(`[OpenRouter] Success! Generated content length: ${content.length}`);
+          return content;
+        }
+        console.warn(`[OpenRouter] Empty content in choices payload:`, JSON.stringify(data));
+      } else {
+        console.error(`[OpenRouter Error ${res.status}]: ${resText}`);
       }
       
-      console.warn(`OpenRouter primary call returned status ${res.status}. Falling back to Cloudflare Workers AI...`);
+      console.warn(`[OpenRouter] Call failed (Status ${res.status}). Falling back to Cloudflare Workers AI...`);
     } catch (err) {
-      console.warn(`OpenRouter primary call failed: ${err.message}. Falling back to Cloudflare Workers AI...`);
+      console.error(`[OpenRouter Exception]: ${err.message}`, err.stack);
+      console.warn(`Falling back to Cloudflare Workers AI...`);
     }
   } else {
-    console.warn("OPENROUTER_API_KEY is not configured. Falling back to Cloudflare Workers AI...");
+    console.warn("OPENROUTER_API_KEY is not configured in environment. Falling back to Cloudflare Workers AI...");
   }
 
+  console.log(`[AI Reasoning] Attempting fallback via Cloudflare Workers AI...`);
   try {
     return await callWorkersAI(env, messages);
   } catch (err) {
+    console.error(`[Cloudflare Workers AI Fallback Failed]: ${err.message}`);
     throw new Error(`Reasoning failure (OpenRouter failed & Cloudflare Workers AI fallback failed: ${err.message})`);
   }
 }
@@ -587,8 +612,13 @@ export default {
             if (car) carInfo = car;
           }
 
-          const text = await runReActAgent(env, carInfo, body.contents);
-          return json({ text });
+          try {
+            const text = await runReActAgent(env, carInfo, body.contents);
+            return json({ text });
+          } catch (err) {
+            console.error('[AI Chat Route Error]:', err);
+            return deny(err.message || 'AI processing error', 500);
+          }
         })();
       }
 
