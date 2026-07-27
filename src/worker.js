@@ -176,7 +176,7 @@ async function callReasoningModel(env, messages) {
   console.log(`[AI Reasoning] OPENROUTER_API_KEY configured: ${hasKey}`);
 
   if (hasKey) {
-    const model = env.OPENROUTER_MODEL || "openai/gpt-oss-120b:free";
+    const model = env.OPENROUTER_MODEL || "openai/gpt-oss-20b:free";
     const baseUrl = env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1";
     const url = `${baseUrl}/chat/completions`;
     
