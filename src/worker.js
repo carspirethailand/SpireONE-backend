@@ -1325,10 +1325,394 @@ function maintText(d, est, lang, carName) {
 }
 
 
+/* ══════════════════════════════════════════════════════════════════
+   เพดานแจ้งเตือน — สิ่งที่ตัดสินว่าแอปนี้จะมีคนใช้ต่อหรือโดนปิด noti
+
+   นับเหตุการณ์จริงของรถหนึ่งคันแล้วมีราว 5-7 ครั้งต่อปี:
+   น้ำมันเครื่อง 1-2 · ภาษี+พ.ร.บ.+ตรอ. 3 · ของนาน ๆ ที ~1
+   ไม่ถึงเดือนละครั้งด้วยซ้ำ ถ้าแอปส่งมากกว่านี้แปลว่าดีไซน์ผิด
+
+   กฎที่บังคับไว้ในโค้ด ไม่ใช่แค่ตั้งใจ:
+     1. เพดานแข็ง 1 ครั้ง/รถ/14 วัน ทุกช่องทางรวมกัน
+     2. ถึงกำหนดหลายเรื่องพร้อมกัน = ส่งข้อความเดียว ไม่ใช่หลายข้อความ
+     3. เรื่องจุกจิกไม่ push ขึ้นเป็นจุดแดงในแอปพอ
+     4. ห้าม push เพื่อขอข้อมูลจากผู้ใช้เด็ดขาด
+   ══════════════════════════════════════════════════════════════════ */
+
+const PUSH_GAP_MS = 14 * 86400000;   // เพดานแข็ง: อย่างน้อย 14 วันระหว่างครั้ง
+const DIGEST_MAX = 3;                // ใส่ในข้อความเดียวไม่เกิน 3 เรื่อง
+
+/* เรื่องไหนควรรบกวนถึงหน้าจอล็อก เรื่องไหนแค่ขึ้นจุดแดงในแอปก็พอ
+   เกณฑ์: ถ้าข้อความนี้มาจากเพื่อนที่เป็นช่าง เราจะดีใจที่เขาส่งมาไหม
+   กรองแอร์ตันไม่มีใครดีใจที่ถูกปลุก แต่เบรกหมดคือคนละเรื่อง */
+const PUSH_WORTHY = new Set([
+  'engine_oil',    // ปล่อยไว้พังจริงและแพงจริง
+  'brake_pad_f',   // ความปลอดภัย
+  'brake_fluid',
+  'tyre',
+  'battery',       // จอดเสียกลางทางคือเรื่องใหญ่
+  'coolant',
+]);
+/* ที่เหลือ (กรองอากาศ กรองแอร์ หัวเทียน) ขึ้นในแอปอย่างเดียว
+   ผู้ใช้จะเห็นตอนเปิดแอปเอง ซึ่งเขาเปิดอยู่แล้วเวลามีเรื่องกับรถ */
+
+async function notifyState(env, uid, carId) {
+  let r = null;
+  try {
+    r = await env.DB.prepare('SELECT * FROM notify_state WHERE car_id = ?').bind(carId).first();
+  } catch (e) { return null; }        // ยังไม่ได้ migrate — ให้ผ่านไปก่อน
+  if (!r) {
+    try {
+      await env.DB.prepare(
+        'INSERT INTO notify_state (car_id, uid, last_at, sent_30d) VALUES (?, ?, NULL, 0)'
+      ).bind(carId, uid).run();
+    } catch (e) {}
+    return { car_id: carId, uid, last_at: null, last_digest: '', sent_30d: 0, muted_until: null };
+  }
+  return r;
+}
+
+/* ยอมให้ส่งหรือยัง — ตอบเหตุผลกลับไปด้วยเพื่อให้ log อ่านรู้เรื่อง
+   ว่าเงียบเพราะไม่มีอะไรถึงคิว หรือเงียบเพราะติดเพดาน */
+function allowPush(st, at, gapMs) {
+  if (!st) return { ok: true };
+  if (st.muted_until && at < Number(st.muted_until)) return { ok: false, why: 'muted' };
+  if (st.last_at && (at - Number(st.last_at)) < (gapMs || PUSH_GAP_MS))
+    return { ok: false, why: 'budget' };
+  return { ok: true };
+}
+
+/* ลายเซ็นของเนื้อหาที่จะส่ง — ถ้าเหมือนครั้งก่อนเป๊ะ ไม่ต้องส่งซ้ำ
+   ผู้ใช้ที่ยังไม่ได้ทำตามเตือนครั้งก่อน ไม่ได้ต้องการให้ย้ำเรื่องเดิม
+   เขารู้แล้ว เขาแค่ยังไม่ว่าง */
+const digestSig = (parts) => parts.slice().sort().join(',');
+
+async function markPushed(env, carId, at, sig) {
+  try {
+    await env.DB.prepare(
+      `UPDATE notify_state SET last_at = ?, last_digest = ?, sent_30d = sent_30d + 1
+       WHERE car_id = ?`
+    ).bind(at, sig, carId).run();
+  } catch (e) {}
+}
+
+/* รวมหลายเรื่องเป็นข้อความเดียว — ข้อความที่สอง สาม สี่ ในวันเดียวกัน
+   คือสิ่งที่ทำให้คนกดปิดแจ้งเตือน ไม่ใช่ข้อความแรก */
+function digestText(due, est, lang, carName) {
+  const th = lang === 'th';
+  const names = due.slice(0, DIGEST_MAX).map((d) => partName(d.item.part, lang));
+  const more = due.length - names.length;
+
+  if (names.length === 1) return maintText(due[0], est, lang, carName);
+
+  const list = th ? names.join(' · ') : names.join(' · ');
+  const tail = more > 0 ? (th ? ` และอีก ${more} รายการ` : ` and ${more} more`) : '';
+  return {
+    title: th ? `${carName} ถึงกำหนด ${names.length} รายการ`
+              : `${names.length} services due on your ${carName}`,
+    body: (th ? list + tail + ' — แตะเพื่อดูรายละเอียด'
+              : list + tail + ' — tap for details'),
+  };
+}
+
+
+/* ══════════════════════════════════════════════════════════════════
+   LINE — แก้สองปัญหาที่ยากที่สุดพร้อมกัน
+
+   1. การส่ง: Web Push บน iPhone ต้องติดตั้ง PWA ก่อน ซึ่งคนส่วนใหญ่ไม่ทำ
+      เท่ากับเสียผู้ใช้ iOS เกือบหมดตั้งแต่ยังไม่เริ่ม
+      LINE อยู่ในมือถือคนไทยแทบทุกเครื่องแล้ว ไม่ต้องติดตั้งอะไรเพิ่ม
+
+   2. การเก็บจุดยืนยัน: อู่ในไทยส่งใบเสร็จทาง LINE กันเป็นปกติอยู่แล้ว
+      ผู้ใช้แค่ forward เข้าแชตบอต — เป็นการกดครั้งเดียวในสิ่งที่เขาทำอยู่แล้ว
+      ไม่ใช่การเปิดแอปแล้วถ่ายรูปใหม่
+
+   ข้อความ reply ไม่คิดเงิน ส่วน push คิดตามจำนวนคน จึงออกแบบให้
+   บอทตอบเยอะ (ฟรี) แต่ push น้อยมาก (เสียเงิน) — ตรงกับเพดานแจ้งเตือนพอดี
+   ══════════════════════════════════════════════════════════════════ */
+
+const LINE_API = 'https://api.line.me/v2/bot';
+const LINE_DATA = 'https://api-data.line.me/v2/bot';
+
+/* LINE เซ็นทุก request ด้วย HMAC-SHA256 ของ body ดิบ
+   ต้องตรวจก่อนแตะข้อมูลใด ๆ ไม่งั้นใครก็ยิง webhook ปลอมเข้ามาได้
+   สำคัญ: ต้องใช้ body ดิบ ไม่ใช่ JSON ที่ parse แล้ว stringify กลับ */
+async function lineVerify(env, rawBody, signature) {
+  if (!env.LINE_CHANNEL_SECRET || !signature) return false;
+  const key = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(env.LINE_CHANNEL_SECRET),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  const mac = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(rawBody));
+  const b64 = btoa(String.fromCharCode(...new Uint8Array(mac)));
+  /* เทียบแบบเวลาคงที่ กัน timing attack */
+  if (b64.length !== signature.length) return false;
+  let diff = 0;
+  for (let i = 0; i < b64.length; i++) diff |= b64.charCodeAt(i) ^ signature.charCodeAt(i);
+  return diff === 0;
+}
+
+async function lineCall(env, path, body, base) {
+  if (!env.LINE_CHANNEL_TOKEN) return { ok: false, status: 0 };
+  return await fetch((base || LINE_API) + path, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer ' + env.LINE_CHANNEL_TOKEN,
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+/* ตอบกลับข้อความที่ผู้ใช้ทักมา — ไม่คิดเงิน ใช้ได้เต็มที่ */
+const lineReply = (env, token, msgs) =>
+  lineCall(env, '/message/reply', { replyToken: token, messages: msgs });
+
+/* ส่งเองโดยผู้ใช้ไม่ได้ทัก — คิดเงินตามจำนวนคน ใช้เฉพาะเรื่องที่ผ่านเพดานแล้ว */
+const linePush = (env, to, msgs) =>
+  lineCall(env, '/message/push', { to, messages: msgs });
+
+const txt = (s) => ({ type: 'text', text: String(s).slice(0, 4900) });
+
+/* ─────────── ผูกบัญชี ───────────
+   ผู้ใช้เห็นรหัส 6 ตัวในแอป แล้วพิมพ์ทักบอทครั้งเดียว จบตลอดไป
+   ไม่ใช้ LINE Login เพราะนั่นต้องเด้งออกไปหน้าเว็บแล้วกลับมา
+   ซึ่งมีคนหลุดกลางทางเยอะกว่าการพิมพ์หกตัว */
+function newCode() {
+  const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';   // ตัด I O 0 1 ที่อ่านสับสน
+  let s = '';
+  const b = crypto.getRandomValues(new Uint8Array(6));
+  for (let i = 0; i < 6; i++) s += A[b[i] % A.length];
+  return s;
+}
+
+async function lineLinkByCode(env, lineUid, code) {
+  const row = await env.DB.prepare(
+    'SELECT * FROM line_code WHERE code = ? AND used = 0 AND expires_at > ?'
+  ).bind(String(code).toUpperCase(), Date.now()).first();
+  if (!row) return null;
+  await env.DB.prepare('UPDATE line_code SET used = 1 WHERE code = ?').bind(row.code).run();
+  await env.DB.prepare(
+    `INSERT INTO line_link (line_uid, uid, lang, active, linked_at) VALUES (?, ?, 'th', 1, ?)
+     ON CONFLICT(line_uid) DO UPDATE SET uid = excluded.uid, active = 1, linked_at = excluded.linked_at`
+  ).bind(lineUid, row.uid, Date.now()).run();
+  return row.uid;
+}
+
+const lineUidFor = async (env, lineUid) =>
+  await env.DB.prepare('SELECT * FROM line_link WHERE line_uid = ? AND active = 1')
+    .bind(lineUid).first();
+
+/* ─────────── รับรูปใบเสร็จที่ forward เข้ามา ───────────
+   นี่คือหัวใจของ "ผู้ใช้ไม่ต้องทำอะไร" — เขา forward รูปที่อู่ส่งมาให้
+   อยู่แล้ว ระบบอ่านเลขไมล์ออกมาเองแล้วเก็บเป็นจุดยืนยัน จบในหนึ่งการกด */
+async function lineHandleImage(env, ev, link) {
+  const r = await fetch(`${LINE_DATA}/message/${ev.message.id}/content`, {
+    headers: { Authorization: 'Bearer ' + env.LINE_CHANNEL_TOKEN },
+  });
+  if (!r.ok) return txt('อ่านรูปไม่ได้ ลองส่งใหม่อีกครั้งนะครับ');
+  const buf = await r.arrayBuffer();
+  /* จำกัดขนาดกันรูปใหญ่เกินจนกิน CPU ของ Worker จนหมดเวลา */
+  if (buf.byteLength > 6 * 1024 * 1024)
+    return txt('รูปใหญ่เกินไปครับ ลองถ่ายใหม่หรือย่อขนาดก่อน');
+
+  let bin = '';
+  const b = new Uint8Array(buf);
+  for (let i = 0; i < b.length; i += 8192)
+    bin += String.fromCharCode.apply(null, b.subarray(i, i + 8192));
+  const b64 = btoa(bin);
+
+  const car = await env.DB.prepare(
+    'SELECT * FROM cars WHERE uid = ? ORDER BY created_at DESC LIMIT 1'
+  ).bind(link.uid).first();
+  if (!car) return txt('ยังไม่มีรถในระบบครับ เพิ่มรถในแอปก่อนแล้วส่งใบเสร็จมาใหม่ได้เลย');
+
+  let parsed;
+  try {
+    /* readQuote รับ base64 ล้วน ไม่ใช่ data URL */
+    parsed = await readQuote(env, { image: b64, mime: 'image/jpeg',
+      car: { make: car.make, model: car.model, year: car.year, mileage: car.mileage },
+      done: [], lang: link.lang || 'th' });
+  } catch (e) {
+    return txt('อ่านใบนี้ไม่ออกครับ ถ่ายให้เห็นทั้งใบและตัวเลขชัด ๆ แล้วส่งมาใหม่ได้');
+  }
+
+  if (!parsed || !parsed.odometer) {
+    return txt('อ่านใบได้แล้วครับ แต่ไม่เจอเลขไมล์บนใบนี้\n'
+      + 'ถ้ามีใบอื่นที่มีเลขไมล์ ส่งมาได้เลย จะช่วยให้เตือนแม่นขึ้นมาก');
+  }
+
+  await addAnchor(env, link.uid, car.id, parsed.odometer, 'receipt',
+    parsed.docDate ? Date.parse(parsed.docDate + 'T12:00:00Z') : Date.now(), 'line');
+
+  const st = await env.DB.prepare('SELECT * FROM odo_state WHERE car_id = ?')
+    .bind(car.id).first();
+  const est = st ? estimateAt(st, Date.now()) : null;
+  const rate = st ? Math.round(Number(st.km_per_day) * 10) / 10 : null;
+
+  return txt(`บันทึกแล้วครับ — ${car.make} ${car.model}\n`
+    + `เลขไมล์จากใบนี้: ${Number(parsed.odometer).toLocaleString('en-US')} กม.\n`
+    + (est ? `ตอนนี้ประเมินไว้ที่ ~${est.km.toLocaleString('en-US')} กม. (±${est.sigma.toLocaleString('en-US')})\n` : '')
+    + (rate ? `เรียนรู้ว่าคุณขับราว ${rate} กม./วัน\n` : '')
+    + '\nส่งใบเสร็จมาได้เรื่อย ๆ ครับ ยิ่งส่งยิ่งเตือนตรงเวลา');
+}
+
+/* ─────────── ข้อความตัวอักษร ───────────
+   ตอบให้สั้นและมีประโยชน์ ไม่ต้องทำเป็นแชตบอตคุยเล่น
+   เพราะคนทักบอทนี้เพราะมีเรื่องกับรถ ไม่ได้อยากคุย */
+async function lineHandleText(env, ev, link) {
+  const t = String(ev.message.text || '').trim();
+
+  if (!link) {
+    const m = t.toUpperCase().match(/\b([A-Z2-9]{6})\b/);
+    if (m) {
+      const uid = await lineLinkByCode(env, ev.source.userId, m[1]);
+      if (uid) return txt('เชื่อมบัญชีเรียบร้อยครับ\n\n'
+        + 'จากนี้:\n'
+        + '• ผมจะเตือนเมื่อรถถึงกำหนดเปลี่ยนอะไหล่ หรือใกล้หมดภาษี/ประกัน\n'
+        + '• ส่งรูปใบเสร็จจากอู่มาที่นี่ได้เลย ผมอ่านเลขไมล์เก็บให้เอง\n\n'
+        + 'ผมจะไม่ทักบ่อยครับ อย่างมากสองสัปดาห์ครั้ง เฉพาะเรื่องที่สำคัญจริง');
+      return txt('รหัสนี้ใช้ไม่ได้หรือหมดอายุแล้วครับ เปิดแอปแล้วขอรหัสใหม่ได้เลย');
+    }
+    return txt('สวัสดีครับ ผมคือผู้ช่วยดูแลรถ SpireONE\n\n'
+      + 'เปิดแอป SpireONE → ตั้งค่า → เชื่อม LINE\n'
+      + 'แล้วส่งรหัส 6 ตัวที่เห็นมาที่นี่ครับ');
+  }
+
+  if (/^(หยุด|เงียบ|พัก|mute|stop)/i.test(t)) {
+    await env.DB.prepare(
+      'UPDATE notify_state SET muted_until = ? WHERE uid = ?'
+    ).bind(Date.now() + 90 * 86400000, link.uid).run();
+    return txt('พักการเตือนให้ 90 วันครับ พิมพ์ "เปิดเตือน" เมื่อไรก็กลับมาได้');
+  }
+  if (/^(เปิดเตือน|เปิด|unmute|start)/i.test(t)) {
+    await env.DB.prepare('UPDATE notify_state SET muted_until = NULL WHERE uid = ?')
+      .bind(link.uid).run();
+    return txt('เปิดการเตือนแล้วครับ');
+  }
+
+  /* ถามเลขไมล์ — ตอบด้วยค่าที่ระบบใช้จริง ไม่ใช่คำนวณใหม่อีกชุด */
+  const cars = await env.DB.prepare('SELECT * FROM cars WHERE uid = ?').bind(link.uid).all();
+  const list = (cars.results || []);
+  if (!list.length) return txt('ยังไม่มีรถในระบบครับ เพิ่มรถในแอปก่อนนะครับ');
+
+  const lines = [];
+  for (const c of list) {
+    const st = await env.DB.prepare('SELECT * FROM odo_state WHERE car_id = ?')
+      .bind(c.id).first();
+    if (!st) { lines.push(`${c.make} ${c.model} — ยังไม่มีข้อมูลไมล์`); continue; }
+    const e = estimateAt(st, Date.now());
+    lines.push(`${c.make} ${c.model}\n  ~${e.km.toLocaleString('en-US')} กม. (±${e.sigma.toLocaleString('en-US')})`);
+  }
+  return txt('เลขไมล์ที่ประเมินไว้ตอนนี้:\n\n' + lines.join('\n\n')
+    + '\n\nส่งรูปใบเสร็จมาได้เลยครับ จะได้แม่นขึ้น');
+}
+
+async function lineWebhook(env, ev) {
+  if (!ev || !ev.source || !ev.source.userId) return;
+  const lineUid = ev.source.userId;
+  const link = await lineUidFor(env, lineUid);
+
+  if (ev.type === 'follow') {
+    return await lineReply(env, ev.replyToken, [txt(
+      'สวัสดีครับ ผมคือผู้ช่วยดูแลรถ SpireONE\n\n'
+      + 'เปิดแอป → ตั้งค่า → เชื่อม LINE แล้วส่งรหัส 6 ตัวมาที่นี่ครับ\n\n'
+      + 'เชื่อมแล้วผมจะเตือนเรื่องรถให้ตรงเวลา และคุณส่งใบเสร็จจากอู่มาให้ผมอ่านได้เลย')]);
+  }
+  if (ev.type === 'unfollow') {
+    await env.DB.prepare('UPDATE line_link SET active = 0 WHERE line_uid = ?')
+      .bind(lineUid).run();
+    return;
+  }
+  if (ev.type !== 'message' || !ev.replyToken) return;
+
+  let msg;
+  try {
+    if (ev.message.type === 'image') {
+      if (!link) msg = txt('เชื่อมบัญชีก่อนนะครับ — เปิดแอป → ตั้งค่า → เชื่อม LINE');
+      else msg = await lineHandleImage(env, ev, link);
+    } else if (ev.message.type === 'text') {
+      msg = await lineHandleText(env, ev, link);
+    } else {
+      msg = txt('ส่งรูปใบเสร็จหรือพิมพ์ข้อความมาได้ครับ');
+    }
+  } catch (e) {
+    msg = txt('ระบบขัดข้องชั่วคราวครับ ลองใหม่อีกครั้ง');
+  }
+  await lineReply(env, ev.replyToken, [msg]);
+}
+
+
+/* ══════════════════════════════════════════════════════════════════
+   OBD DONGLE — ทางเดียวที่ได้ "ไม่คลาดเคลื่อน" ตามตัวอักษรจริง ๆ
+
+   dongle ที่มีซิมของตัวเองยิงข้อมูลเข้ามาตรง ๆ ไม่ผ่านมือถือเลย
+   เสียบครั้งเดียว ไม่ต้องเปิดแอป ไม่ต้องพกมือถือ ไม่ต้องขอ permission
+   ไม่กินแบตมือถือ — zero effort ของจริงตามที่ตั้งใจไว้แต่แรก
+
+   ข้อควรรู้: OBD-II มาตรฐานไม่มี PID เลขไมล์รวมทุกรุ่น หลายคันอ่านได้
+   แค่ระยะสะสมของตัว dongle เอง จึงรับได้สองแบบ:
+     • km  = เลขไมล์จริงจาก ECU (รุ่นที่อ่านได้) — ใช้ตรง ๆ
+     • dist = ระยะสะสมของ dongle — บวกกับเลขตั้งต้นตอนติดตั้ง
+   วิธีที่สองแม่นเท่ากันในทางปฏิบัติ เพราะ "ระยะที่วิ่งเพิ่ม" คือค่าที่แม่นเสมอ
+
+   ข้อจำกัดของแพลตฟอร์ม: Cloudflare Workers รับ TCP ขาเข้าดิบไม่ได้
+   dongle จึงต้องพูด HTTP หรือ MQTT over WebSocket ได้ ไม่ใช่โปรโตคอล
+   TCP เฉพาะของผู้ผลิต — ถ้าเลือกรุ่นผิดต้องมีตัวกลางอีกชั้น
+   ══════════════════════════════════════════════════════════════════ */
+
+/* ยืนยันตัวตนอุปกรณ์ด้วย HMAC ของ body ไม่ใช่แค่ส่ง token เปล่า ๆ
+   เพราะ dongle อยู่ในรถคนอื่นได้ ถ้าใครดักจับ token ไปจะยิงข้อมูลปลอม
+   เข้ามาทำให้เลขไมล์ของเจ้าของตัวจริงเพี้ยนถาวร */
+async function obdVerify(secret, rawBody, sig) {
+  if (!secret || !sig) return false;
+  const key = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  const mac = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(rawBody));
+  const hex = [...new Uint8Array(mac)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  const got = String(sig).toLowerCase().replace(/^sha256=/, '');
+  if (hex.length !== got.length) return false;
+  let diff = 0;
+  for (let i = 0; i < hex.length; i++) diff |= hex.charCodeAt(i) ^ got.charCodeAt(i);
+  return diff === 0;
+}
+
+/* รับค่าจาก dongle แล้วแปลงเป็นเลขไมล์สัมบูรณ์
+   คืน null เมื่อยังคำนวณไม่ได้ (ยังไม่ตั้งค่าตั้งต้น) ดีกว่าเดาแล้วผิด */
+function obdAbsoluteKm(dev, body) {
+  const km = Number(body.km);
+  if (isFinite(km) && km > 0) return Math.round(km);       // อ่านจาก ECU ได้ตรง ๆ
+
+  const dist = Number(body.dist);
+  if (!isFinite(dist) || dist < 0) return null;
+  if (dev.base_km == null || dev.base_dist == null) return null;
+  const v = Number(dev.base_km) + (dist - Number(dev.base_dist));
+  return v > 0 ? Math.round(v) : null;
+}
+
+/* dongle รายงานถี่มาก (บางรุ่นทุก 30 วินาที) — ไม่ต้องเก็บทุกครั้ง
+   เก็บเป็นจุดยืนยันเมื่อวิ่งเพิ่มพอสมควรหรือเว้นช่วงพอสมควรเท่านั้น
+   ไม่งั้น D1 โตวันละหมื่นแถวต่อรถหนึ่งคันโดยไม่ได้ข้อมูลเพิ่มเลย */
+const OBD_MIN_KM = 25;                  // วิ่งเพิ่มอย่างน้อย 25 กม.
+const OBD_MIN_GAP = 6 * 3600000;        // หรือห่างกันอย่างน้อย 6 ชั่วโมง
+
+function obdShouldAnchor(dev, km, at) {
+  if (dev.last_km == null || dev.last_seen == null) return true;
+  if (Math.abs(km - Number(dev.last_km)) >= OBD_MIN_KM) return true;
+  return (at - Number(dev.last_seen)) >= OBD_MIN_GAP;
+}
+
+
 /* รอบเดินเลขไมล์ประจำวัน — หัวใจของ "ไมล์ขยับเองจริง"
    ไม่ได้รอให้ผู้ใช้เปิดแอป เซิร์ฟเวอร์เดินเลขให้ทุกวันตามอัตราที่เรียนรู้ไว้
    แล้วเช็คว่ามีอะไรถึงคิวหรือยัง ถ้าถึงก็ยิงแจ้งเตือนออกไปเลย
-   นี่คือเหตุผลที่การแจ้งเตือนตรงเวลาจริงโดยที่แอปไม่ต้องเปิดค้างไว้ */
+   นี่คือเหตุผลที่การแจ้งเตือนตรงเวลาจริงโดยที่แอปไม่ต้องเปิดค้างไว้
+
+   การส่งอยู่ใต้เพดานเดียว: 1 ครั้ง/รถ/14 วัน รวมทุกช่องทาง และรวมทุกเรื่อง
+   ที่ถึงกำหนดเป็นข้อความเดียว — ข้อความที่สองในวันเดียวกันคือสิ่งที่ทำให้
+   คนกดปิดแจ้งเตือน ซึ่งแปลว่าเสียผู้ใช้คนนั้นไปถาวร */
 async function runOdoRound(env) {
   const at = Date.now();
 
@@ -1351,12 +1735,15 @@ async function runOdoRound(env) {
     } catch (e) { /* คันเดียวล้มต้องไม่ทำให้ทั้งรอบหยุด */ }
   }
 
-  if (!env.VAPID_PRIVATE || !env.VAPID_PUBLIC) return;   // ยังไม่ตั้งคีย์ก็แค่ไม่ส่ง
-
   /* 2. หาว่ามีรายการไหนถึงคิว แล้วส่งให้เจ้าของรถ */
-  let subs;
-  try { subs = await env.DB.prepare('SELECT * FROM push_subs').all(); }
-  catch (e) { return; }
+  const haveWeb = !!(env.VAPID_PRIVATE && env.VAPID_PUBLIC);
+  const haveLine = !!env.LINE_CHANNEL_TOKEN;
+  if (!haveWeb && !haveLine) return;          // ไม่มีช่องทางไหนเลยก็ไม่ต้องคำนวณต่อ
+
+  let subs = { results: [] };
+  if (haveWeb) {
+    try { subs = await env.DB.prepare('SELECT * FROM push_subs').all(); } catch (e) {}
+  }
   const byUid = new Map();
   for (const s of (subs.results || [])) {
     if (!byUid.has(s.uid)) byUid.set(s.uid, []);
@@ -1364,8 +1751,18 @@ async function runOdoRound(env) {
   }
 
   for (const st of (states.results || [])) {
-    const devices = byUid.get(st.uid);
-    if (!devices || !devices.length) continue;       // ไม่ได้เปิดแจ้งเตือนไว้
+    /* เพดานก่อนอย่างอื่นทั้งหมด — ถ้ายังไม่ถึงคิวส่ง ไม่ต้องเสียเวลาคำนวณ
+       และที่สำคัญกว่า: ไม่ต้องเสี่ยงส่งออกไปโดยพลาด */
+    const ns = await notifyState(env, st.uid, st.car_id);
+    const gate = allowPush(ns, at);
+    if (!gate.ok) continue;
+
+    let devices = byUid.get(st.uid) || [];
+    const line = haveLine
+      ? await env.DB.prepare('SELECT * FROM line_link WHERE uid = ? AND active = 1')
+          .bind(st.uid).first()
+      : null;
+    if (!devices.length && !line) continue;   // ไม่มีช่องทางถึงคนนี้
 
     let items;
     try {
@@ -1375,50 +1772,80 @@ async function runOdoRound(env) {
     } catch (e) { continue; }
 
     const est = estimateAt(st, at);
-    const due = dueItems(items.results || [], est, at);
+    const allDue = dueItems(items.results || [], est, at);
+    if (!allDue.length) continue;
+
+    /* เรื่องจุกจิกขึ้นเป็นจุดแดงในแอปพอ ไม่ต้องปลุกคนถึงหน้าจอล็อก
+       คนที่ถูกปลุกเพราะกรองแอร์ตัน จะปิดแจ้งเตือนแล้วไม่กลับมาเปิดอีก */
+    const due = allDue.filter((d) => PUSH_WORTHY.has(d.item.part));
     if (!due.length) continue;
 
-    /* เรื่องที่เลยกำหนดมากที่สุดก่อน และส่งรอบละเรื่องเดียวต่อรถหนึ่งคัน
-       การยิงรัวคือเหตุผลอันดับหนึ่งที่คนกดปิดแจ้งเตือนแล้วไม่กลับมาเปิดอีก */
+    /* เลยกำหนดมากที่สุดขึ้นก่อน */
     due.sort((a, b) => {
       const ao = (a.byKm ? a.byKm.over : 0) + (a.byTime ? a.byTime.overDays * 40 : 0);
       const bo = (b.byKm ? b.byKm.over : 0) + (b.byTime ? b.byTime.overDays * 40 : 0);
       return bo - ao;
     });
-    const d = due[0];
+
+    /* เนื้อหาเดิมกับครั้งก่อนไม่ต้องส่งซ้ำ — เขารู้แล้ว เขาแค่ยังไม่ว่าง
+       การย้ำเรื่องเดิมไม่ได้ทำให้เขาไปทำเร็วขึ้น มีแต่ทำให้รำคาญ */
+    const sig = digestSig(due.map((d) => d.item.part));
+    if (ns && ns.last_digest === sig) continue;
 
     const car = await env.DB.prepare('SELECT make, model FROM cars WHERE id = ?')
       .bind(st.car_id).first();
     const carName = car ? `${car.make || ''} ${car.model || ''}`.trim() : 'รถของคุณ';
+    const deepLink = `/garage.html?car=${encodeURIComponent(st.car_id)}&due=${encodeURIComponent(due[0].item.part)}`;
 
     let anySent = false;
-    for (const sub of devices) {
-      const lang = sub.lang || 'th';
-      const { title, body } = maintText(d, est, lang, carName);
+
+    /* LINE ก่อน — ถึงทุกเครื่องโดยไม่ต้องติดตั้ง PWA
+       ถ้าส่ง LINE สำเร็จแล้วไม่ต้องส่ง Web Push ซ้ำ ไม่งั้นผู้ใช้ได้สองต่อ
+       ซึ่งพังเจตนาของเพดานทั้งหมด */
+    if (line) {
+      const lang = line.lang || 'th';
+      const { title, body } = digestText(due, est, lang, carName);
+      const link = (env.SITE_URL || '') + deepLink;
       try {
-        const r = await sendPush(env, sub, {
-          title, body,
-          /* แตะแล้วเปิดการาจพร้อมชี้ไปที่รถคันนั้น หน้าเว็บจะเปิดแผงยืนยันเลขไมล์ให้
-             การขอยืนยันจึงแฝงอยู่ในเรื่องที่เขาได้รับอยู่แล้ว ไม่ใช่การเด้งถามต่างหาก */
-          url: `/garage.html?car=${encodeURIComponent(st.car_id)}&due=${encodeURIComponent(d.item.part)}`,
-          tag: 'maint_' + d.item.part,
-        });
-        if (r.status === 404 || r.status === 410) {
-          await env.DB.prepare('DELETE FROM push_subs WHERE endpoint = ?').bind(sub.endpoint).run();
-          continue;
+        const r = await linePush(env, line.line_uid,
+          [txt(`${title}\n\n${body}${link ? '\n\n' + link : ''}`)]);
+        if (r && r.ok) anySent = true;
+        /* 403 = ผู้ใช้บล็อกบอทไปแล้ว เลิกส่งช่องทางนี้ */
+        else if (r && r.status === 403) {
+          await env.DB.prepare('UPDATE line_link SET active = 0 WHERE line_uid = ?')
+            .bind(line.line_uid).run();
         }
-        if (r.ok) anySent = true;
-      } catch (e) { /* เครื่องเดียวล้มต้องไม่ทำให้ทั้งรอบหยุด */ }
+      } catch (e) {}
     }
 
-    /* จดว่าเตือนไปแล้วก็ต่อเมื่อส่งถึงอย่างน้อยหนึ่งเครื่องจริง
-       ไม่งั้นเน็ตสะดุดรอบเดียวแล้วเรื่องนั้นเงียบหายไปเลย */
+    if (!anySent && devices.length) {
+      for (const sub of devices) {
+        const lang = sub.lang || 'th';
+        const { title, body } = digestText(due, est, lang, carName);
+        try {
+          const r = await sendPush(env, sub, { title, body, url: deepLink,
+            tag: 'maint_' + st.car_id });
+          if (r.status === 404 || r.status === 410) {
+            await env.DB.prepare('DELETE FROM push_subs WHERE endpoint = ?')
+              .bind(sub.endpoint).run();
+            continue;
+          }
+          if (r.ok) anySent = true;
+        } catch (e) { /* เครื่องเดียวล้มต้องไม่ทำให้ทั้งรอบหยุด */ }
+      }
+    }
+
+    /* จดว่าเตือนไปแล้วก็ต่อเมื่อส่งถึงจริงอย่างน้อยหนึ่งช่องทาง
+       ไม่งั้นเน็ตสะดุดรอบเดียวแล้วเรื่องนั้นเงียบหายไป 14 วัน */
     if (anySent) {
-      try {
-        await env.DB.prepare(
-          'UPDATE maint_item SET notified_km = ?, notified_at = ? WHERE id = ?'
-        ).bind(est.km, at, d.item.id).run();
-      } catch (e) {}
+      await markPushed(env, st.car_id, at, sig);
+      for (const d of due) {
+        try {
+          await env.DB.prepare(
+            'UPDATE maint_item SET notified_km = ?, notified_at = ? WHERE id = ?'
+          ).bind(est.km, at, d.item.id).run();
+        } catch (e) {}
+      }
     }
   }
 }
@@ -1444,6 +1871,13 @@ async function runPushRound(env) {
     const alerts = dueAlerts(cars, sent);
     if (!alerts.length) continue;
 
+    /* รอบนี้กับรอบไมล์ต้องใช้เพดานเดียวกัน ไม่งั้นผู้ใช้ได้ข้อความจากทั้งสองรอบ
+       แล้วเพดาน 14 วันก็ไม่มีความหมาย — ใช้ uid เป็นคีย์เพราะเรื่องภาษี/ประกัน
+       ผูกกับคน ไม่ได้ผูกกับรถคันใดคันหนึ่งในตารางนี้
+       เรื่องกฎหมายมีเส้นตายจริง จึงให้ช่องถี่กว่าเรื่องบำรุงรักษาได้บ้าง */
+    const ns = await notifyState(env, sub.uid, 'legal:' + sub.uid);
+    if (!allowPush(ns, Date.now(), 7 * 86400000).ok) continue;
+
     // ส่งเรื่องที่ด่วนที่สุดเรื่องเดียวต่อรอบ การยิงรัวคือเหตุผลที่คนปิดแจ้งเตือน
     alerts.sort((a, b) => a.left - b.left);
     const a = alerts[0];
@@ -1458,6 +1892,7 @@ async function runPushRound(env) {
         sent[a.tag] = today;
         await env.DB.prepare('UPDATE push_subs SET sent = ? WHERE endpoint = ?')
           .bind(JSON.stringify(sent), sub.endpoint).run();
+        await markPushed(env, 'legal:' + sub.uid, Date.now(), a.tag);
       }
     } catch (e) { /* เครื่องเดียวล้มต้องไม่ทำให้ทั้งรอบหยุด */ }
   }
@@ -1612,6 +2047,141 @@ export default {
       });
 
       // สกิลของฉัน
+      /* ══════════════ LINE ══════════════ */
+
+      /* webhook — ต้องไม่ผ่าน guarded เพราะ LINE ไม่มี token ของเรา
+         มันพิสูจน์ตัวเองด้วยลายเซ็น HMAC ของ body ดิบแทน */
+      if (url.pathname === '/api/line/webhook' && request.method === 'POST') {
+        const raw = await request.text();
+        const sig = request.headers.get('X-Line-Signature') || '';
+        if (!(await lineVerify(env, raw, sig))) return deny('Bad signature', 401);
+        let payload = null;
+        try { payload = JSON.parse(raw); } catch (e) { return json({ ok: true }); }
+        /* ตอบ 200 กลับทันทีแล้วค่อยทำงานเบื้องหลัง — LINE ตัดที่ไม่กี่วินาที
+           ถ้ารอ AI อ่านใบเสร็จเสร็จก่อนค่อยตอบ มันจะ timeout แล้วส่งซ้ำ */
+        ctx.waitUntil((async () => {
+          for (const ev of (payload.events || [])) {
+            try { await lineWebhook(env, ev); } catch (e) {}
+          }
+        })());
+        return json({ ok: true });
+      }
+
+      /* ขอรหัสผูกบัญชี — ผู้ใช้เอาไปพิมพ์ทักบอทครั้งเดียว */
+      if (url.pathname === '/api/line/code' && request.method === 'POST') {
+        return await guarded('user', async (actor) => {
+          const uid = actor.payload.sub;
+          const code = newCode();
+          const exp = Date.now() + 20 * 60000;      // 20 นาทีพอสำหรับการสลับแอป
+          await env.DB.prepare('DELETE FROM line_code WHERE uid = ? OR expires_at < ?')
+            .bind(uid, Date.now()).run();
+          await env.DB.prepare(
+            'INSERT INTO line_code (code, uid, expires_at, used) VALUES (?, ?, ?, 0)'
+          ).bind(code, uid, exp).run();
+          return json({ code, expiresAt: exp, oa: env.LINE_OA_ID || '' });
+        })();
+      }
+
+      /* สถานะการเชื่อม + ยกเลิกการเชื่อม */
+      if (url.pathname === '/api/line/link' && request.method === 'GET') {
+        return await guarded('user', async (actor) => {
+          const r = await env.DB.prepare(
+            'SELECT line_uid, linked_at, active FROM line_link WHERE uid = ? AND active = 1'
+          ).bind(actor.payload.sub).first();
+          return json({ linked: !!r, linkedAt: r ? r.linked_at : null });
+        })();
+      }
+      if (url.pathname === '/api/line/link' && request.method === 'DELETE') {
+        return await guarded('user', async (actor) => {
+          await env.DB.prepare('UPDATE line_link SET active = 0 WHERE uid = ?')
+            .bind(actor.payload.sub).run();
+          return json({ ok: true });
+        })();
+      }
+
+      /* ══════════════ OBD DONGLE ══════════════ */
+
+      /* จับคู่ dongle กับรถ — คืน secret กลับไปครั้งเดียวเท่านั้น
+         ผู้ใช้เอาไปตั้งค่าใน dongle (หรือเราตั้งให้ก่อนส่งของ) */
+      if (url.pathname === '/api/obd/pair' && request.method === 'POST') {
+        return await guarded('user', async (actor) => {
+          const b = await readBody();
+          if (!b || !b.carId || !b.deviceId) return deny('carId and deviceId required', 400);
+          const uid = actor.payload.sub;
+          const car = await env.DB.prepare('SELECT * FROM cars WHERE id = ? AND uid = ?')
+            .bind(String(b.carId), uid).first();
+          if (!car) return deny('Car not found', 404);
+
+          const exist = await env.DB.prepare('SELECT uid FROM obd_device WHERE device_id = ?')
+            .bind(String(b.deviceId)).first();
+          if (exist && exist.uid !== uid) return deny('Device already paired', 409);
+
+          const secret = [...crypto.getRandomValues(new Uint8Array(24))]
+            .map((x) => x.toString(16).padStart(2, '0')).join('');
+          /* เลขไมล์ตั้งต้น: ใช้ค่าที่ระบบประเมินไว้ ถ้าผู้ใช้ไม่ได้ส่งมา
+             จากจุดนี้ไป dongle จะบวกระยะจริงเข้าไป จึงแม่นตลอดไป */
+          let baseKm = Math.round(Number(b.baseKm));
+          if (!isFinite(baseKm) || baseKm <= 0) {
+            const st = await env.DB.prepare('SELECT * FROM odo_state WHERE car_id = ?')
+              .bind(String(b.carId)).first();
+            baseKm = st ? estimateAt(st, Date.now()).km : null;
+          }
+          const baseDist = isFinite(Number(b.baseDist)) ? Math.round(Number(b.baseDist)) : null;
+
+          await env.DB.prepare(
+            `INSERT INTO obd_device (device_id, uid, car_id, secret, base_km, base_dist, t)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(device_id) DO UPDATE SET car_id = excluded.car_id,
+               secret = excluded.secret, base_km = excluded.base_km,
+               base_dist = excluded.base_dist`
+          ).bind(String(b.deviceId), uid, String(b.carId), secret, baseKm, baseDist, Date.now()).run();
+
+          return json({ ok: true, deviceId: b.deviceId, secret, baseKm,
+            ingestUrl: url.origin + '/api/obd/ingest' });
+        })();
+      }
+
+      /* ทางเข้าข้อมูลจาก dongle — ไม่มี Firebase token เพราะไม่ใช่คน
+         พิสูจน์ตัวด้วย HMAC ของ body ด้วย secret ที่ผูกไว้ตอน pair */
+      if (url.pathname === '/api/obd/ingest' && request.method === 'POST') {
+        const raw = await request.text();
+        let b = null;
+        try { b = JSON.parse(raw); } catch (e) { return deny('Bad JSON', 400); }
+        if (!b || !b.deviceId) return deny('deviceId required', 400);
+
+        const dev = await env.DB.prepare('SELECT * FROM obd_device WHERE device_id = ?')
+          .bind(String(b.deviceId)).first();
+        if (!dev) return deny('Unknown device', 404);
+
+        const sig = request.headers.get('X-Spire-Signature') || '';
+        if (!(await obdVerify(dev.secret, raw, sig))) return deny('Bad signature', 401);
+
+        const at = Date.now();
+        const km = obdAbsoluteKm(dev, b);
+        if (km == null) {
+          /* ยังตั้งค่าตั้งต้นไม่ครบ — จำระยะดิบไว้ก่อนเพื่อใช้เป็นฐาน
+             ดีกว่าปฏิเสธทิ้ง เพราะ dongle จะยิงซ้ำมาเรื่อย ๆ อยู่ดี */
+          if (isFinite(Number(b.dist)) && dev.base_dist == null) {
+            await env.DB.prepare('UPDATE obd_device SET base_dist = ?, last_seen = ? WHERE device_id = ?')
+              .bind(Math.round(Number(b.dist)), at, dev.device_id).run();
+          }
+          return json({ ok: true, stored: false, need: 'baseKm' });
+        }
+
+        let stored = false;
+        if (obdShouldAnchor(dev, km, at)) {
+          try {
+            await addAnchor(env, dev.uid, dev.car_id, km, 'obd', at, 'dongle');
+            stored = true;
+          } catch (e) { /* เลขเพี้ยนรอบเดียวต้องไม่ทำให้ dongle หยุดส่ง */ }
+        }
+        await env.DB.prepare(
+          'UPDATE obd_device SET last_seen = ?, last_km = ? WHERE device_id = ?'
+        ).bind(at, km, dev.device_id).run();
+
+        return json({ ok: true, stored, km });
+      }
+
       /* ══════════════ ODOMETER + MAINTENANCE ══════════════
          ระบบเดินเลขไมล์เองที่เซิร์ฟเวอร์ ดูคำอธิบายที่ odo engine ด้านบน */
 
