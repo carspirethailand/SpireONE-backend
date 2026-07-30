@@ -1053,6 +1053,377 @@ async function readQuote(env, { image, mime, car, done, lang }) {
 }
 
 
+/* ══════════════════════════════════════════════════════════════════
+   ODOMETER ENGINE — ประเมินเลขไมล์เองโดยผู้ใช้ไม่ต้องทำอะไร
+
+   ข้อจำกัดที่ยอมรับตรง ๆ: เว็บแอปอ่านเซนเซอร์เบื้องหลังไม่ได้
+   (ไม่มี background location / Bluetooth / motion บนเบราว์เซอร์)
+   ระบบนี้จึงไม่ "วัด" ระยะทาง แต่ "เรียนรู้อัตราการขับ" ของรถแต่ละคัน
+   จากจุดยืนยันจริง แล้วเดินเลขต่อเองที่เซิร์ฟเวอร์ทุกวัน
+
+   จุดยืนยันมาจากสิ่งที่ผู้ใช้ทำอยู่แล้ว ไม่ได้เพิ่มภาระ:
+     • เลขไมล์ตอนเพิ่มรถ            → ได้ค่าเฉลี่ยทั้งชีวิตรถทันทีจากปีรถ
+     • ใบเสร็จอู่ที่สแกนอยู่แล้ว      → มีเลขไมล์จริงพิมพ์อยู่บนใบ
+     • ลิตรที่เติม × อัตราสิ้นเปลือง  → ได้ระยะที่วิ่งไปโดยประมาณ
+     • กดยืนยันจากการแจ้งเตือน       → แฝงในเรื่องที่เขาจะได้รับอยู่แล้ว
+
+   หลักสำคัญ: บอกความไม่แน่นอนตรง ๆ (±) ไม่แกล้งแม่น และเมื่อไม่มั่นใจ
+   ให้ตกไปใช้เกณฑ์เวลา ซึ่งแม่น 100% เสมอ ไม่ต้องเดาและไม่ต้องถามใคร
+   ══════════════════════════════════════════════════════════════════ */
+
+const DAY_MS = 86400000;
+
+/* ขอบเขตความสมเหตุสมผลของอัตราการขับ — กันข้อมูลเพี้ยนทำให้ระบบหลุดโลก
+   1 กม./วัน = รถจอดเกือบตลอด · 400 กม./วัน = ขับรับจ้างเต็มเวลา */
+const RATE_MIN = 1, RATE_MAX = 400;
+/* ยังไม่รู้อะไรเลยเกี่ยวกับรถคันนี้ ใช้ค่ากลางของรถใช้งานทั่วไป
+   ~15,000 กม./ปี เป็นตัวเลขที่ใช้กันกว้างขวางเป็นค่าเริ่มต้น */
+const RATE_FALLBACK = 41;
+
+const clampRate = (r) => Math.min(RATE_MAX, Math.max(RATE_MIN, r));
+const nowMs = () => Date.now();
+
+/* ค่าเฉลี่ยทั้งชีวิตรถ — ใช้ได้ตั้งแต่มีจุดยืนยันจุดเดียว
+   ผู้ใช้กรอกปีรถกับเลขไมล์ตอนเพิ่มรถอยู่แล้ว จึงได้อัตราเริ่มต้นฟรี
+   โดยไม่ต้องรอสะสมข้อมูลเป็นเดือน */
+function lifetimeRate(car, anchorKm, anchorAt) {
+  const year = parseInt(car && car.year, 10);
+  if (!year || year < 1950 || year > 2100) return null;
+  /* ถือว่ารถออกจากโรงงานกลางปีนั้น ค่าเฉลี่ยจึงไม่เพี้ยนมากไม่ว่าซื้อเดือนไหน */
+  const born = Date.UTC(year, 5, 30);
+  const days = (anchorAt - born) / DAY_MS;
+  if (days < 90) return null;                  // รถใหม่มาก ค่าเฉลี่ยยังไม่มีความหมาย
+  const r = anchorKm / days;
+  if (!isFinite(r) || r <= 0) return null;
+  return clampRate(r);
+}
+
+/* อัตราที่เรียนรู้จากพฤติกรรมจริงของรถคันนี้
+   ใช้จุดยืนยันในช่วง 18 เดือนหลัง เพราะพฤติกรรมการขับเปลี่ยนได้
+   ต้องมีช่วงห่างอย่างน้อย 20 วัน ไม่งั้นสัญญาณรบกวนกลบแนวโน้มจริง */
+function learnedRate(anchors) {
+  if (!anchors || anchors.length < 2) return null;
+  const cut = nowMs() - 540 * DAY_MS;
+  let recent = anchors.filter((a) => a.observed_at >= cut);
+  if (recent.length < 2) recent = anchors.slice(-2);
+
+  const first = recent[0], last = recent[recent.length - 1];
+  const days = (last.observed_at - first.observed_at) / DAY_MS;
+  const dist = last.km - first.km;
+  if (days < 20 || dist < 0) return null;
+  /* เลขไมล์ถอยหลังแปลว่าข้อมูลผิด (พิมพ์ผิด/สลับคัน) ไม่ใช่รถวิ่งถอยหลัง */
+  const r = dist / days;
+  if (!isFinite(r) || r <= 0) return null;
+  return clampRate(r);
+}
+
+/* ความคลาดเคลื่อนสัมพัทธ์ของอัตรา — ยิ่งมีจุดยืนยันมาก ยิ่งมั่นใจ
+   ตัวเลขชุดนี้เป็นค่าตั้งต้นเชิงออกแบบ ไม่ใช่ค่าที่วัดจากผู้ใช้จริง
+   ควรปรับหลังเก็บสถิติจากการใช้งานจริงได้แล้ว */
+function rateError(basis, nAnchor) {
+  if (basis === 'lifetime') return 0.35;       // ค่าเฉลี่ยทั้งชีวิต หยาบที่สุด
+  if (nAnchor >= 5) return 0.10;
+  if (nAnchor >= 3) return 0.15;
+  return 0.22;
+}
+
+/* ประมาณเลขไมล์ ณ เวลาหนึ่ง พร้อมความไม่แน่นอน
+   sigma โตตามระยะที่เดินมาจากจุดยืนยันล่าสุด ไม่ใช่ตามเวลาเปล่า ๆ
+   รถที่จอดทิ้งไว้จึงไม่ถูกลงโทษด้วยความไม่แน่นอนที่บวมขึ้นฟรี ๆ */
+function estimateAt(state, at) {
+  const base = Number(state.anchor_km);
+  const from = Number(state.anchor_at);
+  if (!isFinite(base) || !isFinite(from)) {
+    return { km: Math.round(Number(state.est_km) || 0), sigma: 0, days: 0 };
+  }
+  const days = Math.max(0, (at - from) / DAY_MS);
+  const run = Number(state.km_per_day) * days;
+  const err = rateError(state.rate_basis, Number(state.n_anchor) || 0);
+  /* พื้น 40 กม. เพราะแม้แต่เลขที่อ่านจากใบเสร็จก็มีวันคลาดเคลื่อนได้บ้าง */
+  const sigma = Math.max(40, run * err);
+  return { km: Math.round(base + run), sigma: Math.round(sigma), days: Math.round(days) };
+}
+
+/* คำนวณสถานะใหม่ทั้งก้อนจากจุดยืนยันทั้งหมดของรถคันนั้น
+   เรียกทุกครั้งที่มีจุดยืนยันเข้ามาใหม่ — ถูกกว่าการพยายามอัปเดตทีละนิด
+   และไม่มีทางเพี้ยนสะสมเหมือนการบวกเพิ่มไปเรื่อย ๆ */
+async function recomputeOdo(env, uid, carId, car) {
+  const rs = await env.DB.prepare(
+    'SELECT km, source, observed_at FROM odo_anchor WHERE car_id = ? ORDER BY observed_at ASC'
+  ).bind(carId).all();
+  const anchors = (rs && rs.results) || [];
+  if (!anchors.length) return null;
+
+  const last = anchors[anchors.length - 1];
+  let rate = learnedRate(anchors);
+  let basis = 'learned';
+  if (rate == null) {
+    rate = lifetimeRate(car, last.km, last.observed_at);
+    basis = 'lifetime';
+  }
+  if (rate == null) { rate = RATE_FALLBACK; basis = 'lifetime'; }
+
+  const t = nowMs();
+  const state = {
+    car_id: carId, uid,
+    km_per_day: rate, rate_basis: basis,
+    anchor_km: last.km, anchor_at: last.observed_at,
+    n_anchor: anchors.length,
+  };
+  const est = estimateAt(state, t);
+
+  await env.DB.prepare(
+    `INSERT INTO odo_state
+       (car_id, uid, est_km, km_per_day, sigma_km, anchor_km, anchor_at, n_anchor, rate_basis, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(car_id) DO UPDATE SET
+       uid = excluded.uid, est_km = excluded.est_km, km_per_day = excluded.km_per_day,
+       sigma_km = excluded.sigma_km, anchor_km = excluded.anchor_km,
+       anchor_at = excluded.anchor_at, n_anchor = excluded.n_anchor,
+       rate_basis = excluded.rate_basis, updated_at = excluded.updated_at`
+  ).bind(carId, uid, est.km, rate, est.sigma, last.km, last.observed_at,
+    anchors.length, basis, t).run();
+
+  return Object.assign({}, state, { est_km: est.km, sigma_km: est.sigma, updated_at: t });
+}
+
+/* บันทึกจุดยืนยันหนึ่งจุด แล้วคำนวณสถานะใหม่
+   ปฏิเสธค่าที่เป็นไปไม่ได้ตั้งแต่ต้นทาง ดีกว่าปล่อยให้ไปทำลายอัตราที่เรียนรู้ไว้ */
+async function addAnchor(env, uid, carId, km, source, observedAt, note) {
+  const v = Math.round(Number(km));
+  if (!isFinite(v) || v < 0 || v > 3000000) throw new Error('bad_km');
+  const at = Number(observedAt) || nowMs();
+  /* จุดยืนยันในอนาคตแปลว่านาฬิกาเครื่องผู้ใช้เพี้ยน ดึงกลับมาเป็นตอนนี้ */
+  const when = Math.min(at, nowMs());
+
+  const car = await env.DB.prepare('SELECT * FROM cars WHERE id = ? AND uid = ?')
+    .bind(carId, uid).first();
+  if (!car) throw new Error('no_car');
+
+  /* ใบเสร็จใบเดิมสแกนซ้ำได้ — ดัชนี unique กันซ้ำไว้แล้ว ชนก็ข้ามไปเงียบ ๆ */
+  try {
+    await env.DB.prepare(
+      `INSERT INTO odo_anchor (id, uid, car_id, km, source, observed_at, note, t)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind('a' + when + Math.random().toString(36).slice(2, 8), uid, carId, v,
+      String(source || 'manual').slice(0, 20), when, String(note || '').slice(0, 200), nowMs()).run();
+  } catch (e) {
+    if (!String(e && e.message || '').includes('UNIQUE')) throw e;
+  }
+
+  /* เลขไมล์บนการ์ดรถต้องขยับตามด้วย ไม่งั้นผู้ใช้เห็นเลขเก่าค้างอยู่ */
+  const cur = parseInt(String(car.mileage || '').replace(/[^0-9]/g, ''), 10);
+  if (!isFinite(cur) || v > cur) {
+    await env.DB.prepare('UPDATE cars SET mileage = ? WHERE id = ?').bind(String(v), carId).run();
+  }
+  return await recomputeOdo(env, uid, carId, car);
+}
+
+/* ══════════════ รายการบำรุงรักษา ══════════════ */
+
+/* ชุดเริ่มต้นสำหรับรถที่เพิ่งเพิ่มเข้ามา — ผู้ใช้ไม่ต้องตั้งอะไรเลย
+   ระยะเหล่านี้เป็นค่ากลางที่ใช้กันทั่วไป ไม่ใช่คู่มือของรุ่นใดรุ่นหนึ่ง
+   ผู้ใช้แก้ได้ภายหลัง และเมื่อสแกนใบเสร็จจริงระบบจะรีเซ็ตรอบให้เอง */
+const DEFAULT_MAINT = [
+  { part: 'engine_oil',    km: 10000, months: 6 },
+  { part: 'oil_filter',    km: 10000, months: 6 },
+  { part: 'air_filter',    km: 20000, months: 12 },
+  { part: 'cabin_filter',  km: 20000, months: 12 },
+  { part: 'brake_pad_f',   km: 40000, months: null },
+  { part: 'brake_fluid',   km: 40000, months: 24 },
+  { part: 'coolant',       km: 80000, months: 48 },
+  { part: 'spark_plug',    km: 60000, months: null },
+  { part: 'tyre',          km: 50000, months: 60 },
+  { part: 'battery',       km: null,  months: 30 },
+];
+
+async function seedMaint(env, uid, carId, baseKm, baseAt) {
+  const t = nowMs();
+  for (const m of DEFAULT_MAINT) {
+    try {
+      await env.DB.prepare(
+        `INSERT INTO maint_item
+           (id, uid, car_id, part, interval_km, interval_months, last_km, last_at, enabled, t)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`
+      ).bind('m' + carId.slice(0, 8) + '_' + m.part, uid, carId, m.part,
+        m.km, m.months, baseKm, baseAt, t).run();
+    } catch (e) { /* มีอยู่แล้วก็ข้าม */ }
+  }
+}
+
+/* ประเมินว่ารายการไหนถึงคิวแล้ว
+   เกณฑ์ระยะใช้ขอบบนของช่วงความมั่นใจ (est + sigma) ไม่ใช่ค่ากลาง —
+   พลาดการเตือนอันตรายกว่าเตือนเช้าไปหน่อย ส่วนเกณฑ์เวลาแม่นเสมอ
+   จึงเป็นตัวกันเหนียวช่วงที่ค่าประมาณยังหยาบ โดยไม่ต้องถามผู้ใช้เลย */
+function dueItems(items, est, at) {
+  const out = [];
+  for (const it of items) {
+    if (!it.enabled) continue;
+    let byKm = null, byTime = null;
+
+    if (it.interval_km && it.last_km != null) {
+      const dueKm = it.last_km + it.interval_km;
+      const reach = est.km + est.sigma;
+      if (reach >= dueKm) {
+        /* เตือนซ้ำเรื่องเดิมได้ก็ต่อเมื่อเลยไปอีกครึ่งรอบ ไม่ใช่ทุกวัน */
+        const already = it.notified_km != null && (est.km - it.notified_km) < it.interval_km * 0.5;
+        if (!already) byKm = { dueKm, over: Math.round(est.km - dueKm) };
+      }
+    }
+    if (it.interval_months && it.last_at != null) {
+      const d = new Date(Number(it.last_at));
+      d.setMonth(d.getMonth() + it.interval_months);
+      const dueAt = d.getTime();
+      if (at >= dueAt) {
+        const already = it.notified_at != null && (at - it.notified_at) < 45 * DAY_MS;
+        if (!already) byTime = { dueAt, overDays: Math.round((at - dueAt) / DAY_MS) };
+      }
+    }
+    if (byKm || byTime) out.push({ item: it, byKm, byTime });
+  }
+  return out;
+}
+
+const PART_TH = {
+  engine_oil: 'น้ำมันเครื่อง', oil_filter: 'กรองน้ำมันเครื่อง',
+  air_filter: 'กรองอากาศ', cabin_filter: 'กรองแอร์',
+  brake_pad_f: 'ผ้าเบรกหน้า', brake_fluid: 'น้ำมันเบรก',
+  coolant: 'น้ำยาหม้อน้ำ', spark_plug: 'หัวเทียน',
+  tyre: 'ยาง', battery: 'แบตเตอรี่',
+};
+const PART_EN = {
+  engine_oil: 'Engine oil', oil_filter: 'Oil filter',
+  air_filter: 'Air filter', cabin_filter: 'Cabin filter',
+  brake_pad_f: 'Front brake pads', brake_fluid: 'Brake fluid',
+  coolant: 'Coolant', spark_plug: 'Spark plugs',
+  tyre: 'Tyres', battery: 'Battery',
+};
+const partName = (k, lang) => (lang === 'th' ? PART_TH[k] : PART_EN[k]) || k;
+
+/* ข้อความแจ้งเตือน — การขอยืนยันเลขไมล์ถูกแฝงไว้ในเรื่องที่เขาจะได้รับอยู่แล้ว
+   ไม่มีการเด้งถามเป็นรอบ ๆ ต่างหาก เพราะนั่นคือการผลักภาระกลับไปหาผู้ใช้ */
+function maintText(d, est, lang, carName) {
+  const th = lang === 'th';
+  const name = partName(d.item.part, lang);
+  const approx = d.item.interval_km && est.sigma > 0;
+  const kmTxt = est.km.toLocaleString('en-US');
+
+  if (d.byTime && !d.byKm) {
+    return {
+      title: th ? `ถึงกำหนดเปลี่ยน${name}แล้ว` : `${name} is due`,
+      body: th
+        ? `${carName} — ครบตามอายุการใช้งานแล้ว ไม่ว่าจะวิ่งมากี่กิโล`
+        : `${carName} — due by age, regardless of distance covered`,
+    };
+  }
+  return {
+    title: th ? `ใกล้ถึงระยะเปลี่ยน${name}` : `${name} is coming due`,
+    body: th
+      ? `${carName} — ประเมินว่าตอนนี้ราว ${kmTxt} กม.${approx ? ` (±${est.sigma.toLocaleString('en-US')})` : ''} แตะเพื่อดูและแก้เลขได้ถ้าไม่ตรง`
+      : `${carName} — we estimate about ${kmTxt} km${approx ? ` (±${est.sigma.toLocaleString('en-US')})` : ''}. Tap to check or correct it`,
+  };
+}
+
+
+/* รอบเดินเลขไมล์ประจำวัน — หัวใจของ "ไมล์ขยับเองจริง"
+   ไม่ได้รอให้ผู้ใช้เปิดแอป เซิร์ฟเวอร์เดินเลขให้ทุกวันตามอัตราที่เรียนรู้ไว้
+   แล้วเช็คว่ามีอะไรถึงคิวหรือยัง ถ้าถึงก็ยิงแจ้งเตือนออกไปเลย
+   นี่คือเหตุผลที่การแจ้งเตือนตรงเวลาจริงโดยที่แอปไม่ต้องเปิดค้างไว้ */
+async function runOdoRound(env) {
+  const at = Date.now();
+
+  /* 1. เดินเลขทุกคันให้เป็นปัจจุบัน — เขียนลง odo_state เพื่อให้หน้าเว็บ
+        อ่านค่าเดียวกับที่ระบบเตือนใช้ ไม่ใช่ต่างคนต่างคำนวณแล้วเลขไม่ตรงกัน */
+  let states;
+  try { states = await env.DB.prepare('SELECT * FROM odo_state').all(); }
+  catch (e) { return; }                       // ยังไม่ได้ migrate ก็ข้ามทั้งรอบ
+
+  for (const st of (states.results || [])) {
+    const est = estimateAt(st, at);
+    try {
+      await env.DB.prepare(
+        'UPDATE odo_state SET est_km = ?, sigma_km = ?, updated_at = ? WHERE car_id = ?'
+      ).bind(est.km, est.sigma, at, st.car_id).run();
+      /* การ์ดรถควรโชว์เลขล่าสุดด้วย แต่ห้ามทับเลขที่ยืนยันแล้วให้ต่ำลง */
+      await env.DB.prepare(
+        'UPDATE cars SET mileage = ? WHERE id = ? AND CAST(mileage AS INTEGER) < ?'
+      ).bind(String(est.km), st.car_id, est.km).run();
+    } catch (e) { /* คันเดียวล้มต้องไม่ทำให้ทั้งรอบหยุด */ }
+  }
+
+  if (!env.VAPID_PRIVATE || !env.VAPID_PUBLIC) return;   // ยังไม่ตั้งคีย์ก็แค่ไม่ส่ง
+
+  /* 2. หาว่ามีรายการไหนถึงคิว แล้วส่งให้เจ้าของรถ */
+  let subs;
+  try { subs = await env.DB.prepare('SELECT * FROM push_subs').all(); }
+  catch (e) { return; }
+  const byUid = new Map();
+  for (const s of (subs.results || [])) {
+    if (!byUid.has(s.uid)) byUid.set(s.uid, []);
+    byUid.get(s.uid).push(s);
+  }
+
+  for (const st of (states.results || [])) {
+    const devices = byUid.get(st.uid);
+    if (!devices || !devices.length) continue;       // ไม่ได้เปิดแจ้งเตือนไว้
+
+    let items;
+    try {
+      items = await env.DB.prepare(
+        'SELECT * FROM maint_item WHERE car_id = ? AND enabled = 1'
+      ).bind(st.car_id).all();
+    } catch (e) { continue; }
+
+    const est = estimateAt(st, at);
+    const due = dueItems(items.results || [], est, at);
+    if (!due.length) continue;
+
+    /* เรื่องที่เลยกำหนดมากที่สุดก่อน และส่งรอบละเรื่องเดียวต่อรถหนึ่งคัน
+       การยิงรัวคือเหตุผลอันดับหนึ่งที่คนกดปิดแจ้งเตือนแล้วไม่กลับมาเปิดอีก */
+    due.sort((a, b) => {
+      const ao = (a.byKm ? a.byKm.over : 0) + (a.byTime ? a.byTime.overDays * 40 : 0);
+      const bo = (b.byKm ? b.byKm.over : 0) + (b.byTime ? b.byTime.overDays * 40 : 0);
+      return bo - ao;
+    });
+    const d = due[0];
+
+    const car = await env.DB.prepare('SELECT make, model FROM cars WHERE id = ?')
+      .bind(st.car_id).first();
+    const carName = car ? `${car.make || ''} ${car.model || ''}`.trim() : 'รถของคุณ';
+
+    let anySent = false;
+    for (const sub of devices) {
+      const lang = sub.lang || 'th';
+      const { title, body } = maintText(d, est, lang, carName);
+      try {
+        const r = await sendPush(env, sub, {
+          title, body,
+          /* แตะแล้วเปิดการาจพร้อมชี้ไปที่รถคันนั้น หน้าเว็บจะเปิดแผงยืนยันเลขไมล์ให้
+             การขอยืนยันจึงแฝงอยู่ในเรื่องที่เขาได้รับอยู่แล้ว ไม่ใช่การเด้งถามต่างหาก */
+          url: `/garage.html?car=${encodeURIComponent(st.car_id)}&due=${encodeURIComponent(d.item.part)}`,
+          tag: 'maint_' + d.item.part,
+        });
+        if (r.status === 404 || r.status === 410) {
+          await env.DB.prepare('DELETE FROM push_subs WHERE endpoint = ?').bind(sub.endpoint).run();
+          continue;
+        }
+        if (r.ok) anySent = true;
+      } catch (e) { /* เครื่องเดียวล้มต้องไม่ทำให้ทั้งรอบหยุด */ }
+    }
+
+    /* จดว่าเตือนไปแล้วก็ต่อเมื่อส่งถึงอย่างน้อยหนึ่งเครื่องจริง
+       ไม่งั้นเน็ตสะดุดรอบเดียวแล้วเรื่องนั้นเงียบหายไปเลย */
+    if (anySent) {
+      try {
+        await env.DB.prepare(
+          'UPDATE maint_item SET notified_km = ?, notified_at = ? WHERE id = ?'
+        ).bind(est.km, at, d.item.id).run();
+      } catch (e) {}
+    }
+  }
+}
+
+
 /* รอบเตือนประจำวัน — ไล่ทุกเครื่องที่สมัครไว้ แล้วส่งเฉพาะเรื่องที่ถึงคิว
    ถ้าคีย์ VAPID ยังไม่ได้ตั้ง ให้เงียบไปเฉย ๆ ไม่ต้องทำให้ cron ทั้งรอบล้ม */
 async function runPushRound(env) {
@@ -1241,6 +1612,139 @@ export default {
       });
 
       // สกิลของฉัน
+      /* ══════════════ ODOMETER + MAINTENANCE ══════════════
+         ระบบเดินเลขไมล์เองที่เซิร์ฟเวอร์ ดูคำอธิบายที่ odo engine ด้านบน */
+
+      // สถานะไมล์ + รายการที่ถึงคิว ของรถทุกคันของผู้ใช้
+      if (url.pathname === '/api/odo/state' && request.method === 'GET') {
+        return await guarded('user', async (actor) => {
+          const uid = actor.payload.sub;
+          const cars = await env.DB.prepare('SELECT * FROM cars WHERE uid = ?').bind(uid).all();
+          const at = Date.now();
+          const out = [];
+          for (const car of (cars.results || [])) {
+            let st = await env.DB.prepare('SELECT * FROM odo_state WHERE car_id = ?')
+              .bind(car.id).first();
+            /* รถที่เพิ่มไว้ก่อนมีระบบนี้ยังไม่มีจุดยืนยัน — สร้างจากเลขที่กรอกไว้
+               ให้อัตโนมัติ ผู้ใช้ไม่ต้องกลับมากรอกอะไรใหม่ */
+            if (!st) {
+              const km = parseInt(String(car.mileage || '').replace(/[^0-9]/g, ''), 10);
+              if (isFinite(km) && km > 0) {
+                await addAnchor(env, uid, car.id, km, 'signup', car.created_at || at, '');
+                await seedMaint(env, uid, car.id, km, car.created_at || at);
+                st = await env.DB.prepare('SELECT * FROM odo_state WHERE car_id = ?')
+                  .bind(car.id).first();
+              }
+            }
+            if (!st) { out.push({ carId: car.id, known: false }); continue; }
+
+            const est = estimateAt(st, at);
+            const items = await env.DB.prepare(
+              'SELECT * FROM maint_item WHERE car_id = ? AND enabled = 1'
+            ).bind(car.id).all();
+            const list = (items.results || []).map((it) => {
+              const o = {
+                part: it.part, intervalKm: it.interval_km, intervalMonths: it.interval_months,
+                lastKm: it.last_km, lastAt: it.last_at,
+              };
+              if (it.interval_km && it.last_km != null) {
+                o.dueKm = it.last_km + it.interval_km;
+                o.leftKm = o.dueKm - est.km;
+              }
+              if (it.interval_months && it.last_at != null) {
+                const d = new Date(Number(it.last_at));
+                d.setMonth(d.getMonth() + it.interval_months);
+                o.dueAt = d.getTime();
+                o.leftDays = Math.round((o.dueAt - at) / 86400000);
+              }
+              return o;
+            });
+            out.push({
+              carId: car.id, known: true,
+              km: est.km, sigma: est.sigma, kmPerDay: Math.round(st.km_per_day * 10) / 10,
+              basis: st.rate_basis, anchors: st.n_anchor,
+              anchorKm: st.anchor_km, anchorAt: st.anchor_at,
+              daysSinceAnchor: est.days, items: list,
+            });
+          }
+          return json({ cars: out, at });
+        })();
+      }
+
+      // บันทึกจุดยืนยันเลขไมล์ — ใช้ร่วมกันทุกแหล่ง (ใบเสร็จ/ยืนยัน/น้ำมัน/OBD)
+      if (url.pathname === '/api/odo/anchor' && request.method === 'POST') {
+        return await guarded('user', async (actor) => {
+          const b = await readBody();
+          if (!b || !b.carId) return deny('carId required', 400);
+          const OK = ['receipt', 'confirm', 'fuel', 'obd', 'signup', 'manual'];
+          const src = OK.includes(b.source) ? b.source : 'manual';
+          let st;
+          try {
+            st = await addAnchor(env, actor.payload.sub, String(b.carId), b.km, src,
+              b.observedAt, b.note);
+          } catch (e) {
+            const m = e && e.message;
+            if (m === 'no_car') return deny('Car not found', 404);
+            if (m === 'bad_km') return deny('Mileage out of range', 400);
+            throw e;
+          }
+          /* รถที่ยังไม่มีรายการบำรุงรักษาให้ตั้งชุดเริ่มต้นให้เลย
+             ผู้ใช้ไม่ต้องมานั่งกรอกว่ารถต้องเปลี่ยนอะไรบ้าง */
+          const has = await env.DB.prepare(
+            'SELECT COUNT(*) AS n FROM maint_item WHERE car_id = ?'
+          ).bind(String(b.carId)).first();
+          if (!has || !has.n) {
+            await seedMaint(env, actor.payload.sub, String(b.carId), Math.round(b.km),
+              Number(b.observedAt) || Date.now());
+          }
+          const est = estimateAt(st, Date.now());
+          return json({ ok: true, km: est.km, sigma: est.sigma, basis: st.rate_basis,
+            kmPerDay: Math.round(st.km_per_day * 10) / 10, anchors: st.n_anchor });
+        })();
+      }
+
+      // บันทึกว่าเพิ่งเปลี่ยนอะไหล่ชิ้นนี้ไป — รีเซ็ตรอบของชิ้นนั้น
+      if (url.pathname === '/api/maint/done' && request.method === 'POST') {
+        return await guarded('user', async (actor) => {
+          const b = await readBody();
+          if (!b || !b.carId || !b.part) return deny('carId and part required', 400);
+          const uid = actor.payload.sub;
+          const car = await env.DB.prepare('SELECT id FROM cars WHERE id = ? AND uid = ?')
+            .bind(String(b.carId), uid).first();
+          if (!car) return deny('Car not found', 404);
+          const at = Number(b.at) || Date.now();
+          let km = Math.round(Number(b.km));
+          if (!isFinite(km)) {
+            const st = await env.DB.prepare('SELECT * FROM odo_state WHERE car_id = ?')
+              .bind(String(b.carId)).first();
+            km = st ? estimateAt(st, at).km : 0;
+          }
+          await env.DB.prepare(
+            `UPDATE maint_item SET last_km = ?, last_at = ?, notified_km = NULL, notified_at = NULL
+             WHERE car_id = ? AND part = ?`
+          ).bind(km, at, String(b.carId), String(b.part)).run();
+          return json({ ok: true, km, at });
+        })();
+      }
+
+      // แก้ระยะ/รอบเวลาของรายการหนึ่ง หรือปิดรายการที่ไม่ต้องการ
+      if (url.pathname === '/api/maint/set' && request.method === 'POST') {
+        return await guarded('user', async (actor) => {
+          const b = await readBody();
+          if (!b || !b.carId || !b.part) return deny('carId and part required', 400);
+          const car = await env.DB.prepare('SELECT id FROM cars WHERE id = ? AND uid = ?')
+            .bind(String(b.carId), actor.payload.sub).first();
+          if (!car) return deny('Car not found', 404);
+          const km = b.intervalKm == null ? null : Math.max(0, Math.round(Number(b.intervalKm))) || null;
+          const mo = b.intervalMonths == null ? null : Math.max(0, Math.round(Number(b.intervalMonths))) || null;
+          await env.DB.prepare(
+            `UPDATE maint_item SET interval_km = ?, interval_months = ?, enabled = ?
+             WHERE car_id = ? AND part = ?`
+          ).bind(km, mo, b.enabled === false ? 0 : 1, String(b.carId), String(b.part)).run();
+          return json({ ok: true });
+        })();
+      }
+
       if (url.pathname === '/api/skills/mine' && request.method === 'GET') {
         return await guarded('user', async (actor) => {
           const rs = await env.DB.prepare(
@@ -2351,6 +2855,7 @@ ${convo}`;
     if (event.cron !== '*/10 * * * *') {
       ctx.waitUntil(fetchAndSaveNews(env));
       ctx.waitUntil(runPushRound(env));
+      ctx.waitUntil(runOdoRound(env));
     }
   }
 };
