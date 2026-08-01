@@ -1,6 +1,6 @@
--- Migration 0003: Add Admin and Security tables (config, audit, usage) and missing columns in users
-ALTER TABLE users ADD COLUMN created_at INTEGER;
-ALTER TABLE users ADD COLUMN banned INTEGER DEFAULT 0;
+-- Migration 0003: Add Admin and Security tables (config, audit, usage)
+-- ALTER TABLE users ADD COLUMN created_at INTEGER; (Already exists on remote table)
+-- ALTER TABLE users ADD COLUMN banned INTEGER DEFAULT 0; (Already exists on remote table)
 
 CREATE TABLE IF NOT EXISTS config (
   key TEXT PRIMARY KEY,
