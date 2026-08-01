@@ -2552,8 +2552,13 @@ export default {
             const car = await env.DB.prepare('SELECT make, model, year, mileage FROM cars WHERE id = ? AND uid = ?')
               .bind(String(body.carId), actor.payload.sub).first();
             if (car) {
-              carInfo = car;
-              console.log(`[AI Chat] Car details found in D1:`, JSON.stringify(carInfo));
+              carInfo = {
+                make: car.make || String(body.make || '').slice(0, 60),
+                model: car.model || String(body.model || '').slice(0, 60),
+                year: car.year || (body.year != null ? String(body.year).slice(0, 8) : ''),
+                mileage: car.mileage || (body.mileage != null ? String(body.mileage).slice(0, 12) : ''),
+              };
+              console.log(`[AI Chat] Car details found in D1 (merged):`, JSON.stringify(carInfo));
             } else {
               console.warn(`[AI Chat] carId ${body.carId} requested but no matching record found in D1 for UID ${actor.payload.sub}`);
             }
