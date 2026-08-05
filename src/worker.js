@@ -63,6 +63,278 @@ async function getActor(request, env) {
 
 function rank(role) { return ROLE_RANK[role] || 0; }
 
+/* ══════════════════════════════════════════════════════════════════
+   SCHEMA — ฐานข้อมูลสร้างตัวเองอัตโนมัติ ไม่ต้องรัน migration ด้วยมือ
+
+   ผู้ใช้ทั่วไปไม่เกี่ยวกับเรื่องนี้เลย เขาแค่เปิดเว็บแล้วใช้งาน
+   D1 เป็นฐานข้อมูลก้อนเดียวของทั้งแอป ใช้ร่วมกันทุกคน ไม่ใช่คนละก้อนต่อคน
+   ส่วนนี้คือการตั้งเซิร์ฟเวอร์ ซึ่งควรเป็นหน้าที่ของเซิร์ฟเวอร์เอง
+
+   เดิมต้องพิมพ์ wrangler d1 execute ทีละไฟล์ ซึ่งพลาดแล้วรู้ยากมาก —
+   0007 เคยหายไปเงียบ ๆ ทำให้การเตือนหมดเวลาจอดตายทั้งฟีเจอร์
+   โดยที่หน้าเว็บยังขึ้นว่า "ตั้งเวลาแล้ว" ตามปกติ
+   ตอนนี้ Worker ตรวจเองตอนบูตแล้วสร้างส่วนที่ขาดให้ครบ
+
+   ทุกคำสั่งเป็น IF NOT EXISTS จึงรันซ้ำได้ไม่จำกัด ปลอดภัยเสมอ
+   ยกเว้น ALTER TABLE สองบรรทัดที่ต้องดักข้อผิดพลาด "มีคอลัมน์นี้แล้ว" ทิ้ง
+   ══════════════════════════════════════════════════════════════════ */
+
+const SCHEMA_VERSION = 12;
+
+const SCHEMA_SQL = [
+  `CREATE TABLE IF NOT EXISTS users (
+  uid TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  email TEXT NOT NULL,
+  photo TEXT,
+  role TEXT DEFAULT 'user',
+  last_login INTEGER NOT NULL
+)`,
+  `CREATE TABLE IF NOT EXISTS cars (
+  id TEXT PRIMARY KEY,
+  uid TEXT NOT NULL,
+  make TEXT NOT NULL,
+  model TEXT NOT NULL,
+  year TEXT,
+  mileage TEXT,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (uid) REFERENCES users(uid) ON DELETE CASCADE
+)`,
+  `CREATE TABLE IF NOT EXISTS magazine (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  short_description TEXT,
+  full_description TEXT,
+  type TEXT,
+  created_at INTEGER NOT NULL
+)`,
+  `ALTER TABLE users ADD COLUMN created_at INTEGER`,
+  `ALTER TABLE users ADD COLUMN banned INTEGER DEFAULT 0`,
+  `CREATE TABLE IF NOT EXISTS config (
+  key TEXT PRIMARY KEY,
+  value TEXT
+)`,
+  `CREATE TABLE IF NOT EXISTS audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  t INTEGER NOT NULL,
+  actor TEXT NOT NULL,
+  action TEXT NOT NULL,
+  target TEXT,
+  detail TEXT
+)`,
+  `CREATE TABLE IF NOT EXISTS usage (
+  uid TEXT NOT NULL,
+  day TEXT NOT NULL,
+  count INTEGER NOT NULL,
+  in_tok INTEGER NOT NULL DEFAULT 0,
+  out_tok INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (uid, day)
+)`,
+  /* ค่าที่ผู้ใช้ตั้งเองสำหรับห้องแชท แยกจากการตั้งค่าโปรไฟล์
+     เก็บเป็น JSON ก้อนเดียว เพิ่มตัวเลือกใหม่ได้โดยไม่ต้อง migrate อีก */
+  `CREATE TABLE IF NOT EXISTS chat_prefs (
+  uid TEXT PRIMARY KEY,
+  prefs TEXT NOT NULL,
+  t INTEGER NOT NULL
+)`,
+  `CREATE TABLE IF NOT EXISTS shop (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  category TEXT,
+  price TEXT,
+  url TEXT,
+  image TEXT,
+  note TEXT,
+  created_at INTEGER NOT NULL
+)`,
+  `CREATE TABLE IF NOT EXISTS spares_cache (
+  k TEXT PRIMARY KEY,
+  uid TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  t INTEGER NOT NULL
+)`,
+  `CREATE TABLE IF NOT EXISTS push_subs (
+  endpoint TEXT PRIMARY KEY,
+  uid      TEXT NOT NULL,
+  p256dh   TEXT NOT NULL,
+  auth     TEXT NOT NULL,
+  cars     TEXT NOT NULL DEFAULT '[]',  
+  lang     TEXT NOT NULL DEFAULT 'th',
+  sent     TEXT NOT NULL DEFAULT '{}',  
+  t        INTEGER NOT NULL
+)`,
+  `CREATE INDEX IF NOT EXISTS idx_push_uid ON push_subs(uid)`,
+  `CREATE TABLE IF NOT EXISTS push_jobs (
+  id      TEXT PRIMARY KEY,
+  uid     TEXT NOT NULL,
+  send_at INTEGER NOT NULL,   
+  title   TEXT NOT NULL,
+  body    TEXT NOT NULL DEFAULT '',
+  url     TEXT NOT NULL DEFAULT '/',
+  tag     TEXT NOT NULL DEFAULT 'spireone',
+  done    INTEGER NOT NULL DEFAULT 0,
+  t       INTEGER NOT NULL
+)`,
+  `CREATE INDEX IF NOT EXISTS idx_jobs_due ON push_jobs(done, send_at)`,
+  `CREATE TABLE IF NOT EXISTS skills (
+  id         TEXT PRIMARY KEY,
+  uid        TEXT NOT NULL,
+  author     TEXT NOT NULL DEFAULT '',
+  name       TEXT NOT NULL,
+  slug       TEXT NOT NULL,
+  summary    TEXT NOT NULL DEFAULT '',
+  body       TEXT NOT NULL,
+  status     TEXT NOT NULL DEFAULT 'private',
+  reason     TEXT NOT NULL DEFAULT '',
+  installs   INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY (uid) REFERENCES users(uid) ON DELETE CASCADE
+)`,
+  `CREATE INDEX IF NOT EXISTS idx_skills_uid    ON skills(uid)`,
+  `CREATE INDEX IF NOT EXISTS idx_skills_status ON skills(status)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_skills_public_slug
+  ON skills(slug) WHERE status = 'public'`,
+  `CREATE TABLE IF NOT EXISTS skill_stars (
+  skill_id TEXT NOT NULL,
+  uid      TEXT NOT NULL,
+  stars    INTEGER NOT NULL,
+  t        INTEGER NOT NULL,
+  PRIMARY KEY (skill_id, uid)
+)`,
+  `CREATE INDEX IF NOT EXISTS idx_stars_skill ON skill_stars(skill_id)`,
+  `CREATE TABLE IF NOT EXISTS odo_anchor (
+  id          TEXT PRIMARY KEY,
+  uid         TEXT NOT NULL,
+  car_id      TEXT NOT NULL,
+  km          INTEGER NOT NULL,
+  
+  
+  
+  
+  
+  
+  source      TEXT NOT NULL,
+  
+  observed_at INTEGER NOT NULL,
+  note        TEXT NOT NULL DEFAULT '',
+  t           INTEGER NOT NULL
+)`,
+  `CREATE INDEX IF NOT EXISTS idx_anchor_car ON odo_anchor(car_id, observed_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_anchor_uid ON odo_anchor(uid)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_anchor_dedup
+  ON odo_anchor(car_id, source, km, observed_at)`,
+  `CREATE TABLE IF NOT EXISTS odo_state (
+  car_id     TEXT PRIMARY KEY,
+  uid        TEXT NOT NULL,
+  est_km     REAL NOT NULL,          
+  km_per_day REAL NOT NULL,          
+  sigma_km   REAL NOT NULL DEFAULT 0,
+  anchor_km  INTEGER,                
+  anchor_at  INTEGER,
+  n_anchor   INTEGER NOT NULL DEFAULT 0,
+  
+  
+  rate_basis TEXT NOT NULL DEFAULT 'lifetime',
+  updated_at INTEGER NOT NULL
+)`,
+  `CREATE INDEX IF NOT EXISTS idx_state_uid ON odo_state(uid)`,
+  `ALTER TABLE odo_state ADD COLUMN rate_err REAL`,
+  `CREATE TABLE IF NOT EXISTS maint_item (
+  id              TEXT PRIMARY KEY,
+  uid             TEXT NOT NULL,
+  car_id          TEXT NOT NULL,
+  part            TEXT NOT NULL,
+  interval_km     INTEGER,
+  interval_months INTEGER,
+  last_km         INTEGER,
+  last_at         INTEGER,
+  enabled         INTEGER NOT NULL DEFAULT 1,
+  
+  notified_km     INTEGER,
+  notified_at     INTEGER,
+  t               INTEGER NOT NULL
+)`,
+  `CREATE INDEX IF NOT EXISTS idx_maint_car ON maint_item(car_id, enabled)`,
+  `CREATE INDEX IF NOT EXISTS idx_maint_uid ON maint_item(uid)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_maint_part ON maint_item(car_id, part)`,
+  `CREATE TABLE IF NOT EXISTS notify_state (
+  car_id      TEXT PRIMARY KEY,
+  uid         TEXT NOT NULL,
+  last_at     INTEGER,             
+  last_digest TEXT DEFAULT '',     
+  sent_30d    INTEGER NOT NULL DEFAULT 0,
+  muted_until INTEGER              
+)`,
+  `CREATE INDEX IF NOT EXISTS idx_notify_uid ON notify_state(uid)`,
+  `CREATE TABLE IF NOT EXISTS line_link (
+  line_uid  TEXT PRIMARY KEY,      
+  uid       TEXT NOT NULL,         
+  lang      TEXT NOT NULL DEFAULT 'th',
+  active    INTEGER NOT NULL DEFAULT 1,
+  linked_at INTEGER NOT NULL
+)`,
+  `CREATE INDEX IF NOT EXISTS idx_line_uid ON line_link(uid)`,
+  `CREATE TABLE IF NOT EXISTS line_code (
+  code       TEXT PRIMARY KEY,
+  uid        TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  used       INTEGER NOT NULL DEFAULT 0
+)`,
+  `CREATE TABLE IF NOT EXISTS obd_device (
+  device_id  TEXT PRIMARY KEY,     
+  uid        TEXT NOT NULL,
+  car_id     TEXT NOT NULL,
+  secret     TEXT NOT NULL,        
+  
+  
+  base_km    INTEGER,              
+  base_dist  INTEGER,              
+  last_seen  INTEGER,
+  last_km    INTEGER,
+  t          INTEGER NOT NULL
+)`,
+  `CREATE INDEX IF NOT EXISTS idx_obd_car ON obd_device(car_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_obd_uid ON obd_device(uid)`,
+];
+
+/* จำไว้ในหน่วยความจำของ isolate ว่าตรวจไปแล้ว จะได้ไม่อ่าน config ทุกคำขอ
+   isolate ถูกรีไซเคิลเมื่อไรก็แค่ตรวจใหม่หนึ่งครั้ง ซึ่งเป็นการอ่านแถวเดียว */
+let schemaChecked = false;
+
+async function ensureSchema(env) {
+  if (schemaChecked || !env.DB) return;
+  try {
+    const row = await env.DB.prepare("SELECT value FROM config WHERE key = 'schema_version'")
+      .first();
+    const have = row && row.value ? parseInt(JSON.parse(row.value), 10) : 0;
+    if (have >= SCHEMA_VERSION) { schemaChecked = true; return; }
+  } catch (e) {
+    /* ตาราง config เองยังไม่มี = ฐานข้อมูลเปล่า ต้องสร้างทั้งชุด ไปต่อ */
+  }
+
+  for (const sql of SCHEMA_SQL) {
+    try {
+      await env.DB.prepare(sql).run();
+    } catch (e) {
+      const m = String((e && e.message) || e).toLowerCase();
+      /* ALTER TABLE ADD COLUMN ซ้ำเป็นเรื่องปกติเมื่อรันรอบสอง ไม่ใช่ความผิดพลาด */
+      if (m.includes('duplicate column')) continue;
+      /* ที่เหลือปล่อยผ่านเหมือนกัน เพราะถ้าหยุดกลางคัน ตารางที่เหลือจะไม่ถูกสร้าง
+         ซึ่งแย่กว่าการข้ามคำสั่งเดียวที่มีปัญหา */
+    }
+  }
+
+  try {
+    await env.DB.prepare(
+      "INSERT INTO config (key, value) VALUES ('schema_version', ?) "
+      + 'ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+    ).bind(JSON.stringify(SCHEMA_VERSION)).run();
+    schemaChecked = true;
+  } catch (e) { /* ครั้งหน้าค่อยลองใหม่ */ }
+}
+
+
 async function getConfig(env, key, fallback) {
   try {
     const row = await env.DB.prepare('SELECT value FROM config WHERE key = ?').bind(key).first();
@@ -104,7 +376,8 @@ async function schemaReport(env) {
     magazine: ['id', 'title', 'short_description', 'full_description', 'type', 'created_at'],
     config:   ['key', 'value'],
     audit:    ['id', 't', 'actor', 'action', 'target', 'detail'],
-    usage:    ['uid', 'day', 'count'],
+    usage:    ['uid', 'day', 'count', 'in_tok', 'out_tok'],
+    chat_prefs: ['uid', 'prefs', 't'],
     shop:     ['id', 'title', 'category', 'price', 'url', 'image', 'note', 'created_at'],
     spares_cache: ['k', 'uid', 'payload', 't'],
     push_subs: ['endpoint', 'uid', 'p256dh', 'auth', 'cars', 'lang', 'sent', 't'],
@@ -131,8 +404,70 @@ async function schemaReport(env) {
   return out;
 }
 
+
+/* ===== มาตรวัด token =====
+ * โควตาเดิมนับเป็นจำนวนครั้ง ซึ่งไม่ตรงกับต้นทุนจริงเลย
+ * ข้อความสั้นกับบทสนทนายาวสิบรอบคิดเท่ากันหมด ทั้งที่ต่างกันหลายสิบเท่า
+ * ผู้ให้บริการทั้งสามรายที่ใช้อยู่รายงานจำนวน token กลับมาให้อยู่แล้ว
+ * แค่ชื่อฟิลด์ต่างกัน จึงอ่านให้ครบทุกแบบแล้วรวมเป็นหน่วยเดียว
+ */
+function newMeter() { return { in: 0, out: 0, calls: 0, src: [] }; }
+
+function readUsage(meter, raw, from) {
+  if (!meter || !raw) return;
+  const u = raw.usageMetadata || raw.usage || raw;
+  const pick = (...keys) => {
+    for (const k of keys) if (typeof u[k] === 'number') return u[k];
+    return 0;
+  };
+  const i = pick('promptTokenCount', 'prompt_tokens', 'input_tokens', 'prompt_token_count');
+  const out = pick('candidatesTokenCount', 'completion_tokens', 'output_tokens', 'completion_token_count');
+  /* บางเจ้าส่งมาแต่ยอดรวม ไม่แยกขา  กรณีนั้นให้ลงเป็นขาออกทั้งก้อน
+     เพราะขาออกแพงกว่าเสมอ คิดแบบนี้จะไม่คิดผู้ใช้ต่ำกว่าความจริง */
+  const total = pick('totalTokenCount', 'total_tokens');
+  if (!i && !out && total) { meter.out += total; }
+  else { meter.in += i; meter.out += out; }
+  meter.calls += 1;
+  if (from) meter.src.push(from);
+}
+
+/* หน่วยที่แอปคิดกับผู้ใช้  ขาออกแพงกว่าขาเข้าจริงราวสี่เท่าในทุกเจ้า
+   จึงถ่วงน้ำหนักให้ตรงกับต้นทุน ไม่ใช่บวกดิบ ๆ */
+const OUT_WEIGHT = 4;
+function billable(meter) {
+  return Math.max(1, Math.round(meter.in + meter.out * OUT_WEIGHT));
+}
+
+/* บันทึกลงตาราง usage แล้วคืนยอดสะสมของวันนั้น
+   count ยังนับต่อไปเพื่อไม่ให้หน้าเดิมที่อ่านค่านี้พัง */
+async function meterTokens(env, uid, meter) {
+  const day = new Date().toISOString().slice(0, 10);
+  const row = await env.DB.prepare(`
+    INSERT INTO usage (uid, day, count, in_tok, out_tok) VALUES (?, ?, 1, ?, ?)
+    ON CONFLICT(uid, day) DO UPDATE SET
+      count = count + 1, in_tok = in_tok + ?, out_tok = out_tok + ?
+    RETURNING count, in_tok, out_tok
+  `).bind(uid, day, meter.in, meter.out, meter.in, meter.out).first();
+  return row || { count: 0, in_tok: 0, out_tok: 0 };
+}
+
+/* โควตาต่อวันคิดเป็น token ที่คิดเงินได้  อ่านค่าที่ตั้งไว้ในระบบก่อน
+   ถ้าไม่มีค่อยใช้ตัวแปรสภาพแวดล้อม */
+async function tokenLimit(env) {
+  const cfg = await getConfig(env, 'limits', {});
+  return cfg.aiTokensDaily || parseInt(env.AI_TOKEN_DAILY_LIMIT || '120000', 10);
+}
+
+async function tokensToday(env, uid) {
+  const day = new Date().toISOString().slice(0, 10);
+  const r = await env.DB.prepare(
+    'SELECT in_tok, out_tok FROM usage WHERE uid = ? AND day = ?').bind(uid, day).first();
+  if (!r) return 0;
+  return Math.round((r.in_tok || 0) + (r.out_tok || 0) * OUT_WEIGHT);
+}
+
 /* ===== Gemini (server-side only — key never leaves the Worker) ===== */
-async function callGemini(env, { contents, system, search, temp, json: wantJson, maxTokens }) {
+async function callGemini(env, { contents, system, search, temp, json: wantJson, maxTokens, meter }) {
   const geminiKey = env.GEMINI_KEY;
   if (!geminiKey) throw new Error('AI is not configured');
   const model = env.GEMINI_MODEL || 'gemini-2.5-flash';
@@ -168,6 +503,7 @@ async function callGemini(env, { contents, system, search, temp, json: wantJson,
     throw new Error(`AI upstream error ${res.status}: ${t.slice(0, 200)}`);
   }
   const data = await res.json();
+  readUsage(meter, data, 'gemini');
   const c = (data.candidates && data.candidates[0]) || {};
   const text = ((c.content && c.content.parts) || []).map(p => p.text || '').join('').trim();
   if (!text) {
@@ -242,7 +578,7 @@ async function fetchWithRetry(url, options, maxRetries = 2) {
   return fetch(url, options);
 }
 
-async function callWorkersAI(env, messages) {
+async function callWorkersAI(env, messages, meter) {
   if (!env.AI) {
     throw new Error("Cloudflare Workers AI binding 'AI' is not configured");
   }
@@ -257,13 +593,14 @@ async function callWorkersAI(env, messages) {
   });
 
   const response = await env.AI.run(model, { messages: formatted });
+  readUsage(meter, response, 'workers-ai');
   if (!response || !response.response) {
     throw new Error("Cloudflare Workers AI returned an empty response");
   }
   return response.response.trim();
 }
 
-async function callReasoningModel(env, messages) {
+async function callReasoningModel(env, messages, meter) {
   const hasKey = !!env.OPENROUTER_API_KEY;
   console.log(`[AI Reasoning] OPENROUTER_API_KEY configured: ${hasKey}`);
 
@@ -303,6 +640,7 @@ async function callReasoningModel(env, messages) {
           throw e;
         }
 
+        readUsage(meter, data, 'openrouter');
         const content = ((data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "").trim();
         if (content) {
           console.log(`[OpenRouter] Success! Generated content length: ${content.length}`);
@@ -324,14 +662,60 @@ async function callReasoningModel(env, messages) {
 
   console.log(`[AI Reasoning] Attempting fallback via Cloudflare Workers AI...`);
   try {
-    return await callWorkersAI(env, messages);
+    return await callWorkersAI(env, messages, meter);
   } catch (err) {
     console.error(`[Cloudflare Workers AI Fallback Failed]: ${err.message}`);
     throw new Error(`Reasoning failure (OpenRouter failed & Cloudflare Workers AI fallback failed: ${err.message})`);
   }
 }
 
-async function runReActAgent(env, carInfo, messages) {
+
+/* ===== สไตล์การพูดของแชทบอท =====
+ * ต่อท้าย system prompt เท่านั้น ไม่ไปแก้เนื้อหาหรือกฎการใช้เครื่องมือ
+ * สไตล์เปลี่ยนแค่ "น้ำเสียง" ไม่เปลี่ยน "สิ่งที่ตอบ"
+ * ทุกแบบยังต้องบอกความจริงและไม่เดาข้อมูลที่ไม่มี
+ */
+const CHAT_STYLES = {
+  precise: {
+    th: 'เป็นระเบียบ', en: 'Precise',
+    prompt: '',   // ค่าเริ่มต้น ใช้น้ำเสียงเดิมของระบบ
+  },
+  natural: {
+    th: 'เหมือนคนทั่วไป', en: 'Natural',
+    prompt: 'น้ำเสียง: พูดเหมือนช่างที่คุยกับเพื่อนลูกค้า ใช้ภาษาพูดธรรมดา '
+          + 'เลี่ยงศัพท์เทคนิคถ้าไม่จำเป็น ถ้าจำเป็นให้อธิบายสั้น ๆ ต่อท้าย '
+          + 'ไม่ต้องขึ้นหัวข้อเป็นข้อ ๆ ถ้าเรื่องไม่ซับซ้อน',
+  },
+  playful: {
+    th: 'ติดเล่น', en: 'Playful',
+    prompt: 'น้ำเสียง: เป็นกันเอง แทรกมุกเบา ๆ ได้บ้างแต่ไม่เกินหนึ่งครั้งต่อคำตอบ '
+          + 'ห้ามเล่นมุกตอนที่เรื่องเกี่ยวกับความปลอดภัยหรือค่าใช้จ่ายก้อนใหญ่ '
+          + 'ตรงนั้นให้พูดตรงและจริงจัง',
+  },
+  funny: {
+    th: 'ตลก', en: 'Funny',
+    prompt: 'น้ำเสียง: ขำขัน เปรียบเทียบให้เห็นภาพแบบสนุก ๆ '
+          + 'แต่ข้อมูลทุกอย่างต้องยังถูกต้องครบถ้วน ห้ามลดเนื้อหาเพื่อเอาฮา '
+          + 'ถ้าเป็นเรื่องความปลอดภัยหรืออาการที่อาจทำให้รถเสียหาย ให้พูดจริงจังทันที',
+  },
+};
+
+function stylePrompt(key) {
+  const s = CHAT_STYLES[key];
+  return s && s.prompt ? '\n\n' + s.prompt : '';
+}
+
+async function getChatPrefs(env, uid) {
+  const fallback = { style: 'precise' };
+  try {
+    const r = await env.DB.prepare('SELECT prefs FROM chat_prefs WHERE uid = ?').bind(uid).first();
+    if (!r || !r.prefs) return fallback;
+    const v = JSON.parse(r.prefs);
+    return { style: CHAT_STYLES[v.style] ? v.style : 'precise' };
+  } catch { return fallback; }
+}
+
+async function runReActAgent(env, carInfo, messages, meter, style) {
   const carContext = (carInfo.make || carInfo.model) 
     ? `\nรถของผู้ใช้: ${carInfo.make || ''} ${carInfo.model || ''} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` 
     : '';
@@ -357,7 +741,7 @@ Final Answer: [คำตอบภาษาไทยสรุปอย่าง�
 - ห้ามเขียน Observation หรือข้อมูลหลังคำว่า Observation เองเด็ดขาด!
 - หากมีไฟล์แนบในแชต คุณต้องเรียกใช้ describe_media เสมอเพื่อเอาข้อมูลสังเกตมาคิดวิเคราะห์
 - หากต้องการเช็กราคาสินค้า ข่าว หรือสเปกที่ต้องการความสดใหม่ ให้เรียกใช้ google_search
-- หากข้อมูลพร้อมและไม่ต้องรันเครื่องมือ ให้ข้าม Action และเขียน Final Answer ได้เลย`;
+- หากข้อมูลพร้อมและไม่ต้องรันเครื่องมือ ให้ข้าม Action และเขียน Final Answer ได้เลย` + stylePrompt(style);
 
   const chatHistory = messages.map(m => {
     const o = { role: m.role === "user" ? "user" : "assistant", content: "" };
@@ -389,7 +773,7 @@ Final Answer: [คำตอบภาษาไทยสรุปอย่าง�
     
     let completionText;
     try {
-      completionText = await callReasoningModel(env, agentLog);
+      completionText = await callReasoningModel(env, agentLog, meter);
     } catch (err) {
       throw new Error(`ReAct reasoning failure: ${err.message}`);
     }
@@ -1117,14 +1501,50 @@ function learnedRate(anchors) {
   return clampRate(r);
 }
 
-/* ความคลาดเคลื่อนสัมพัทธ์ของอัตรา — ยิ่งมีจุดยืนยันมาก ยิ่งมั่นใจ
-   ตัวเลขชุดนี้เป็นค่าตั้งต้นเชิงออกแบบ ไม่ใช่ค่าที่วัดจากผู้ใช้จริง
-   ควรปรับหลังเก็บสถิติจากการใช้งานจริงได้แล้ว */
-function rateError(basis, nAnchor) {
+/* อัตราของแต่ละช่วงระหว่างจุดยืนยันสองจุดที่ติดกัน
+   ช่วงที่สั้นกว่า 10 วันทิ้ง เพราะสัญญาณรบกวนกลบแนวโน้มจริง */
+function segmentRates(anchors) {
+  const out = [];
+  for (let i = 1; i < anchors.length; i++) {
+    const days = (anchors[i].observed_at - anchors[i - 1].observed_at) / DAY_MS;
+    const dist = anchors[i].km - anchors[i - 1].km;
+    if (days < 10 || dist < 0) continue;
+    const r = dist / days;
+    if (isFinite(r) && r > 0 && r < RATE_MAX) out.push(r);
+  }
+  return out;
+}
+
+const median = (a) => {
+  if (!a.length) return 0;
+  const s = a.slice().sort((x, y) => x - y), m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+};
+
+/* ความคลาดเคลื่อนสัมพัทธ์ของอัตรา — วัดจากรถคันนี้จริง ๆ ถ้าข้อมูลพอ
+   ไม่พอก็ตกไปใช้ค่าตั้งต้นเดิมซึ่งเป็นการเดาอย่างระวังตัว */
+function rateError(basis, nAnchor, anchors) {
+  /* ต้องมีอย่างน้อยสามช่วง (สี่จุดยืนยัน) ถึงจะพูดเรื่องความแปรปรวนได้
+     สองช่วงบอกได้แค่ว่าต่างกัน ไม่ได้บอกว่าปกติมันเหวี่ยงแค่ไหน */
+  if (anchors && anchors.length >= 4) {
+    const rates = segmentRates(anchors);
+    if (rates.length >= 3) {
+      const med = median(rates);
+      if (med > 0) {
+        const mad = median(rates.map((r) => Math.abs(r - med)));
+        /* 1.4826 แปลง MAD ให้เทียบเท่าส่วนเบี่ยงเบนมาตรฐานของการแจกแจงปกติ */
+        const rel = (mad * 1.4826) / med;
+        /* พื้น 8% เพราะแม้แต่คนที่ขับสม่ำเสมอที่สุดก็ยังมีสัปดาห์ที่ผิดปกติ
+           เพดาน 60% เพราะเกินนั้นค่าประมาณไม่มีความหมายแล้ว ควรพึ่งเกณฑ์เวลา */
+        return Math.min(0.6, Math.max(0.08, rel));
+      }
+    }
+  }
+  /* ยังไม่รู้จักผู้ใช้คนนี้ดีพอ — เดาอย่างระวังตัวไว้ก่อน */
   if (basis === 'lifetime') return 0.35;       // ค่าเฉลี่ยทั้งชีวิต หยาบที่สุด
-  if (nAnchor >= 5) return 0.10;
-  if (nAnchor >= 3) return 0.15;
-  return 0.22;
+  if (nAnchor >= 5) return 0.12;
+  if (nAnchor >= 3) return 0.18;
+  return 0.25;
 }
 
 /* ประมาณเลขไมล์ ณ เวลาหนึ่ง พร้อมความไม่แน่นอน
@@ -1138,7 +1558,11 @@ function estimateAt(state, at) {
   }
   const days = Math.max(0, (at - from) / DAY_MS);
   const run = Number(state.km_per_day) * days;
-  const err = rateError(state.rate_basis, Number(state.n_anchor) || 0);
+  /* ค่าที่คำนวณไว้ตอนมีจุดยืนยันเข้ามา — รอบ cron ไม่ได้โหลด anchors มาด้วย
+     จึงต้องอ่านของที่เก็บไว้ ไม่ใช่คำนวณใหม่ทุกครั้ง */
+  const err = Number(state.rate_err) > 0
+    ? Number(state.rate_err)
+    : rateError(state.rate_basis, Number(state.n_anchor) || 0, null);
   /* พื้น 40 กม. เพราะแม้แต่เลขที่อ่านจากใบเสร็จก็มีวันคลาดเคลื่อนได้บ้าง */
   const sigma = Math.max(40, run * err);
   return { km: Math.round(base + run), sigma: Math.round(sigma), days: Math.round(days) };
@@ -1169,20 +1593,24 @@ async function recomputeOdo(env, uid, carId, car) {
     km_per_day: rate, rate_basis: basis,
     anchor_km: last.km, anchor_at: last.observed_at,
     n_anchor: anchors.length,
+    /* วัดความเหวี่ยงของคนนี้จากประวัติจริง แล้วเก็บไว้ให้รอบ cron ใช้ */
+    rate_err: rateError(basis, anchors.length, anchors),
   };
   const est = estimateAt(state, t);
 
   await env.DB.prepare(
     `INSERT INTO odo_state
-       (car_id, uid, est_km, km_per_day, sigma_km, anchor_km, anchor_at, n_anchor, rate_basis, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       (car_id, uid, est_km, km_per_day, sigma_km, anchor_km, anchor_at, n_anchor,
+        rate_basis, rate_err, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(car_id) DO UPDATE SET
        uid = excluded.uid, est_km = excluded.est_km, km_per_day = excluded.km_per_day,
        sigma_km = excluded.sigma_km, anchor_km = excluded.anchor_km,
        anchor_at = excluded.anchor_at, n_anchor = excluded.n_anchor,
-       rate_basis = excluded.rate_basis, updated_at = excluded.updated_at`
+       rate_basis = excluded.rate_basis, rate_err = excluded.rate_err,
+       updated_at = excluded.updated_at`
   ).bind(carId, uid, est.km, rate, est.sigma, last.km, last.observed_at,
-    anchors.length, basis, t).run();
+    anchors.length, basis, state.rate_err, t).run();
 
   return Object.assign({}, state, { est_km: est.km, sigma_km: est.sigma, updated_at: t });
 }
@@ -1952,6 +2380,9 @@ export default {
 
     if (!env.DB) return deny('Database is not configured', 500);
 
+    /* สร้าง/อัปเดตตารางเองถ้ายังไม่ครบ — เจ้าของแอปไม่ต้องรัน migration ด้วยมือ */
+    await ensureSchema(env);
+
     // Wraps a handler with auth + minimum-role + ban checks.
     const guarded = (minRole, handler) => async () => {
       let actor;
@@ -2496,7 +2927,7 @@ export default {
           const uid = actor.payload.sub;
           // ลบทีละตาราง ไม่ใช้ transaction เพราะ D1 ยังไม่รองรับข้าม statement
           // ถ้าตารางไหนพลาด ตัวที่ลบไปแล้วยังถือว่าลบจริง จึงรายงานเป็นรายตาราง
-          const tables = ['cars', 'usage', 'push_subs', 'push_jobs'];
+          const tables = ['cars', 'usage', 'push_subs', 'push_jobs', 'chat_prefs'];
           const removed = {};
           for (const t of tables) {
             try {
@@ -2522,6 +2953,41 @@ export default {
         })();
       }
 
+      /* ===== การตั้งค่าห้องแชท และยอด token =====
+       * แยกจากการตั้งค่าโปรไฟล์โดยสิ้นเชิง อันนี้เป็นของแชทบอทเท่านั้น
+       * อ่านและเขียนที่เดียวกัน เพื่อให้หน้าแชทเรียกครั้งเดียวได้ครบ
+       */
+      if (url.pathname === '/api/chat/prefs' && request.method === 'GET') {
+        return await guarded('user', async (actor) => {
+          const uid = actor.payload.sub;
+          const prefs = await getChatPrefs(env, uid);
+          const limit = await tokenLimit(env);
+          const used = await tokensToday(env, uid);
+          const styles = Object.keys(CHAT_STYLES).map(k => ({
+            key: k, th: CHAT_STYLES[k].th, en: CHAT_STYLES[k].en,
+          }));
+          return json({
+            prefs, styles,
+            tokens: { used, limit, left: Math.max(0, limit - used),
+                      unlimited: rank(actor.role) >= rank('admin') },
+          });
+        })();
+      }
+
+      if (url.pathname === '/api/chat/prefs' && request.method === 'PUT') {
+        return await guarded('user', async (actor) => {
+          const b = (await readBody()) || {};
+          /* รับเฉพาะคีย์ที่รู้จัก ค่าที่ไม่รู้จักตกกลับไปเป็นค่าเริ่มต้น
+             ไม่เก็บอะไรที่ผู้ใช้ส่งมาดิบ ๆ ลงฐานข้อมูล */
+          const style = CHAT_STYLES[b.style] ? b.style : 'precise';
+          await env.DB.prepare(`
+            INSERT INTO chat_prefs (uid, prefs, t) VALUES (?, ?, ?)
+            ON CONFLICT(uid) DO UPDATE SET prefs = excluded.prefs, t = excluded.t
+          `).bind(actor.payload.sub, JSON.stringify({ style }), Date.now()).run();
+          return json({ ok: true, prefs: { style } });
+        })();
+      }
+
       /* ===== AI PROXY (login required, quota enforced) ===== */
       if (url.pathname === '/api/ai/chat' && request.method === 'POST') {
         return await guarded('user', async (actor) => {
@@ -2534,16 +3000,15 @@ export default {
           try { validateContents(body.contents); }
           catch (e) { return deny(e.message, 400); }
 
-          // Daily quota (admins and owners are exempt)
+          /* โควตารายวันคิดเป็น token ที่ใช้จริง ไม่ใช่จำนวนครั้งที่พิมพ์
+             ตรวจ "ก่อน" ยิงคำถาม โดยดูยอดสะสมของวันนี้
+             ตัวคำถามนี้จะถูกบวกเข้าไปหลังได้คำตอบ ผู้ใช้จึงยิงทะลุเพดานได้
+             อย่างมากหนึ่งครั้ง ซึ่งยอมรับได้ เพราะยังไม่รู้ราคาก่อนถาม
+             ผู้ดูแลกับเจ้าของระบบไม่ติดโควตา */
           if (rank(actor.role) < rank('admin')) {
-            const limit = (await getConfig(env, 'limits', {})).aiDaily || parseInt(env.AI_DAILY_LIMIT || '60', 10);
-            const day = new Date().toISOString().slice(0, 10);
-            const row = await env.DB.prepare(`
-              INSERT INTO usage (uid, day, count) VALUES (?, ?, 1)
-              ON CONFLICT(uid, day) DO UPDATE SET count = count + 1
-              RETURNING count
-            `).bind(actor.payload.sub, day).first();
-            if (row && row.count > limit) return deny('quota', 429);
+            const limit = await tokenLimit(env);
+            const used = await tokensToday(env, actor.payload.sub);
+            if (used >= limit) return deny('quota', 429);
           }
 
           let carInfo = { make: '', model: '', year: '', mileage: '' };
@@ -2552,13 +3017,8 @@ export default {
             const car = await env.DB.prepare('SELECT make, model, year, mileage FROM cars WHERE id = ? AND uid = ?')
               .bind(String(body.carId), actor.payload.sub).first();
             if (car) {
-              carInfo = {
-                make: car.make || String(body.make || '').slice(0, 60),
-                model: car.model || String(body.model || '').slice(0, 60),
-                year: car.year || (body.year != null ? String(body.year).slice(0, 8) : ''),
-                mileage: car.mileage || (body.mileage != null ? String(body.mileage).slice(0, 12) : ''),
-              };
-              console.log(`[AI Chat] Car details found in D1 (merged):`, JSON.stringify(carInfo));
+              carInfo = car;
+              console.log(`[AI Chat] Car details found in D1:`, JSON.stringify(carInfo));
             } else {
               console.warn(`[AI Chat] carId ${body.carId} requested but no matching record found in D1 for UID ${actor.payload.sub}`);
             }
@@ -2579,8 +3039,20 @@ export default {
           }
 
           try {
-            const text = await runReActAgent(env, carInfo, body.contents);
-            return json({ text });
+            const meter = newMeter();
+            const prefs = await getChatPrefs(env, actor.payload.sub);
+            const text = await runReActAgent(env, carInfo, body.contents, meter, prefs.style);
+            /* บันทึกหลังได้คำตอบ เพราะเพิ่งรู้ราคาจริงตอนนี้
+               ถ้าเขียนไม่สำเร็จก็ไม่ควรทำให้คำตอบที่ได้มาแล้วหายไป */
+            let usage = null;
+            try {
+              const row = await meterTokens(env, actor.payload.sub, meter);
+              const limit = await tokenLimit(env);
+              const spent = Math.round((row.in_tok || 0) + (row.out_tok || 0) * OUT_WEIGHT);
+              usage = { used: spent, limit, cost: billable(meter),
+                        in: meter.in, out: meter.out, src: meter.src };
+            } catch (e) { console.error('[meter] write failed', e); }
+            return json({ text, usage });
           } catch (err) {
             console.error('[AI Chat Route Error]:', err);
             return deny(err.message || 'AI processing error', 500);
@@ -2597,16 +3069,19 @@ export default {
           const maintenance = await getConfig(env, 'maintenance', { enabled: false });
           if (maintenance.enabled && rank(actor.role) < rank('moderator')) return deny('maintenance', 503);
 
-          // a live session is heavier than a text message — count it as 5 toward the daily quota
+          /* การโทรคุยด้วยเสียงวิ่งตรงจากเบราว์เซอร์ไป Gemini
+             Worker จึงไม่เห็นยอด token ของเซสชันนั้นเลย
+             ประเมินเอาไว้ล่วงหน้าเป็นก้อนเดียวตามค่าเฉลี่ยของสายสั้น ๆ
+             ค่านี้ปรับได้ที่ config โดยไม่ต้องแก้โค้ด */
           if (rank(actor.role) < rank('admin')) {
-            const limit = (await getConfig(env, 'limits', {})).aiDaily || parseInt(env.AI_DAILY_LIMIT || '60', 10);
-            const day = new Date().toISOString().slice(0, 10);
-            const row = await env.DB.prepare(`
-              INSERT INTO usage (uid, day, count) VALUES (?, ?, 5)
-              ON CONFLICT(uid, day) DO UPDATE SET count = count + 5
-              RETURNING count
-            `).bind(actor.payload.sub, day).first();
-            if (row && row.count > limit) return deny('quota', 429);
+            const limit = await tokenLimit(env);
+            const used = await tokensToday(env, actor.payload.sub);
+            if (used >= limit) return deny('quota', 429);
+            const est = (await getConfig(env, 'limits', {})).liveCallTokens
+              || parseInt(env.AI_LIVE_CALL_TOKENS || '6000', 10);
+            try {
+              await meterTokens(env, actor.payload.sub, { in: 0, out: Math.round(est / OUT_WEIGHT), calls: 1, src: ['live'] });
+            } catch (e) { console.error('[meter] live write failed', e); }
           }
 
           const geminiKey = env.GEMINI_KEY;
@@ -2930,13 +3405,15 @@ ${convo}`;
             one('cars', 'SELECT COUNT(*) c FROM cars'),
             one('magazine', 'SELECT COUNT(*) c FROM magazine'),
             one('usage.today', 'SELECT COALESCE(SUM(count),0) c FROM usage WHERE day = ?', [day]),
+            one('usage.tokensToday', 'SELECT COALESCE(SUM(in_tok),0) i, COALESCE(SUM(out_tok),0) o FROM usage WHERE day = ?', [day]),
+            one('usage.tokensTotal', 'SELECT COALESCE(SUM(in_tok),0) i, COALESCE(SUM(out_tok),0) o FROM usage'),
             one('usage.total', 'SELECT COALESCE(SUM(count),0) c FROM usage'),
             one('shop', 'SELECT COUNT(*) c FROM shop'),
             one('audit', 'SELECT COUNT(*) c FROM audit'),
           ]);
 
           const aiDaily = await many('usage.daily',
-            'SELECT day, SUM(count) c FROM usage GROUP BY day ORDER BY day DESC LIMIT 14');
+            'SELECT day, SUM(count) c, SUM(in_tok) i, SUM(out_tok) o FROM usage GROUP BY day ORDER BY day DESC LIMIT 14');
           const signups = await many('users.signups',
             "SELECT date(created_at/1000,'unixepoch') d, COUNT(*) c FROM users WHERE created_at IS NOT NULL GROUP BY d ORDER BY d DESC LIMIT 14");
           const roles = await many('users.roles',
@@ -3020,7 +3497,7 @@ ${convo}`;
             return results || [];
           }, []);
           const usage = await safe(env, w, 'usage', async () => {
-            const { results } = await env.DB.prepare('SELECT day, count FROM usage WHERE uid = ? ORDER BY day DESC LIMIT 30').bind(uid).all();
+            const { results } = await env.DB.prepare('SELECT day, count, in_tok, out_tok FROM usage WHERE uid = ? ORDER BY day DESC LIMIT 30').bind(uid).all();
             return results || [];
           }, []);
           const own = owners(env);
@@ -3425,6 +3902,8 @@ ${convo}`;
   },
 
   async scheduled(event, env, ctx) {
+    /* cron ทำงานได้แม้ยังไม่มีใครเปิดเว็บเลย จึงต้องตรวจตรงนี้ด้วย */
+    ctx.waitUntil(ensureSchema(env));
     // รอบถี่ทำเฉพาะงานที่นัดเวลาไว้ ส่วนงานหนักปล่อยให้รอบวันละครั้งทำ
     ctx.waitUntil(runDueJobs(env));
     if (event.cron !== '*/10 * * * *') {
