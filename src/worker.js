@@ -451,11 +451,16 @@ async function meterTokens(env, uid, meter) {
   return row || { count: 0, in_tok: 0, out_tok: 0 };
 }
 
-/* โควตาต่อวันคิดเป็น token ที่คิดเงินได้  อ่านค่าที่ตั้งไว้ในระบบก่อน
-   ถ้าไม่มีค่อยใช้ตัวแปรสภาพแวดล้อม */
-async function tokenLimit(env) {
+/* โควตาต่อวันคิดเป็น 10,000 TPD (Tokens Per Day) หรืออ่านจาก tpd_limit ในตาราง users */
+async function tokenLimit(env, uid) {
+  if (uid && env.DB) {
+    try {
+      const u = await env.DB.prepare('SELECT tpd_limit FROM users WHERE uid = ?').bind(uid).first();
+      if (u && typeof u.tpd_limit === 'number' && u.tpd_limit > 0) return u.tpd_limit;
+    } catch (e) {}
+  }
   const cfg = await getConfig(env, 'limits', {});
-  return cfg.aiTokensDaily || parseInt(env.AI_TOKEN_DAILY_LIMIT || '120000', 10);
+  return cfg.aiTokensDaily || parseInt(env.AI_TOKEN_DAILY_LIMIT || '10000', 10);
 }
 
 async function tokensToday(env, uid) {
@@ -463,7 +468,7 @@ async function tokensToday(env, uid) {
   const r = await env.DB.prepare(
     'SELECT in_tok, out_tok FROM usage WHERE uid = ? AND day = ?').bind(uid, day).first();
   if (!r) return 0;
-  return Math.round((r.in_tok || 0) + (r.out_tok || 0) * OUT_WEIGHT);
+  return (r.in_tok || 0) + (r.out_tok || 0);
 }
 
 /* ===== Gemini (server-side only — key never leaves the Worker) ===== */
@@ -2961,7 +2966,7 @@ export default {
         return await guarded('user', async (actor) => {
           const uid = actor.payload.sub;
           const prefs = await getChatPrefs(env, uid);
-          const limit = await tokenLimit(env);
+          const limit = await tokenLimit(env, uid);
           const used = await tokensToday(env, uid);
           const styles = Object.keys(CHAT_STYLES).map(k => ({
             key: k, th: CHAT_STYLES[k].th, en: CHAT_STYLES[k].en,
@@ -3000,13 +3005,10 @@ export default {
           try { validateContents(body.contents); }
           catch (e) { return deny(e.message, 400); }
 
-          /* โควตารายวันคิดเป็น token ที่ใช้จริง ไม่ใช่จำนวนครั้งที่พิมพ์
-             ตรวจ "ก่อน" ยิงคำถาม โดยดูยอดสะสมของวันนี้
-             ตัวคำถามนี้จะถูกบวกเข้าไปหลังได้คำตอบ ผู้ใช้จึงยิงทะลุเพดานได้
-             อย่างมากหนึ่งครั้ง ซึ่งยอมรับได้ เพราะยังไม่รู้ราคาก่อนถาม
+          /* โควตารายวันคิดเป็น 10,000 TPD (หรืออ่านตาม tpd_limit ของผู้ใช้)
              ผู้ดูแลกับเจ้าของระบบไม่ติดโควตา */
           if (rank(actor.role) < rank('admin')) {
-            const limit = await tokenLimit(env);
+            const limit = await tokenLimit(env, actor.payload.sub);
             const used = await tokensToday(env, actor.payload.sub);
             if (used >= limit) return deny('quota', 429);
           }
@@ -3042,16 +3044,28 @@ export default {
             const meter = newMeter();
             const prefs = await getChatPrefs(env, actor.payload.sub);
             const text = await runReActAgent(env, carInfo, body.contents, meter, prefs.style);
-            /* บันทึกหลังได้คำตอบ เพราะเพิ่งรู้ราคาจริงตอนนี้
-               ถ้าเขียนไม่สำเร็จก็ไม่ควรทำให้คำตอบที่ได้มาแล้วหายไป */
+            
             let usage = null;
             try {
               const row = await meterTokens(env, actor.payload.sub, meter);
-              const limit = await tokenLimit(env);
-              const spent = Math.round((row.in_tok || 0) + (row.out_tok || 0) * OUT_WEIGHT);
-              usage = { used: spent, limit, cost: billable(meter),
+              const limit = await tokenLimit(env, actor.payload.sub);
+              const spent = (row.in_tok || 0) + (row.out_tok || 0);
+              usage = { used: spent, limit, cost: meter.in + meter.out,
                         in: meter.in, out: meter.out, src: meter.src };
-            } catch (e) { console.error('[meter] write failed', e); }
+
+              // บันทึกประวัติการแชทพร้อมโทเคนลงในตาราง chat_logs
+              const promptText = (body.contents && body.contents.length > 0 && body.contents[body.contents.length - 1].parts)
+                ? body.contents[body.contents.length - 1].parts.map(p => p.text || '').join(' ')
+                : '';
+              const day = new Date().toISOString().slice(0, 10);
+              const now = Date.now();
+              const modelName = (meter.src && meter.src.join(',')) || 'gpt-oss-20b:free';
+
+              await env.DB.prepare(`
+                INSERT INTO chat_logs (uid, car_id, prompt, response, in_tok, out_tok, total_tok, model, day, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              `).bind(actor.payload.sub, body.carId || null, promptText.slice(0, 4000), text.slice(0, 8000), meter.in, meter.out, (meter.in + meter.out), modelName, day, now).run();
+            } catch (e) { console.error('[meter/chat_logs] write failed', e); }
             return json({ text, usage });
           } catch (err) {
             console.error('[AI Chat Route Error]:', err);
@@ -3889,9 +3903,19 @@ ${convo}`;
       if (shopIdMatch && request.method === 'DELETE') {
         return await guarded('moderator', async (actor) => {
           const r = await env.DB.prepare('DELETE FROM shop WHERE id = ?').bind(+shopIdMatch[1]).run();
-          if (r.meta && r.meta.changes === 0) return deny('Product not found', 404);
-          await logAudit(env, actor.email, 'shop.delete', '#' + shopIdMatch[1], '');
           return json({ success: true });
+        })();
+      }
+
+      if (url.pathname === '/api/admin/users/tpd' && request.method === 'POST') {
+        return await guarded('admin', async (actor) => {
+          const b = (await readBody()) || {};
+          if (!b.uid || typeof b.tpd_limit !== 'number') return deny('uid and numeric tpd_limit required', 400);
+          const limitVal = Math.max(0, parseInt(b.tpd_limit, 10));
+          await env.DB.prepare('UPDATE users SET tpd_limit = ? WHERE uid = ?')
+            .bind(limitVal, String(b.uid)).run();
+          await logAudit(env, actor.email, 'admin.user_tpd_update', String(b.uid), `New limit: ${limitVal}`);
+          return json({ ok: true, uid: b.uid, tpd_limit: limitVal });
         })();
       }
 
