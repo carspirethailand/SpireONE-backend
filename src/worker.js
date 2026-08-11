@@ -821,10 +821,10 @@ Final Answer: [คำตอบภาษาไทยสรุปอย่าง�
       agentLog.push({ role: "user", content: `Observation: ${observation}` });
     } else if (hasMedia && !mediaProcessed) {
       console.log('[ReAct Agent] Media file attached but explicit Action tag not generated. Executing describe_media fallback...');
+      mediaProcessed = true;
       let observation = "";
       try {
         observation = await executeDescribeMediaTool(env, messages, "ตรวจสอบและอธิบายรายละเอียดไฟล์สื่อที่แนบมาในแชตนี้");
-        mediaProcessed = true;
       } catch (toolErr) {
         observation = `Error running describe_media: ${toolErr.message}`;
       }
