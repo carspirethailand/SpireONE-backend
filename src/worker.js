@@ -824,9 +824,9 @@ async function executeDescribeMediaTool(env, messages, prompt) {
   if (!geminiKey) {
     throw new Error('GEMINI_KEY environment variable is not configured');
   }
-  const model = env.GEMINI_MODEL || "gemini-2.5-flash";
+  const primaryModel = (env.GEMINI_MODEL && !env.GEMINI_MODEL.includes('3.5')) ? env.GEMINI_MODEL : 'gemini-2.5-flash';
+  const modelsToTry = [primaryModel, 'gemini-2.5-flash', 'gemini-1.5-flash'];
   const baseUrl = env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com";
-  const url = `${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`;
 
   const parts = [];
   messages.forEach(m => {
@@ -855,22 +855,34 @@ async function executeDescribeMediaTool(env, messages, prompt) {
     generationConfig: { temperature: 0.4 }
   };
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body)
-  });
+  let lastErr = null;
+  for (const mName of [...new Set(modelsToTry)]) {
+    const url = `${baseUrl}/v1beta/models/${mName}:generateContent?key=${geminiKey}`;
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
 
-  if (!res.ok) {
-    throw new Error(`Media reader error: ${res.status}`);
+      if (res.ok) {
+        const data = await res.json();
+        const candidate = (data.candidates && data.candidates[0]) || {};
+        const text = ((candidate.content && candidate.content.parts) || [])
+          .map(p => p.text || "")
+          .join("")
+          .trim();
+        if (text) return text;
+      } else {
+        const errTxt = await res.text();
+        lastErr = new Error(`Media reader error ${res.status} (${mName}): ${errTxt.slice(0, 150)}`);
+      }
+    } catch (e) {
+      lastErr = e;
+    }
   }
 
-  const data = await res.json();
-  const candidate = (data.candidates && data.candidates[0]) || {};
-  return ((candidate.content && candidate.content.parts) || [])
-    .map(p => p.text || "")
-    .join("")
-    .trim();
+  throw lastErr || new Error('Failed to analyze media file with Gemini API');
 }
 
 async function executeGoogleSearchTool(env, query) {
