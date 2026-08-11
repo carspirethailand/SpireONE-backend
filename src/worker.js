@@ -646,12 +646,23 @@ async function callReasoningModel(env, messages, meter) {
         }
 
         readUsage(meter, data, 'openrouter');
-        const content = ((data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "").trim();
+        const msg = (data.choices && data.choices[0] && data.choices[0].message) || {};
+        let content = (typeof msg.content === 'string' && msg.content.trim()) ? msg.content.trim() : '';
+
+        // OpenRouter open-weights reasoning models (e.g. gpt-oss-20b:free) return reasoning in msg.reasoning
+        if (!content) {
+          const reasoningText = String(msg.reasoning || msg.reasoning_content || '').trim();
+          if (reasoningText) {
+            console.log(`[OpenRouter] Extracted content from message.reasoning: ${reasoningText.slice(0, 120)}`);
+            content = reasoningText;
+          }
+        }
+
         if (content) {
           console.log(`[OpenRouter] Success! Generated content length: ${content.length}`);
           return content;
         }
-        console.warn(`[OpenRouter] Empty content in choices payload:`, JSON.stringify(data));
+        console.warn(`[OpenRouter] Empty content & reasoning in choices payload:`, JSON.stringify(data));
       } else {
         console.error(`[OpenRouter Error ${res.status}]: ${resText}`);
       }
@@ -771,6 +782,8 @@ Final Answer: [คำตอบภาษาไทยสรุปอย่าง�
   ];
 
   let step = 0;
+  const hasMedia = messages.some(m => m.parts && Array.isArray(m.parts) && m.parts.some(p => p.inline_data));
+  let mediaProcessed = false;
   const maxSteps = 3;
 
   while (step < maxSteps) {
@@ -795,6 +808,7 @@ Final Answer: [คำตอบภาษาไทยสรุปอย่าง�
       try {
         if (toolName === "describe_media") {
           observation = await executeDescribeMediaTool(env, messages, toolInput);
+          mediaProcessed = true;
         } else if (toolName === "google_search") {
           observation = await executeGoogleSearchTool(env, toolInput);
         } else {
@@ -804,6 +818,16 @@ Final Answer: [คำตอบภาษาไทยสรุปอย่าง�
         observation = `Error running tool: ${toolErr.message}`;
       }
 
+      agentLog.push({ role: "user", content: `Observation: ${observation}` });
+    } else if (hasMedia && !mediaProcessed) {
+      console.log('[ReAct Agent] Media file attached but explicit Action tag not generated. Executing describe_media fallback...');
+      let observation = "";
+      try {
+        observation = await executeDescribeMediaTool(env, messages, "ตรวจสอบและอธิบายรายละเอียดไฟล์สื่อที่แนบมาในแชตนี้");
+        mediaProcessed = true;
+      } catch (toolErr) {
+        observation = `Error running describe_media: ${toolErr.message}`;
+      }
       agentLog.push({ role: "user", content: `Observation: ${observation}` });
     } else {
       const finalAnswerMatch = completionText.match(/Final Answer:\s*([\s\S]+)$/i);
