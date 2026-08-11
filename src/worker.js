@@ -475,7 +475,7 @@ async function tokensToday(env, uid) {
 async function callGemini(env, { contents, system, search, temp, json: wantJson, maxTokens, meter }) {
   const geminiKey = env.GEMINI_KEY;
   if (!geminiKey) throw new Error('AI is not configured');
-  const model = env.GEMINI_MODEL || 'gemini-2.5-flash';
+  const model = env.GEMINI_MODEL || 'gemini-3.6-flash';
   const baseUrl = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
   const url = `${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`;
 
@@ -848,8 +848,8 @@ async function executeDescribeMediaTool(env, messages, prompt) {
   if (!geminiKey) {
     throw new Error('GEMINI_KEY environment variable is not configured');
   }
-  const primaryModel = (env.GEMINI_MODEL && !env.GEMINI_MODEL.includes('3.5')) ? env.GEMINI_MODEL : 'gemini-2.5-flash';
-  const modelsToTry = [primaryModel, 'gemini-2.5-flash', 'gemini-1.5-flash'];
+  const primaryModel = env.GEMINI_MODEL || 'gemini-3.6-flash';
+  const modelsToTry = [primaryModel, 'gemini-3.6-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'];
   const baseUrl = env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com";
 
   const parts = [];

@@ -21,8 +21,8 @@
   },
   "vars": {
     "FIREBASE_PROJECT_ID": "sp1p-82396",
-    "GEMINI_MODEL": "gemini-2.5-flash",
-    "GEMINI_LIVE_MODEL": "gemini-live-2.5-flash-native-audio",
+    "GEMINI_MODEL": "gemini-3.6-flash",
+    "GEMINI_LIVE_MODEL": "gemini-3.1-flash-live-preview",
     "GEMINI_BASE_URL": "https://generativelanguage.googleapis.com",
     "OWNERS": "anapatmaliwong@gmail.com,carspirethailand@gmail.com",
     "AI_DAILY_LIMIT": "60",
