@@ -4443,7 +4443,10 @@ const TT=(th,en)=>(window.spireT?window.spireT(th,en):((window.lang||"th")==="en
  * โควตาคิดจาก token ที่โมเดลใช้จริง ไม่ใช่จำนวนครั้งที่พิมพ์
  * ข้อความสั้นกับบทสนทนายาวจึงกินโควตาไม่เท่ากัน ซึ่งตรงกับต้นทุนจริง
  */
-let chatPrefs={style:"precise"},chatStyles=[],tokState=null;
+let chatPrefs={
+  style: LS.get("chatStyle", "precise"),
+  customStyle: LS.get("customChatStyle", "")
+},chatStyles=[],tokState=null;
 
 async function authFetch(path,opts){
   const u=auth&&auth.currentUser; if(!u||!BACKEND_URL) throw new Error("not signed in");
@@ -4459,24 +4462,70 @@ async function loadChatPrefs(){
     const r=await authFetch("/api/chat/prefs");
     if(!r.ok) throw new Error("HTTP "+r.status);
     const d=await r.json();
-    chatPrefs=d.prefs||chatPrefs; chatStyles=d.styles||[]; tokState=d.tokens||null;
+    if(d.prefs){
+      chatPrefs.style = d.prefs.style || chatPrefs.style;
+      if(d.prefs.customStyle !== undefined) chatPrefs.customStyle = d.prefs.customStyle;
+      LS.set("chatStyle", chatPrefs.style);
+      LS.set("customChatStyle", chatPrefs.customStyle);
+    }
+    chatStyles=d.styles||[]; tokState=d.tokens||null;
   }catch(e){
-    /* ออฟไลน์หรือยังไม่ล็อกอินก็ยังต้องเปิดแผ่นตั้งค่าได้
-       ใช้รายการสำรองที่ตรงกับฝั่งเซิร์ฟเวอร์ */
     if(!chatStyles.length) chatStyles=[
       {key:"precise",th:"เป็นระเบียบ",en:"Precise"},
       {key:"natural",th:"เหมือนคนทั่วไป",en:"Natural"},
       {key:"playful",th:"ติดเล่น",en:"Playful"},
-      {key:"funny",th:"ตลก",en:"Funny"}];
+      {key:"funny",th:"ตลก",en:"Funny"},
+      {key:"custom",th:"กำหนดเอง",en:"Custom"}];
+  }
+  if(!chatStyles.some(s=>s.key==="custom")){
+    chatStyles.push({key:"custom",th:"กำหนดเอง",en:"Custom"});
   }
   renderChatPrefs();
 }
 
 function renderChatPrefs(){
-  const row=$("styleRow");
-  if(row) row.innerHTML=chatStyles.map(st=>
-    `<button class="st-opt" aria-pressed="${st.key===chatPrefs.style}" `+
-    `onclick="setChatStyle('${st.key}')">${(window.lang||"th")==="th"?st.th:st.en}</button>`).join("");
+  document.querySelectorAll(".style-row").forEach(row=>{
+    row.innerHTML=chatStyles.map(st=>
+      `<button class="st-opt ${st.key==='custom'?'st-custom':''}" aria-pressed="${st.key===chatPrefs.style}" `+
+      `onclick="setChatStyle('${st.key}')">${(window.lang||"th")==="th"?st.th:st.en}</button>`).join("");
+    
+    let customBox = row.parentNode.querySelector(".custom-style-wrap");
+    if(!customBox){
+      customBox = document.createElement("div");
+      customBox.className = "custom-style-wrap";
+      customBox.style.cssText = "margin-top:8px;display:none;flex-direction:column;gap:6px;";
+      customBox.innerHTML = `
+        <label style="font-size:12px;color:var(--c-mut, #9AA6BE);font-weight:600">${TT("พิมพ์กำหนดสไตล์น้ำเสียงของ AI เอง:","Custom AI speaking style prompt:")}</label>
+        <div style="display:flex;gap:6px">
+          <input type="text" class="custom-style-input" placeholder="${TT("เช่น พูดจาสุภาพเรียบร้อย ลงท้ายด้วยขอรับ...","e.g. Formal tone, end sentences with sir...")}"
+                 style="flex:1;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.12);border-radius:8px;padding:7px 10px;color:var(--c-ink, #EEF2FB);font-size:13px;outline:none;"
+                 value="${esc(chatPrefs.customStyle||"")}">
+          <button class="btn sm primary save-custom-style-btn" style="padding:6px 12px;white-space:nowrap;font-size:12px">${TT("บันทึก","Save")}</button>
+        </div>`;
+      row.parentNode.insertBefore(customBox, row.nextSibling);
+      
+      const input = customBox.querySelector(".custom-style-input");
+      const btn = customBox.querySelector(".save-custom-style-btn");
+      if(btn && input){
+        btn.onclick = () => { setChatStyle("custom", input.value); };
+        input.onkeydown = (ev) => {
+          if(ev.key === "Enter"){
+            ev.preventDefault();
+            setChatStyle("custom", input.value);
+          }
+        };
+      }
+    } else {
+      const input = customBox.querySelector(".custom-style-input");
+      if(input && document.activeElement !== input){
+        input.value = chatPrefs.customStyle || "";
+      }
+    }
+    if(customBox){
+      customBox.style.display = (chatPrefs.style === "custom") ? "flex" : "none";
+    }
+  });
+
   const fill=$("tokFill"),txt=$("tokTxt"),bar=fill&&fill.parentNode;
   if(!fill||!txt) return;
   if(!tokState){ txt.textContent=TT("ดูโควตาได้เมื่อเข้าสู่ระบบ","Sign in to see your quota"); fill.style.width="0"; return; }
@@ -4492,17 +4541,28 @@ function renderChatPrefs(){
     `ใช้ไป ${n(tokState.used)} จาก ${n(tokState.limit)} โทเคน (${pct}%) · เหลือ ${n(tokState.left)}`,
     `${n(tokState.used)} of ${n(tokState.limit)} tokens used (${pct}%) · ${n(tokState.left)} left`);
 }
+window.loadChatPrefs=loadChatPrefs;
+window.renderChatPrefs=renderChatPrefs;
 
-async function setChatStyle(key){
-  const prev=chatPrefs.style; chatPrefs={style:key}; renderChatPrefs();
+async function setChatStyle(key, customText){
+  chatPrefs.style = key;
+  if(customText !== undefined) chatPrefs.customStyle = customText;
+  
+  LS.set("chatStyle", chatPrefs.style);
+  LS.set("customChatStyle", chatPrefs.customStyle);
+  renderChatPrefs();
+
   try{
-    const r=await authFetch("/api/chat/prefs",{method:"PUT",body:JSON.stringify({style:key})});
+    const r=await authFetch("/api/chat/prefs",{
+      method:"PUT",
+      body:JSON.stringify({style: key, customStyle: chatPrefs.customStyle})
+    });
     if(!r.ok) throw new Error("HTTP "+r.status);
+    if(key === "custom" && window.toast){
+      window.toast(TT("บันทึกสไตล์การพูดเรียบร้อย","Saved speaking style"), "ti-check");
+    }
   }catch(e){
-    /* เขียนไม่สำเร็จต้องย้อนปุ่มกลับ ไม่งั้นผู้ใช้เห็นว่าเลือกแล้ว
-       แต่เซิร์ฟเวอร์ยังใช้ค่าเดิม แล้วงงว่าทำไมน้ำเสียงไม่เปลี่ยน */
-    chatPrefs={style:prev}; renderChatPrefs();
-    window.toast&&window.toast(TT("บันทึกไม่สำเร็จ ลองใหม่อีกครั้ง","Could not save — try again"));
+    console.warn("Save chat prefs failed (using local preference):", e);
   }
 }
 window.setChatStyle=setChatStyle;
@@ -4646,7 +4706,7 @@ async function gemini(contents,opts){opts=opts||{};
   const tok=await auth.currentUser.getIdToken();
   const r=await fetch(`${BACKEND_URL}/api/ai/chat`,{method:"POST",
     headers:{"Content-Type":"application/json","Authorization":"Bearer "+tok},
-    body:JSON.stringify({contents,system:opts.system,search:!!opts.search,temp:opts.temp!=null?opts.temp:0.5})});
+    body:JSON.stringify({contents,system:opts.system,search:!!opts.search,temp:opts.temp!=null?opts.temp:0.5,style:chatPrefs.style,customStyle:chatPrefs.customStyle})});
   let d=null;try{d=await r.json()}catch(e){}
   if(!r.ok){
     const err=(d&&d.error)||"";
@@ -4971,7 +5031,16 @@ function useChip(b){$("inp").value=b.textContent;autoSize();updateSend();$("inp"
 
 /* ===== MESSAGES ===== */
 const LOGO_SVG=`<svg viewBox="-6.0 -6.0 94.8 112.0"><path d="M 79.33 0.29 Q 79.62 0.00 79.97 0.21 L 81.37 1.05 Q 82.80 1.91 82.80 3.58 L 82.80 4.36 Q 82.80 6.37 82.17 8.27 L 75.34 28.74 Q 74.52 31.21 71.93 30.97 L 49.09 28.90 Q 46.50 28.66 44.60 30.44 L 37.56 37.07 Q 35.67 38.85 34.46 41.16 L 29.87 49.93 Q 28.66 52.23 28.92 54.82 L 29.04 56.01 Q 29.30 58.60 31.49 60.00 L 45.43 68.97 Q 47.13 70.06 49.14 69.78 L 49.59 69.71 Q 51.59 69.43 52.63 67.68 L 60.46 54.47 Q 61.78 52.23 64.32 52.79 L 64.98 52.94 Q 67.52 53.50 68.61 55.86 L 70.25 59.42 Q 71.34 61.78 70.55 64.26 L 63.84 85.42 Q 63.06 87.90 60.77 89.13 L 48.79 95.58 Q 46.50 96.82 43.96 96.25 L 43.14 96.07 Q 40.76 95.54 39.04 97.26 L 38.66 97.64 Q 36.94 99.36 34.52 99.61 L 33.16 99.74 Q 30.57 100.00 30.70 97.40 L 31.08 89.86 Q 31.21 87.26 29.02 85.87 L 5.38 70.82 Q 3.18 69.43 2.55 66.90 L 0.63 59.21 Q 0.00 56.69 1.41 54.50 L 27.26 14.29 Q 28.66 12.10 29.48 9.64 L 31.02 5.01 Q 31.85 2.55 34.36 3.22 L 45.90 6.33 Q 48.41 7.01 51.01 7.01 L 61.73 7.01 Q 64.33 7.01 66.72 5.97 L 78.61 0.80 Q 78.98 0.64 79.27 0.35 Z"/></svg>`;
-const sysPrompt=()=>`คุณคือ Cendon ผู้ช่วย AI ดูแลรถยนต์ พูดจาเป็นกันเองอบอุ่นเหมือนเพื่อนช่างมืออาชีพ ตอบเป็นภาษา${lang==="en"?"อังกฤษ":lang==="ja"?"ญี่ปุ่น":lang==="zh"?"จีน":lang==="de"?"เยอรมัน":lang==="es"?"สเปน":"ไทย"}. ช่วยวินิจฉัยอาการรถ ให้คำแนะนำเป็นขั้นตอน ประเมินค่าใช้จ่ายคร่าวๆ และตอบคำถามเรื่องรถทุกอย่าง. ถ้ามีรูป/วิดีโอ/เสียงแนบมา ให้วิเคราะห์จากสื่อนั้นจริงๆ. ตอบกระชับ อ่านง่าย ใช้หัวข้อย่อย (ขึ้นต้นด้วย "- ") เมื่อเหมาะสม. ย้ำเสมอว่าเป็นการประเมินเบื้องต้น ควรให้ช่างตรวจจริงเพื่อความปลอดภัย.`+(selCar()?`\nรถของผู้ใช้: ${selCar().name} ปี ${selCar().year||"-"} เลขไมล์ ${selCar().mileage||"-"} กม.`:"");
+const getStylePromptText=()=>{
+  if(chatPrefs.style==="custom" && chatPrefs.customStyle && chatPrefs.customStyle.trim()){
+    return `\nข้อกำหนดสไตล์น้ำเสียงการพูด: ${chatPrefs.customStyle.trim()}`;
+  }
+  if(chatPrefs.style==="natural") return `\nข้อกำหนดสไตล์น้ำเสียงการพูด: พูดจาเป็นกันเอง เหมือนช่างยนต์ใจดีคุยกับเพื่อนลูกค้า ใช้ภาษาพูดธรรมดา (เช่น ครับ/ค่ะ, พี่/คุณ)`;
+  if(chatPrefs.style==="playful") return `\nข้อกำหนดสไตล์น้ำเสียงการพูด: ตอบแบบเป็นกันเอง อารมณ์ดี แอบแทรกมุกตลกเบา ๆ ได้เล็กน้อย (ไม่เกิน 1 มุกต่อคำตอบ)`;
+  if(chatPrefs.style==="funny") return `\nข้อกำหนดสไตล์น้ำเสียงการพูด: ตอบแบบอารมณ์ดี ขำขัน เปรียบเทียบอาการรถกับเรื่องฮา ๆ ให้เห็นภาพชัดเจน`;
+  return `\nข้อกำหนดสไตล์น้ำเสียงการพูด: ตอบเป็นระเบียบ สรุปประเด็นสำคัญ กระชับ`;
+};
+const sysPrompt=()=>`คุณคือ Cendon ผู้ช่วย AI ดูแลรถยนต์ ตอบเป็นภาษา${lang==="en"?"อังกฤษ":lang==="ja"?"ญี่ปุ่น":lang==="zh"?"จีน":lang==="de"?"เยอรมัน":lang==="es"?"สเปน":"ไทย"}. ช่วยวินิจฉัยอาการรถ ให้คำแนะนำเป็นขั้นตอน ประเมินค่าใช้จ่ายคร่าวๆ และตอบคำถามเรื่องรถทุกอย่าง. ถ้ามีรูป/วิดีโอ/เสียงแนบมา ให้วิเคราะห์จากสื่อนั้นจริงๆ. ตอบกระชับ อ่านง่าย ใช้หัวข้อย่อย (ขึ้นต้นด้วย "- ") เมื่อเหมาะสม. ย้ำเสมอว่าเป็นการประเมินเบื้องต้น ควรให้ช่างตรวจจริงเพื่อความปลอดภัย.`+getStylePromptText()+(selCar()?`\nรถของผู้ใช้: ${selCar().name} ปี ${selCar().year||"-"} เลขไมล์ ${selCar().mileage||"-"} กม.`:"");
 function md(t){let s=esc(t);const lines=s.split("\n");let out="",inList=false;
   lines.forEach(l=>{if(/^\s*[-*]\s+/.test(l)){if(!inList){out+="<ul>";inList=true}out+="<li>"+l.replace(/^\s*[-*]\s+/,"")+"</li>"}else{if(inList){out+="</ul>";inList=false}out+=l+"<br>"}});
   if(inList)out+="</ul>";return out.replace(/\*\*(.+?)\*\*/g,"<strong>$1</strong>").replace(/(<br>)+$/,"")}
