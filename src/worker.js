@@ -694,51 +694,58 @@ async function callReasoningModel(env, messages, meter) {
 const CHAT_STYLES = {
   precise: {
     th: 'เป็นระเบียบ', en: 'Precise',
-    prompt: '',   // ค่าเริ่มต้น ใช้น้ำเสียงเดิมของระบบ
+    prompt: 'ตอบเป็นระเบียบ สรุปประเด็นสำคัญ กระชับ และใช้น้ำเสียงเป็นทางการแต่เป็นมิตร',
   },
   natural: {
     th: 'เหมือนคนทั่วไป', en: 'Natural',
-    prompt: 'น้ำเสียง: พูดเหมือนช่างที่คุยกับเพื่อนลูกค้า ใช้ภาษาพูดธรรมดา '
-          + 'เลี่ยงศัพท์เทคนิคถ้าไม่จำเป็น ถ้าจำเป็นให้อธิบายสั้น ๆ ต่อท้าย '
-          + 'ไม่ต้องขึ้นหัวข้อเป็นข้อ ๆ ถ้าเรื่องไม่ซับซ้อน',
+    prompt: 'พูดจาเป็นกันเอง เหมือนช่างยนต์ใจดีคุยกับเพื่อนลูกค้า ใช้ภาษาพูดธรรมดา (เช่น ครับ/ค่ะ, พี่/คุณ) เลี่ยงศัพท์ช่างซับซ้อนโดยไม่จำเป็น',
   },
   playful: {
     th: 'ติดเล่น', en: 'Playful',
-    prompt: 'น้ำเสียง: เป็นกันเอง แทรกมุกเบา ๆ ได้บ้างแต่ไม่เกินหนึ่งครั้งต่อคำตอบ '
-          + 'ห้ามเล่นมุกตอนที่เรื่องเกี่ยวกับความปลอดภัยหรือค่าใช้จ่ายก้อนใหญ่ '
-          + 'ตรงนั้นให้พูดตรงและจริงจัง',
+    prompt: 'ตอบแบบเป็นกันเอง อารมณ์ดี แอบแทรกมุกตลกเบา ๆ ได้เล็กน้อย (ไม่เกิน 1 มุกต่อคำตอบ) แต่ถ้ารู้ว่าเป็นเรื่องความปลอดภัยหรือค่าใช้จ่ายสูง ให้สลับมาพูดตรงและจริงจังทันที',
   },
   funny: {
     th: 'ตลก', en: 'Funny',
-    prompt: 'น้ำเสียง: ขำขัน เปรียบเทียบให้เห็นภาพแบบสนุก ๆ '
-          + 'แต่ข้อมูลทุกอย่างต้องยังถูกต้องครบถ้วน ห้ามลดเนื้อหาเพื่อเอาฮา '
-          + 'ถ้าเป็นเรื่องความปลอดภัยหรืออาการที่อาจทำให้รถเสียหาย ให้พูดจริงจังทันที',
+    prompt: 'ตอบแบบอารมณ์ดี ขำขัน เปรียบเทียบอาการรถกับเรื่องฮา ๆ ให้เห็นภาพชัดเจน แต่ต้องให้ข้อมูลที่ถูกต้อง ครบถ้วน ไม่ตัดสาระสำคัญทิ้ง (ยกเว้นเรื่องอันตรายรุนแรงให้เตือนอย่างจริงจัง)',
+  },
+  custom: {
+    th: 'กำหนดเอง', en: 'Custom',
+    prompt: '',
   },
 };
 
-function stylePrompt(key) {
+function stylePrompt(key, customStyle) {
+  if (key === 'custom' && customStyle && customStyle.trim()) {
+    return '\n\n[ข้อกำหนดน้ำเสียงและบุคลิกการตอบ (สำคัญมาก)]\nให้ออกแบบคำตอบ Final Answer โดยปรับสไตล์น้ำเสียงตามคำสั่งต่อไปนี้อย่างเคร่งครัด: ' + customStyle.trim();
+  }
   const s = CHAT_STYLES[key];
-  return s && s.prompt ? '\n\n' + s.prompt : '';
+  if (s && s.prompt) {
+    return '\n\n[ข้อกำหนดน้ำเสียงและบุคลิกการตอบ (สำคัญมาก)]\nให้ออกแบบคำตอบ Final Answer ให้มีน้ำเสียงและสไตล์ดังนี้: ' + s.prompt;
+  }
+  return '';
 }
 
 async function getChatPrefs(env, uid) {
-  const fallback = { style: 'precise' };
+  const fallback = { style: 'precise', customStyle: '' };
   try {
     const r = await env.DB.prepare('SELECT prefs FROM chat_prefs WHERE uid = ?').bind(uid).first();
     if (!r || !r.prefs) return fallback;
     const v = JSON.parse(r.prefs);
-    return { style: CHAT_STYLES[v.style] ? v.style : 'precise' };
+    const validStyle = (CHAT_STYLES[v.style] || v.style === 'custom') ? v.style : 'precise';
+    return { style: validStyle, customStyle: String(v.customStyle || '') };
   } catch { return fallback; }
 }
 
-async function runReActAgent(env, carInfo, messages, meter, style) {
+async function runReActAgent(env, carInfo, messages, meter, style, customStyle) {
   const carContext = (carInfo.make || carInfo.model) 
     ? `\nรถของผู้ใช้: ${carInfo.make || ''} ${carInfo.model || ''} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` 
     : '';
 
   console.log(`[ReAct Agent] Injected vehicle context: ${carContext ? carContext.trim() : '(None)'}`);
 
-  const systemPrompt = `คุณคือ SpireONE ผู้ช่วย AI ดูแลรถยนต์และวิเคราะห์ปัญหารถยนต์ที่ชาญฉลาด ตอบเป็นภาษาไทยเป็นหลัก พูดจาเป็นกันเองและเป็นมืออาชีพ คุณจะควบคุมกระบวนการคิดในการหาคำตอบที่ถูกต้องที่สุดให้ผู้ใช้ โดยเขียนวิเคราะห์กระบวนการใน Thought ก่อนเสมอ
+  const appliedStylePrompt = stylePrompt(style, customStyle);
+
+  const systemPrompt = `คุณคือ SpireONE ผู้ช่วย AI ดูแลรถยนต์และวิเคราะห์ปัญหารถยนต์ที่ชาญฉลาด ตอบเป็นภาษาไทยเป็นหลัก คุณจะควบคุมกระบวนการคิดในการหาคำตอบที่ถูกต้องที่สุดให้ผู้ใช้ โดยเขียนวิเคราะห์กระบวนการใน Thought ก่อนเสมอ
 ข้อมูลรถปัจจุบัน:${carContext}
 
 คุณมีเครื่องมือช่วยเหลือดังต่อไปนี้ที่คุณสามารถระบุสั่งงานได้:
@@ -751,13 +758,13 @@ Action: [เลือกเรียกเครื่องมือเพี�
 Observation: [ระบบหลังบ้านจะนำผลลัพธ์มาแปะให้ตรงนี้เอง ห้ามคุณเขียนขึ้นมาเองเด็ดขาด]
 ... (คิดวนซ้ำ Thought/Action/Observation ได้สูงสุด 3 รอบ)
 Thought: [เมื่อได้ข้อมูลครบถ้วนแล้วและต้องการปิดคำตอบ]
-Final Answer: [คำตอบภาษาไทยสรุปอย่างเป็นมืออาชีพที่จะส่งไปให้ผู้ใช้จริง]
+Final Answer: [คำตอบสรุปผลภาษาไทย ที่มีเนื้อหาถูกต้องและปรับสไตล์น้ำเสียงตามข้อกำหนด]
 
 สำคัญมาก:
 - ห้ามเขียน Observation หรือข้อมูลหลังคำว่า Observation เองเด็ดขาด!
 - หากมีไฟล์แนบในแชต คุณต้องเรียกใช้ describe_media เสมอเพื่อเอาข้อมูลสังเกตมาคิดวิเคราะห์
 - หากต้องการเช็กราคาสินค้า ข่าว หรือสเปกที่ต้องการความสดใหม่ ให้เรียกใช้ google_search
-- หากข้อมูลพร้อมและไม่ต้องรันเครื่องมือ ให้ข้าม Action และเขียน Final Answer ได้เลย` + stylePrompt(style);
+- หากข้อมูลพร้อมและไม่ต้องรันเครื่องมือ ให้ข้าม Action และเขียน Final Answer ได้เลย${appliedStylePrompt}`;
 
   const chatHistory = messages.map(m => {
     const o = { role: m.role === "user" ? "user" : "assistant", content: "" };
@@ -3018,14 +3025,14 @@ export default {
       if (url.pathname === '/api/chat/prefs' && request.method === 'PUT') {
         return await guarded('user', async (actor) => {
           const b = (await readBody()) || {};
-          /* รับเฉพาะคีย์ที่รู้จัก ค่าที่ไม่รู้จักตกกลับไปเป็นค่าเริ่มต้น
-             ไม่เก็บอะไรที่ผู้ใช้ส่งมาดิบ ๆ ลงฐานข้อมูล */
-          const style = CHAT_STYLES[b.style] ? b.style : 'precise';
+          /* รับคีย์มาตรฐาน หรือ custom */
+          const style = (CHAT_STYLES[b.style] || b.style === 'custom') ? b.style : 'precise';
+          const customStyle = String(b.customStyle || '').slice(0, 500);
           await env.DB.prepare(`
             INSERT INTO chat_prefs (uid, prefs, t) VALUES (?, ?, ?)
             ON CONFLICT(uid) DO UPDATE SET prefs = excluded.prefs, t = excluded.t
-          `).bind(actor.payload.sub, JSON.stringify({ style }), Date.now()).run();
-          return json({ ok: true, prefs: { style } });
+          `).bind(actor.payload.sub, JSON.stringify({ style, customStyle }), Date.now()).run();
+          return json({ ok: true, prefs: { style, customStyle } });
         })();
       }
 
@@ -3079,7 +3086,13 @@ export default {
           try {
             const meter = newMeter();
             const prefs = await getChatPrefs(env, actor.payload.sub);
-            const text = await runReActAgent(env, carInfo, body.contents, meter, prefs.style);
+            const activeStyle = (body.style && (CHAT_STYLES[body.style] || body.style === 'custom'))
+              ? body.style
+              : prefs.style;
+            const activeCustomStyle = body.customStyle !== undefined
+              ? String(body.customStyle)
+              : prefs.customStyle;
+            const text = await runReActAgent(env, carInfo, body.contents, meter, activeStyle, activeCustomStyle);
             
             let usage = null;
             try {
