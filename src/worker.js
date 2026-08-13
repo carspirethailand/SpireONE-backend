@@ -79,9 +79,45 @@ function rank(role) { return ROLE_RANK[role] || 0; }
    ยกเว้น ALTER TABLE สองบรรทัดที่ต้องดักข้อผิดพลาด "มีคอลัมน์นี้แล้ว" ทิ้ง
    ══════════════════════════════════════════════════════════════════ */
 
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 13;
 
 const SCHEMA_SQL = [
+  /* ── ข้อมูลของผู้ใช้ที่ต้องเหมือนกันทุกเครื่อง ──
+     เดิมทุกอย่างอยู่ใน localStorage ของแต่ละเครื่อง เข้าบัญชีเดียวกัน
+     คนละเครื่องจึงเห็นธีมคนละสี บทสนทนาคนละชุด ตารางนี้เก็บเป็น
+     key/value ต่อผู้ใช้ ฝั่งหน้าเว็บซิงก์ขึ้นลงเองโดยผู้ใช้ไม่ต้องทำอะไร */
+  `CREATE TABLE IF NOT EXISTS user_state (
+  uid TEXT NOT NULL,
+  k   TEXT NOT NULL,
+  v   TEXT NOT NULL,
+  t   INTEGER NOT NULL,
+  PRIMARY KEY (uid, k)
+)`,
+  `CREATE INDEX IF NOT EXISTS idx_state_uid ON user_state(uid)`,
+  /* โควตาแบบหน้าต่างเลื่อน 5 ชั่วโมง เหมือน AI เจ้าอื่น
+     ตาราง usage เดิมยังเขียนต่อไปเพื่อให้หน้าสถิติของแอดมินไม่พัง */
+  `CREATE TABLE IF NOT EXISTS usage_win (
+  uid     TEXT NOT NULL,
+  win     INTEGER NOT NULL,
+  in_tok  INTEGER NOT NULL DEFAULT 0,
+  out_tok INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (uid, win)
+)`,
+  `CREATE TABLE IF NOT EXISTS feedback (
+  id         TEXT PRIMARY KEY,
+  uid        TEXT NOT NULL DEFAULT '',
+  name       TEXT NOT NULL DEFAULT '',
+  email      TEXT NOT NULL DEFAULT '',
+  kind       TEXT NOT NULL DEFAULT 'other',
+  rating     INTEGER NOT NULL DEFAULT 0,
+  message    TEXT NOT NULL,
+  page       TEXT NOT NULL DEFAULT '',
+  ua         TEXT NOT NULL DEFAULT '',
+  status     TEXT NOT NULL DEFAULT 'new',
+  note       TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+)`,
+  `CREATE INDEX IF NOT EXISTS idx_fb_status ON feedback(status, created_at)`,
   `CREATE TABLE IF NOT EXISTS users (
   uid TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -110,6 +146,7 @@ const SCHEMA_SQL = [
 )`,
   `ALTER TABLE users ADD COLUMN created_at INTEGER`,
   `ALTER TABLE users ADD COLUMN banned INTEGER DEFAULT 0`,
+  `ALTER TABLE users ADD COLUMN plan TEXT DEFAULT 'free'`,
   `CREATE TABLE IF NOT EXISTS config (
   key TEXT PRIMARY KEY,
   value TEXT
@@ -448,6 +485,14 @@ async function meterTokens(env, uid, meter) {
       count = count + 1, in_tok = in_tok + ?, out_tok = out_tok + ?
     RETURNING count, in_tok, out_tok
   `).bind(uid, day, meter.in, meter.out, meter.in, meter.out).first();
+  /* เขียนลงหน้าต่าง 5 ชั่วโมงด้วย อันนี้คือตัวที่ใช้กั้นโควตาจริง */
+  try {
+    await env.DB.prepare(`
+      INSERT INTO usage_win (uid, win, in_tok, out_tok) VALUES (?, ?, ?, ?)
+      ON CONFLICT(uid, win) DO UPDATE SET
+        in_tok = in_tok + ?, out_tok = out_tok + ?
+    `).bind(uid, winKey(), meter.in, meter.out, meter.in, meter.out).run();
+  } catch (e) { console.error('[usage_win] write failed', e); }
   return row || { count: 0, in_tok: 0, out_tok: 0 };
 }
 
@@ -462,6 +507,55 @@ async function tokenLimit(env, uid) {
   const cfg = await getConfig(env, 'limits', {});
   return cfg.aiTokensDaily || parseInt(env.AI_TOKEN_DAILY_LIMIT || '10000', 10);
 }
+
+/* ── หน้าต่างโควตา ──
+ * เดิมรีเซ็ตตอนเที่ยงคืนตามวันที่ ใครใช้หมดตอนเช้าต้องรอทั้งวัน
+ * เปลี่ยนเป็นหน้าต่างละ 5 ชั่วโมงแบบ AI เจ้าอื่น รอไม่นานก็ได้ใช้ต่อ
+ * และหน้าเว็บเอา resetAt ไปนับถอยหลังให้ผู้ใช้เห็นได้ว่าเหลืออีกเท่าไร
+ */
+const QUOTA_WINDOW_MS = 5 * 60 * 60 * 1000;
+const winKey = (now) => Math.floor((now || Date.now()) / QUOTA_WINDOW_MS);
+const winResetAt = (now) => (winKey(now) + 1) * QUOTA_WINDOW_MS;
+
+async function tokensWindow(env, uid) {
+  try {
+    const r = await env.DB.prepare(
+      'SELECT in_tok, out_tok FROM usage_win WHERE uid = ? AND win = ?')
+      .bind(uid, winKey()).first();
+    if (!r) return 0;
+    return (r.in_tok || 0) + (r.out_tok || 0);
+  } catch (e) { return 0; }
+}
+
+/* สรุปสถานะโควตาชุดเดียว ใช้ร่วมกันทุกเส้นทางที่ต้องบอกผู้ใช้ */
+async function quotaState(env, uid, role) {
+  const unlimited = rank(role) >= rank('admin');
+  const limit = await tokenLimit(env, uid);
+  const used = await tokensWindow(env, uid);
+  return {
+    used, limit, left: Math.max(0, limit - used), unlimited,
+    resetAt: winResetAt(), windowHours: QUOTA_WINDOW_MS / 3600000,
+    plan: await userPlan(env, uid),
+    plans: await getConfig(env, 'plans', DEFAULT_PLANS),
+  };
+}
+
+async function userPlan(env, uid) {
+  try {
+    const u = await env.DB.prepare('SELECT plan FROM users WHERE uid = ?').bind(uid).first();
+    return (u && u.plan) || 'free';
+  } catch (e) { return 'free'; }
+}
+
+/* แผนเติมโควตา แก้ราคาได้จากหน้าแอดมิน (config key = plans) โดยไม่ต้องแก้โค้ด */
+const DEFAULT_PLANS = [
+  { key: 'light',   th: 'Light',   en: 'Light',   price: 99,  cur: 'THB', per: 'เดือน',
+    tokens: 60000,  th_desc: 'ใช้ต่อได้สบาย ๆ ทุกวัน เหมาะกับคนถามรถเป็นประจำ',
+    en_desc: 'Comfortable everyday headroom for regular questions.' },
+  { key: 'gourmet', th: 'Gourmet', en: 'Gourmet', price: 299, cur: 'THB', per: 'เดือน',
+    tokens: 250000, th_desc: 'โควตาก้อนใหญ่ วิเคราะห์รูป วิดีโอ และคุยยาวได้เต็มที่',
+    en_desc: 'A large pool for photo/video analysis and long conversations.' },
+];
 
 async function tokensToday(env, uid) {
   const day = new Date().toISOString().slice(0, 10);
@@ -691,6 +785,89 @@ async function callReasoningModel(env, messages, meter) {
  * สไตล์เปลี่ยนแค่ "น้ำเสียง" ไม่เปลี่ยน "สิ่งที่ตอบ"
  * ทุกแบบยังต้องบอกความจริงและไม่เดาข้อมูลที่ไม่มี
  */
+/* ── สกิลมาตรฐานของ Cendon ──
+ * เก็บไว้ในโค้ดฝั่ง Worker ไม่ใช่ในฐานข้อมูล จะได้มีครบทุกบัญชีตั้งแต่วันแรก
+ * โดยที่เจ้าของแอปไม่ต้องไปนั่งเพิ่มให้ทีละคน  ผู้ใช้เลือกจากช่องพิมพ์ด้วย /
+ * แล้ว body ด้านล่างจะถูกต่อเข้า system prompt ของรอบนั้นตรง ๆ
+ */
+const DEFAULT_SKILLS = [
+  {
+    id: 'cdn_diag', slug: 'diagnose', name: 'วินิจฉัยอาการรถ', en: 'Diagnose',
+    icon: 'ti-stethoscope',
+    summary: 'ไล่หาสาเหตุจากอาการทีละขั้น พร้อมระดับความเร่งด่วน',
+    body: `เมื่อผู้ใช้เล่าอาการรถ ให้ทำตามนี้:
+1. สรุปอาการที่ได้ยินเป็นข้อ ๆ สั้น ๆ ก่อน เพื่อยืนยันว่าเข้าใจตรงกัน
+2. ไล่สาเหตุที่เป็นไปได้จาก "น่าจะใช่ที่สุด" ไป "เป็นไปได้น้อย" พร้อมบอกเหตุผลสั้น ๆ ของแต่ละข้อ
+3. บอกวิธีเช็กเองที่บ้านที่ปลอดภัย ทำได้จริง ไม่ต้องใช้เครื่องมือแพง
+4. ให้ระดับความเร่งด่วนชัดเจน: หยุดรถทันที / รีบเข้าอู่ใน 1-2 วัน / รอได้ถึงเช็กระยะหน้า
+5. ปิดท้ายด้วยคำถามที่ช่างจะถาม เพื่อให้ผู้ใช้เตรียมคำตอบไปล่วงหน้า`,
+  },
+  {
+    id: 'cdn_cost', slug: 'cost', name: 'ประเมินค่าใช้จ่าย', en: 'Cost estimate',
+    icon: 'ti-coin',
+    summary: 'แยกค่าอะไหล่กับค่าแรง เทียบศูนย์กับอู่ทั่วไป',
+    body: `เวลาประเมินราคา ให้แยกเป็นตารางหรือหัวข้อย่อยเสมอ:
+- ค่าอะไหล่ (ระบุว่าเป็นของแท้ศูนย์ / OEM / เทียบเท่า และช่วงราคาของแต่ละแบบ)
+- ค่าแรง (ประมาณกี่ชั่วโมง คิดชั่วโมงละเท่าไร)
+- รวมช่วงราคาต่ำสุด-สูงสุด เป็นเงินบาท
+- เทียบให้เห็นว่าศูนย์บริการกับอู่ทั่วไปต่างกันประมาณกี่เปอร์เซ็นต์
+บอกเสมอว่าเป็นราคาประเมินในไทยโดยประมาณ ราคาจริงขึ้นกับรุ่นปีและร้าน
+ถ้าไม่มั่นใจเรื่องราคาปัจจุบัน ให้เรียก google_search ก่อนตอบ`,
+  },
+  {
+    id: 'cdn_maint', slug: 'maintenance', name: 'แผนเช็กระยะ', en: 'Service plan',
+    icon: 'ti-calendar-check',
+    summary: 'วางตารางบำรุงรักษาจากเลขไมล์และอายุรถ',
+    body: `วางแผนบำรุงรักษาจากเลขไมล์และอายุรถของผู้ใช้:
+- รายการที่ "ถึงกำหนดแล้ว" ต้องขึ้นก่อนเสมอ
+- รายการที่ใกล้ถึงในอีก 5,000 กม. ข้างหน้า
+- แยกให้ชัดว่าอันไหนคือความปลอดภัย (เบรก ยาง ช่วงล่าง) อันไหนคือยืดอายุเครื่อง
+- ประเมินค่าใช้จ่ายรวมของรอบนั้นคร่าว ๆ
+ถ้าผู้ใช้ยังไม่ได้บอกเลขไมล์ ให้ถามก่อนเพียงคำถามเดียว แล้วค่อยวางแผน`,
+  },
+  {
+    id: 'cdn_part', slug: 'parts', name: 'หาอะไหล่', en: 'Find parts',
+    icon: 'ti-settings-cog',
+    summary: 'ระบุเบอร์อะไหล่ ของเทียบ และจุดที่ต้องระวัง',
+    body: `ช่วยหาอะไหล่ให้ตรงรุ่น:
+- ระบุชื่ออะไหล่แบบที่ร้านเข้าใจ พร้อมเบอร์อะไหล่ถ้ารู้
+- เสนอของเทียบที่คุณภาพใช้ได้ พร้อมยี่ห้อที่คนไทยใช้กันจริง
+- เตือนจุดที่ซื้อผิดบ่อย เช่น ปีรุ่นย่อย เครื่องคนละบล็อก ขั้วปลั๊กคนละแบบ
+- บอกว่าควรเปลี่ยนคู่กับอะไรในคราวเดียวเพื่อไม่ต้องรื้อซ้ำ
+ถ้าต้องการราคาหรือความพร้อมของสินค้าปัจจุบัน ให้เรียก google_search`,
+  },
+  {
+    id: 'cdn_photo', slug: 'photo', name: 'อ่านภาพ/วิดีโอ', en: 'Read media',
+    icon: 'ti-camera',
+    summary: 'วิเคราะห์รูปหรือคลิปอาการรถอย่างละเอียด',
+    body: `ถ้ามีไฟล์แนบ ให้เรียก describe_media ก่อนเสมอ แล้วตอบโดย:
+- บอกสิ่งที่เห็นจริงในภาพก่อน แยกจากสิ่งที่เป็นการอนุมาน อย่าปนกัน
+- ถ้าภาพไม่ชัดพอจะสรุป ให้บอกตรง ๆ ว่าต้องถ่ายมุมไหนเพิ่ม
+- ถ้าเป็นคลิปเสียงเครื่อง ให้บอกว่าเสียงลักษณะนี้มักมาจากชิ้นส่วนใด
+ห้ามเดาสีของเหลวหรือรอยรั่วถ้าภาพมืดเกินไป ให้ขอภาพใหม่แทน`,
+  },
+  {
+    id: 'cdn_buy', slug: 'inspect', name: 'ตรวจรถมือสอง', en: 'Used-car check',
+    icon: 'ti-list-check',
+    summary: 'เช็กลิสต์ก่อนตัดสินใจซื้อรถมือสอง',
+    body: `ทำเช็กลิสต์ตรวจรถมือสองให้ใช้ได้จริงหน้างาน:
+- แบ่งเป็น ภายนอก / ภายใน / ห้องเครื่อง / ทดลองขับ / เอกสาร
+- แต่ละข้อบอกว่า "ถ้าเจอแบบนี้ = ต่อราคาได้" หรือ "ถ้าเจอแบบนี้ = ควรเดินหนี"
+- ใส่จุดอ่อนเฉพาะรุ่นที่ผู้ใช้ถามด้วย ถ้ารู้
+- ปิดท้ายด้วยราคากลางของรุ่นนั้นในตลาดมือสองไทย (ใช้ google_search ถ้าจำเป็น)`,
+  },
+  {
+    id: 'cdn_simple', slug: 'simple', name: 'อธิบายให้ง่าย', en: 'Explain simply',
+    icon: 'ti-bulb',
+    summary: 'เลี่ยงศัพท์ช่าง อธิบายด้วยการเปรียบเทียบ',
+    body: `อธิบายทุกอย่างแบบคนไม่รู้เรื่องรถก็เข้าใจ:
+- ห้ามใช้ศัพท์ช่างโดยไม่อธิบาย ถ้าจำเป็นต้องใช้ ให้วงเล็บคำอธิบายสั้น ๆ ไว้
+- ใช้การเปรียบเทียบกับของใกล้ตัวอย่างน้อยหนึ่งอย่างต่อคำตอบ
+- คำตอบต้องไม่เกิน 6 บรรทัดหลัก ถ้ายาวกว่านั้นให้ตัดเป็นข้อ ๆ
+- ปิดท้ายด้วยประโยคเดียวว่า "สรุปคือ ..." เสมอ`,
+  },
+];
+
 const CHAT_STYLES = {
   precise: {
     th: 'เป็นระเบียบ', en: 'Precise',
@@ -714,6 +891,31 @@ const CHAT_STYLES = {
   },
 };
 
+/* รวม body ของสกิลที่เลือกเป็นบล็อกเดียวต่อท้าย system prompt
+   รับได้ทั้งสกิลมาตรฐาน (อยู่ในโค้ดนี้) และสกิลที่ผู้ใช้สร้างเองในฐานข้อมูล */
+async function skillsPrompt(env, uid, ids) {
+  if (!Array.isArray(ids) || !ids.length) return '';
+  const want = ids.slice(0, 5).map(String);
+  const picked = [];
+  for (const d of DEFAULT_SKILLS) {
+    if (want.includes(d.id) || want.includes(d.slug)) picked.push({ name: d.name, body: d.body });
+  }
+  const custom = want.filter((x) => !DEFAULT_SKILLS.some((d) => d.id === x || d.slug === x));
+  if (custom.length && uid) {
+    try {
+      const marks = custom.map(() => '?').join(',');
+      /* ของตัวเองหยิบได้ทุกสถานะ ของคนอื่นต้องเป็นสกิลสาธารณะที่ผ่านการอนุมัติแล้ว */
+      const rs = await env.DB.prepare(
+        `SELECT name, body FROM skills WHERE id IN (${marks}) AND (uid = ? OR status = 'public')`
+      ).bind(...custom, uid).all();
+      (rs.results || []).forEach((r) => picked.push({ name: r.name, body: r.body }));
+    } catch (e) { console.error('[skillsPrompt] load failed', e); }
+  }
+  if (!picked.length) return '';
+  return '\n\n[สกิลที่ผู้ใช้เลือกใช้ในข้อความนี้ (สำคัญมาก ต้องทำตาม)]\n'
+    + picked.map((sk) => `— ${sk.name} —\n${String(sk.body || '').slice(0, 4000)}`).join('\n\n');
+}
+
 function stylePrompt(key, customStyle) {
   if (key === 'custom' && customStyle && customStyle.trim()) {
     return '\n\n[ข้อกำหนดน้ำเสียงและบุคลิกการตอบ (สำคัญมาก)]\nให้ออกแบบคำตอบ Final Answer โดยปรับสไตล์น้ำเสียงตามคำสั่งต่อไปนี้อย่างเคร่งครัด: ' + customStyle.trim();
@@ -736,7 +938,7 @@ async function getChatPrefs(env, uid) {
   } catch { return fallback; }
 }
 
-async function runReActAgent(env, carInfo, messages, meter, style, customStyle) {
+async function runReActAgent(env, carInfo, messages, meter, style, customStyle, skillPrompt) {
   const carContext = (carInfo.make || carInfo.model) 
     ? `\nรถของผู้ใช้: ${carInfo.make || ''} ${carInfo.model || ''} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` 
     : '';
@@ -744,6 +946,9 @@ async function runReActAgent(env, carInfo, messages, meter, style, customStyle) 
   console.log(`[ReAct Agent] Injected vehicle context: ${carContext ? carContext.trim() : '(None)'}`);
 
   const appliedStylePrompt = stylePrompt(style, customStyle);
+  /* สกิลที่ผู้ใช้เลือกด้วย / ในช่องพิมพ์ ต้องมาก่อนน้ำเสียง
+     เพราะเป็นคำสั่งเรื่องเนื้อหา ส่วนน้ำเสียงเป็นเรื่องวิธีพูด */
+  const appliedSkills = skillPrompt || '';
 
   const systemPrompt = `คุณคือ SpireONE ผู้ช่วย AI ดูแลรถยนต์และวิเคราะห์ปัญหารถยนต์ที่ชาญฉลาด ตอบเป็นภาษาไทยเป็นหลัก คุณจะควบคุมกระบวนการคิดในการหาคำตอบที่ถูกต้องที่สุดให้ผู้ใช้ โดยเขียนวิเคราะห์กระบวนการใน Thought ก่อนเสมอ
 ข้อมูลรถปัจจุบัน:${carContext}
@@ -764,7 +969,7 @@ Final Answer: [คำตอบสรุปผลภาษาไทย ที่�
 - ห้ามเขียน Observation หรือข้อมูลหลังคำว่า Observation เองเด็ดขาด!
 - หากมีไฟล์แนบในแชต คุณต้องเรียกใช้ describe_media เสมอเพื่อเอาข้อมูลสังเกตมาคิดวิเคราะห์
 - หากต้องการเช็กราคาสินค้า ข่าว หรือสเปกที่ต้องการความสดใหม่ ให้เรียกใช้ google_search
-- หากข้อมูลพร้อมและไม่ต้องรันเครื่องมือ ให้ข้าม Action และเขียน Final Answer ได้เลย${appliedStylePrompt}`;
+- หากข้อมูลพร้อมและไม่ต้องรันเครื่องมือ ให้ข้าม Action และเขียน Final Answer ได้เลย${appliedSkills}${appliedStylePrompt}`;
 
   const chatHistory = messages.map(m => {
     const o = { role: m.role === "user" ? "user" : "assistant", content: "" };
@@ -2794,6 +2999,138 @@ export default {
         })();
       }
 
+      /* ===== ข้อมูลผู้ใช้บนคลาวด์ =====
+       * หน้าเว็บเก็บของไว้ใน localStorage เพื่อความเร็ว แล้วซิงก์ขึ้นที่นี่
+       * เข้าบัญชีเดียวกันจากเครื่องไหนก็เห็นธีมและบทสนทนาชุดเดียวกัน
+       * เทียบด้วยเวลาแก้ล่าสุดต่อคีย์ ของใหม่กว่าชนะ จึงไม่ต้องมีตัว merge ซับซ้อน
+       */
+      if (url.pathname === '/api/state' && request.method === 'GET') {
+        return await guarded('user', async (actor) => {
+          const only = (url.searchParams.get('keys') || '').split(',').filter(Boolean);
+          let sql = 'SELECT k, v, t FROM user_state WHERE uid = ?';
+          const args = [actor.payload.sub];
+          if (only.length && only.length <= 40) {
+            sql += ` AND k IN (${only.map(() => '?').join(',')})`;
+            args.push(...only);
+          }
+          const rs = await env.DB.prepare(sql).bind(...args).all();
+          const state = {};
+          (rs.results || []).forEach((r) => {
+            let v = null;
+            try { v = JSON.parse(r.v); } catch (e) { v = r.v; }
+            state[r.k] = { v, t: r.t };
+          });
+          return json({ state, now: Date.now() });
+        })();
+      }
+
+      if (url.pathname === '/api/state' && request.method === 'PUT') {
+        return await guarded('user', async (actor) => {
+          const b = (await readBody()) || {};
+          const items = b.state && typeof b.state === 'object' ? b.state : {};
+          const uid = actor.payload.sub;
+          const now = Date.now();
+          const saved = [];
+          const skipped = [];
+          for (const k of Object.keys(items).slice(0, 40)) {
+            if (!/^[A-Za-z0-9_:.-]{1,64}$/.test(k)) { skipped.push(k); continue; }
+            const item = items[k] || {};
+            const raw = JSON.stringify(item.v === undefined ? null : item.v);
+            /* กันคนยัดข้อมูลก้อนใหญ่จนฐานข้อมูลบวม 256KB ต่อคีย์พอสำหรับบทสนทนาเป็นร้อย */
+            if (raw.length > 256 * 1024) { skipped.push(k); continue; }
+            const t = Number(item.t) > 0 ? Number(item.t) : now;
+            await env.DB.prepare(`
+              INSERT INTO user_state (uid, k, v, t) VALUES (?, ?, ?, ?)
+              ON CONFLICT(uid, k) DO UPDATE SET v = excluded.v, t = excluded.t
+              WHERE excluded.t >= user_state.t
+            `).bind(uid, k, raw, t).run();
+            saved.push(k);
+          }
+          return json({ ok: true, saved, skipped, now });
+        })();
+      }
+
+      /* ===== สถานะโควตาอย่างเดียว เรียกถี่ได้ ไม่ต้องลากอย่างอื่นมาด้วย ===== */
+      if (url.pathname === '/api/quota' && request.method === 'GET') {
+        return await guarded('user', async (actor) =>
+          json({ quota: await quotaState(env, actor.payload.sub, actor.role) }))();
+      }
+
+      /* ===== รายชื่อสกิลทั้งหมดที่ผู้ใช้เลือกได้จากช่องพิมพ์ (/) =====
+       * รวมสกิลมาตรฐานของ Cendon กับสกิลที่ผู้ใช้สร้างเอง ไว้ในชุดเดียว
+       * หน้าเว็บจึงเรียกครั้งเดียวแล้วค้นในเครื่องได้ทันทีตอนพิมพ์
+       */
+      if (url.pathname === '/api/skills/all' && request.method === 'GET') {
+        return await guarded('user', async (actor) => {
+          const out = DEFAULT_SKILLS.map((d) => ({
+            id: d.id, slug: d.slug, name: d.name, en: d.en,
+            summary: d.summary, icon: d.icon, builtin: true,
+          }));
+          try {
+            const rs = await env.DB.prepare(
+              "SELECT id, name, slug, summary FROM skills WHERE uid = ? ORDER BY updated_at DESC LIMIT 60"
+            ).bind(actor.payload.sub).all();
+            (rs.results || []).forEach((r) => out.push({
+              id: r.id, slug: r.slug, name: r.name, en: r.name,
+              summary: r.summary || '', icon: 'ti-puzzle', builtin: false,
+            }));
+          } catch (e) { /* ไม่มีสกิลของตัวเองก็ยังต้องได้ชุดมาตรฐานไปใช้ */ }
+          return json({ skills: out });
+        })();
+      }
+
+      /* ===== FEEDBACK — ส่งถึงแอดมินจริง เก็บลงฐานข้อมูล ===== */
+      if (url.pathname === '/api/feedback' && request.method === 'POST') {
+        return await guarded('user', async (actor) => {
+          const b = (await readBody()) || {};
+          const message = String(b.message || '').trim();
+          if (message.length < 3) return deny('message is required', 400);
+          const id = 'fb_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+          const kinds = ['bug', 'idea', 'praise', 'other'];
+          await env.DB.prepare(`
+            INSERT INTO feedback (id, uid, name, email, kind, rating, message, page, ua, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?)
+          `).bind(
+            id, actor.payload.sub,
+            String(b.name || actor.payload.name || '').slice(0, 80),
+            String(b.email || actor.email || '').slice(0, 120),
+            kinds.includes(b.kind) ? b.kind : 'other',
+            Math.max(0, Math.min(5, parseInt(b.rating, 10) || 0)),
+            message.slice(0, 4000),
+            String(b.page || '').slice(0, 200),
+            String(request.headers.get('user-agent') || '').slice(0, 200),
+            Date.now()
+          ).run();
+          return json({ ok: true, id });
+        })();
+      }
+
+      if (url.pathname === '/api/admin/feedback' && request.method === 'GET') {
+        return await guarded('moderator', async () => {
+          const st = url.searchParams.get('status') || '';
+          const rs = st
+            ? await env.DB.prepare(
+                'SELECT * FROM feedback WHERE status = ? ORDER BY created_at DESC LIMIT 300').bind(st).all()
+            : await env.DB.prepare(
+                'SELECT * FROM feedback ORDER BY created_at DESC LIMIT 300').all();
+          const counts = await env.DB.prepare(
+            'SELECT status, COUNT(*) AS n FROM feedback GROUP BY status').all();
+          return json({ feedback: rs.results || [], counts: counts.results || [] });
+        })();
+      }
+
+      if (url.pathname === '/api/admin/feedback' && request.method === 'POST') {
+        return await guarded('moderator', async (actor) => {
+          const b = (await readBody()) || {};
+          if (!b.id) return deny('id is required', 400);
+          const st = ['new', 'read', 'done', 'spam'].includes(b.status) ? b.status : 'read';
+          await env.DB.prepare('UPDATE feedback SET status = ?, note = ? WHERE id = ?')
+            .bind(st, String(b.note || '').slice(0, 500), String(b.id)).run();
+          await logAudit(env, actor.email, 'feedback.' + st, String(b.id), '');
+          return json({ ok: true });
+        })();
+      }
+
       if (url.pathname === '/api/skills/mine' && request.method === 'GET') {
         return await guarded('user', async (actor) => {
           const rs = await env.DB.prepare(
@@ -2975,7 +3312,7 @@ export default {
           const uid = actor.payload.sub;
           // ลบทีละตาราง ไม่ใช้ transaction เพราะ D1 ยังไม่รองรับข้าม statement
           // ถ้าตารางไหนพลาด ตัวที่ลบไปแล้วยังถือว่าลบจริง จึงรายงานเป็นรายตาราง
-          const tables = ['cars', 'usage', 'push_subs', 'push_jobs', 'chat_prefs'];
+          const tables = ['cars', 'usage', 'usage_win', 'user_state', 'push_subs', 'push_jobs', 'chat_prefs'];
           const removed = {};
           for (const t of tables) {
             try {
@@ -3009,16 +3346,10 @@ export default {
         return await guarded('user', async (actor) => {
           const uid = actor.payload.sub;
           const prefs = await getChatPrefs(env, uid);
-          const limit = await tokenLimit(env, uid);
-          const used = await tokensToday(env, uid);
           const styles = Object.keys(CHAT_STYLES).map(k => ({
             key: k, th: CHAT_STYLES[k].th, en: CHAT_STYLES[k].en,
           }));
-          return json({
-            prefs, styles,
-            tokens: { used, limit, left: Math.max(0, limit - used),
-                      unlimited: rank(actor.role) >= rank('admin') },
-          });
+          return json({ prefs, styles, tokens: await quotaState(env, uid, actor.role) });
         })();
       }
 
@@ -3051,9 +3382,12 @@ export default {
           /* โควตารายวันคิดเป็น 10,000 TPD (หรืออ่านตาม tpd_limit ของผู้ใช้)
              ผู้ดูแลกับเจ้าของระบบไม่ติดโควตา */
           if (rank(actor.role) < rank('admin')) {
-            const limit = await tokenLimit(env, actor.payload.sub);
-            const used = await tokensToday(env, actor.payload.sub);
-            if (used >= limit) return deny('quota', 429);
+            const q = await quotaState(env, actor.payload.sub, actor.role);
+            /* ส่งรายละเอียดกลับไปด้วย หน้าเว็บจะได้เด้งกล่องบอกว่าหมดตอนไหน
+               รีเซ็ตกี่โมง และมีแผนอะไรให้เติมบ้าง โดยไม่ต้องยิงถามอีกรอบ */
+            if (q.used >= q.limit) {
+              return json({ error: 'quota', quota: q }, 429);
+            }
           }
 
           let carInfo = { make: '', model: '', year: '', mileage: '' };
@@ -3092,15 +3426,16 @@ export default {
             const activeCustomStyle = body.customStyle !== undefined
               ? String(body.customStyle)
               : prefs.customStyle;
-            const text = await runReActAgent(env, carInfo, body.contents, meter, activeStyle, activeCustomStyle);
+            const skillPrompt = await skillsPrompt(env, actor.payload.sub, body.skillIds);
+            const text = await runReActAgent(env, carInfo, body.contents, meter,
+                                             activeStyle, activeCustomStyle, skillPrompt);
             
             let usage = null;
             try {
-              const row = await meterTokens(env, actor.payload.sub, meter);
-              const limit = await tokenLimit(env, actor.payload.sub);
-              const spent = (row.in_tok || 0) + (row.out_tok || 0);
-              usage = { used: spent, limit, cost: meter.in + meter.out,
-                        in: meter.in, out: meter.out, src: meter.src };
+              await meterTokens(env, actor.payload.sub, meter);
+              const q = await quotaState(env, actor.payload.sub, actor.role);
+              usage = Object.assign({ cost: meter.in + meter.out,
+                                      in: meter.in, out: meter.out, src: meter.src }, q);
 
               // บันทึกประวัติการแชทพร้อมโทเคนลงในตาราง chat_logs
               const promptText = (body.contents && body.contents.length > 0 && body.contents[body.contents.length - 1].parts)
