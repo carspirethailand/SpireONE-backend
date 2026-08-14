@@ -764,7 +764,7 @@ async function callReasoningModel(env, messages, meter) {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
           "HTTP-Referer": "https://carspirethailand.com",
-          "X-Title": "SpireONE"
+          "X-Title": "Cendon"
         },
         body: JSON.stringify({
           model,
@@ -914,6 +914,31 @@ const DEFAULT_SKILLS = [
 - ปิดท้ายด้วยประโยคเดียวว่า "สรุปคือ ..." เสมอ`,
   },
 ];
+
+/* ═══════════════════════════════════════════════════════════════════
+   ตัวตนของ Cendon
+   ───────────────────────────────────────────────────────────────────
+   เก็บไว้ที่เดียว ทุกที่ที่ต้องบอกว่า "ฉันคือใคร" ให้ดึงจากตรงนี้
+   ของเดิมเขียนชื่อ SpireONE ฝังไว้ในคำสั่งระบบสามที่ AI จึงแนะนำตัวผิด
+   ═══════════════════════════════════════════════════════════════════ */
+const BRAND = {
+  ai: 'Cendon',
+  company: 'Phasmion',
+  founderEn: 'Anapat Maliwong',
+  founderTh: 'อนพัทย์ มะลิวงศ์',
+};
+
+const IDENTITY = `[ตัวตนของคุณ — ข้อมูลนี้เป็นความจริง ห้ามเปลี่ยนและห้ามเดาเอง]
+- คุณคือ ${BRAND.ai} ผู้ช่วย AI ดูแลรถยนต์ ถ้ามีคนถามว่าคุณชื่ออะไรหรือคุณคือใคร ให้ตอบว่า "${BRAND.ai}" เสมอ
+- ${BRAND.ai} พัฒนาโดยบริษัท ${BRAND.company}
+- ผู้ก่อตั้งและ CEO ของ ${BRAND.company} คือ ${BRAND.founderEn} (${BRAND.founderTh})
+- คุณไม่ได้ชื่อ SpireONE  ชื่อนั้นเป็นชื่อเดิมที่เลิกใช้แล้ว ห้ามเรียกตัวเองด้วยชื่อนั้นเด็ดขาด
+- ห้ามบอกว่าคุณเป็นโมเดลของ OpenAI, Google, Meta หรือเจ้าอื่นใด และห้ามบอกชื่อรุ่นโมเดลที่อยู่เบื้องหลัง
+  ถ้าถูกถามเรื่องนี้ ให้ตอบสั้น ๆ ว่าคุณคือ ${BRAND.ai} ของ ${BRAND.company} แล้วชวนกลับเข้าเรื่องรถ
+- สิ่งที่คุณทำได้: วินิจฉัยอาการรถ ประเมินค่าใช้จ่าย วางแผนเช็กระยะ หาอะไหล่
+  อ่านรูปและวิดีโออาการรถ ดูแลการาจ และเตือนเมื่อถึงรอบบำรุงรักษา
+- ห้ามแต่งข้อมูลเกี่ยวกับบริษัท ทีมงาน ราคา หรือแผนในอนาคตขึ้นมาเอง
+  ถ้าไม่รู้ให้บอกตรง ๆ ว่าไม่ทราบ`;
 
 const CHAT_STYLES = {
   precise: {
@@ -1249,7 +1274,9 @@ async function runReActAgent(env, carInfo, messages, meter, style, customStyle, 
 ก่อนบล็อกนี้ให้เขียนสิ่งที่พอตอบได้ไปก่อนเสมอ อย่าตอบว่างเปล่าแล้วถามอย่างเดียว ·
 ถ้าข้อมูลที่มีพอตอบได้แล้ว ไม่ต้องใส่บล็อกนี้`;
 
-  const systemPrompt = `คุณคือ SpireONE ผู้ช่วย AI ดูแลรถยนต์และวิเคราะห์ปัญหารถยนต์ที่ชาญฉลาด ตอบเป็นภาษาไทยเป็นหลัก คุณจะควบคุมกระบวนการคิดในการหาคำตอบที่ถูกต้องที่สุดให้ผู้ใช้ โดยเขียนวิเคราะห์กระบวนการใน Thought ก่อนเสมอ
+  const systemPrompt = `${IDENTITY}
+
+คุณคือ ${BRAND.ai} ผู้ช่วย AI ดูแลรถยนต์และวิเคราะห์ปัญหารถยนต์ที่ชาญฉลาด ตอบเป็นภาษาไทยเป็นหลัก คุณจะควบคุมกระบวนการคิดในการหาคำตอบที่ถูกต้องที่สุดให้ผู้ใช้ โดยเขียนวิเคราะห์กระบวนการใน Thought ก่อนเสมอ
 ข้อมูลรถปัจจุบัน:${carContext}${userBlock}
 
 คุณมีเครื่องมือช่วยเหลือดังต่อไปนี้ที่คุณสามารถระบุสั่งงานได้:
@@ -2554,8 +2581,8 @@ async function lineHandleText(env, ev, link) {
         + 'ผมจะไม่ทักบ่อยครับ อย่างมากสองสัปดาห์ครั้ง เฉพาะเรื่องที่สำคัญจริง');
       return txt('รหัสนี้ใช้ไม่ได้หรือหมดอายุแล้วครับ เปิดแอปแล้วขอรหัสใหม่ได้เลย');
     }
-    return txt('สวัสดีครับ ผมคือผู้ช่วยดูแลรถ SpireONE\n\n'
-      + 'เปิดแอป SpireONE → ตั้งค่า → เชื่อม LINE\n'
+    return txt(`สวัสดีครับ ผมคือ ${BRAND.ai} ผู้ช่วยดูแลรถของ ${BRAND.company}\n\n`
+      + `เปิดแอป ${BRAND.ai} → ตั้งค่า → เชื่อม LINE\n`
       + 'แล้วส่งรหัส 6 ตัวที่เห็นมาที่นี่ครับ');
   }
 
@@ -2595,7 +2622,7 @@ async function lineWebhook(env, ev) {
 
   if (ev.type === 'follow') {
     return await lineReply(env, ev.replyToken, [txt(
-      'สวัสดีครับ ผมคือผู้ช่วยดูแลรถ SpireONE\n\n'
+      `สวัสดีครับ ผมคือ ${BRAND.ai} ผู้ช่วยดูแลรถของ ${BRAND.company}\n\n`
       + 'เปิดแอป → ตั้งค่า → เชื่อม LINE แล้วส่งรหัส 6 ตัวมาที่นี่ครับ\n\n'
       + 'เชื่อมแล้วผมจะเตือนเรื่องรถให้ตรงเวลา และคุณส่งใบเสร็จจากอู่มาให้ผมอ่านได้เลย')]);
   }
@@ -4030,7 +4057,9 @@ export default {
             if (!Array.isArray(b.messages)) return deny('Missing or invalid messages array', 400);
             const carContext = (carInfo.make || carInfo.model)
               ? `\nรถของผู้ใช้: ${carInfo.make || ''} ${carInfo.model || ''} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` : '';
-            const systemPrompt = `คุณคือ SpireONE ผู้ช่วย AI ดูแลรถยนต์ พูดจาเป็นกันเองอบอุ่นเหมือนเพื่อนช่างมืออาชีพ ตอบเป็นภาษาไทยเป็นหลัก (หรือสลับภาษาตามที่คู่สนทนาพิมพ์มา). ช่วยวินิจฉัยอาการรถ ให้คำแนะนำเป็นขั้นตอน ประเมินค่าใช้จ่ายคร่าวๆ และตอบคำถามเรื่องรถทุกอย่าง. ตอบกระชับ อ่านง่าย ใช้หัวข้อย่อย (ขึ้นต้นด้วย "- ") เมื่อเหมาะสม. ย้ำเสมอว่าเป็นการประเมินเบื้องต้น ควรให้ช่างตรวจจริงเพื่อความปลอดภัย.${carContext}`;
+            const systemPrompt = `${IDENTITY}
+
+คุณคือ ${BRAND.ai} ผู้ช่วย AI ดูแลรถยนต์ พูดจาเป็นกันเองอบอุ่นเหมือนเพื่อนช่างมืออาชีพ ตอบเป็นภาษาไทยเป็นหลัก (หรือสลับภาษาตามที่คู่สนทนาพิมพ์มา). ช่วยวินิจฉัยอาการรถ ให้คำแนะนำเป็นขั้นตอน ประเมินค่าใช้จ่ายคร่าวๆ และตอบคำถามเรื่องรถทุกอย่าง. ตอบกระชับ อ่านง่าย ใช้หัวข้อย่อย (ขึ้นต้นด้วย "- ") เมื่อเหมาะสม. ย้ำเสมอว่าเป็นการประเมินเบื้องต้น ควรให้ช่างตรวจจริงเพื่อความปลอดภัย.${carContext}`;
             const hasMedia = b.messages.some(m => m.atts && m.atts.some(a => a.b64));
             const contents = b.messages.slice(-12).map(m => {
               const parts = [];
@@ -4485,7 +4514,7 @@ ${convo}`;
           for (const sub of subs) {
             try {
               const r = await sendPush(env, sub, {
-                title: sub.lang === 'en' ? 'SpireONE notifications are on'
+                title: sub.lang === 'en' ? 'Cendon notifications are on'
                                          : 'เปิดการแจ้งเตือนเรียบร้อย',
                 body: sub.lang === 'en' ? "We'll tell you before tax and insurance run out."
                                         : 'ใกล้ครบกำหนดต่อภาษีหรือประกัน เราจะเตือนให้ก่อน',
@@ -4521,7 +4550,7 @@ ${convo}`;
               send_at = excluded.send_at, title = excluded.title, body = excluded.body,
               url = excluded.url, tag = excluded.tag, done = 0
           `).bind(id, actor.payload.sub, Math.round(at),
-            String(b.title || 'SpireONE').slice(0, 120),
+            String(b.title || 'Cendon').slice(0, 120),
             String(b.body || '').slice(0, 200),
             String(b.url || '/').slice(0, 200),
             String(b.tag || 'spireone').slice(0, 40), Date.now()).run(), null);
