@@ -1103,23 +1103,72 @@ async function kbFor(env, carInfo, question) {
 
 /* ── ข้อมูลผู้ใช้ทั้งหมดที่ AI ควรรู้ ──
    ชื่อ รถทุกคัน ประวัติเช็กระยะ อะไหล่ที่เคยค้น และสรุปสิ่งที่เคยคุยกัน */
-async function userContext(env, uid, carId) {
+/* อ่านค่าที่หน้าเว็บซิงก์ขึ้นมาเก็บไว้ในตาราง user_state
+   ตรงนี้คือ "ความจริงตามที่ผู้ใช้ตั้งไว้ในแอป" ซึ่งใหม่กว่าและครบกว่าตาราง users
+   เช่นชื่อเล่นที่ตั้งตอน setup ไม่เคยถูกเขียนลงตาราง users เลย */
+async function stateOf(env, uid, key) {
+  try {
+    const r = await env.DB.prepare('SELECT v FROM user_state WHERE uid = ? AND k = ?')
+      .bind(uid, key).first();
+    if (!r || !r.v) return null;
+    return JSON.parse(r.v);
+  } catch (e) { return null }
+}
+
+async function userContext(env, uid, carId, hint) {
   const parts = [];
+  const [setup, gar, sel] = await Promise.all([
+    stateOf(env, uid, 'setup'), stateOf(env, uid, 'garage'), stateOf(env, uid, 'selCar'),
+  ]);
+
+  /* ── ชื่อ ── ชื่อเล่นที่ผู้ใช้ตั้งเองมาก่อนเสมอ ค่อยตกมาที่ชื่อบัญชี */
+  let name = (setup && typeof setup === 'object' && setup.name) ? String(setup.name).trim() : '';
+  let email = '';
   try {
     const u = await env.DB.prepare('SELECT name, email FROM users WHERE uid = ?').bind(uid).first();
-    if (u && u.name) parts.push(`ชื่อผู้ใช้: ${u.name}`);
+    if (u) { if (!name && u.name) name = String(u.name); email = String(u.email || '') }
   } catch (e) {}
+  /* หน้าเว็บส่งชื่อมาด้วยทุกครั้ง ใช้เป็นตัวสำรองกรณีข้อมูลยังซิงก์ขึ้นมาไม่ทัน */
+  if (!name && hint && hint.userName) name = String(hint.userName).trim().slice(0, 60);
+  if (name) parts.push(`ชื่อผู้ใช้ (เรียกเขาด้วยชื่อนี้ได้เลย): ${name}`);
+  if (email) parts.push(`อีเมล: ${email}`);
+  if (setup && typeof setup === 'object') {
+    const lv = { basic: 'มือใหม่ อธิบายให้ง่าย เลี่ยงศัพท์ช่าง',
+                 advance: 'พอมีพื้นฐาน อธิบายลงรายละเอียดได้',
+                 enthusiast: 'สนใจรถมาก คุยศัพท์ช่างและตัวเลขได้เต็มที่' }[setup.level];
+    if (lv) parts.push(`ระดับความรู้เรื่องรถของผู้ใช้: ${lv}`);
+    if (setup.units) parts.push(`หน่วยที่ใช้: ${setup.units === 'imperial' ? 'ไมล์/แกลลอน' : 'กิโลเมตร/ลิตร'}`);
+  }
+
+  /* ── รถ ── รวมจากตาราง cars กับการาจที่ซิงก์มา อันไหนมีก็ใช้อันนั้น
+     บางบัญชีมีรถอยู่ในการาจแต่ยังไม่ทันขึ้นตาราง cars จึงต้องดูทั้งสองที่ */
+  const byId = {};
   try {
     const rs = await env.DB.prepare(
       'SELECT id, make, model, year, mileage FROM cars WHERE uid = ? ORDER BY created_at DESC LIMIT 8'
     ).bind(uid).all();
-    const cars = rs.results || [];
-    if (cars.length) {
-      parts.push('รถในการาจของผู้ใช้:\n' + cars.map(c =>
-        `- ${c.make || ''} ${c.model || ''} ปี ${c.year || '-'} เลขไมล์ ${c.mileage || '-'} กม.`
-        + (String(c.id) === String(carId) ? '  ← คันที่กำลังถามถึงตอนนี้' : '')).join('\n'));
-    }
+    (rs.results || []).forEach(c => { byId[String(c.id)] = c });
   } catch (e) {}
+  if (Array.isArray(gar)) {
+    gar.slice(0, 8).forEach(c => {
+      if (!c || !c.id) return;
+      const prev = byId[String(c.id)] || {};
+      byId[String(c.id)] = {
+        id: c.id,
+        make: c.make || prev.make || '',
+        model: c.model || prev.model || (c.name || ''),
+        year: c.year || prev.year || '',
+        mileage: c.mileage || prev.mileage || '',
+      };
+    });
+  }
+  const cars = Object.keys(byId).map(k => byId[k]);
+  const curId = String(carId || sel || '');
+  if (cars.length) {
+    parts.push('รถในการาจของผู้ใช้:\n' + cars.map(c =>
+      `- ${[c.make, c.model].filter(Boolean).join(' ') || 'ไม่ระบุรุ่น'} ปี ${c.year || '-'} เลขไมล์ ${c.mileage || '-'} กม.`
+      + (String(c.id) === curId ? '  ← คันที่กำลังถามถึงตอนนี้' : '')).join('\n'));
+  }
   if (carId) {
     try {
       const rs = await env.DB.prepare(`
@@ -3757,6 +3806,16 @@ export default {
             }
           }
           
+          if (!carInfo.make && !carInfo.model && body.carId) {
+            /* ตาราง cars ยังไม่มีคันนี้ ลองดูในการาจที่หน้าเว็บซิงก์ขึ้นมา */
+            try {
+              const gar = await stateOf(env, actor.payload.sub, 'garage');
+              const c = Array.isArray(gar) ? gar.find(x => x && String(x.id) === String(body.carId)) : null;
+              if (c) carInfo = { make: c.make || '', model: c.model || c.name || '',
+                                 year: c.year != null ? String(c.year) : '',
+                                 mileage: c.mileage != null ? String(c.mileage) : '' };
+            } catch (e) {}
+          }
           if (!carInfo.make && !carInfo.model) {
             carInfo = {
               make: String(body.make || '').slice(0, 60),
@@ -3808,7 +3867,7 @@ export default {
             }
 
             const [userBlock, kbBlock] = await Promise.all([
-              userContext(env, actor.payload.sub, body.carId),
+              userContext(env, actor.payload.sub, body.carId, { userName: body.userName }),
               kbFor(env, carInfo, question),
             ]);
             const text = await runReActAgent(env, carInfo, body.contents, meter,
