@@ -79,7 +79,7 @@ function rank(role) { return ROLE_RANK[role] || 0; }
    ยกเว้น ALTER TABLE สองบรรทัดที่ต้องดักข้อผิดพลาด "มีคอลัมน์นี้แล้ว" ทิ้ง
    ══════════════════════════════════════════════════════════════════ */
 
-const SCHEMA_VERSION = 13;
+const SCHEMA_VERSION = 14;
 
 const SCHEMA_SQL = [
   /* ── ข้อมูลของผู้ใช้ที่ต้องเหมือนกันทุกเครื่อง ──
@@ -103,6 +103,53 @@ const SCHEMA_SQL = [
   out_tok INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (uid, win)
 )`,
+  /* ── คลังความรู้เรื่องรถ ──
+     ผู้ดูแลระบบขึ้นไปเท่านั้นที่เขียนได้ ความรู้ที่ใส่ตรงนี้จะถูกหยิบไปแปะ
+     ในคำสั่งระบบตอนคำถามเข้าเรื่องเดียวกัน ทำให้ตอบได้ลึกกว่าที่โมเดลรู้เอง */
+  `CREATE TABLE IF NOT EXISTS kb (
+  id         TEXT PRIMARY KEY,
+  title      TEXT NOT NULL,
+  body       TEXT NOT NULL,
+  keywords   TEXT NOT NULL DEFAULT '',
+  make       TEXT NOT NULL DEFAULT '',
+  model      TEXT NOT NULL DEFAULT '',
+  author     TEXT NOT NULL DEFAULT '',
+  enabled    INTEGER NOT NULL DEFAULT 1,
+  uses       INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+)`,
+  `CREATE INDEX IF NOT EXISTS idx_kb_model ON kb(make, model, enabled)`,
+  /* ── คำตอบเก่าที่เก็บไว้ใช้ซ้ำ ──
+     ผูกกับรุ่นรถเสมอ คำตอบของ Civic จะไม่ถูกเอาไปตอบคนขับ Vios
+     ตรงคำถามเดิมกับรุ่นเดิมเมื่อไร ตอบจากตรงนี้ทันที ไม่เสียโควตาเลย */
+  `CREATE TABLE IF NOT EXISTS qa_cache (
+  id         TEXT PRIMARY KEY,
+  make       TEXT NOT NULL DEFAULT '',
+  model      TEXT NOT NULL DEFAULT '',
+  qhash      TEXT NOT NULL,
+  qnorm      TEXT NOT NULL,
+  question   TEXT NOT NULL,
+  answer     TEXT NOT NULL,
+  hits       INTEGER NOT NULL DEFAULT 0,
+  good       INTEGER NOT NULL DEFAULT 0,
+  bad        INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  used_at    INTEGER NOT NULL
+)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_qa_key ON qa_cache(make, model, qhash)`,
+  `CREATE INDEX IF NOT EXISTS idx_qa_model ON qa_cache(make, model, used_at)`,
+  /* ── สิ่งที่จำได้เกี่ยวกับผู้ใช้แต่ละคน ──
+     สรุปสั้น ๆ จากบทสนทนาก่อน ๆ เอาไปแปะให้ AI รู้ว่าเคยคุยอะไรกันไว้ */
+  `CREATE TABLE IF NOT EXISTS user_memory (
+  id         TEXT PRIMARY KEY,
+  uid        TEXT NOT NULL,
+  car_id     TEXT NOT NULL DEFAULT '',
+  text       TEXT NOT NULL,
+  weight     INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL
+)`,
+  `CREATE INDEX IF NOT EXISTS idx_mem_uid ON user_memory(uid, created_at)`,
   `CREATE TABLE IF NOT EXISTS feedback (
   id         TEXT PRIMARY KEY,
   uid        TEXT NOT NULL DEFAULT '',
@@ -938,7 +985,195 @@ async function getChatPrefs(env, uid) {
   } catch { return fallback; }
 }
 
-async function runReActAgent(env, carInfo, messages, meter, style, customStyle, skillPrompt) {
+/* ═══════════════════════════════════════════════════════════════════
+   ยิ่งคุยยิ่งฉลาด — คลังความรู้ · คำตอบใช้ซ้ำ · ความจำเกี่ยวกับผู้ใช้
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* ตัดคำหยาบ ๆ พอใช้จับว่าเป็นคำถามเดียวกันไหม
+   ภาษาไทยไม่มีช่องว่างระหว่างคำ จึงใช้วิธีตัดอักขระที่ไม่ใช่ตัวอักษรทิ้ง
+   แล้วเทียบด้วยชุดอักขระสามตัวติดกัน ซึ่งใช้ได้ทั้งไทยและอังกฤษ */
+function normQ(q) {
+  return String(q || '')
+    .toLowerCase()
+    .replace(/[\s็-๎]/g, '')                 /* ช่องว่างและวรรณยุกต์ไทย */
+    .replace(/[^฀-๿a-z0-9]/g, '')
+    .slice(0, 400);
+}
+function grams(t) {
+  const out = new Set();
+  for (let i = 0; i + 3 <= t.length; i++) out.add(t.slice(i, i + 3));
+  return out;
+}
+function similar(a, b) {
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  const A = grams(a), B = grams(b);
+  if (!A.size || !B.size) return 0;
+  let hit = 0;
+  A.forEach(g => { if (B.has(g)) hit++ });
+  return hit / Math.max(A.size, B.size);            /* Jaccard แบบง่าย */
+}
+function hashOf(t) {
+  let h = 5381;
+  for (let i = 0; i < t.length; i++) h = ((h * 33) ^ t.charCodeAt(i)) >>> 0;
+  return t.length.toString(36) + '_' + h.toString(36);
+}
+
+/* ── คำตอบเก่าที่ตรงรุ่นรถเดียวกัน ──
+   ตรงเป๊ะใช้ได้เลย ใกล้เคียงมากกว่า 0.82 ก็ถือว่าเป็นคำถามเดียวกัน
+   ผู้ใช้เคยกดว่าคำตอบไม่ดี (bad) จะไม่ถูกหยิบมาใช้ซ้ำอีก */
+async function cacheLookup(env, carInfo, question) {
+  const make = String(carInfo.make || '').toLowerCase();
+  const model = String(carInfo.model || '').toLowerCase();
+  if (!make && !model) return null;                 /* ไม่รู้รุ่นรถ ไม่กล้าใช้ซ้ำ */
+  const qn = normQ(question);
+  if (qn.length < 6) return null;
+  try {
+    const exact = await env.DB.prepare(
+      'SELECT * FROM qa_cache WHERE make = ? AND model = ? AND qhash = ? AND bad < 2'
+    ).bind(make, model, hashOf(qn)).first();
+    if (exact) return exact;
+    const rs = await env.DB.prepare(
+      'SELECT * FROM qa_cache WHERE make = ? AND model = ? AND bad < 2 ORDER BY used_at DESC LIMIT 60'
+    ).bind(make, model).all();
+    let best = null, bestScore = 0;
+    for (const r of (rs.results || [])) {
+      const sc = similar(qn, r.qnorm);
+      if (sc > bestScore) { bestScore = sc; best = r }
+    }
+    return bestScore >= 0.82 ? best : null;
+  } catch (e) { console.error('[cacheLookup]', e); return null }
+}
+
+async function cacheSave(env, carInfo, question, answer) {
+  const make = String(carInfo.make || '').toLowerCase();
+  const model = String(carInfo.model || '').toLowerCase();
+  if (!make && !model) return;
+  const qn = normQ(question);
+  if (qn.length < 6 || !answer || answer.length < 40) return;
+  /* คำตอบที่ยังถามข้อมูลเพิ่มอยู่ ไม่ใช่คำตอบจบ อย่าเก็บไว้ใช้ซ้ำ */
+  if (/\[\[ASK\]\]/.test(answer)) return;
+  const now = Date.now();
+  try {
+    await env.DB.prepare(`
+      INSERT INTO qa_cache (id, make, model, qhash, qnorm, question, answer, hits, created_at, used_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+      ON CONFLICT(make, model, qhash) DO UPDATE SET
+        answer = excluded.answer, used_at = excluded.used_at
+    `).bind('qa_' + now.toString(36) + Math.random().toString(36).slice(2, 6),
+      make, model, hashOf(qn), qn, String(question).slice(0, 500),
+      String(answer).slice(0, 6000), now, now).run();
+  } catch (e) { console.error('[cacheSave]', e) }
+}
+
+/* ── ความรู้ที่ทีมงานสอนไว้ ──
+   เลือกเฉพาะที่ตรงรุ่นรถหรือเป็นความรู้กลาง และมีคำสำคัญตรงกับคำถาม */
+async function kbFor(env, carInfo, question) {
+  const qn = normQ(question);
+  if (!qn) return '';
+  const make = String(carInfo.make || '').toLowerCase();
+  const model = String(carInfo.model || '').toLowerCase();
+  try {
+    const rs = await env.DB.prepare(`
+      SELECT id, title, body, keywords, make, model FROM kb
+      WHERE enabled = 1 AND (make = '' OR make = ?) AND (model = '' OR model = ?)
+      ORDER BY updated_at DESC LIMIT 120
+    `).bind(make, model).all();
+    const scored = [];
+    for (const r of (rs.results || [])) {
+      const keys = String(r.keywords || '').split(',').map(x => normQ(x)).filter(Boolean);
+      let sc = 0;
+      for (const k of keys) if (k.length >= 3 && qn.includes(k)) sc += 2;
+      sc += similar(qn, normQ(r.title)) * 3;
+      if (r.model) sc += 0.5;                        /* ตรงรุ่นได้แต้มพิเศษ */
+      if (sc > 0) scored.push([sc, r]);
+    }
+    scored.sort((a, b) => b[0] - a[0]);
+    const top = scored.slice(0, 4).filter(x => x[0] >= 1);
+    if (!top.length) return '';
+    /* นับว่าถูกใช้ เพื่อให้ทีมงานเห็นว่าความรู้ชิ้นไหนมีประโยชน์จริง */
+    try {
+      for (const [, r] of top)
+        await env.DB.prepare('UPDATE kb SET uses = uses + 1 WHERE id = ?').bind(r.id).run();
+    } catch (e) {}
+    return '\n\n[ความรู้จากคลังของ Cendon (เชื่อถือได้ ใช้ก่อนความรู้ทั่วไปของคุณเสมอ)]\n'
+      + top.map(([, r]) => `— ${r.title} —\n${String(r.body).slice(0, 2500)}`).join('\n\n');
+  } catch (e) { console.error('[kbFor]', e); return '' }
+}
+
+/* ── ข้อมูลผู้ใช้ทั้งหมดที่ AI ควรรู้ ──
+   ชื่อ รถทุกคัน ประวัติเช็กระยะ อะไหล่ที่เคยค้น และสรุปสิ่งที่เคยคุยกัน */
+async function userContext(env, uid, carId) {
+  const parts = [];
+  try {
+    const u = await env.DB.prepare('SELECT name, email FROM users WHERE uid = ?').bind(uid).first();
+    if (u && u.name) parts.push(`ชื่อผู้ใช้: ${u.name}`);
+  } catch (e) {}
+  try {
+    const rs = await env.DB.prepare(
+      'SELECT id, make, model, year, mileage FROM cars WHERE uid = ? ORDER BY created_at DESC LIMIT 8'
+    ).bind(uid).all();
+    const cars = rs.results || [];
+    if (cars.length) {
+      parts.push('รถในการาจของผู้ใช้:\n' + cars.map(c =>
+        `- ${c.make || ''} ${c.model || ''} ปี ${c.year || '-'} เลขไมล์ ${c.mileage || '-'} กม.`
+        + (String(c.id) === String(carId) ? '  ← คันที่กำลังถามถึงตอนนี้' : '')).join('\n'));
+    }
+  } catch (e) {}
+  if (carId) {
+    try {
+      const rs = await env.DB.prepare(`
+        SELECT part, last_km, last_at, interval_km FROM maint_item
+        WHERE uid = ? AND car_id = ? AND last_at IS NOT NULL
+        ORDER BY last_at DESC LIMIT 10
+      `).bind(uid, String(carId)).all();
+      const list = rs.results || [];
+      if (list.length) {
+        parts.push('ประวัติบำรุงรักษาที่บันทึกไว้:\n' + list.map(m =>
+          `- ${m.part} ครั้งล่าสุดที่ ${m.last_km || '-'} กม.`
+          + (m.last_at ? ` (${new Date(m.last_at).toISOString().slice(0, 10)})` : '')
+          + (m.interval_km ? ` · รอบเปลี่ยนทุก ${m.interval_km} กม.` : '')).join('\n'));
+      }
+    } catch (e) {}
+  }
+  try {
+    const rs = await env.DB.prepare(
+      'SELECT k FROM spares_cache WHERE uid = ? ORDER BY t DESC LIMIT 8'
+    ).bind(uid).all();
+    const ks = (rs.results || []).map(r => String(r.k).split('|').slice(-1)[0]).filter(Boolean);
+    if (ks.length) parts.push('อะไหล่ที่ผู้ใช้เคยค้นหา: ' + [...new Set(ks)].join(', '));
+  } catch (e) {}
+  try {
+    const rs = await env.DB.prepare(
+      'SELECT text FROM user_memory WHERE uid = ? ORDER BY created_at DESC LIMIT 12'
+    ).bind(uid).all();
+    const mem = (rs.results || []).map(r => r.text).filter(Boolean);
+    if (mem.length) parts.push('สิ่งที่เคยคุยกันไว้ก่อนหน้านี้:\n' + mem.map(t => '- ' + t).join('\n'));
+  } catch (e) {}
+  if (!parts.length) return '';
+  return '\n\n[ข้อมูลของผู้ใช้คนนี้ — ใช้ตอบได้เลยโดยไม่ต้องถามซ้ำ]\n' + parts.join('\n');
+}
+
+/* จำสิ่งที่เพิ่งคุยไว้สั้น ๆ ไม่เรียกโมเดลเพิ่ม จึงไม่กินโควตา */
+async function rememberTurn(env, uid, carId, question, answer) {
+  const q = String(question || '').replace(/\s+/g, ' ').trim();
+  if (q.length < 8) return;
+  const line = q.slice(0, 160)
+    + (answer ? ' → ' + String(answer).replace(/\s+/g, ' ').trim().slice(0, 160) : '');
+  try {
+    await env.DB.prepare(
+      'INSERT INTO user_memory (id, uid, car_id, text, created_at) VALUES (?, ?, ?, ?, ?)'
+    ).bind('m_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+      uid, String(carId || ''), line, Date.now()).run();
+    /* เก็บแค่ 40 บรรทัดล่าสุดต่อคน ไม่ให้ prompt บวมและฐานข้อมูลโต */
+    await env.DB.prepare(`
+      DELETE FROM user_memory WHERE uid = ? AND id NOT IN (
+        SELECT id FROM user_memory WHERE uid = ? ORDER BY created_at DESC LIMIT 40)
+    `).bind(uid, uid).run();
+  } catch (e) { console.error('[rememberTurn]', e) }
+}
+
+async function runReActAgent(env, carInfo, messages, meter, style, customStyle, skillPrompt, extra) {
   const carContext = (carInfo.make || carInfo.model) 
     ? `\nรถของผู้ใช้: ${carInfo.make || ''} ${carInfo.model || ''} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` 
     : '';
@@ -949,9 +1184,24 @@ async function runReActAgent(env, carInfo, messages, meter, style, customStyle, 
   /* สกิลที่ผู้ใช้เลือกด้วย / ในช่องพิมพ์ ต้องมาก่อนน้ำเสียง
      เพราะเป็นคำสั่งเรื่องเนื้อหา ส่วนน้ำเสียงเป็นเรื่องวิธีพูด */
   const appliedSkills = skillPrompt || '';
+  const ex = extra || {};
+  const userBlock = ex.user || '';
+  const kbBlock = ex.kb || '';
+  /* ── ถามกลับผู้ใช้เป็นแบบฟอร์ม ──
+     ถ้าโมเดลอยากรู้อะไรเพิ่ม ให้ตอบเป็นบล็อกนี้แทนการเขียนคำถามลอย ๆ
+     หน้าเว็บจะแปลงเป็นกล่องให้กดเลือกหรือพิมพ์ แล้วส่งกลับมาให้เอง */
+  const askBlock = `
+
+[การถามข้อมูลเพิ่มจากผู้ใช้]
+ถ้าคุณต้องการข้อมูลเพิ่มเพื่อตอบให้แม่นขึ้น ให้ถามด้วยรูปแบบนี้แทนการเขียนคำถามเป็นข้อความธรรมดา
+วางไว้ท้าย Final Answer และห้ามใส่ข้อความอื่นต่อจากบล็อกนี้:
+[[ASK]]{"title":"หัวข้อสั้น ๆ","fields":[{"k":"km","label":"เลขไมล์ตอนนี้","type":"number","unit":"กม."},{"k":"when","label":"เป็นตอนไหน","type":"choice","options":["ตอนสตาร์ต","ตอนขับ","ตอนเบรก","ตลอดเวลา"]},{"k":"more","label":"อธิบายเพิ่ม","type":"text","optional":true}]}[[/ASK]]
+กติกา: ถามไม่เกิน 4 ช่องต่อครั้ง · type ใช้ได้แค่ number, choice, text, yesno ·
+ก่อนบล็อกนี้ให้เขียนสิ่งที่พอตอบได้ไปก่อนเสมอ อย่าตอบว่างเปล่าแล้วถามอย่างเดียว ·
+ถ้าข้อมูลที่มีพอตอบได้แล้ว ไม่ต้องใส่บล็อกนี้`;
 
   const systemPrompt = `คุณคือ SpireONE ผู้ช่วย AI ดูแลรถยนต์และวิเคราะห์ปัญหารถยนต์ที่ชาญฉลาด ตอบเป็นภาษาไทยเป็นหลัก คุณจะควบคุมกระบวนการคิดในการหาคำตอบที่ถูกต้องที่สุดให้ผู้ใช้ โดยเขียนวิเคราะห์กระบวนการใน Thought ก่อนเสมอ
-ข้อมูลรถปัจจุบัน:${carContext}
+ข้อมูลรถปัจจุบัน:${carContext}${userBlock}
 
 คุณมีเครื่องมือช่วยเหลือดังต่อไปนี้ที่คุณสามารถระบุสั่งงานได้:
 1. describe_media(prompt): สั่งให้ Gemini ช่วยตรวจดูและอธิบายไฟล์สื่อ (ภาพ, วิดีโอ, เสียง) ที่แนบเข้ามาในประวัติแชต โดยคุณสามารถใส่คำอธิบายเพิ่มเติมใน prompt ได้ตามต้องการ เช่น describe_media("ตรวจสอบจุดรั่วซึมใต้ท้องรถจากภาพถ่าย")
@@ -969,7 +1219,7 @@ Final Answer: [คำตอบสรุปผลภาษาไทย ที่�
 - ห้ามเขียน Observation หรือข้อมูลหลังคำว่า Observation เองเด็ดขาด!
 - หากมีไฟล์แนบในแชต คุณต้องเรียกใช้ describe_media เสมอเพื่อเอาข้อมูลสังเกตมาคิดวิเคราะห์
 - หากต้องการเช็กราคาสินค้า ข่าว หรือสเปกที่ต้องการความสดใหม่ ให้เรียกใช้ google_search
-- หากข้อมูลพร้อมและไม่ต้องรันเครื่องมือ ให้ข้าม Action และเขียน Final Answer ได้เลย${appliedSkills}${appliedStylePrompt}`;
+- หากข้อมูลพร้อมและไม่ต้องรันเครื่องมือ ให้ข้าม Action และเขียน Final Answer ได้เลย${kbBlock}${appliedSkills}${askBlock}${appliedStylePrompt}`;
 
   const chatHistory = messages.map(m => {
     const o = { role: m.role === "user" ? "user" : "assistant", content: "" };
@@ -3080,6 +3330,110 @@ export default {
       }
 
       /* ===== FEEDBACK — ส่งถึงแอดมินจริง เก็บลงฐานข้อมูล ===== */
+      /* ═══════════ คลังความรู้ — สอน AI ═══════════
+         เขียนได้เฉพาะผู้ดูแลระบบขึ้นไป ความรู้ที่ใส่จะถูกใช้กับผู้ใช้ทุกคน
+         จึงต้องมาจากคนที่รับผิดชอบได้ ไม่เปิดให้ทุกคนแก้ */
+      if (url.pathname === '/api/kb' && request.method === 'GET') {
+        return await guarded('moderator', async () => {
+          const q = (url.searchParams.get('q') || '').trim().toLowerCase();
+          const rs = await env.DB.prepare(
+            'SELECT * FROM kb ORDER BY updated_at DESC LIMIT 400').all();
+          let list = rs.results || [];
+          if (q) list = list.filter(r =>
+            (r.title + ' ' + r.keywords + ' ' + r.make + ' ' + r.model).toLowerCase().includes(q));
+          return json({ kb: list });
+        })();
+      }
+
+      if (url.pathname === '/api/kb' && request.method === 'POST') {
+        return await guarded('moderator', async (actor) => {
+          const b = (await readBody()) || {};
+          const title = String(b.title || '').trim();
+          const body2 = String(b.body || '').trim();
+          if (title.length < 3 || body2.length < 10)
+            return deny('ต้องมีหัวข้อและเนื้อหาความรู้', 400);
+          const now = Date.now();
+          const id = String(b.id || '') || 'kb_' + now.toString(36) + Math.random().toString(36).slice(2, 6);
+          await env.DB.prepare(`
+            INSERT INTO kb (id, title, body, keywords, make, model, author, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              title = excluded.title, body = excluded.body, keywords = excluded.keywords,
+              make = excluded.make, model = excluded.model,
+              enabled = excluded.enabled, updated_at = excluded.updated_at
+          `).bind(id, title.slice(0, 200), body2.slice(0, 8000),
+            String(b.keywords || '').slice(0, 400),
+            String(b.make || '').toLowerCase().slice(0, 60),
+            String(b.model || '').toLowerCase().slice(0, 60),
+            actor.email || '', b.enabled === false ? 0 : 1, now, now).run();
+          await logAudit(env, actor.email, 'kb.save', id, title.slice(0, 60));
+          return json({ ok: true, id });
+        })();
+      }
+
+      if (url.pathname.startsWith('/api/kb/') && request.method === 'DELETE') {
+        return await guarded('moderator', async (actor) => {
+          const id = url.pathname.split('/').pop();
+          await env.DB.prepare('DELETE FROM kb WHERE id = ?').bind(id).run();
+          await logAudit(env, actor.email, 'kb.delete', id, '');
+          return json({ ok: true });
+        })();
+      }
+
+      /* ═══════════ คำตอบที่เก็บไว้ใช้ซ้ำ ═══════════ */
+      if (url.pathname === '/api/cache' && request.method === 'GET') {
+        return await guarded('moderator', async () => {
+          const rs = await env.DB.prepare(
+            'SELECT id, make, model, question, answer, hits, good, bad, created_at, used_at FROM qa_cache ORDER BY used_at DESC LIMIT 300').all();
+          const sum = await env.DB.prepare(
+            'SELECT COUNT(*) AS n, SUM(hits) AS h FROM qa_cache').first();
+          return json({ cache: rs.results || [], total: (sum && sum.n) || 0, saved: (sum && sum.h) || 0 });
+        })();
+      }
+
+      if (url.pathname.startsWith('/api/cache/') && request.method === 'DELETE') {
+        return await guarded('moderator', async (actor) => {
+          const id = url.pathname.split('/').pop();
+          await env.DB.prepare('DELETE FROM qa_cache WHERE id = ?').bind(id).run();
+          await logAudit(env, actor.email, 'cache.delete', id, '');
+          return json({ ok: true });
+        })();
+      }
+
+      /* ผู้ใช้บอกว่าคำตอบที่หยิบมาใช้ซ้ำนั้นดีหรือไม่ดี
+         ถ้าโดนกดว่าไม่ดีสองครั้ง จะเลิกหยิบมาใช้ซ้ำอีก */
+      if (url.pathname === '/api/cache/vote' && request.method === 'POST') {
+        return await guarded('user', async () => {
+          const b = (await readBody()) || {};
+          if (!b.id) return deny('id is required', 400);
+          const col = b.good ? 'good' : 'bad';
+          await env.DB.prepare(
+            `UPDATE qa_cache SET ${col} = ${col} + 1 WHERE id = ?`).bind(String(b.id)).run();
+          return json({ ok: true });
+        })();
+      }
+
+      /* ความจำเกี่ยวกับผู้ใช้ — เจ้าตัวดูและลบของตัวเองได้ */
+      if (url.pathname === '/api/memory' && request.method === 'GET') {
+        return await guarded('user', async (actor) => {
+          const rs = await env.DB.prepare(
+            'SELECT id, car_id, text, created_at FROM user_memory WHERE uid = ? ORDER BY created_at DESC LIMIT 60'
+          ).bind(actor.payload.sub).all();
+          return json({ memory: rs.results || [] });
+        })();
+      }
+
+      if (url.pathname === '/api/memory' && request.method === 'DELETE') {
+        return await guarded('user', async (actor) => {
+          const id = url.searchParams.get('id');
+          if (id) await env.DB.prepare('DELETE FROM user_memory WHERE uid = ? AND id = ?')
+            .bind(actor.payload.sub, id).run();
+          else await env.DB.prepare('DELETE FROM user_memory WHERE uid = ?')
+            .bind(actor.payload.sub).run();
+          return json({ ok: true });
+        })();
+      }
+
       if (url.pathname === '/api/feedback' && request.method === 'POST') {
         return await guarded('user', async (actor) => {
           const b = (await readBody()) || {};
@@ -3312,7 +3666,7 @@ export default {
           const uid = actor.payload.sub;
           // ลบทีละตาราง ไม่ใช้ transaction เพราะ D1 ยังไม่รองรับข้าม statement
           // ถ้าตารางไหนพลาด ตัวที่ลบไปแล้วยังถือว่าลบจริง จึงรายงานเป็นรายตาราง
-          const tables = ['cars', 'usage', 'usage_win', 'user_state', 'push_subs', 'push_jobs', 'chat_prefs'];
+          const tables = ['cars', 'usage', 'usage_win', 'user_state', 'user_memory', 'push_subs', 'push_jobs', 'chat_prefs'];
           const removed = {};
           for (const t of tables) {
             try {
@@ -3427,8 +3781,45 @@ export default {
               ? String(body.customStyle)
               : prefs.customStyle;
             const skillPrompt = await skillsPrompt(env, actor.payload.sub, body.skillIds);
+            /* คำถามล่าสุดของผู้ใช้ ใช้ทั้งค้นคำตอบเก่าและค้นคลังความรู้ */
+            const lastMsg = (body.contents && body.contents.length)
+              ? body.contents[body.contents.length - 1] : null;
+            const question = (lastMsg && lastMsg.parts)
+              ? lastMsg.parts.map(x => x.text || '').join(' ').trim() : '';
+            const hasMedia = (body.contents || []).some(m =>
+              m.parts && m.parts.some(x => x.inline_data));
+
+            /* ── ตอบจากคำตอบเก่าก่อน ถ้าเป็นคำถามเดิมกับรถรุ่นเดิม ──
+               ไม่เรียกโมเดลเลย จึงไม่หักโควตาสักหน่วย
+               ข้ามขั้นนี้ถ้ามีไฟล์แนบ เพราะต้องดูของจริงทุกครั้ง
+               หรือผู้ใช้เลือกสกิลไว้ เพราะคำสั่งเปลี่ยนคำตอบ */
+            if (!hasMedia && !(body.skillIds && body.skillIds.length) && body.fresh !== true) {
+              const hit = await cacheLookup(env, carInfo, question);
+              if (hit) {
+                try {
+                  await env.DB.prepare(
+                    'UPDATE qa_cache SET hits = hits + 1, used_at = ? WHERE id = ?'
+                  ).bind(Date.now(), hit.id).run();
+                } catch (e) {}
+                const q = await quotaState(env, actor.payload.sub, actor.role);
+                return json({ text: hit.answer, cached: true, cacheId: hit.id,
+                              usage: Object.assign({ cost: 0, in: 0, out: 0, src: ['cache'] }, q) });
+              }
+            }
+
+            const [userBlock, kbBlock] = await Promise.all([
+              userContext(env, actor.payload.sub, body.carId),
+              kbFor(env, carInfo, question),
+            ]);
             const text = await runReActAgent(env, carInfo, body.contents, meter,
-                                             activeStyle, activeCustomStyle, skillPrompt);
+                                             activeStyle, activeCustomStyle, skillPrompt,
+                                             { user: userBlock, kb: kbBlock });
+            /* เก็บไว้ตอบซ้ำครั้งหน้า และจำไว้ว่าเคยคุยเรื่องนี้กัน */
+            try {
+              if (!hasMedia && !(body.skillIds && body.skillIds.length))
+                await cacheSave(env, carInfo, question, text);
+              await rememberTurn(env, actor.payload.sub, body.carId, question, text);
+            } catch (e) { console.error('[learn]', e) }
             
             let usage = null;
             try {
