@@ -1300,6 +1300,107 @@ function needsFresh(q) {
   return false;
 }
 
+/* ── วิธีคุยสำหรับโหมดสตรีม ──
+   ไม่มีลูป ReAct แล้ว เครื่องมือถูกเรียกไปก่อนหน้านี้และผลอยู่ในคำสั่งระบบเรียบร้อย
+   จึงไม่ต้องมีรูปแบบ Thought/Action/Final Answer ให้โมเดลสับสนอีก */
+const STREAM_TALK = `[วิธีคุย]
+คุยกับคนให้เป็นธรรมชาติ เหมือนเพื่อนที่บังเอิญเก่งเรื่องรถ ไม่ใช่ระบบตอบคำถามอัตโนมัติ
+
+เรื่องที่ไม่ใช่รถ (ทักทาย เล่าเรื่องทั่วไป หยอกเล่น):
+- คุยด้วยตามปกติสั้น ๆ ตอบเรื่องนั้นจริง ๆ
+- ห้ามลากกลับเข้าเรื่องรถ ห้ามปิดท้ายด้วยการเสนอช่วยเรื่องรถถ้าเขาไม่ได้ถาม
+- ห้ามแนะนำตัวยาวหรือร่ายว่าทำอะไรได้บ้าง
+
+เรื่องรถ:
+- ตอบให้ลึกและใช้ได้จริง บอกสาเหตุที่เป็นไปได้ วิธีเช็ก ความเร่งด่วน และค่าใช้จ่ายคร่าว ๆ
+- ใช้ข้อมูลรถและประวัติที่ให้มาแล้ว อย่าถามซ้ำสิ่งที่รู้อยู่แล้ว
+- เรื่องความปลอดภัยพูดตรงและจริงจัง
+
+วิธีเขียน:
+- เขียนเหมือนคนพิมพ์คุย ประโยคสั้น อ่านลื่น
+- ใช้หัวข้อย่อยเมื่อของมันเป็นรายการจริง ๆ เท่านั้น
+- ห้ามทวนคำถาม ห้ามเกริ่นว่า "จากข้อมูลที่ให้มา" หรือ "ในฐานะผู้ช่วย AI"
+- ห้ามเขียน Thought: Action: หรือ Final Answer: เด็ดขาด ตอบเนื้อหาออกมาตรง ๆ เลย
+- ความยาวพอดีกับคำถาม ถามสั้นตอบสั้น`;
+
+function askBlockText() {
+  return `
+
+[ถามข้อมูลเพิ่มจากผู้ใช้]
+ถ้าต้องการข้อมูลเพิ่มเพื่อตอบให้แม่นขึ้น ให้ปิดท้ายด้วยบล็อกนี้ และห้ามใส่ข้อความอื่นต่อจากมัน:
+[[ASK]]{"title":"หัวข้อสั้น ๆ","fields":[{"k":"km","label":"เลขไมล์ตอนนี้","type":"number","unit":"กม."},{"k":"when","label":"เป็นตอนไหน","type":"choice","options":["ตอนสตาร์ต","ตอนขับ","ตอนเบรก"]}]}[[/ASK]]
+กติกา: ไม่เกิน 4 ช่อง · type ใช้ได้แค่ number, choice, text, yesno ·
+ต้องเขียนสิ่งที่พอตอบได้ไปก่อนเสมอ ·
+ใช้เฉพาะเรื่องรถและข้อมูลที่ขาดมีผลกับคำตอบจริง ๆ คุยเล่นห้ามใช้`;
+}
+
+/* ── เรียกโมเดลแบบสตรีม ──
+   OpenRouter ส่งกลับเป็น SSE ทีละก้อน แยก reasoning กับ content คนละฟิลด์
+   ส่งต่อออกไปให้หน้าเว็บทันทีที่ได้ ผู้ใช้จึงเห็นความคิดไหลออกมาสด ๆ */
+async function streamModel(env, messages, meter, send) {
+  const key = env.OPENROUTER_API_KEY;
+  if (!key) {
+    /* ไม่มีคีย์สตรีม ใช้ทางเดิมแบบรอจนจบ อย่างน้อยยังตอบได้ */
+    const r = await callReasoningModel(env, messages, meter);
+    const t = (r && r.text) || '';
+    if (r && r.reasoning) await send({ type: 'reasoning', delta: r.reasoning });
+    await send({ type: 'text', delta: t });
+    return { text: t };
+  }
+  const model = env.OPENROUTER_MODEL || 'openai/gpt-oss-20b:free';
+  const baseUrl = env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
+  const res = await fetch(`${baseUrl}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${key}`,
+      'HTTP-Referer': 'https://carspirethailand.com',
+      'X-Title': 'Cendon',
+    },
+    body: JSON.stringify({ model, messages, temperature: 0.3, stream: true }),
+  });
+  if (!res.ok || !res.body) {
+    const txt = await res.text().catch(() => '');
+    console.error('[stream model]', res.status, txt.slice(0, 200));
+    const r = await callReasoningModel(env, messages, meter);
+    const t = (r && r.text) || '';
+    if (r && r.reasoning) await send({ type: 'reasoning', delta: r.reasoning });
+    await send({ type: 'text', delta: t });
+    return { text: t };
+  }
+
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '', text = '', reasoning = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop() || '';
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t.startsWith('data:')) continue;
+      const payload = t.slice(5).trim();
+      if (payload === '[DONE]') continue;
+      let d = null;
+      try { d = JSON.parse(payload) } catch (e) { continue }
+      if (d.usage) readUsage(meter, d, 'openrouter-stream');
+      const delta = (d.choices && d.choices[0] && d.choices[0].delta) || {};
+      const rDelta = delta.reasoning || delta.reasoning_content;
+      if (rDelta) { reasoning += rDelta; await send({ type: 'reasoning', delta: rDelta }) }
+      if (delta.content) { text += delta.content; await send({ type: 'text', delta: delta.content }) }
+    }
+  }
+  /* บางรอบโมเดลคิดอย่างเดียวไม่ยอมตอบ ให้ดึงคำตอบจากในความคิดมาใช้ */
+  if (!text.trim() && reasoning.trim()) {
+    const fa = reasoning.match(/Final Answer:\s*([\s\S]+)$/i);
+    if (fa) { text = fa[1].trim(); await send({ type: 'text', delta: text }) }
+  }
+  if (!meter.calls) { meter.calls = 1; meter.src.push('openrouter-stream') }
+  return { text, reasoning };
+}
+
 async function runReActAgent(env, carInfo, messages, meter, style, customStyle, skillPrompt, extra) {
   const carContext = (carInfo.make || carInfo.model) 
     ? `\nรถของผู้ใช้: ${carInfo.make || ''} ${carInfo.model || ''} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` 
@@ -1487,6 +1588,7 @@ function cleanReply(t) {
   const fa = x.match(/Final Answer:\s*([\s\S]+)$/i);
   if (fa) x = fa[1];
   x = x
+    .replace(/https?:\/\/\S*(vertexaisearch|grounding-api-redirect)\S*/gi, '')
     .replace(/^\s*(Thought|Action|Observation|Reasoning)\s*:.*$/gim, '')
     .replace(/^\s*```(?:\w+)?\s*$/gm, '')
     .replace(/\n{3,}/g, '\n\n')
@@ -1587,9 +1689,26 @@ async function executeGoogleSearchTool(env, query) {
 
   const data = await res.json();
   const candidate = (data.candidates && data.candidates[0]) || {};
-  return ((candidate.content && candidate.content.parts) || [])
+  const raw = ((candidate.content && candidate.content.parts) || [])
     .map(p => p.text || "")
     .join("")
+    .trim();
+  return cleanSearch(raw);
+}
+
+/* ── เก็บกวาดผลค้นก่อนส่งต่อให้โมเดล ──
+   ผลจาก Gemini มักพ่วงลิงก์อ้างอิงของ Google และหมายเลขเชิงอรรถมาด้วย
+   โมเดลฟรีมักคัดลอกทั้งดุ้นไปเป็นคำตอบ ผู้ใช้เลยเห็นลิงก์แปลก ๆ ของ Google
+   แทนที่จะเป็นเนื้อข้อมูลที่ค้นมา */
+function cleanSearch(t) {
+  return String(t || '')
+    .replace(/https?:\/\/vertexaisearch\.cloud\.google\.com\S*/gi, '')
+    .replace(/https?:\/\/\S*grounding-api-redirect\S*/gi, '')
+    .replace(/\[\d+(?:,\s*\d+)*\]/g, '')          /* เชิงอรรถแบบ [1] [2,3] */
+    .replace(/\(https?:\/\/[^)]+\)/g, '')          /* ลิงก์ในวงเล็บ */
+    .replace(/^\s*(อ้างอิง|แหล่งที่มา|Sources?|References?)\s*:.*$/gim, '')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
     .trim();
 }
 
@@ -3947,6 +4066,170 @@ export default {
         })();
       }
 
+      /* ═══════════════════════════════════════════════════════════════
+         AI แบบสตรีม — ส่งความคิดออกมาสด ๆ ระหว่างที่กำลังคิด
+         ───────────────────────────────────────────────────────────────
+         ของเดิมรอจนคิดเสร็จแล้วค่อยส่งทีเดียว ผู้ใช้จึงเห็นความคิด
+         ตอนที่มันคิดจบไปแล้ว ซึ่งไม่มีประโยชน์
+         ตรงนี้ทำงานเตรียมข้อมูลให้เสร็จก่อน (ดูรูป / ค้นเน็ต) แล้วค่อย
+         เรียกโมเดลรอบเดียวแบบสตรีม จึงได้ทั้งความคิดสด ๆ และเร็วขึ้นด้วย
+         เพราะไม่ต้องวนเรียกโมเดลหลายรอบเหมือนลูป ReAct เดิม
+         ═══════════════════════════════════════════════════════════════ */
+      if (url.pathname === '/api/ai/stream' && request.method === 'POST') {
+        return await guarded('user', async (actor) => {
+          const maintenance = await getConfig(env, 'maintenance', { enabled: false });
+          if (maintenance.enabled && rank(actor.role) < rank('moderator')) return deny('maintenance', 503);
+          const body = await readBody();
+          if (!body) return deny('Invalid JSON body', 400);
+          try { validateContents(body.contents); }
+          catch (e) { return deny(e.message, 400); }
+
+          const uid = actor.payload.sub;
+          if (rank(actor.role) < rank('admin')) {
+            const q = await quotaState(env, uid, actor.role);
+            if (q.used >= q.limit) return json({ error: 'quota', quota: q }, 429);
+          }
+
+          const { readable, writable } = new TransformStream();
+          const writer = writable.getWriter();
+          const enc = new TextEncoder();
+          const send = async (obj) => {
+            try { await writer.write(enc.encode('data: ' + JSON.stringify(obj) + '\n\n')) } catch (e) {}
+          };
+
+          /* งานหลักทำเบื้องหลัง ปล่อยให้ตอบกลับทันทีเพื่อให้สตรีมเริ่มไหลเลย */
+          const work = (async () => {
+            const meter = newMeter();
+            try {
+              /* ── รวบรวมบริบท ── */
+              await send({ type: 'status', key: 'context', text: 'กำลังดูข้อมูลรถและประวัติของคุณ' });
+
+              let carInfo = { make: '', model: '', year: '', mileage: '' };
+              if (body.carId && env.DB) {
+                try {
+                  const car = await env.DB.prepare(
+                    'SELECT make, model, year, mileage FROM cars WHERE id = ? AND uid = ?')
+                    .bind(String(body.carId), uid).first();
+                  if (car) carInfo = car;
+                } catch (e) {}
+                if (!carInfo.make && !carInfo.model) {
+                  try {
+                    const gar = await stateOf(env, uid, 'garage');
+                    const c = Array.isArray(gar) ? gar.find(x => x && String(x.id) === String(body.carId)) : null;
+                    if (c) carInfo = { make: c.make || '', model: c.model || c.name || '',
+                                       year: c.year != null ? String(c.year) : '',
+                                       mileage: c.mileage != null ? String(c.mileage) : '' };
+                  } catch (e) {}
+                }
+              }
+              if (!carInfo.make && !carInfo.model) {
+                carInfo = { make: String(body.make || '').slice(0, 60), model: String(body.model || '').slice(0, 60),
+                            year: String(body.year || '').slice(0, 8), mileage: String(body.mileage || '').slice(0, 12) };
+              }
+
+              const msgs = body.contents || [];
+              const last = msgs.length ? msgs[msgs.length - 1] : null;
+              const question = (last && last.parts) ? last.parts.map(x => x.text || '').join(' ').trim() : '';
+              const hasMedia = msgs.some(m => m.parts && m.parts.some(x => x.inline_data));
+
+              const prefs = await getChatPrefs(env, uid);
+              const activeStyle = (body.style && (CHAT_STYLES[body.style] || body.style === 'custom'))
+                ? body.style : prefs.style;
+              const activeCustom = body.customStyle !== undefined ? String(body.customStyle) : prefs.customStyle;
+
+              const [userBlock, kbBlock, skillBlock] = await Promise.all([
+                userContext(env, uid, body.carId, { userName: body.userName }),
+                kbFor(env, carInfo, question),
+                skillsPrompt(env, uid, body.skillIds),
+              ]);
+
+              /* ── ดูรูป/วิดีโอที่แนบมา ── */
+              let mediaBlock = '';
+              if (hasMedia) {
+                await send({ type: 'status', key: 'media', text: 'กำลังดูรูปที่แนบมา' });
+                try {
+                  const desc = await executeDescribeMediaTool(env, msgs,
+                    'อธิบายสิ่งที่เห็นในสื่อนี้อย่างละเอียด เน้นรายละเอียดที่เกี่ยวกับสภาพรถ ความเสียหาย รอยรั่ว หรือตัวเลขที่อ่านได้');
+                  if (desc) mediaBlock = '\n\n[สิ่งที่เห็นในไฟล์ที่ผู้ใช้แนบมา]\n' + String(desc).slice(0, 4000);
+                } catch (e) { console.error('[stream media]', e) }
+              }
+
+              /* ── ค้นข้อมูลสด ── */
+              let freshBlock = '';
+              if (question && needsFresh(question)) {
+                await send({ type: 'status', key: 'search', text: 'กำลังค้นข้อมูลล่าสุดจากอินเทอร์เน็ต' });
+                try {
+                  const carName = [carInfo.make, carInfo.model].filter(Boolean).join(' ');
+                  const found = await executeGoogleSearchTool(env,
+                    carName ? `${question.slice(0, 180)} (บริบท: ${carName})` : question.slice(0, 180));
+                  if (found && found.length > 20) {
+                    freshBlock = '\n\n[ข้อมูลสดจากอินเทอร์เน็ต ณ ตอนนี้ — เชื่อชุดนี้ก่อนความจำของคุณเสมอ]\n'
+                      + found.slice(0, 4000)
+                      + '\n\nวิธีใช้: เรียบเรียงใหม่ด้วยคำของคุณเอง ห้ามคัดลอกทั้งก้อน ห้ามใส่ลิงก์หรือเลขเชิงอรรถ '
+                      + 'ห้ามเขียนว่า "จากข้อมูลที่ค้นมา" และห้ามยืนยันว่าสิ่งที่ผู้ใช้ถามถึงไม่มีอยู่จริง';
+                  }
+                } catch (e) { console.error('[stream search]', e) }
+              }
+
+              await send({ type: 'status', key: 'think', text: 'กำลังเรียบเรียงคำตอบ' });
+
+              const carContext = (carInfo.make || carInfo.model)
+                ? `\nรถของผู้ใช้: ${carInfo.make || ''} ${carInfo.model || ''} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` : '';
+              const sys = `${IDENTITY}
+
+${STREAM_TALK}
+${carContext ? `\n[รถที่กำลังคุยถึง]${carContext}` : ''}${userBlock}${mediaBlock}${freshBlock}${kbBlock}${skillBlock}${askBlockText()}${stylePrompt(activeStyle, activeCustom)}`;
+
+              const history = msgs.map(m => {
+                const o = { role: m.role === 'user' ? 'user' : 'assistant', content: '' };
+                (m.parts || []).forEach(x => {
+                  if (x.text) o.content += x.text;
+                  if (x.inline_data) o.content += ' [ผู้ใช้แนบไฟล์สื่อมาด้วย ดูคำอธิบายในคำสั่งระบบ]';
+                });
+                return o;
+              });
+
+              const full = await streamModel(env, [{ role: 'system', content: sys }, ...history], meter, send);
+
+              /* ── เก็บกวาดหลังจบ ── */
+              const text = cleanReply(full.text || '');
+              await send({ type: 'text_done', text });
+
+              let usage = null;
+              try {
+                await meterTokens(env, uid, meter);
+                usage = Object.assign({ cost: meter.in + meter.out, in: meter.in, out: meter.out, src: meter.src },
+                                      await quotaState(env, uid, actor.role));
+              } catch (e) {}
+              await send({ type: 'done', usage });
+
+              try {
+                if (!hasMedia && !(body.skillIds && body.skillIds.length) && !needsFresh(question))
+                  await cacheSave(env, carInfo, question, text);
+                await rememberTurn(env, uid, body.carId, question, text);
+                const day = new Date().toISOString().slice(0, 10);
+                await env.DB.prepare(`
+                  INSERT INTO chat_logs (uid, car_id, prompt, response, in_tok, out_tok, total_tok, model, day, created_at)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                `).bind(uid, body.carId || null, question.slice(0, 4000), text.slice(0, 8000),
+                  meter.in, meter.out, meter.in + meter.out,
+                  (meter.src && meter.src.join(',')) || 'stream', day, Date.now()).run();
+              } catch (e) { console.error('[stream save]', e) }
+            } catch (err) {
+              console.error('[stream]', err);
+              await send({ type: 'error', message: String((err && err.message) || err).slice(0, 200) });
+            }
+            try { await writer.close() } catch (e) {}
+          })();
+          ctx.waitUntil(work);
+
+          return new Response(readable, {
+            headers: { ...cors, 'Content-Type': 'text/event-stream; charset=utf-8',
+                       'Cache-Control': 'no-cache', 'Connection': 'keep-alive' },
+          });
+        })();
+      }
+
       /* ===== AI PROXY (login required, quota enforced) ===== */
       if (url.pathname === '/api/ai/chat' && request.method === 'POST') {
         return await guarded('user', async (actor) => {
@@ -4061,7 +4344,11 @@ export default {
                 if (found && found.length > 20) {
                   freshBlock = '\n\n[ข้อมูลสดจากอินเทอร์เน็ต ณ ตอนนี้ — เชื่อข้อมูลชุดนี้ก่อนความจำของคุณเสมอ]\n'
                     + found.slice(0, 4000)
-                    + '\nถ้าข้อมูลชุดนี้ขัดกับสิ่งที่คุณจำได้ ให้ยึดชุดนี้ และห้ามยืนยันว่าสิ่งที่ผู้ใช้ถามถึงไม่มีอยู่จริง';
+                    + '\n\nวิธีใช้ข้อมูลชุดนี้:'
+                    + '\n- ถ้าขัดกับสิ่งที่คุณจำได้ ให้ยึดชุดนี้ และห้ามยืนยันว่าสิ่งที่ผู้ใช้ถามถึงไม่มีอยู่จริง'
+                    + '\n- เรียบเรียงใหม่ด้วยคำของคุณเอง ห้ามคัดลอกข้อความชุดนี้ทั้งก้อนไปเป็นคำตอบ'
+                    + '\n- ห้ามใส่ลิงก์ ห้ามใส่เลขเชิงอรรถ ห้ามเขียนว่า "จากข้อมูลที่ค้นมา"'
+                    + '\n- ตอบเหมือนคุณรู้เรื่องนี้อยู่แล้ว บอกเนื้อหาไปตรง ๆ';
                 }
               } catch (e) { console.error('[fresh search]', e) }
             }
