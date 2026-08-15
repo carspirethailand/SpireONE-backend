@@ -3533,6 +3533,43 @@ export default {
         })();
       }
 
+      /* นำเข้าความรู้ทีละหลายชิ้น ใช้กับไฟล์ชุดความรู้ที่เตรียมไว้
+         หัวข้อซ้ำจะเขียนทับของเดิม จะได้กดนำเข้าซ้ำได้โดยไม่มีของซ้ำงอก */
+      if (url.pathname === '/api/kb/bulk' && request.method === 'POST') {
+        return await guarded('moderator', async (actor) => {
+          const b = (await readBody()) || {};
+          const items = Array.isArray(b.items) ? b.items : [];
+          if (!items.length) return deny('ไม่มีรายการให้นำเข้า', 400);
+          const now = Date.now();
+          let added = 0, updated = 0, skipped = 0;
+          for (const it of items.slice(0, 300)) {
+            const title = String((it && it.title) || '').trim();
+            const body2 = String((it && it.body) || '').trim();
+            if (title.length < 3 || body2.length < 10) { skipped++; continue }
+            const make = String(it.make || '').toLowerCase().slice(0, 60);
+            const model = String(it.model || '').toLowerCase().slice(0, 60);
+            try {
+              const old = await env.DB.prepare(
+                'SELECT id FROM kb WHERE title = ? AND make = ? AND model = ?'
+              ).bind(title.slice(0, 200), make, model).first();
+              const id = (old && old.id) || 'kb_' + now.toString(36) + Math.random().toString(36).slice(2, 7);
+              await env.DB.prepare(`
+                INSERT INTO kb (id, title, body, keywords, make, model, author, enabled, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  title = excluded.title, body = excluded.body, keywords = excluded.keywords,
+                  make = excluded.make, model = excluded.model, updated_at = excluded.updated_at
+              `).bind(id, title.slice(0, 200), body2.slice(0, 8000),
+                String(it.keywords || '').slice(0, 400), make, model,
+                actor.email || '', now, now).run();
+              if (old) updated++; else added++;
+            } catch (e) { console.error('[kb bulk]', e); skipped++ }
+          }
+          await logAudit(env, actor.email, 'kb.bulk', String(items.length), `+${added} ~${updated} x${skipped}`);
+          return json({ ok: true, added, updated, skipped });
+        })();
+      }
+
       if (url.pathname.startsWith('/api/kb/') && request.method === 'DELETE') {
         return await guarded('moderator', async (actor) => {
           const id = url.pathname.split('/').pop();
