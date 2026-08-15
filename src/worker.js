@@ -695,9 +695,11 @@ function validateContents(contents) {
     for (const p of m.parts) {
       if (typeof p.text === 'string') {
         if (p.text.length > 24000) throw new Error('Message too long');
-      } else if (p.inline_data) {
-        const d = p.inline_data;
-        if (typeof d.mime_type !== 'string' || !/^(image|video|audio)\//.test(d.mime_type)) throw new Error('Invalid media type');
+      } else if (p.inline_data || p.inlineData) {
+        const d = p.inline_data || p.inlineData;
+        const rawMime = d.mime_type || d.mimeType || '';
+        const mime = String(rawMime).split(';')[0].trim().toLowerCase();
+        if (typeof mime !== 'string' || !/^(image|video|audio)\//.test(mime)) throw new Error('Invalid media type');
         if (typeof d.data !== 'string' || d.data.length > 15000000) throw new Error('Media too large');
       } else {
         throw new Error('Invalid part');
@@ -1644,11 +1646,21 @@ async function executeDescribeMediaTool(env, messages, prompt) {
   messages.forEach(m => {
     if (m.parts && Array.isArray(m.parts)) {
       m.parts.forEach(p => {
-        if (p.inline_data) {
+        const d = p.inline_data || p.inlineData;
+        if (d && d.data) {
+          let cleanB64 = String(d.data).trim();
+          if (cleanB64.includes(',')) cleanB64 = cleanB64.split(',')[1];
+          cleanB64 = cleanB64.replace(/[\r\n\s]/g, '');
+
+          let cleanMime = String(d.mime_type || d.mimeType || 'image/jpeg').split(';')[0].trim().toLowerCase();
+          if (!cleanMime || cleanMime === 'undefined' || !cleanMime.includes('/')) {
+            cleanMime = 'image/jpeg';
+          }
+
           parts.push({
-            inline_data: {
-              mime_type: p.inline_data.mime_type,
-              data: p.inline_data.data
+            inlineData: {
+              mimeType: cleanMime,
+              data: cleanB64
             }
           });
         }
