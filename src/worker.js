@@ -1281,6 +1281,25 @@ async function rememberTurn(env, uid, carId, question, answer) {
   } catch (e) { console.error('[rememberTurn]', e) }
 }
 
+/* ── คำถามแบบไหนที่ห้ามตอบจากความจำของโมเดล ──
+   โมเดลฟรีมีความรู้ถึงแค่วันที่เทรน ถามรถรุ่นที่เพิ่งเปิดตัวมันจะยืนยันว่า "ไม่มีรุ่นนี้"
+   ซึ่งแย่กว่าการบอกว่าไม่รู้ เพราะผู้ใช้เชื่อไปแล้ว
+   ปล่อยให้โมเดลตัดสินใจเรียกเครื่องมือเองไม่ได้ผล มันมักคิดว่ารู้อยู่แล้ว
+   จึงต้องดักจากคำถามแล้วไปค้นมาให้ก่อนเสมอ */
+const FRESH_WORDS = [
+  'ล่าสุด','ใหม่ล่าสุด','รุ่นใหม่','เพิ่งเปิดตัว','เปิดตัว','ปีนี้','ตอนนี้','ปัจจุบัน',
+  'ข่าว','ราคา','กี่บาท','เท่าไหร่','เท่าไร','โปรโมชั่น','ส่วนลด','สเปก','สเป็ค',
+  'latest','newest','new model','just launched','launch','price','how much','news','spec','2025','2026','2027',
+];
+function needsFresh(q) {
+  const t = String(q || '').toLowerCase();
+  if (!t) return false;
+  if (FRESH_WORDS.some(w => t.includes(w))) return true;
+  /* มีปี พ.ศ. หรือ ค.ศ. ล่าสุดอยู่ในคำถาม */
+  if (/\b(20[2-9]\d|25[6-9]\d)\b/.test(t)) return true;
+  return false;
+}
+
 async function runReActAgent(env, carInfo, messages, meter, style, customStyle, skillPrompt, extra) {
   const carContext = (carInfo.make || carInfo.model) 
     ? `\nรถของผู้ใช้: ${carInfo.make || ''} ${carInfo.model || ''} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` 
@@ -1295,6 +1314,7 @@ async function runReActAgent(env, carInfo, messages, meter, style, customStyle, 
   const ex = extra || {};
   const userBlock = ex.user || '';
   const kbBlock = ex.kb || '';
+  const freshBlock = ex.fresh || '';
   /* ── ถามกลับผู้ใช้เป็นแบบฟอร์ม ──
      ถ้าโมเดลอยากรู้อะไรเพิ่ม ให้ตอบเป็นบล็อกนี้แทนการเขียนคำถามลอย ๆ
      หน้าเว็บจะแปลงเป็นกล่องให้กดเลือกหรือพิมพ์ แล้วส่งกลับมาให้เอง */
@@ -1361,7 +1381,7 @@ Action: [เรียกเครื่องมือหนึ่งอย่�
 สำคัญ:
 - คำทักทายหรือคำถามทั่วไป ตอบ Final Answer ทันที ห้ามเรียกเครื่องมือและห้ามเขียน Thought
 - ถ้ามีไฟล์แนบมา ต้องเรียก describe_media ก่อนเสมอ
-- ข้อความหลัง "Final Answer:" คือสิ่งที่ผู้ใช้จะเห็น อย่าใส่ร่องรอยการคิดลงไป${kbBlock}${appliedSkills}${askBlock}${appliedStylePrompt}`;
+- ข้อความหลัง "Final Answer:" คือสิ่งที่ผู้ใช้จะเห็น อย่าใส่ร่องรอยการคิดลงไป${freshBlock}${kbBlock}${appliedSkills}${askBlock}${appliedStylePrompt}`;
 
   const chatHistory = messages.map(m => {
     const o = { role: m.role === "user" ? "user" : "assistant", content: "" };
@@ -1407,7 +1427,14 @@ Action: [เรียกเครื่องมือหนึ่งอย่�
 
     agentLog.push({ role: "assistant", content: completionText });
 
-    const actionMatch = completionText.match(/Action:\s*(\w+)\s*\((["'])(.*?)\2\)/i);
+    /* ของเดิมบังคับว่าต้องมีเครื่องหมายคำพูดตรงเป๊ะ โมเดลฟรีมักเขียนไม่ตรงรูปแบบ
+       เช่นใช้ backtick อัญประกาศไทย หรือไม่ใส่คำพูดเลย แล้วเครื่องมือก็ไม่ถูกเรียก
+       ยอมรับหลายรูปแบบ จะได้ไม่พลาดเพราะเรื่องเครื่องหมาย */
+    let actionMatch = completionText.match(/Action:\s*(\w+)\s*\(\s*(["'`\u201c\u2018])([\s\S]*?)\2\s*\)/i);
+    if (!actionMatch) {
+      const loose = completionText.match(/Action:\s*(\w+)\s*\(([^)]*)\)/i);
+      if (loose) actionMatch = [loose[0], loose[1], '"', loose[2].replace(/^["'`\u201c\u2018]|["'`\u201d\u2019]$/g, '').trim()];
+    }
     
     if (actionMatch) {
       const toolName = actionMatch[1].toLowerCase();
@@ -4002,7 +4029,8 @@ export default {
                ไม่เรียกโมเดลเลย จึงไม่หักโควตาสักหน่วย
                ข้ามขั้นนี้ถ้ามีไฟล์แนบ เพราะต้องดูของจริงทุกครั้ง
                หรือผู้ใช้เลือกสกิลไว้ เพราะคำสั่งเปลี่ยนคำตอบ */
-            if (!hasMedia && !(body.skillIds && body.skillIds.length) && body.fresh !== true) {
+            if (!hasMedia && !(body.skillIds && body.skillIds.length) && body.fresh !== true
+                && !needsFresh(question)) {
               const hit = await cacheLookup(env, carInfo, question);
               if (hit) {
                 try {
@@ -4020,14 +4048,31 @@ export default {
               userContext(env, actor.payload.sub, body.carId, { userName: body.userName }),
               kbFor(env, carInfo, question),
             ]);
+
+            /* ── ค้นข้อมูลสดมาให้ก่อน ถ้าคำถามเป็นเรื่องที่ความจำโมเดลตามไม่ทัน ──
+               ไม่รอให้โมเดลตัดสินใจเรียกเครื่องมือเอง เพราะมันมักคิดว่ารู้อยู่แล้ว
+               แล้วตอบผิดอย่างมั่นใจ เช่นยืนยันว่ารถรุ่นที่เพิ่งเปิดตัวไม่มีอยู่จริง */
+            let freshBlock = '';
+            if (question && needsFresh(question)) {
+              try {
+                const carName = [carInfo.make, carInfo.model].filter(Boolean).join(' ');
+                const q = question.length > 180 ? question.slice(0, 180) : question;
+                const found = await executeGoogleSearchTool(env, carName ? `${q} (บริบท: ${carName})` : q);
+                if (found && found.length > 20) {
+                  freshBlock = '\n\n[ข้อมูลสดจากอินเทอร์เน็ต ณ ตอนนี้ — เชื่อข้อมูลชุดนี้ก่อนความจำของคุณเสมอ]\n'
+                    + found.slice(0, 4000)
+                    + '\nถ้าข้อมูลชุดนี้ขัดกับสิ่งที่คุณจำได้ ให้ยึดชุดนี้ และห้ามยืนยันว่าสิ่งที่ผู้ใช้ถามถึงไม่มีอยู่จริง';
+                }
+              } catch (e) { console.error('[fresh search]', e) }
+            }
             const agentOut = await runReActAgent(env, carInfo, body.contents, meter,
                                                 activeStyle, activeCustomStyle, skillPrompt,
-                                                { user: userBlock, kb: kbBlock });
+                                                { user: userBlock, kb: kbBlock, fresh: freshBlock });
             const text = (agentOut && agentOut.text) || '';
             const reasoning = (agentOut && agentOut.reasoning) || '';
             /* เก็บไว้ตอบซ้ำครั้งหน้า และจำไว้ว่าเคยคุยเรื่องนี้กัน */
             try {
-              if (!hasMedia && !(body.skillIds && body.skillIds.length))
+              if (!hasMedia && !(body.skillIds && body.skillIds.length) && !needsFresh(question))
                 await cacheSave(env, carInfo, question, text);
               await rememberTurn(env, actor.payload.sub, body.carId, question, text);
             } catch (e) { console.error('[learn]', e) }
