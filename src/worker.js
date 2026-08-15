@@ -789,19 +789,52 @@ async function callReasoningModel(env, messages, meter) {
         readUsage(meter, data, 'openrouter');
         const msg = (data.choices && data.choices[0] && data.choices[0].message) || {};
         let content = (typeof msg.content === 'string' && msg.content.trim()) ? msg.content.trim() : '';
+        /* โมเดลตระกูลนี้ส่งกระบวนการคิดมาแยกใน msg.reasoning
+           ของเดิมพอ content ว่างก็หยิบ reasoning มาใช้เป็นคำตอบเลย
+           ผู้ใช้จึงเห็นบทที่โมเดลคิดกับตัวเองเต็ม ๆ แทนคำตอบจริง
+           ตอนนี้แยกกันเด็ดขาด ความคิดคือความคิด คำตอบคือคำตอบ */
+        const reasoning = String(msg.reasoning || msg.reasoning_content || '').trim();
 
-        // OpenRouter open-weights reasoning models (e.g. gpt-oss-20b:free) return reasoning in msg.reasoning
-        if (!content) {
-          const reasoningText = String(msg.reasoning || msg.reasoning_content || '').trim();
-          if (reasoningText) {
-            console.log(`[OpenRouter] Extracted content from message.reasoning: ${reasoningText.slice(0, 120)}`);
-            content = reasoningText;
-          }
+        if (!content && reasoning) {
+          /* ไม่มีคำตอบ แต่พอมีความคิด — ลองหา Final Answer ที่ซ่อนอยู่ในนั้นก่อน */
+          const fa = reasoning.match(/Final Answer:\s*([\s\S]+)$/i);
+          if (fa) content = fa[1].trim();
         }
 
         if (content) {
           console.log(`[OpenRouter] Success! Generated content length: ${content.length}`);
-          return content;
+          return { text: content, reasoning };
+        }
+        if (reasoning) {
+          /* ยังไม่ได้คำตอบจริง ขอใหม่อีกรอบโดยสั่งให้ตอบอย่างเดียว
+             ถูกกว่าและเร็วกว่าการปล่อยความคิดดิบ ๆ ออกไปให้ผู้ใช้อ่าน */
+          console.warn('[OpenRouter] ได้แต่ความคิด ไม่มีคำตอบ — ขอใหม่แบบสั้น');
+          try {
+            const again = await fetchWithRetry(url, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${env.OPENROUTER_API_KEY}`,
+                'HTTP-Referer': 'https://carspirethailand.com',
+                'X-Title': 'Cendon',
+              },
+              body: JSON.stringify({
+                model,
+                messages: messages.concat([
+                  { role: 'assistant', content: '(กำลังคิด)' },
+                  { role: 'user', content: 'ตอบผู้ใช้ได้เลย เขียนเฉพาะคำตอบสุดท้ายอย่างเดียว ขึ้นต้นด้วย "Final Answer:" ห้ามอธิบายกระบวนการคิด' },
+                ]),
+                temperature: 0.3,
+              }),
+            });
+            if (again.ok) {
+              const d2 = JSON.parse(await again.text());
+              readUsage(meter, d2, 'openrouter');
+              const m2 = (d2.choices && d2.choices[0] && d2.choices[0].message) || {};
+              const c2 = (typeof m2.content === 'string' ? m2.content : '').trim();
+              if (c2) return { text: c2, reasoning };
+            }
+          } catch (e) { console.error('[OpenRouter retry]', e) }
         }
         console.warn(`[OpenRouter] Empty content & reasoning in choices payload:`, JSON.stringify(data));
       } else {
@@ -819,7 +852,7 @@ async function callReasoningModel(env, messages, meter) {
 
   console.log(`[AI Reasoning] Attempting fallback via Cloudflare Workers AI...`);
   try {
-    return await callWorkersAI(env, messages, meter);
+    return { text: await callWorkersAI(env, messages, meter), reasoning: '' };
   } catch (err) {
     console.error(`[Cloudflare Workers AI Fallback Failed]: ${err.message}`);
     throw new Error(`Reasoning failure (OpenRouter failed & Cloudflare Workers AI fallback failed: ${err.message})`);
@@ -1353,6 +1386,9 @@ Action: [เรียกเครื่องมือหนึ่งอย่�
   ];
 
   let step = 0;
+  /* เก็บกระบวนการคิดของทุกรอบไว้ ส่งกลับให้หน้าเว็บแสดงเป็นบล็อกที่กดดูได้
+     ไม่ใช่เอามาปนกับคำตอบเหมือนเดิม */
+  const thoughts = [];
   const hasMedia = messages.some(m => m.parts && Array.isArray(m.parts) && m.parts.some(p => p.inline_data));
   let mediaProcessed = false;
   const maxSteps = 3;
@@ -1362,7 +1398,9 @@ Action: [เรียกเครื่องมือหนึ่งอย่�
     
     let completionText;
     try {
-      completionText = await callReasoningModel(env, agentLog, meter);
+      const r = await callReasoningModel(env, agentLog, meter);
+      completionText = (r && typeof r === 'object') ? (r.text || '') : String(r || '');
+      if (r && r.reasoning) thoughts.push(r.reasoning);
     } catch (err) {
       throw new Error(`ReAct reasoning failure: ${err.message}`);
     }
@@ -1402,16 +1440,15 @@ Action: [เรียกเครื่องมือหนึ่งอย่�
       agentLog.push({ role: "user", content: `Observation: ${observation}` });
     } else {
       const finalAnswerMatch = completionText.match(/Final Answer:\s*([\s\S]+)$/i);
-      if (finalAnswerMatch) {
-        return cleanReply(finalAnswerMatch[1]);
-      }
-      return cleanReply(completionText);
+      const out = cleanReply(finalAnswerMatch ? finalAnswerMatch[1] : completionText);
+      return { text: out, reasoning: thoughts.join('\n\n').slice(0, 6000) };
     }
   }
 
   const lastText = agentLog[agentLog.length - 1].content;
   const finalAnswerMatch = lastText.match(/Final Answer:\s*([\s\S]+)$/i);
-  return cleanReply(finalAnswerMatch ? finalAnswerMatch[1] : lastText);
+  return { text: cleanReply(finalAnswerMatch ? finalAnswerMatch[1] : lastText),
+           reasoning: thoughts.join('\n\n').slice(0, 6000) };
 }
 
 /* ── เก็บกวาดคำตอบก่อนส่งให้ผู้ใช้ ──
@@ -3946,9 +3983,11 @@ export default {
               userContext(env, actor.payload.sub, body.carId, { userName: body.userName }),
               kbFor(env, carInfo, question),
             ]);
-            const text = await runReActAgent(env, carInfo, body.contents, meter,
-                                             activeStyle, activeCustomStyle, skillPrompt,
-                                             { user: userBlock, kb: kbBlock });
+            const agentOut = await runReActAgent(env, carInfo, body.contents, meter,
+                                                activeStyle, activeCustomStyle, skillPrompt,
+                                                { user: userBlock, kb: kbBlock });
+            const text = (agentOut && agentOut.text) || '';
+            const reasoning = (agentOut && agentOut.reasoning) || '';
             /* เก็บไว้ตอบซ้ำครั้งหน้า และจำไว้ว่าเคยคุยเรื่องนี้กัน */
             try {
               if (!hasMedia && !(body.skillIds && body.skillIds.length))
@@ -3976,7 +4015,7 @@ export default {
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
               `).bind(actor.payload.sub, body.carId || null, promptText.slice(0, 4000), text.slice(0, 8000), meter.in, meter.out, (meter.in + meter.out), modelName, day, now).run();
             } catch (e) { console.error('[meter/chat_logs] write failed', e); }
-            return json({ text, usage });
+            return json({ text, reasoning, usage });
           } catch (err) {
             console.error('[AI Chat Route Error]:', err);
             return deny(err.message || 'AI processing error', 500);
