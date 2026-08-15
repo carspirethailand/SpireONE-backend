@@ -972,7 +972,14 @@ const IDENTITY = `[ฉันคือใคร — ข้อมูลนี้�
 ห้ามเรียกตัวเองว่า SpireONE ชื่อนั้นเป็นชื่อเดิมที่เลิกใช้แล้ว
 ห้ามบอกว่าเป็นโมเดลของ OpenAI, Google, Meta หรือเจ้าอื่นใด และห้ามบอกชื่อรุ่นโมเดลเบื้องหลัง
 ถ้าถูกถามเรื่องนี้ ตอบสั้น ๆ ว่าเป็น ${BRAND.ai} ของ ${BRAND.company} พอ
-ห้ามแต่งข้อมูลบริษัท ทีมงาน ราคา หรือแผนอนาคตขึ้นมาเอง ไม่รู้ก็บอกว่าไม่ทราบ`;
+ห้ามแต่งข้อมูลบริษัท ทีมงาน ราคา หรือแผนอนาคตขึ้นมาเอง ไม่รู้ก็บอกว่าไม่ทราบ
+
+[กฎเหล็กเรื่องความถูกต้อง]
+ห้ามแต่งข้อมูลขึ้นมาเองเด็ดขาด โดยเฉพาะ ชื่อรุ่นรถ ตัวเลขสเปก แรงม้า ราคา วันเปิดตัว และปีรุ่น
+ถ้าไม่มีข้อมูลยืนยัน ให้บอกตรง ๆ ว่า "ยังไม่มีข้อมูลยืนยันเรื่องนี้" แล้วเสนอสิ่งที่ช่วยได้จริงแทน
+การตอบว่าไม่รู้ ถือว่าถูกต้องเสมอ ส่วนการเดาแล้วพูดเหมือนรู้จริง ถือว่าผิดร้ายแรงที่สุด
+ห้ามพูดถึงเครื่องมือหรือระบบเบื้องหลัง เช่น google_search, describe_media, การค้นเว็บ หรือชื่อผู้ให้บริการใด ๆ
+ผู้ใช้ไม่ต้องรู้ว่าคำตอบมาจากไหน ให้เล่าเนื้อหาไปตรง ๆ เหมือนคุณรู้เรื่องนี้อยู่แล้ว`;
 
 const CHAT_STYLES = {
   precise: {
@@ -1465,10 +1472,11 @@ async function runReActAgent(env, carInfo, messages, meter, style, customStyle, 
 ${talkRules}
 ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext}` : ''}${userBlock}
 
-[เครื่องมือ]
+[เครื่องมือภายใน — ห้ามเอ่ยชื่อให้ผู้ใช้เห็นเด็ดขาด]
 ใช้เมื่อจำเป็นเท่านั้น ถ้าตอบได้เองอยู่แล้วไม่ต้องเรียก
-1. describe_media(prompt) — ให้ระบบดูไฟล์ภาพ วิดีโอ หรือเสียงที่แนบมาแล้วอธิบายกลับมา
-2. google_search(query) — ค้นข้อมูลที่ต้องการความสดใหม่ เช่น ราคาปัจจุบัน ข่าว สเปกรุ่นใหม่
+1. describe_media(prompt) — ดูไฟล์ภาพ วิดีโอ หรือเสียงที่แนบมา
+2. google_search(query) — ค้นข้อมูลที่ต้องการความสดใหม่
+ห้ามพูดถึงชื่อเครื่องมือเหล่านี้ในคำตอบ และห้ามบอกผู้ใช้ว่ากำลังค้นเว็บอยู่
 
 [รูปแบบการตอบ]
 ถ้าไม่ต้องใช้เครื่องมือ ให้ตอบด้วยบรรทัดเดียวว่า
@@ -1589,10 +1597,25 @@ function cleanReply(t) {
   if (fa) x = fa[1];
   x = x
     .replace(/https?:\/\/\S*(vertexaisearch|grounding-api-redirect)\S*/gi, '')
+    /* ชื่อเครื่องมือเบื้องหลังไม่ควรหลุดถึงผู้ใช้
+       ตัดทั้งบรรทัดที่เอ่ยถึง ไม่ใช่ตัดแค่ชื่อ ไม่งั้นจะเหลือประโยคขาดวิ่น */
+    .replace(/^.*\b(google_search|google_search_retrieval|describe_media)\b.*$/gim, '')
+    .replace(/^.*(Google Search|กูเกิลเสิร์ช|ค้นหาจากเว็บ|ค้นเว็บให้แล้ว).*$/gim, '')
     .replace(/^\s*(Thought|Action|Observation|Reasoning)\s*:.*$/gim, '')
     .replace(/^\s*```(?:\w+)?\s*$/gm, '')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+  /* ถ้าตัดจนไม่เหลืออะไรเลย แปลว่าทั้งคำตอบพูดถึงแต่เครื่องมือ
+     ส่งข้อความว่างให้ผู้ใช้ไม่ได้ ให้ตัดแบบเบาแทน เอาแค่ลิงก์กับร่องรอยการคิดออก */
+  if (!x) {
+    x = String(t || '')
+      .replace(/Final Answer:\s*/i, '')
+      .replace(/https?:\/\/\S*(vertexaisearch|grounding-api-redirect)\S*/gi, '')
+      .replace(/^\s*(Thought|Action|Observation|Reasoning)\s*:.*$/gim, '')
+      .replace(/\b(google_search|google_search_retrieval|describe_media)\b/gi, 'ระบบค้นข้อมูล')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
   return x;
 }
 
@@ -1662,54 +1685,56 @@ async function executeDescribeMediaTool(env, messages, prompt) {
   throw lastErr || new Error('Failed to analyze media file with Gemini API');
 }
 
+/* ── ค้นเน็ตผ่าน Gemini ──
+   ของเดิมยิงโมเดลเดียวแล้วโยน error ทิ้งเมื่อพลาด ผลคือฝั่งเรียกได้ค่าว่าง
+   แล้วปล่อยให้โมเดลตอบจากความจำ ซึ่งกลายเป็นมั่วอย่างมั่นใจ
+   ตอนนี้ไล่ลองหลายโมเดลและรูปแบบเครื่องมือทั้งสองแบบ
+   ถ้าไม่ได้จริง ๆ จะคืนค่าว่างพร้อมบอกผู้เรียกให้จัดการอย่างซื่อสัตย์ */
 async function executeGoogleSearchTool(env, query) {
   const geminiKey = env.GEMINI_KEY;
-  if (!geminiKey) {
-    throw new Error('GEMINI_KEY environment variable is not configured');
+  if (!geminiKey) { console.warn('[search] ไม่มี GEMINI_KEY'); return '' }
+  const baseUrl = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
+  /* เรียงจากที่น่าจะรองรับการค้นดีที่สุด ถ้าตัวไหนไม่มีจริงจะข้ามไปตัวถัดไปเอง */
+  const models = [];
+  if (env.GEMINI_SEARCH_MODEL) models.push(env.GEMINI_SEARCH_MODEL);
+  models.push('gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash');
+  if (env.GEMINI_MODEL && !models.includes(env.GEMINI_MODEL)) models.push(env.GEMINI_MODEL);
+
+  const prompt = `ค้นข้อมูลล่าสุดในอินเทอร์เน็ตเรื่องนี้แล้วสรุปข้อเท็จจริงที่ยืนยันได้: ${query}
+ถ้าค้นแล้วไม่พบข้อมูลที่ยืนยันได้จริง ให้ตอบว่า "ไม่พบข้อมูลยืนยัน" เท่านั้น ห้ามเดาและห้ามแต่งขึ้นมาเอง`;
+
+  for (const model of models) {
+    for (const toolShape of [{ google_search: {} }, { google_search_retrieval: {} }]) {
+      try {
+        const res = await fetch(`${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            tools: [toolShape],
+            generationConfig: { temperature: 0.2 },
+          }),
+        });
+        if (!res.ok) {
+          console.warn(`[search] ${model} ตอบ ${res.status}`);
+          continue;
+        }
+        const data = await res.json();
+        const cand = (data.candidates && data.candidates[0]) || {};
+        const txt = cleanSearch(((cand.content && cand.content.parts) || [])
+          .map(x => x.text || '').join('').trim());
+        if (txt && !/^ไม่พบข้อมูลยืนยัน/.test(txt)) {
+          console.log(`[search] สำเร็จด้วย ${model}`);
+          return txt;
+        }
+        if (/^ไม่พบข้อมูลยืนยัน/.test(txt)) return '';
+      } catch (e) {
+        console.warn(`[search] ${model} ล้มเหลว: ${e.message}`);
+      }
+    }
   }
-  const model = env.GEMINI_MODEL || "gemini-2.5-flash";
-  const baseUrl = env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com";
-  const url = `${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`;
-
-  const body = {
-    contents: [{ parts: [{ text: `ค้นข้อมูลในอินเทอร์เน็ตเกี่ยวกับหัวข้อนี้ และตอบสรุปสั้นๆ ให้ถูกต้องและกระชับ: ${query}` }] }],
-    tools: [{ google_search: {} }],
-    generationConfig: { temperature: 0.4 }
-  };
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body)
-  });
-
-  if (!res.ok) {
-    throw new Error(`Google Search tool error: ${res.status}`);
-  }
-
-  const data = await res.json();
-  const candidate = (data.candidates && data.candidates[0]) || {};
-  const raw = ((candidate.content && candidate.content.parts) || [])
-    .map(p => p.text || "")
-    .join("")
-    .trim();
-  return cleanSearch(raw);
-}
-
-/* ── เก็บกวาดผลค้นก่อนส่งต่อให้โมเดล ──
-   ผลจาก Gemini มักพ่วงลิงก์อ้างอิงของ Google และหมายเลขเชิงอรรถมาด้วย
-   โมเดลฟรีมักคัดลอกทั้งดุ้นไปเป็นคำตอบ ผู้ใช้เลยเห็นลิงก์แปลก ๆ ของ Google
-   แทนที่จะเป็นเนื้อข้อมูลที่ค้นมา */
-function cleanSearch(t) {
-  return String(t || '')
-    .replace(/https?:\/\/vertexaisearch\.cloud\.google\.com\S*/gi, '')
-    .replace(/https?:\/\/\S*grounding-api-redirect\S*/gi, '')
-    .replace(/\[\d+(?:,\s*\d+)*\]/g, '')          /* เชิงอรรถแบบ [1] [2,3] */
-    .replace(/\(https?:\/\/[^)]+\)/g, '')          /* ลิงก์ในวงเล็บ */
-    .replace(/^\s*(อ้างอิง|แหล่งที่มา|Sources?|References?)\s*:.*$/gim, '')
-    .replace(/[ \t]{2,}/g, ' ')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
+  console.warn('[search] ค้นไม่สำเร็จทุกโมเดล');
+  return '';
 }
 
 function parseJsonLoose(text) {
@@ -4166,9 +4191,18 @@ export default {
                     freshBlock = '\n\n[ข้อมูลสดจากอินเทอร์เน็ต ณ ตอนนี้ — เชื่อชุดนี้ก่อนความจำของคุณเสมอ]\n'
                       + found.slice(0, 4000)
                       + '\n\nวิธีใช้: เรียบเรียงใหม่ด้วยคำของคุณเอง ห้ามคัดลอกทั้งก้อน ห้ามใส่ลิงก์หรือเลขเชิงอรรถ '
-                      + 'ห้ามเขียนว่า "จากข้อมูลที่ค้นมา" และห้ามยืนยันว่าสิ่งที่ผู้ใช้ถามถึงไม่มีอยู่จริง';
+                      + 'ห้ามเขียนว่า "จากข้อมูลที่ค้นมา" และเรื่องไหนที่ชุดนี้ไม่ได้พูดถึง ห้ามเติมเอง';
                   }
                 } catch (e) { console.error('[stream search]', e) }
+                if (!freshBlock) {
+                  /* ค้นไม่ได้ = ต้องบอกผู้ใช้ตรง ๆ ไม่ใช่ปล่อยให้เดา
+                     บอกหน้าเว็บด้วย จะได้ไม่เข้าใจว่าค้นสำเร็จแล้ว */
+                  await send({ type: 'status', key: 'nodata', text: 'ยังไม่มีข้อมูลยืนยันเรื่องนี้' });
+                  freshBlock = '\n\n[หมายเหตุสำคัญ]\n'
+                    + 'คำถามนี้ต้องใช้ข้อมูลล่าสุด แต่ระบบยังไม่มีข้อมูลยืนยันในตอนนี้\n'
+                    + 'ห้ามเดา ห้ามแต่งตัวเลข สเปก ราคา หรือวันเปิดตัวขึ้นมาเอง\n'
+                    + 'ให้บอกตรง ๆ ว่ายังไม่มีข้อมูลยืนยัน แล้วเสนอสิ่งที่ช่วยได้จริงแทน';
+                }
               }
 
               await send({ type: 'status', key: 'think', text: 'กำลังเรียบเรียงคำตอบ' });
@@ -4345,12 +4379,22 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                   freshBlock = '\n\n[ข้อมูลสดจากอินเทอร์เน็ต ณ ตอนนี้ — เชื่อข้อมูลชุดนี้ก่อนความจำของคุณเสมอ]\n'
                     + found.slice(0, 4000)
                     + '\n\nวิธีใช้ข้อมูลชุดนี้:'
-                    + '\n- ถ้าขัดกับสิ่งที่คุณจำได้ ให้ยึดชุดนี้ และห้ามยืนยันว่าสิ่งที่ผู้ใช้ถามถึงไม่มีอยู่จริง'
+                    + '\n- ถ้าขัดกับสิ่งที่คุณจำได้ ให้ยึดชุดนี้'
                     + '\n- เรียบเรียงใหม่ด้วยคำของคุณเอง ห้ามคัดลอกข้อความชุดนี้ทั้งก้อนไปเป็นคำตอบ'
                     + '\n- ห้ามใส่ลิงก์ ห้ามใส่เลขเชิงอรรถ ห้ามเขียนว่า "จากข้อมูลที่ค้นมา"'
-                    + '\n- ตอบเหมือนคุณรู้เรื่องนี้อยู่แล้ว บอกเนื้อหาไปตรง ๆ';
+                    + '\n- เรื่องไหนที่ชุดนี้ไม่ได้พูดถึง ห้ามเติมเอง ให้บอกว่ายังไม่มีข้อมูลยืนยัน';
                 }
               } catch (e) { console.error('[fresh search]', e) }
+              if (!freshBlock) {
+                /* ค้นไม่สำเร็จ ต้องสั่งให้ซื่อสัตย์ ไม่ใช่ปล่อยให้เดา
+                   ของเดิมสั่งว่า "ห้ามยืนยันว่าไม่มีอยู่จริง" ซึ่งเมื่อไม่มีข้อมูล
+                   กลายเป็นการผลักให้มันแต่งเรื่องขึ้นมาแทนการบอกว่าไม่รู้ */
+                freshBlock = '\n\n[หมายเหตุสำคัญ]\n'
+                  + 'คำถามนี้เป็นเรื่องที่ต้องใช้ข้อมูลล่าสุด แต่ระบบยังไม่มีข้อมูลยืนยันในตอนนี้\n'
+                  + 'ห้ามเดา ห้ามแต่งตัวเลข สเปก ราคา หรือวันเปิดตัวขึ้นมาเอง\n'
+                  + 'ให้บอกตรง ๆ ว่ายังไม่มีข้อมูลยืนยัน แล้วเสนอสิ่งที่ช่วยได้จริงแทน '
+                  + 'เช่น เล่าสิ่งที่รู้แน่ชัดเกี่ยวกับรุ่นก่อนหน้า และบอกว่าถ้ามีข้อมูลใหม่จะอัปเดตให้';
+              }
             }
             const agentOut = await runReActAgent(env, carInfo, body.contents, meter,
                                                 activeStyle, activeCustomStyle, skillPrompt,
