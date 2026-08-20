@@ -1042,6 +1042,11 @@ const IDENTITY = `[ฉันคือใคร — ข้อมูลนี้�
 ถ้าจะบอกว่าไม่มีข้อมูล ให้พูดสั้น ๆ ตรง ๆ เช่น "ยังไม่มีข้อมูลยืนยันเรื่องนี้ครับ"
 แล้วต่อด้วยสิ่งที่ช่วยได้จริง ห้ามอธิบายว่าทำไมถึงตอบแบบนั้น
 
+[อย่าวกกลับมาที่รถของผู้ใช้ถ้าเขาไม่ได้ถาม]
+ถ้าเขาถามถึงรถคันอื่นหรือรถที่เขาไม่ได้เป็นเจ้าของ ให้ตอบเรื่องรถคันนั้นอย่างเดียว
+ห้ามเปลี่ยนเรื่องไปเสนอให้ดูแลรถในการาจของเขา และห้ามเอ่ยถึงรถของเขาเลยถ้าไม่เกี่ยวกับคำถาม
+การรู้ว่าเขามีรถอะไรมีไว้ใช้ตอนที่เขาถามเรื่องรถของเขาเท่านั้น
+
 [ห้ามขัดแย้งกับตัวเอง]
 ถ้าบอกว่าไม่มีข้อมูลยืนยันแล้ว ห้ามลิสต์สเปกหรือตัวเลขต่อท้ายเด็ดขาด
 เลือกอย่างใดอย่างหนึ่ง: มีข้อมูลก็บอกข้อมูล ไม่มีก็บอกว่าไม่มี ห้ามทำทั้งสองอย่างในคำตอบเดียว`;
@@ -4983,6 +4988,75 @@ ${convo}`;
       }
 
       /* ===== ADMIN: SCHEMA HEALTH ===== */
+      /* ═══ ตรวจว่าการค้นเน็ตกับ AI ใช้งานได้จริงไหม ═══
+         เวลาผู้ใช้บอกว่า "ค้นไม่ได้" จะได้รู้ทันทีว่าติดที่คีย์ ที่โมเดล หรือที่อื่น
+         ไม่ต้องเดาและไม่ต้องไปนั่งอ่าน log */
+      if (url.pathname === '/api/admin/diag' && request.method === 'GET') {
+        return await guarded('moderator', async () => {
+          const out = { keys: {}, search: {}, models: [] };
+          out.keys.gemini = !!env.GEMINI_KEY;
+          out.keys.openrouter = !!env.OPENROUTER_API_KEY;
+          out.keys.geminiModel = env.GEMINI_MODEL || '(ไม่ได้ตั้ง)';
+          out.keys.searchModel = env.GEMINI_SEARCH_MODEL || '(ไม่ได้ตั้ง ใช้ค่าเริ่มต้น)';
+          out.keys.orModel = env.OPENROUTER_MODEL || '(ไม่ได้ตั้ง ใช้ค่าเริ่มต้น)';
+
+          if (!env.GEMINI_KEY) {
+            out.search.ok = false;
+            out.search.reason = 'ยังไม่ได้ตั้ง GEMINI_KEY — ต้องรัน wrangler secret put GEMINI_KEY';
+            return json(out);
+          }
+
+          /* ลองทีละโมเดลและทีละรูปแบบเครื่องมือ แล้วรายงานผลจริงของแต่ละตัว */
+          const baseUrl = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
+          const q = url.searchParams.get('q') || 'Lamborghini Revuelto ล่าสุด';
+          const models = [];
+          if (env.GEMINI_SEARCH_MODEL) models.push(env.GEMINI_SEARCH_MODEL);
+          models.push('gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash');
+          if (env.GEMINI_MODEL && !models.includes(env.GEMINI_MODEL)) models.push(env.GEMINI_MODEL);
+
+          for (const model of models) {
+            for (const shape of ['google_search', 'google_search_retrieval']) {
+              const row = { model, tool: shape };
+              try {
+                const res = await fetch(`${baseUrl}/v1beta/models/${model}:generateContent?key=${env.GEMINI_KEY}`, {
+                  method: 'POST', headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    contents: [{ parts: [{ text: `ค้นข้อมูลสั้น ๆ เรื่อง: ${q}` }] }],
+                    tools: [shape === 'google_search' ? { google_search: {} } : { google_search_retrieval: {} }],
+                  }),
+                });
+                row.status = res.status;
+                const txt = await res.text();
+                if (res.ok) {
+                  let d = null; try { d = JSON.parse(txt) } catch (e) {}
+                  const cand = (d && d.candidates && d.candidates[0]) || {};
+                  const answer = ((cand.content && cand.content.parts) || []).map(x => x.text || '').join('').trim();
+                  row.ok = !!answer;
+                  row.sample = answer.slice(0, 200);
+                  row.grounded = !!(cand.groundingMetadata || cand.grounding_metadata);
+                } else {
+                  row.ok = false;
+                  /* ข้อความผิดพลาดของ Google บอกสาเหตุชัดอยู่แล้ว ส่งต่อไปเลย */
+                  row.error = txt.slice(0, 300);
+                }
+              } catch (e) {
+                row.ok = false; row.error = String(e.message || e).slice(0, 200);
+              }
+              out.models.push(row);
+              if (row.ok) break;
+            }
+            if (out.models.length && out.models[out.models.length - 1].ok) break;
+          }
+
+          const win = out.models.find(m => m.ok);
+          out.search.ok = !!win;
+          out.search.reason = win
+            ? `ใช้งานได้ด้วยโมเดล ${win.model} (${win.tool})${win.grounded ? ' และมีการค้นเว็บจริง' : ' แต่ไม่พบร่องรอยการค้นเว็บ อาจตอบจากความจำของโมเดล'}`
+            : 'ค้นไม่สำเร็จทุกโมเดล ดูรายละเอียดในช่อง models ว่าแต่ละตัวตอบอะไรกลับมา';
+          return json(out);
+        })();
+      }
+
       if (url.pathname === '/api/admin/health' && request.method === 'GET') {
         return await guarded('moderator', async () => {
           const schema = await schemaReport(env);
