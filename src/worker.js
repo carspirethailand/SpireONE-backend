@@ -748,116 +748,169 @@ async function callWorkersAI(env, messages, meter) {
   return response.response.trim();
 }
 
-async function callReasoningModel(env, messages, meter) {
-  const hasKey = !!env.OPENROUTER_API_KEY;
-  console.log(`[AI Reasoning] OPENROUTER_API_KEY configured: ${hasKey}`);
+async function callCerebrasReasoningModel(env, messages, meter) {
+  const model = env.CEREBRAS_MODEL || "gpt-oss-120b";
+  const baseUrl = env.CEREBRAS_BASE_URL || "https://api.cerebras.ai/v1";
+  const url = `${baseUrl}/chat/completions`;
 
-  if (hasKey) {
-    const model = env.OPENROUTER_MODEL || "openai/gpt-oss-20b:free";
-    const baseUrl = env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1";
-    const url = `${baseUrl}/chat/completions`;
-    
-    console.log(`[OpenRouter] Sending request to model: ${model} at ${url}`);
-    
+  console.log(`[Cerebras] Sending request to model: ${model} at ${url}`);
+
+  const res = await fetchWithRetry(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${env.CEREBRAS_API_KEY}`
+    },
+    body: JSON.stringify({
+      model,
+      messages,
+      temperature: 0.3
+    })
+  });
+
+  console.log(`[Cerebras] Response HTTP status: ${res.status} ${res.statusText}`);
+  const resText = await res.text();
+
+  if (!res.ok) {
+    throw new Error(`Cerebras Error ${res.status}: ${resText.slice(0, 200)}`);
+  }
+
+  const data = JSON.parse(resText);
+  readUsage(meter, data, 'cerebras');
+
+  const msg = (data.choices && data.choices[0] && data.choices[0].message) || {};
+  let content = (typeof msg.content === 'string' && msg.content.trim()) ? msg.content.trim() : '';
+  const reasoning = String(msg.reasoning || msg.reasoning_content || '').trim();
+
+  if (!content && reasoning) {
+    const fa = reasoning.match(/Final Answer:\s*([\s\S]+)$/i);
+    if (fa) content = fa[1].trim();
+  }
+
+  if (content) {
+    console.log(`[Cerebras] Success! Generated content length: ${content.length}`);
+    return { text: content, reasoning };
+  }
+
+  if (reasoning) {
+    return { text: reasoning, reasoning };
+  }
+
+  throw new Error('Cerebras returned empty content');
+}
+
+async function callOpenRouterReasoningModel(env, messages, meter) {
+  const model = env.OPENROUTER_MODEL || "openrouter/free";
+  const baseUrl = env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1";
+  const url = `${baseUrl}/chat/completions`;
+
+  console.log(`[OpenRouter] Sending request to model: ${model} at ${url}`);
+
+  const res = await fetchWithRetry(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
+      "HTTP-Referer": "https://carspirethailand.com",
+      "X-Title": "Cendon"
+    },
+    body: JSON.stringify({
+      model,
+      messages,
+      temperature: 0.3
+    })
+  });
+
+  console.log(`[OpenRouter] Response HTTP status: ${res.status} ${res.statusText}`);
+  const resText = await res.text();
+
+  if (!res.ok) {
+    throw new Error(`OpenRouter Error ${res.status}: ${resText.slice(0, 200)}`);
+  }
+
+  const data = JSON.parse(resText);
+  readUsage(meter, data, 'openrouter');
+
+  const msg = (data.choices && data.choices[0] && data.choices[0].message) || {};
+  let content = (typeof msg.content === 'string' && msg.content.trim()) ? msg.content.trim() : '';
+  const reasoning = String(msg.reasoning || msg.reasoning_content || '').trim();
+
+  if (!content && reasoning) {
+    const fa = reasoning.match(/Final Answer:\s*([\s\S]+)$/i);
+    if (fa) content = fa[1].trim();
+  }
+
+  if (content) {
+    console.log(`[OpenRouter] Success! Generated content length: ${content.length}`);
+    return { text: content, reasoning };
+  }
+
+  if (reasoning) {
+    console.warn('[OpenRouter] Got reasoning without content — retrying for concise final answer');
     try {
-      const res = await fetchWithRetry(url, {
-        method: "POST",
+      const again = await fetchWithRetry(url, {
+        method: 'POST',
         headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
-          "HTTP-Referer": "https://carspirethailand.com",
-          "X-Title": "Cendon"
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${env.OPENROUTER_API_KEY}`,
+          'HTTP-Referer': 'https://carspirethailand.com',
+          'X-Title': 'Cendon',
         },
         body: JSON.stringify({
           model,
-          messages,
-          temperature: 0.3
-        })
+          messages: messages.concat([
+            { role: 'assistant', content: '(กำลังคิด)' },
+            { role: 'user', content: 'ตอบผู้ใช้ได้เลย เขียนเฉพาะคำตอบสุดท้ายอย่างเดียว ขึ้นต้นด้วย "Final Answer:" ห้ามอธิบายกระบวนการคิด' },
+          ]),
+          temperature: 0.3,
+        }),
       });
-
-      console.log(`[OpenRouter] Response HTTP status: ${res.status} ${res.statusText}`);
-
-      const resText = await res.text();
-
-      if (res.ok) {
-        let data;
-        try {
-          data = JSON.parse(resText);
-        } catch (e) {
-          console.error(`[OpenRouter] Failed to parse JSON response: ${resText}`);
-          throw e;
-        }
-
-        readUsage(meter, data, 'openrouter');
-        const msg = (data.choices && data.choices[0] && data.choices[0].message) || {};
-        let content = (typeof msg.content === 'string' && msg.content.trim()) ? msg.content.trim() : '';
-        /* โมเดลตระกูลนี้ส่งกระบวนการคิดมาแยกใน msg.reasoning
-           ของเดิมพอ content ว่างก็หยิบ reasoning มาใช้เป็นคำตอบเลย
-           ผู้ใช้จึงเห็นบทที่โมเดลคิดกับตัวเองเต็ม ๆ แทนคำตอบจริง
-           ตอนนี้แยกกันเด็ดขาด ความคิดคือความคิด คำตอบคือคำตอบ */
-        const reasoning = String(msg.reasoning || msg.reasoning_content || '').trim();
-
-        if (!content && reasoning) {
-          /* ไม่มีคำตอบ แต่พอมีความคิด — ลองหา Final Answer ที่ซ่อนอยู่ในนั้นก่อน */
-          const fa = reasoning.match(/Final Answer:\s*([\s\S]+)$/i);
-          if (fa) content = fa[1].trim();
-        }
-
-        if (content) {
-          console.log(`[OpenRouter] Success! Generated content length: ${content.length}`);
-          return { text: content, reasoning };
-        }
-        if (reasoning) {
-          /* ยังไม่ได้คำตอบจริง ขอใหม่อีกรอบโดยสั่งให้ตอบอย่างเดียว
-             ถูกกว่าและเร็วกว่าการปล่อยความคิดดิบ ๆ ออกไปให้ผู้ใช้อ่าน */
-          console.warn('[OpenRouter] ได้แต่ความคิด ไม่มีคำตอบ — ขอใหม่แบบสั้น');
-          try {
-            const again = await fetchWithRetry(url, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${env.OPENROUTER_API_KEY}`,
-                'HTTP-Referer': 'https://carspirethailand.com',
-                'X-Title': 'Cendon',
-              },
-              body: JSON.stringify({
-                model,
-                messages: messages.concat([
-                  { role: 'assistant', content: '(กำลังคิด)' },
-                  { role: 'user', content: 'ตอบผู้ใช้ได้เลย เขียนเฉพาะคำตอบสุดท้ายอย่างเดียว ขึ้นต้นด้วย "Final Answer:" ห้ามอธิบายกระบวนการคิด' },
-                ]),
-                temperature: 0.3,
-              }),
-            });
-            if (again.ok) {
-              const d2 = JSON.parse(await again.text());
-              readUsage(meter, d2, 'openrouter');
-              const m2 = (d2.choices && d2.choices[0] && d2.choices[0].message) || {};
-              const c2 = (typeof m2.content === 'string' ? m2.content : '').trim();
-              if (c2) return { text: c2, reasoning };
-            }
-          } catch (e) { console.error('[OpenRouter retry]', e) }
-        }
-        console.warn(`[OpenRouter] Empty content & reasoning in choices payload:`, JSON.stringify(data));
-      } else {
-        console.error(`[OpenRouter Error ${res.status}]: ${resText}`);
+      if (again.ok) {
+        const d2 = JSON.parse(await again.text());
+        readUsage(meter, d2, 'openrouter');
+        const m2 = (d2.choices && d2.choices[0] && d2.choices[0].message) || {};
+        const c2 = (typeof m2.content === 'string' ? m2.content : '').trim();
+        if (c2) return { text: c2, reasoning };
       }
-      
-      console.warn(`[OpenRouter] Call failed (Status ${res.status}). Falling back to Cloudflare Workers AI...`);
-    } catch (err) {
-      console.error(`[OpenRouter Exception]: ${err.message}`, err.stack);
-      console.warn(`Falling back to Cloudflare Workers AI...`);
-    }
-  } else {
-    console.warn("OPENROUTER_API_KEY is not configured in environment. Falling back to Cloudflare Workers AI...");
+    } catch (e) { console.error('[OpenRouter retry]', e); }
+    return { text: reasoning, reasoning };
   }
 
+  throw new Error('OpenRouter returned empty content and reasoning');
+}
+
+async function callReasoningModel(env, messages, meter) {
+  // 1. Primary Brain: Cerebras GPT-OSS 120B
+  if (env.CEREBRAS_API_KEY) {
+    try {
+      console.log('[AI Reasoning] Using Cerebras (GPT-OSS 120B) as PRIMARY reasoning engine...');
+      return await callCerebrasReasoningModel(env, messages, meter);
+    } catch (err) {
+      console.warn(`[Cerebras Failed]: ${err.message}. Falling back to OpenRouter...`);
+    }
+  } else {
+    console.log('[AI Reasoning] CEREBRAS_API_KEY not set. Checking OpenRouter...');
+  }
+
+  // 2. Secondary Brain: OpenRouter
+  if (env.OPENROUTER_API_KEY) {
+    try {
+      console.log('[AI Reasoning] Attempting reasoning via OpenRouter...');
+      return await callOpenRouterReasoningModel(env, messages, meter);
+    } catch (err) {
+      console.warn(`[OpenRouter Failed]: ${err.message}. Falling back to Cloudflare Workers AI...`);
+    }
+  } else {
+    console.warn('[AI Reasoning] OPENROUTER_API_KEY not configured. Falling back to Cloudflare Workers AI...');
+  }
+
+  // 3. Fallback Brain: Cloudflare Workers AI
   console.log(`[AI Reasoning] Attempting fallback via Cloudflare Workers AI...`);
   try {
     return { text: await callWorkersAI(env, messages, meter), reasoning: '' };
   } catch (err) {
     console.error(`[Cloudflare Workers AI Fallback Failed]: ${err.message}`);
-    throw new Error(`Reasoning failure (OpenRouter failed & Cloudflare Workers AI fallback failed: ${err.message})`);
+    throw new Error(`Reasoning failure (Cerebras, OpenRouter, and Cloudflare Workers AI all failed: ${err.message})`);
   }
 }
 
@@ -1699,6 +1752,7 @@ async function executeDescribeMediaTool(env, messages, prompt) {
         if (text) return text;
       } else {
         const errTxt = await res.text();
+        console.warn(`[Gemini Direct Media Error ${res.status} (${mName})]:`, errTxt.slice(0, 200));
         lastErr = new Error(`Media reader error ${res.status} (${mName}): ${errTxt.slice(0, 150)}`);
       }
     } catch (e) {
@@ -1706,7 +1760,76 @@ async function executeDescribeMediaTool(env, messages, prompt) {
     }
   }
 
+  // Tier 2 Fallback: OpenRouter Multimodal (Bypasses Google API geo-blocking / location unsupported errors)
+  if (env.OPENROUTER_API_KEY) {
+    console.log('[describe_media] Direct Gemini failed or location unsupported. Falling back to OpenRouter Multimodal...');
+    const orText = await describeMediaViaOpenRouter(env, parts, prompt);
+    if (orText) {
+      console.log('[describe_media] Successfully analyzed media via OpenRouter Multimodal');
+      return orText;
+    }
+  }
+
   throw lastErr || new Error('Failed to analyze media file with Gemini API');
+}
+
+async function describeMediaViaOpenRouter(env, parts, prompt) {
+  const apiKey = env.OPENROUTER_API_KEY;
+  if (!apiKey) return null;
+  const baseUrl = env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
+
+  const contentParts = [
+    { type: "text", text: `กรุณาอธิบายไฟล์สื่อตามคำสั่งนี้: ${prompt}\nตอบสั้นกระชับเข้าใจง่าย` }
+  ];
+
+  parts.forEach(p => {
+    const d = p.inlineData || p.inline_data;
+    if (d && d.data) {
+      const mime = d.mimeType || d.mime_type || 'image/jpeg';
+      contentParts.push({
+        type: "image_url",
+        image_url: { url: `data:${mime};base64,${d.data}` }
+      });
+    }
+  });
+
+  const models = [
+    'google/gemini-2.0-flash-exp:free',
+    'meta-llama/llama-3.2-11b-vision-instruct:free',
+    'qwen/qwen-2-vl-72b-instruct:free',
+    'openrouter/free'
+  ];
+
+  for (const m of models) {
+    try {
+      const res = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': 'https://spireone.carspire.com',
+          'X-Title': 'SpireONE'
+        },
+        body: JSON.stringify({
+          model: m,
+          messages: [{ role: 'user', content: contentParts }],
+          temperature: 0.3
+        })
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        const msg = (data.choices && data.choices[0] && data.choices[0].message) || {};
+        const text = (typeof msg.content === 'string' && msg.content.trim())
+          ? msg.content.trim()
+          : String(msg.reasoning || msg.reasoning_content || '').trim();
+        if (text) return text;
+      }
+    } catch (e) {
+      console.warn(`[OpenRouter Vision ${m} Error]:`, e.message);
+    }
+  }
+  return null;
 }
 
 /* ── ค้นเน็ตผ่าน Gemini ──
