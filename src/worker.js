@@ -748,169 +748,116 @@ async function callWorkersAI(env, messages, meter) {
   return response.response.trim();
 }
 
-async function callCerebrasReasoningModel(env, messages, meter) {
-  const model = env.CEREBRAS_MODEL || "gpt-oss-120b";
-  const baseUrl = env.CEREBRAS_BASE_URL || "https://api.cerebras.ai/v1";
-  const url = `${baseUrl}/chat/completions`;
+async function callReasoningModel(env, messages, meter) {
+  const hasKey = !!env.OPENROUTER_API_KEY;
+  console.log(`[AI Reasoning] OPENROUTER_API_KEY configured: ${hasKey}`);
 
-  console.log(`[Cerebras] Sending request to model: ${model} at ${url}`);
-
-  const res = await fetchWithRetry(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${env.CEREBRAS_API_KEY}`
-    },
-    body: JSON.stringify({
-      model,
-      messages,
-      temperature: 0.3
-    })
-  });
-
-  console.log(`[Cerebras] Response HTTP status: ${res.status} ${res.statusText}`);
-  const resText = await res.text();
-
-  if (!res.ok) {
-    throw new Error(`Cerebras Error ${res.status}: ${resText.slice(0, 200)}`);
-  }
-
-  const data = JSON.parse(resText);
-  readUsage(meter, data, 'cerebras');
-
-  const msg = (data.choices && data.choices[0] && data.choices[0].message) || {};
-  let content = (typeof msg.content === 'string' && msg.content.trim()) ? msg.content.trim() : '';
-  const reasoning = String(msg.reasoning || msg.reasoning_content || '').trim();
-
-  if (!content && reasoning) {
-    const fa = reasoning.match(/Final Answer:\s*([\s\S]+)$/i);
-    if (fa) content = fa[1].trim();
-  }
-
-  if (content) {
-    console.log(`[Cerebras] Success! Generated content length: ${content.length}`);
-    return { text: content, reasoning };
-  }
-
-  if (reasoning) {
-    return { text: reasoning, reasoning };
-  }
-
-  throw new Error('Cerebras returned empty content');
-}
-
-async function callOpenRouterReasoningModel(env, messages, meter) {
-  const model = env.OPENROUTER_MODEL || "openrouter/free";
-  const baseUrl = env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1";
-  const url = `${baseUrl}/chat/completions`;
-
-  console.log(`[OpenRouter] Sending request to model: ${model} at ${url}`);
-
-  const res = await fetchWithRetry(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
-      "HTTP-Referer": "https://carspirethailand.com",
-      "X-Title": "Cendon"
-    },
-    body: JSON.stringify({
-      model,
-      messages,
-      temperature: 0.3
-    })
-  });
-
-  console.log(`[OpenRouter] Response HTTP status: ${res.status} ${res.statusText}`);
-  const resText = await res.text();
-
-  if (!res.ok) {
-    throw new Error(`OpenRouter Error ${res.status}: ${resText.slice(0, 200)}`);
-  }
-
-  const data = JSON.parse(resText);
-  readUsage(meter, data, 'openrouter');
-
-  const msg = (data.choices && data.choices[0] && data.choices[0].message) || {};
-  let content = (typeof msg.content === 'string' && msg.content.trim()) ? msg.content.trim() : '';
-  const reasoning = String(msg.reasoning || msg.reasoning_content || '').trim();
-
-  if (!content && reasoning) {
-    const fa = reasoning.match(/Final Answer:\s*([\s\S]+)$/i);
-    if (fa) content = fa[1].trim();
-  }
-
-  if (content) {
-    console.log(`[OpenRouter] Success! Generated content length: ${content.length}`);
-    return { text: content, reasoning };
-  }
-
-  if (reasoning) {
-    console.warn('[OpenRouter] Got reasoning without content — retrying for concise final answer');
+  if (hasKey) {
+    const model = env.OPENROUTER_MODEL || "openai/gpt-oss-20b:free";
+    const baseUrl = env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1";
+    const url = `${baseUrl}/chat/completions`;
+    
+    console.log(`[OpenRouter] Sending request to model: ${model} at ${url}`);
+    
     try {
-      const again = await fetchWithRetry(url, {
-        method: 'POST',
+      const res = await fetchWithRetry(url, {
+        method: "POST",
         headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${env.OPENROUTER_API_KEY}`,
-          'HTTP-Referer': 'https://carspirethailand.com',
-          'X-Title': 'Cendon',
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
+          "HTTP-Referer": "https://carspirethailand.com",
+          "X-Title": "Cendon"
         },
         body: JSON.stringify({
           model,
-          messages: messages.concat([
-            { role: 'assistant', content: '(กำลังคิด)' },
-            { role: 'user', content: 'ตอบผู้ใช้ได้เลย เขียนเฉพาะคำตอบสุดท้ายอย่างเดียว ขึ้นต้นด้วย "Final Answer:" ห้ามอธิบายกระบวนการคิด' },
-          ]),
-          temperature: 0.3,
-        }),
+          messages,
+          temperature: 0.3
+        })
       });
-      if (again.ok) {
-        const d2 = JSON.parse(await again.text());
-        readUsage(meter, d2, 'openrouter');
-        const m2 = (d2.choices && d2.choices[0] && d2.choices[0].message) || {};
-        const c2 = (typeof m2.content === 'string' ? m2.content : '').trim();
-        if (c2) return { text: c2, reasoning };
+
+      console.log(`[OpenRouter] Response HTTP status: ${res.status} ${res.statusText}`);
+
+      const resText = await res.text();
+
+      if (res.ok) {
+        let data;
+        try {
+          data = JSON.parse(resText);
+        } catch (e) {
+          console.error(`[OpenRouter] Failed to parse JSON response: ${resText}`);
+          throw e;
+        }
+
+        readUsage(meter, data, 'openrouter');
+        const msg = (data.choices && data.choices[0] && data.choices[0].message) || {};
+        let content = (typeof msg.content === 'string' && msg.content.trim()) ? msg.content.trim() : '';
+        /* โมเดลตระกูลนี้ส่งกระบวนการคิดมาแยกใน msg.reasoning
+           ของเดิมพอ content ว่างก็หยิบ reasoning มาใช้เป็นคำตอบเลย
+           ผู้ใช้จึงเห็นบทที่โมเดลคิดกับตัวเองเต็ม ๆ แทนคำตอบจริง
+           ตอนนี้แยกกันเด็ดขาด ความคิดคือความคิด คำตอบคือคำตอบ */
+        const reasoning = String(msg.reasoning || msg.reasoning_content || '').trim();
+
+        if (!content && reasoning) {
+          /* ไม่มีคำตอบ แต่พอมีความคิด — ลองหา Final Answer ที่ซ่อนอยู่ในนั้นก่อน */
+          const fa = reasoning.match(/Final Answer:\s*([\s\S]+)$/i);
+          if (fa) content = fa[1].trim();
+        }
+
+        if (content) {
+          console.log(`[OpenRouter] Success! Generated content length: ${content.length}`);
+          return { text: content, reasoning };
+        }
+        if (reasoning) {
+          /* ยังไม่ได้คำตอบจริง ขอใหม่อีกรอบโดยสั่งให้ตอบอย่างเดียว
+             ถูกกว่าและเร็วกว่าการปล่อยความคิดดิบ ๆ ออกไปให้ผู้ใช้อ่าน */
+          console.warn('[OpenRouter] ได้แต่ความคิด ไม่มีคำตอบ — ขอใหม่แบบสั้น');
+          try {
+            const again = await fetchWithRetry(url, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${env.OPENROUTER_API_KEY}`,
+                'HTTP-Referer': 'https://carspirethailand.com',
+                'X-Title': 'Cendon',
+              },
+              body: JSON.stringify({
+                model,
+                messages: messages.concat([
+                  { role: 'assistant', content: '(กำลังคิด)' },
+                  { role: 'user', content: 'ตอบผู้ใช้ได้เลย เขียนเฉพาะคำตอบสุดท้ายอย่างเดียว ขึ้นต้นด้วย "Final Answer:" ห้ามอธิบายกระบวนการคิด' },
+                ]),
+                temperature: 0.3,
+              }),
+            });
+            if (again.ok) {
+              const d2 = JSON.parse(await again.text());
+              readUsage(meter, d2, 'openrouter');
+              const m2 = (d2.choices && d2.choices[0] && d2.choices[0].message) || {};
+              const c2 = (typeof m2.content === 'string' ? m2.content : '').trim();
+              if (c2) return { text: c2, reasoning };
+            }
+          } catch (e) { console.error('[OpenRouter retry]', e) }
+        }
+        console.warn(`[OpenRouter] Empty content & reasoning in choices payload:`, JSON.stringify(data));
+      } else {
+        console.error(`[OpenRouter Error ${res.status}]: ${resText}`);
       }
-    } catch (e) { console.error('[OpenRouter retry]', e); }
-    return { text: reasoning, reasoning };
-  }
-
-  throw new Error('OpenRouter returned empty content and reasoning');
-}
-
-async function callReasoningModel(env, messages, meter) {
-  // 1. Primary Brain: Cerebras GPT-OSS 120B
-  if (env.CEREBRAS_API_KEY) {
-    try {
-      console.log('[AI Reasoning] Using Cerebras (GPT-OSS 120B) as PRIMARY reasoning engine...');
-      return await callCerebrasReasoningModel(env, messages, meter);
+      
+      console.warn(`[OpenRouter] Call failed (Status ${res.status}). Falling back to Cloudflare Workers AI...`);
     } catch (err) {
-      console.warn(`[Cerebras Failed]: ${err.message}. Falling back to OpenRouter...`);
+      console.error(`[OpenRouter Exception]: ${err.message}`, err.stack);
+      console.warn(`Falling back to Cloudflare Workers AI...`);
     }
   } else {
-    console.log('[AI Reasoning] CEREBRAS_API_KEY not set. Checking OpenRouter...');
+    console.warn("OPENROUTER_API_KEY is not configured in environment. Falling back to Cloudflare Workers AI...");
   }
 
-  // 2. Secondary Brain: OpenRouter
-  if (env.OPENROUTER_API_KEY) {
-    try {
-      console.log('[AI Reasoning] Attempting reasoning via OpenRouter...');
-      return await callOpenRouterReasoningModel(env, messages, meter);
-    } catch (err) {
-      console.warn(`[OpenRouter Failed]: ${err.message}. Falling back to Cloudflare Workers AI...`);
-    }
-  } else {
-    console.warn('[AI Reasoning] OPENROUTER_API_KEY not configured. Falling back to Cloudflare Workers AI...');
-  }
-
-  // 3. Fallback Brain: Cloudflare Workers AI
   console.log(`[AI Reasoning] Attempting fallback via Cloudflare Workers AI...`);
   try {
     return { text: await callWorkersAI(env, messages, meter), reasoning: '' };
   } catch (err) {
     console.error(`[Cloudflare Workers AI Fallback Failed]: ${err.message}`);
-    throw new Error(`Reasoning failure (Cerebras, OpenRouter, and Cloudflare Workers AI all failed: ${err.message})`);
+    throw new Error(`Reasoning failure (OpenRouter failed & Cloudflare Workers AI fallback failed: ${err.message})`);
   }
 }
 
@@ -1757,7 +1704,6 @@ async function executeDescribeMediaTool(env, messages, prompt) {
         if (text) return text;
       } else {
         const errTxt = await res.text();
-        console.warn(`[Gemini Direct Media Error ${res.status} (${mName})]:`, errTxt.slice(0, 200));
         lastErr = new Error(`Media reader error ${res.status} (${mName}): ${errTxt.slice(0, 150)}`);
       }
     } catch (e) {
@@ -1765,76 +1711,7 @@ async function executeDescribeMediaTool(env, messages, prompt) {
     }
   }
 
-  // Tier 2 Fallback: OpenRouter Multimodal (Bypasses Google API geo-blocking / location unsupported errors)
-  if (env.OPENROUTER_API_KEY) {
-    console.log('[describe_media] Direct Gemini failed or location unsupported. Falling back to OpenRouter Multimodal...');
-    const orText = await describeMediaViaOpenRouter(env, parts, prompt);
-    if (orText) {
-      console.log('[describe_media] Successfully analyzed media via OpenRouter Multimodal');
-      return orText;
-    }
-  }
-
   throw lastErr || new Error('Failed to analyze media file with Gemini API');
-}
-
-async function describeMediaViaOpenRouter(env, parts, prompt) {
-  const apiKey = env.OPENROUTER_API_KEY;
-  if (!apiKey) return null;
-  const baseUrl = env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
-
-  const contentParts = [
-    { type: "text", text: `กรุณาอธิบายไฟล์สื่อตามคำสั่งนี้: ${prompt}\nตอบสั้นกระชับเข้าใจง่าย` }
-  ];
-
-  parts.forEach(p => {
-    const d = p.inlineData || p.inline_data;
-    if (d && d.data) {
-      const mime = d.mimeType || d.mime_type || 'image/jpeg';
-      contentParts.push({
-        type: "image_url",
-        image_url: { url: `data:${mime};base64,${d.data}` }
-      });
-    }
-  });
-
-  const models = [
-    'google/gemini-2.0-flash-exp:free',
-    'meta-llama/llama-3.2-11b-vision-instruct:free',
-    'qwen/qwen-2-vl-72b-instruct:free',
-    'openrouter/free'
-  ];
-
-  for (const m of models) {
-    try {
-      const res = await fetch(`${baseUrl}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-          'HTTP-Referer': 'https://spireone.carspire.com',
-          'X-Title': 'SpireONE'
-        },
-        body: JSON.stringify({
-          model: m,
-          messages: [{ role: 'user', content: contentParts }],
-          temperature: 0.3
-        })
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        const msg = (data.choices && data.choices[0] && data.choices[0].message) || {};
-        const text = (typeof msg.content === 'string' && msg.content.trim())
-          ? msg.content.trim()
-          : String(msg.reasoning || msg.reasoning_content || '').trim();
-        if (text) return text;
-      }
-    } catch (e) {
-      console.warn(`[OpenRouter Vision ${m} Error]:`, e.message);
-    }
-  }
-  return null;
 }
 
 /* ── ค้นเน็ตผ่าน Gemini ──
@@ -1844,12 +1721,22 @@ async function describeMediaViaOpenRouter(env, parts, prompt) {
    ถ้าไม่ได้จริง ๆ จะคืนค่าว่างพร้อมบอกผู้เรียกให้จัดการอย่างซื่อสัตย์ */
 async function executeGoogleSearchTool(env, query) {
   const geminiKey = env.GEMINI_KEY;
+  if (!geminiKey) { console.warn('[search] ไม่มี GEMINI_KEY'); return '' }
   const baseUrl = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
+  /* เรียงจากที่น่าจะรองรับการค้นดีที่สุด ถ้าตัวไหนไม่มีจริงจะข้ามไปตัวถัดไปเอง */
   const models = [];
   if (env.GEMINI_SEARCH_MODEL) models.push(env.GEMINI_SEARCH_MODEL);
-  models.push('gemma-4-31b-it', 'gemma-4-26b-a4b-it', 'gemini-3.6-flash', 'gemini-3.5-flash-lite');
+  models.push(
+    'gemini-2.5-flash',
+    'gemini-2.0-flash',
+    'gemini-2.0-flash-001',
+    'gemini-1.5-flash',
+    'gemini-1.5-flash-latest'
+  );
   if (env.GEMINI_MODEL && !models.includes(env.GEMINI_MODEL)) models.push(env.GEMINI_MODEL);
 
+  /* บอกแหล่งที่ยอมรับให้ชัด ไม่งั้นมันไปหยิบบล็อกหรือเว็บรวมข่าวที่คัดลอกกันมา
+     ซึ่งมั่วบ่อยมากโดยเฉพาะเรื่องรถที่เพิ่งเปิดตัว */
   const prompt = `ค้นข้อมูลล่าสุดในอินเทอร์เน็ตเรื่องนี้ แล้วสรุปเฉพาะข้อเท็จจริงที่ยืนยันได้: ${query}
 
 แหล่งที่ยอมรับ เรียงตามลำดับความน่าเชื่อถือ:
@@ -1866,86 +1753,44 @@ async function executeGoogleSearchTool(env, query) {
 - ถ้าค้นแล้วไม่พบข้อมูลที่ยืนยันได้จากแหล่งเหล่านี้เลย ให้ตอบว่า "ไม่พบข้อมูลยืนยัน" คำเดียว
   ห้ามเดา ห้ามแต่งตัวเลข และห้ามเอาข่าวลือมาตอบ`;
 
-  if (geminiKey) {
-    for (const model of [...new Set(models)]) {
-      for (const toolShape of [{ google_search: {} }, { google_search_retrieval: {} }]) {
-        try {
-          const res = await fetch(`${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              contents: [{ parts: [{ text: prompt }] }],
-              tools: [toolShape],
-              generationConfig: { temperature: 0.2 },
-            }),
-          });
-          if (!res.ok) {
-            console.warn(`[search] ${model} ตอบ ${res.status}`);
-            continue;
-          }
-          const data = await res.json();
-          const cand = (data.candidates && data.candidates[0]) || {};
-          const txt = cleanSearch(((cand.content && cand.content.parts) || [])
-            .map(x => x.text || '').join('').trim());
-          if (txt && !/^ไม่พบข้อมูลยืนยัน/.test(txt)) {
-            console.log(`[search] สำเร็จด้วย Google Search (${model})`);
-            return txt;
-          }
-          if (/^ไม่พบข้อมูลยืนยัน/.test(txt)) return '';
-        } catch (e) {
-          console.warn(`[search] ${model} ล้มเหลว: ${e.message}`);
+  const toolShapes = [
+    { google_search: {} },
+    { googleSearch: {} },
+    { google_search_retrieval: {} },
+  ];
+
+  for (const model of models) {
+    for (const toolShape of toolShapes) {
+      try {
+        const res = await fetch(`${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            tools: [toolShape],
+            generationConfig: { temperature: 0.2 },
+          }),
+        });
+        if (!res.ok) {
+          const errBody = await res.text().catch(() => '');
+          console.warn(`[search] ${model} ตอบ ${res.status}: ${errBody.slice(0, 120)}`);
+          continue;
         }
+        const data = await res.json();
+        const cand = (data.candidates && data.candidates[0]) || {};
+        const txt = cleanSearch(((cand.content && cand.content.parts) || [])
+          .map(x => x.text || '').join('').trim());
+        if (txt && !/^ไม่พบข้อมูลยืนยัน/.test(txt)) {
+          console.log(`[search] สำเร็จด้วย ${model}`);
+          return txt;
+        }
+        if (/^ไม่พบข้อมูลยืนยัน/.test(txt)) return '';
+      } catch (e) {
+        console.warn(`[search] ${model} ล้มเหลว: ${e.message}`);
       }
     }
   }
-
-  // Fallback: OpenRouter Web Search Plugin
-  if (env.OPENROUTER_API_KEY) {
-    console.log('[search] Google Direct Search ล้มเหลวหรือติดข้อจำกัด — ลองค้นผ่าน OpenRouter Web Search...');
-    const orTxt = await executeOpenRouterSearch(env, query);
-    if (orTxt) return orTxt;
-  }
-
-  console.warn('[search] ค้นไม่สำเร็จทุกช่องทาง');
-  return '';
-}
-
-async function executeOpenRouterSearch(env, query) {
-  const apiKey = env.OPENROUTER_API_KEY;
-  if (!apiKey) return '';
-  const baseUrl = env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
-
-  const prompt = `ค้นหาข้อมูลล่าสุดทางอินเทอร์เน็ตเกี่ยวกับเรื่องนี้อย่างกระชับ: ${query}\nระบุข้อเท็จจริง สเปก ราคา หรือข่าวที่ยืนยันได้ ตอบเป็นข้อ ๆ สั้น ๆ`;
-
-  try {
-    const res = await fetch(`${baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-        'HTTP-Referer': 'https://carspirethailand.com',
-        'X-Title': 'Cendon'
-      },
-      body: JSON.stringify({
-        model: 'openrouter/free',
-        messages: [{ role: 'user', content: prompt }],
-        plugins: [{ id: 'web' }],
-        temperature: 0.2
-      })
-    });
-
-    if (res.ok) {
-      const data = await res.json();
-      const msg = (data.choices && data.choices[0] && data.choices[0].message) || {};
-      const txt = cleanSearch((typeof msg.content === 'string' ? msg.content : msg.reasoning || '').trim());
-      if (txt && !/^ไม่พบข้อมูลยืนยัน/.test(txt)) {
-        console.log('[search] สำเร็จด้วย OpenRouter Web Search');
-        return txt;
-      }
-    }
-  } catch (err) {
-    console.warn('[search] OpenRouter web search error:', err.message);
-  }
+  console.warn('[search] ค้นไม่สำเร็จทุกโมเดล');
   return '';
 }
 
@@ -4582,7 +4427,8 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                ไม่รอให้โมเดลตัดสินใจเรียกเครื่องมือเอง เพราะมันมักคิดว่ารู้อยู่แล้ว
                แล้วตอบผิดอย่างมั่นใจ เช่นยืนยันว่ารถรุ่นที่เพิ่งเปิดตัวไม่มีอยู่จริง */
             let freshBlock = '';
-            if (question && needsFresh(question)) {
+            const wantSearch = !!(body.search) || (question && needsFresh(question));
+            if (question && wantSearch) {
               try {
                 const carName = [carInfo.make, carInfo.model].filter(Boolean).join(' ');
                 const q = question.length > 180 ? question.slice(0, 180) : question;
@@ -4598,14 +4444,14 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                 }
               } catch (e) { console.error('[fresh search]', e) }
               if (!freshBlock) {
-                /* ค้นไม่สำเร็จ ต้องสั่งให้ซื่อสัตย์ ไม่ใช่ปล่อยให้เดา
-                   ของเดิมสั่งว่า "ห้ามยืนยันว่าไม่มีอยู่จริง" ซึ่งเมื่อไม่มีข้อมูล
-                   กลายเป็นการผลักให้มันแต่งเรื่องขึ้นมาแทนการบอกว่าไม่รู้ */
-                freshBlock = '\n\n[หมายเหตุสำคัญ]\n'
-                  + 'คำถามนี้เป็นเรื่องที่ต้องใช้ข้อมูลล่าสุด แต่ระบบยังไม่มีข้อมูลยืนยันในตอนนี้\n'
-                  + 'ห้ามเดา ห้ามแต่งตัวเลข สเปก ราคา หรือวันเปิดตัวขึ้นมาเอง\n'
-                  + 'ให้บอกตรง ๆ ว่ายังไม่มีข้อมูลยืนยัน แล้วเสนอสิ่งที่ช่วยได้จริงแทน '
-                  + 'เช่น เล่าสิ่งที่รู้แน่ชัดเกี่ยวกับรุ่นก่อนหน้า และบอกว่าถ้ามีข้อมูลใหม่จะอัปเดตให้';
+                /* ค้นไม่สำเร็จ — อย่าให้โมเดลบอกว่า "ค้นหาไม่ได้/ระบบพัง"
+                   ให้ใช้ความรู้ที่มีอย่างระมัดระวังแทน */
+                freshBlock = '\n\n[หมายเหตุการค้นข้อมูล]\n'
+                  + 'ระบบพยายามค้นข้อมูลล่าสุดแล้วแต่ยังไม่ได้ผลที่ยืนยันได้ในรอบนี้\n'
+                  + 'ห้ามตอบว่า "ค้นหาไม่ได้" หรือ "ระบบค้นเว็บไม่ได้"\n'
+                  + 'ให้ตอบจากความรู้ที่มีอย่างระมัดระวัง ระบุว่าอาจไม่ใช่ข้อมูลฉบับล่าสุด\n'
+                  + 'และแนะนำแหล่งที่ผู้ใช้ตรวจเองได้ เช่น เว็บผู้ผลิตหรือตัวแทนจำหน่าย\n'
+                  + 'ห้ามแต่งตัวเลข สเปก ราคา หรือวันเปิดตัวที่ไม่มีในความรู้ของคุณ';
               }
             }
             const agentOut = await runReActAgent(env, carInfo, body.contents, meter,
@@ -5056,7 +4902,7 @@ ${convo}`;
           const q = url.searchParams.get('q') || 'Lamborghini Revuelto ล่าสุด';
           const models = [];
           if (env.GEMINI_SEARCH_MODEL) models.push(env.GEMINI_SEARCH_MODEL);
-          models.push('gemma-4-31b-it', 'gemma-4-26b-a4b-it', 'gemini-3.6-flash', 'gemini-3.5-flash-lite');
+          models.push('gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash');
           if (env.GEMINI_MODEL && !models.includes(env.GEMINI_MODEL)) models.push(env.GEMINI_MODEL);
 
           for (const model of models) {
