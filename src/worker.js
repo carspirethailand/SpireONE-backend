@@ -1542,25 +1542,27 @@ async function runReActAgent(env, carInfo, messages, meter, style, customStyle, 
 ${talkRules}
 ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext}` : ''}${userBlock}
 
-[เครื่องมือภายใน — ห้ามเอ่ยชื่อให้ผู้ใช้เห็นเด็ดขาด]
-ใช้เมื่อจำเป็นเท่านั้น ถ้าตอบได้เองอยู่แล้วไม่ต้องเรียก
-1. describe_media(prompt) — ดูไฟล์ภาพ วิดีโอ หรือเสียงที่แนบมา
-2. google_search(query) — ค้นข้อมูลที่ต้องการความสดใหม่
-ห้ามพูดถึงชื่อเครื่องมือเหล่านี้ในคำตอบ และห้ามบอกผู้ใช้ว่ากำลังค้นเว็บอยู่
+[เครื่องมือภายใน — ห้ามเอ่ยชื่อให้ผู้ใช้เห็นในคำตอบ]
+1. describe_media(prompt) — บังคับใช้เมื่อมีไฟล์ภาพ วิดีโอ หรือเสียงแนบมาในแชต
+2. google_search(query) — บังคับใช้ทันทีเมื่อผู้ใช้ถามเรื่อง:
+   - ราคากลาง, ราคาขายต่อ, ราคาอะไหล่, โปรโมชั่น, หรือค่าใช้จ่าย
+   - สเปกและข้อมูลรถรุ่นใหม่ (ปี 2024 - 2026, รถยนต์ไฟฟ้า EV, ไฮบริด)
+   - ข่าวสารการเรียกรถคืน (Recall), ปัญหาประจำรุ่น, หรืออัปเดตยานยนต์ล่าสุด
+   - กฎหมายจราจร, ภาษีรถยนต์, หรือระเบียบกรมการขนส่งทางบก
+   * ห้ามเดาตัวเลขราคาหรือสเปกจากความจำเด็ดขาด ให้เรียก google_search ก่อนเสมอ!
 
-[รูปแบบการตอบ]
-ถ้าไม่ต้องใช้เครื่องมือ ให้ตอบด้วยบรรทัดเดียวว่า
-Final Answer: [คำตอบ]
-ถ้าต้องใช้เครื่องมือ ให้เขียน
-Thought: [เหตุผลสั้น ๆ ว่าทำไมต้องใช้]
-Action: [เรียกเครื่องมือหนึ่งอย่าง]
-แล้วหยุดรอ ระบบจะเติม Observation ให้เอง ห้ามเขียน Observation เอง
-เมื่อได้ข้อมูลครบแล้วจึงปิดด้วย Final Answer
+[รูปแบบการเรียกใช้เครื่องมือ]
+เมื่อต้องค้นข้อมูลหรือดูสื่อ ให้เขียนตามรูปแบบนี้:
+Thought: [เหตุผลสั้น ๆ ว่าต้องค้นหาอะไร]
+Action: google_search("คำค้นที่กระชับและตรงประเด็น")
+(แล้วหยุดพิมพ์ทันที ระบบจะป้อน Observation กลับมาให้เอง)
+
+เมื่อได้ Observation แล้ว ให้สรุปคำตอบให้ผู้ใช้โดยขึ้นต้นว่า
+Final Answer: [คำตอบที่สมบูรณ์ เป็นมิตร และตรงประเด็น]
 
 สำคัญ:
-- คำทักทายหรือคำถามทั่วไป ตอบ Final Answer ทันที ห้ามเรียกเครื่องมือและห้ามเขียน Thought
-- ถ้ามีไฟล์แนบมา ต้องเรียก describe_media ก่อนเสมอ
-- ข้อความหลัง "Final Answer:" คือสิ่งที่ผู้ใช้จะเห็น อย่าใส่ร่องรอยการคิดลงไป${freshBlock}${kbBlock}${appliedSkills}${askBlock}${appliedStylePrompt}`;
+- คำทักทายหรือคำถามทั่วไปที่ไม่เกี่ยวกับข้อมูลสด ให้ตอบ "Final Answer: [คำตอบ]" ทันที
+- ข้อความหลัง "Final Answer:" คือสิ่งที่ผู้ใช้จะเห็น ห้ามมีแท็ก Thought หรือ Action ปนลงไป${freshBlock}${kbBlock}${appliedSkills}${askBlock}${appliedStylePrompt}`;
 
   const chatHistory = messages.map(m => {
     const o = { role: m.role === "user" ? "user" : "assistant", content: "" };
@@ -1569,8 +1571,9 @@ Action: [เรียกเครื่องมือหนึ่งอย่�
         if (p.text) {
           o.content += p.text;
         }
-        if (p.inline_data) {
-          o.content += ` [ไฟล์สื่อแนบประเภท: ${p.inline_data.mime_type}]`;
+        if (p.inline_data || p.inlineData) {
+          const mime = (p.inline_data && p.inline_data.mime_type) || (p.inlineData && p.inlineData.mimeType) || 'media';
+          o.content += ` [ไฟล์สื่อแนบประเภท: ${mime}]`;
         }
       });
     } else {
@@ -1585,34 +1588,39 @@ Action: [เรียกเครื่องมือหนึ่งอย่�
   ];
 
   let step = 0;
-  /* เก็บกระบวนการคิดของทุกรอบไว้ ส่งกลับให้หน้าเว็บแสดงเป็นบล็อกที่กดดูได้
-     ไม่ใช่เอามาปนกับคำตอบเหมือนเดิม */
   const thoughts = [];
-  const hasMedia = messages.some(m => m.parts && Array.isArray(m.parts) && m.parts.some(p => p.inline_data));
+  const hasMedia = messages.some(m => m.parts && Array.isArray(m.parts) && m.parts.some(p => p.inline_data || p.inlineData));
   let mediaProcessed = false;
+  let searchProcessed = false;
   const maxSteps = 3;
+
+  // ตรวจจับคำถามที่ต้องการข้อมูลสดออนไลน์
+  const lastUserText = (chatHistory.filter(m => m.role === 'user').pop() || {}).content || '';
+  const needsFreshData = /(ราคา|ราคากลาง|เท่าไหร่|ปี\s*202[4-6]|ล่าสุด|เปิดตัว|สเปก|โปรโมชั่น|เทียบราคา|ศูนย์บริการ|recall|ภาษีรถ|มือสอง)/i.test(lastUserText);
 
   while (step < maxSteps) {
     step++;
     
     let completionText;
+    let reasoningText = '';
     try {
       const r = await callReasoningModel(env, agentLog, meter);
       completionText = (r && typeof r === 'object') ? (r.text || '') : String(r || '');
-      if (r && r.reasoning) thoughts.push(r.reasoning);
+      reasoningText = (r && r.reasoning) ? String(r.reasoning) : '';
+      if (reasoningText) thoughts.push(reasoningText);
     } catch (err) {
       throw new Error(`ReAct reasoning failure: ${err.message}`);
     }
 
     agentLog.push({ role: "assistant", content: completionText });
 
-    /* ของเดิมบังคับว่าต้องมีเครื่องหมายคำพูดตรงเป๊ะ โมเดลฟรีมักเขียนไม่ตรงรูปแบบ
-       เช่นใช้ backtick อัญประกาศไทย หรือไม่ใส่คำพูดเลย แล้วเครื่องมือก็ไม่ถูกเรียก
-       ยอมรับหลายรูปแบบ จะได้ไม่พลาดเพราะเรื่องเครื่องหมาย */
-    let actionMatch = completionText.match(/Action:\s*(\w+)\s*\(\s*(["'`\u201c\u2018])([\s\S]*?)\2\s*\)/i);
+    const combinedForAction = `${completionText}\n${reasoningText}`;
+    let actionMatch = combinedForAction.match(/(?:Action|Tool):\s*(\w+)\s*[:\(]\s*(?:query\s*=\s*)?(["'`\u201c\u2018])([\s\S]*?)\2\s*\)?/i);
     if (!actionMatch) {
-      const loose = completionText.match(/Action:\s*(\w+)\s*\(([^)]*)\)/i);
-      if (loose) actionMatch = [loose[0], loose[1], '"', loose[2].replace(/^["'`\u201c\u2018]|["'`\u201d\u2019]$/g, '').trim()];
+      const loose = combinedForAction.match(/(?:Action|Tool):\s*(\w+)\s*\(([^)]+)\)/i);
+      if (loose) {
+        actionMatch = [loose[0], loose[1], '"', loose[2].replace(/^["'`\u201c\u2018]|["'`\u201d\u2019]$/g, '').trim()];
+      }
     }
     
     if (actionMatch) {
@@ -1624,8 +1632,9 @@ Action: [เรียกเครื่องมือหนึ่งอย่�
         if (toolName === "describe_media") {
           observation = await executeDescribeMediaTool(env, messages, toolInput);
           mediaProcessed = true;
-        } else if (toolName === "google_search") {
+        } else if (toolName === "google_search" || toolName === "search" || toolName === "web_search") {
           observation = await executeGoogleSearchTool(env, toolInput);
+          searchProcessed = true;
         } else {
           observation = `Error: Unknown tool "${toolName}"`;
         }
@@ -1644,6 +1653,23 @@ Action: [เรียกเครื่องมือหนึ่งอย่�
         observation = `Error running describe_media: ${toolErr.message}`;
       }
       agentLog.push({ role: "user", content: `Observation: ${observation}` });
+    } else if (needsFreshData && !searchProcessed && step === 1) {
+      console.log('[ReAct Agent] User question needs fresh data but explicit Action tag not generated. Executing google_search fallback...');
+      searchProcessed = true;
+      let observation = "";
+      try {
+        const carPrefix = (carInfo && (carInfo.make || carInfo.model)) ? `${carInfo.make || ''} ${carInfo.model || ''} ` : '';
+        observation = await executeGoogleSearchTool(env, `${carPrefix}${lastUserText}`);
+      } catch (toolErr) {
+        observation = `Error running google_search: ${toolErr.message}`;
+      }
+      if (observation) {
+        agentLog.push({ role: "user", content: `Observation: ${observation}` });
+      } else {
+        const finalAnswerMatch = completionText.match(/Final Answer:\s*([\s\S]+)$/i);
+        const out = cleanReply(finalAnswerMatch ? finalAnswerMatch[1] : completionText);
+        return { text: out, reasoning: thoughts.join('\n\n').slice(0, 6000) };
+      }
     } else {
       const finalAnswerMatch = completionText.match(/Final Answer:\s*([\s\S]+)$/i);
       const out = cleanReply(finalAnswerMatch ? finalAnswerMatch[1] : completionText);
