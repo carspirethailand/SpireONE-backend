@@ -1844,16 +1844,12 @@ async function describeMediaViaOpenRouter(env, parts, prompt) {
    ถ้าไม่ได้จริง ๆ จะคืนค่าว่างพร้อมบอกผู้เรียกให้จัดการอย่างซื่อสัตย์ */
 async function executeGoogleSearchTool(env, query) {
   const geminiKey = env.GEMINI_KEY;
-  if (!geminiKey) { console.warn('[search] ไม่มี GEMINI_KEY'); return '' }
   const baseUrl = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
-  /* เรียงจากที่น่าจะรองรับการค้นดีที่สุด ถ้าตัวไหนไม่มีจริงจะข้ามไปตัวถัดไปเอง */
   const models = [];
   if (env.GEMINI_SEARCH_MODEL) models.push(env.GEMINI_SEARCH_MODEL);
-  models.push('gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash');
+  models.push('gemma-4-31b-it', 'gemma-4-26b-a4b-it', 'gemini-3.6-flash', 'gemini-3.5-flash-lite');
   if (env.GEMINI_MODEL && !models.includes(env.GEMINI_MODEL)) models.push(env.GEMINI_MODEL);
 
-  /* บอกแหล่งที่ยอมรับให้ชัด ไม่งั้นมันไปหยิบบล็อกหรือเว็บรวมข่าวที่คัดลอกกันมา
-     ซึ่งมั่วบ่อยมากโดยเฉพาะเรื่องรถที่เพิ่งเปิดตัว */
   const prompt = `ค้นข้อมูลล่าสุดในอินเทอร์เน็ตเรื่องนี้ แล้วสรุปเฉพาะข้อเท็จจริงที่ยืนยันได้: ${query}
 
 แหล่งที่ยอมรับ เรียงตามลำดับความน่าเชื่อถือ:
@@ -1870,37 +1866,86 @@ async function executeGoogleSearchTool(env, query) {
 - ถ้าค้นแล้วไม่พบข้อมูลที่ยืนยันได้จากแหล่งเหล่านี้เลย ให้ตอบว่า "ไม่พบข้อมูลยืนยัน" คำเดียว
   ห้ามเดา ห้ามแต่งตัวเลข และห้ามเอาข่าวลือมาตอบ`;
 
-  for (const model of models) {
-    for (const toolShape of [{ google_search: {} }, { google_search_retrieval: {} }]) {
-      try {
-        const res = await fetch(`${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: prompt }] }],
-            tools: [toolShape],
-            generationConfig: { temperature: 0.2 },
-          }),
-        });
-        if (!res.ok) {
-          console.warn(`[search] ${model} ตอบ ${res.status}`);
-          continue;
+  if (geminiKey) {
+    for (const model of [...new Set(models)]) {
+      for (const toolShape of [{ google_search: {} }, { google_search_retrieval: {} }]) {
+        try {
+          const res = await fetch(`${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text: prompt }] }],
+              tools: [toolShape],
+              generationConfig: { temperature: 0.2 },
+            }),
+          });
+          if (!res.ok) {
+            console.warn(`[search] ${model} ตอบ ${res.status}`);
+            continue;
+          }
+          const data = await res.json();
+          const cand = (data.candidates && data.candidates[0]) || {};
+          const txt = cleanSearch(((cand.content && cand.content.parts) || [])
+            .map(x => x.text || '').join('').trim());
+          if (txt && !/^ไม่พบข้อมูลยืนยัน/.test(txt)) {
+            console.log(`[search] สำเร็จด้วย Google Search (${model})`);
+            return txt;
+          }
+          if (/^ไม่พบข้อมูลยืนยัน/.test(txt)) return '';
+        } catch (e) {
+          console.warn(`[search] ${model} ล้มเหลว: ${e.message}`);
         }
-        const data = await res.json();
-        const cand = (data.candidates && data.candidates[0]) || {};
-        const txt = cleanSearch(((cand.content && cand.content.parts) || [])
-          .map(x => x.text || '').join('').trim());
-        if (txt && !/^ไม่พบข้อมูลยืนยัน/.test(txt)) {
-          console.log(`[search] สำเร็จด้วย ${model}`);
-          return txt;
-        }
-        if (/^ไม่พบข้อมูลยืนยัน/.test(txt)) return '';
-      } catch (e) {
-        console.warn(`[search] ${model} ล้มเหลว: ${e.message}`);
       }
     }
   }
-  console.warn('[search] ค้นไม่สำเร็จทุกโมเดล');
+
+  // Fallback: OpenRouter Web Search Plugin
+  if (env.OPENROUTER_API_KEY) {
+    console.log('[search] Google Direct Search ล้มเหลวหรือติดข้อจำกัด — ลองค้นผ่าน OpenRouter Web Search...');
+    const orTxt = await executeOpenRouterSearch(env, query);
+    if (orTxt) return orTxt;
+  }
+
+  console.warn('[search] ค้นไม่สำเร็จทุกช่องทาง');
+  return '';
+}
+
+async function executeOpenRouterSearch(env, query) {
+  const apiKey = env.OPENROUTER_API_KEY;
+  if (!apiKey) return '';
+  const baseUrl = env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
+
+  const prompt = `ค้นหาข้อมูลล่าสุดทางอินเทอร์เน็ตเกี่ยวกับเรื่องนี้อย่างกระชับ: ${query}\nระบุข้อเท็จจริง สเปก ราคา หรือข่าวที่ยืนยันได้ ตอบเป็นข้อ ๆ สั้น ๆ`;
+
+  try {
+    const res = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://carspirethailand.com',
+        'X-Title': 'Cendon'
+      },
+      body: JSON.stringify({
+        model: 'openrouter/free',
+        messages: [{ role: 'user', content: prompt }],
+        plugins: [{ id: 'web' }],
+        temperature: 0.2
+      })
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      const msg = (data.choices && data.choices[0] && data.choices[0].message) || {};
+      const txt = cleanSearch((typeof msg.content === 'string' ? msg.content : msg.reasoning || '').trim());
+      if (txt && !/^ไม่พบข้อมูลยืนยัน/.test(txt)) {
+        console.log('[search] สำเร็จด้วย OpenRouter Web Search');
+        return txt;
+      }
+    }
+  } catch (err) {
+    console.warn('[search] OpenRouter web search error:', err.message);
+  }
   return '';
 }
 
@@ -5011,7 +5056,7 @@ ${convo}`;
           const q = url.searchParams.get('q') || 'Lamborghini Revuelto ล่าสุด';
           const models = [];
           if (env.GEMINI_SEARCH_MODEL) models.push(env.GEMINI_SEARCH_MODEL);
-          models.push('gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash');
+          models.push('gemma-4-31b-it', 'gemma-4-26b-a4b-it', 'gemini-3.6-flash', 'gemini-3.5-flash-lite');
           if (env.GEMINI_MODEL && !models.includes(env.GEMINI_MODEL)) models.push(env.GEMINI_MODEL);
 
           for (const model of models) {
