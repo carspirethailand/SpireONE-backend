@@ -21,7 +21,7 @@ const CHECKS = ['identity', 'phone', 'work', 'skills', 'shop', 'terms'];
    ใบรับรองฝีมือไม่บังคับ — ช่างเก่งจำนวนมากไม่มีใบ ทีมงานสัมภาษณ์ทักษะแทนได้ */
 const DOCS = [['id', 1, 1], ['selfie', 1, 1], ['shop', 1, 3], ['work', 3, 6], ['cert', 0, 2]];
 const PRIVATE_DOCS = ['id', 'selfie', 'cert'];
-const API_VERSION = 4;
+const API_VERSION = 5;
 const PHONE = /^0\d{8,9}$/;
 const now = () => Date.now();
 
@@ -115,6 +115,10 @@ const TECH_ALTER = [
   address TEXT NOT NULL, phone TEXT NOT NULL, requested_time TEXT NOT NULL, mode TEXT NOT NULL, urgent INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
   `CREATE INDEX IF NOT EXISTS tech_posts_open ON tech_posts(status, created_at)`,
+  `ALTER TABLE tech_posts ADD COLUMN note TEXT`,
+  `ALTER TABLE tech_jobs ADD COLUMN note TEXT`,
+  `CREATE TABLE IF NOT EXISTS tech_media (id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, uid TEXT NOT NULL, mime TEXT NOT NULL, data TEXT NOT NULL, created_at INTEGER NOT NULL)`,
+  `CREATE INDEX IF NOT EXISTS tech_media_owner ON tech_media(owner)`,
   `CREATE INDEX IF NOT EXISTS tech_jobs_group ON tech_jobs(group_id)`,
 ];
 let techReady = false;
@@ -237,13 +241,22 @@ function publicTech(r) {
     photos: r.photos || [], online: !!r.online, hours: d.hours || '',
   };
 }
+/* D1 รับตัวแปรได้ไม่เกิน 100 ตัวต่อคำสั่ง — พอช่าง/งานเกินร้อย รายชื่อจะพังทั้งหน้า
+   จึงแบ่ง IN (...) เป็นชุดละ 90 แล้วรวมผล ({IN} ในคำสั่งคือจุดที่ใส่ ? ของรายการ) */
+async function inAll(env, sql, list, pre = [], post = []) {
+  const out = [];
+  for (let i = 0; i < list.length; i += 90) {
+    const part = list.slice(i, i + 90);
+    const { results } = await env.DB.prepare(sql.replace('{IN}', part.map(() => '?').join(','))).bind(...pre, ...part, ...post).all();
+    out.push(...results);
+  }
+  return out;
+}
 /* แนบรูปอู่และรูปผลงาน (ไม่ใช่บัตร) ให้การ์ดช่าง — ดึงครั้งเดียวทั้งรายการ ไม่ใช่ทีละคน */
 async function withPhotos(env, rows) {
   if (!rows.length) return rows;
   const uids = [...new Set(rows.map(r => r.uid))];
-  const { results } = await env.DB.prepare(
-    `SELECT id, uid, kind FROM tech_docs WHERE kind IN ('shop','work') AND uid IN (${uids.map(() => '?').join(',')}) ORDER BY kind DESC, id ASC`)
-    .bind(...uids).all();
+  const results = await inAll(env, "SELECT id, uid, kind FROM tech_docs WHERE kind IN ('shop','work') AND uid IN ({IN}) ORDER BY kind DESC, id ASC", uids);
   const by = {};
   results.forEach(d => (by[d.uid] = by[d.uid] || []).push(d.id));
   return rows.map(r => ({ ...r, photos: by[r.uid] || [] }));
@@ -507,7 +520,7 @@ function jobOut(j, t, role, messages) {
     quote: parse(j.quote), completion: j.completion, dispute: j.dispute, resolution: j.resolution,
     review: parse(j.review), history: parse(j.history) || [],
     createdAt: j.created_at, acceptedAt: j.accepted_at,
-    messages: messages || [],
+    messages: messages || [], note: j.note || '',
   };
   /* ลูกค้าเห็นที่อยู่ของตัวเองเสมอ ช่างเห็นหลังลูกค้ายืนยันราคาแล้วเท่านั้น */
   if (role === 'customer' || role === 'both' || role === 'admin' || accepted) out.address = j.address;
@@ -537,17 +550,14 @@ async function myJobs(env, me, myTech, all) {
   const { results } = await env.DB.prepare(q).bind(...args).all();
   if (!results.length) return [];
   const ids = results.map(r => r.id);
-  const ph = ids.map(() => '?').join(',');
   const [names, unread] = await Promise.all([
-    env.DB.prepare(`SELECT id, data FROM tech_profiles WHERE id IN (${[...new Set(results.map(r => r.tech_id))].map(() => '?').join(',')})`)
-      .bind(...new Set(results.map(r => r.tech_id))).all(),
-    env.DB.prepare(`SELECT m.job_id, COUNT(*) AS n FROM tech_messages m
+    inAll(env, 'SELECT id, data FROM tech_profiles WHERE id IN ({IN})', [...new Set(results.map(r => r.tech_id))]),
+    inAll(env, `SELECT m.job_id, COUNT(*) AS n FROM tech_messages m
       LEFT JOIN tech_reads r ON r.job_id = m.job_id AND r.uid = ?
-      WHERE m.job_id IN (${ph}) AND m.uid != ? AND m.id > COALESCE(r.last, 0) GROUP BY m.job_id`)
-      .bind(me.uid, ...ids, me.uid).all(),
+      WHERE m.job_id IN ({IN}) AND m.uid != ? AND m.id > COALESCE(r.last, 0) GROUP BY m.job_id`, ids, [me.uid], [me.uid]),
   ]);
-  const nm = Object.fromEntries(names.results.map(r => { const d = parse(r.data) || {}; return [r.id, d.shop || d.name]; }));
-  const un = Object.fromEntries(unread.results.map(r => [r.job_id, r.n]));
+  const nm = Object.fromEntries(names.map(r => { const d = parse(r.data) || {}; return [r.id, d.shop || d.name]; }));
+  const un = Object.fromEntries(unread.map(r => [r.job_id, r.n]));
   return results.map(j => {
     const cust = j.customer_uid === me.uid, tech = !!myTech && j.tech_id === myTech.id;
     /* งานไหนรอเราอยู่ — ใช้เรียงขึ้นบนสุดและนับบนปุ่ม */
@@ -561,6 +571,31 @@ async function myJobs(env, me, myTech, all) {
       needsMe, unread: un[j.id] || 0 };
   });
 }
+
+/* ══ รูปแนบกับคำขอ (เช่น รูปรถที่จอด รูปอาการ) ══
+   ผูกกับประกาศหรือใบงาน เห็นได้เฉพาะคนที่เปิดประกาศ/ใบงานนั้นได้ — ไม่มีทางเปิดผ่านลิงก์สาธารณะ */
+function mediaIn(b) {
+  const list = Array.isArray(b.photos) ? b.photos : [];
+  if (list.length > 3) fail(400, 'แนบรูปได้ไม่เกิน 3 รูป');
+  return list.map(x => {
+    const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(x || ''));
+    if (!m || m[2].length > 1400000) fail(400, 'ไฟล์ต้องเป็นรูปภาพ');
+    return { mime: m[1], data: m[2] };
+  });
+}
+async function saveMedia(env, owner, uid, list) {
+  if (!list.length) return;
+  const have = await env.DB.prepare('SELECT COUNT(*) AS n FROM tech_media WHERE owner = ?').bind(owner).first();
+  if (have.n) return;
+  await env.DB.batch(list.map(x => env.DB.prepare('INSERT INTO tech_media (owner, uid, mime, data, created_at) VALUES (?,?,?,?,?)').bind(owner, uid, x.mime, x.data, now())));
+}
+async function mediaOf(env, owners) {
+  const o = owners.filter(Boolean);
+  if (!o.length) return [];
+  const results = await inAll(env, 'SELECT id, mime, data FROM tech_media WHERE owner IN ({IN}) ORDER BY id', o);
+  return results.map(r => `data:${r.mime};base64,${r.data}`);
+}
+const noteIn = b => String(b.note || '').trim().slice(0, 300);
 
 async function createJob(env, me, b) {
   const id = String(b.id || '');
@@ -593,13 +628,16 @@ async function createJob(env, me, b) {
     if (g.n >= 5) fail(400, 'ขอราคาพร้อมกันได้ไม่เกิน 5 ร้าน');
   }
   const ts = now();
-  await env.DB.prepare(`INSERT INTO tech_jobs (id,tech_id,customer_uid,status,test,car,symptom,area,address,phone,requested_time,mode,history,revision,created_at,updated_at,group_id)
-    VALUES (?,?,?,'requested',?,?,?,?,?,?,?,?,?,1,?,?,?)`).bind(
+  const photos = mediaIn(b);
+  await env.DB.prepare(`INSERT INTO tech_jobs (id,tech_id,customer_uid,status,test,car,symptom,area,address,phone,requested_time,mode,history,revision,created_at,updated_at,group_id,note)
+    VALUES (?,?,?,'requested',?,?,?,?,?,?,?,?,?,1,?,?,?,?)`).bind(
     id, t.id, me.uid, t.test ? 1 : 0,
     str(b.car, 'รถ / รุ่น / ปี', 2, 200), str(b.symptom, 'อาการ', 10, 2000),
     str(b.area, 'พื้นที่', 4, 160), str(b.address, 'ที่อยู่', 8, 500), phone(b.phone, 'เบอร์โทร'),
     str(b.requestedTime, 'วันและเวลา', 4, 160), mode,
-    JSON.stringify([{ status: 'requested', at: ts, by: 'customer' }]), ts, ts, group).run();
+    JSON.stringify([{ status: 'requested', at: ts, by: 'customer' }]), ts, ts, group, noteIn(b)).run();
+  /* ขอหลายร้านพร้อมกัน เก็บรูปชุดเดียวผูกกับชุดคำขอ ไม่ต้องเก็บซ้ำทุกร้าน */
+  await saveMedia(env, group || id, me.uid, photos);
   return { id };
 }
 
@@ -607,7 +645,9 @@ async function getJob(env, me, id) {
   const { j, t, role } = await loadJob(env, me, id);
   const messages = await messagesOf(env, id, 0);
   if (role !== 'admin') await markRead(env, id, me.uid, messages.length ? messages[messages.length - 1].id : 0);
-  return { job: jobOut(j, t, role, messages) };
+  const out = jobOut(j, t, role, messages);
+  out.photos = await mediaOf(env, [j.id, j.group_id]);
+  return { job: out };
 }
 
 /* ดึงเฉพาะข้อความใหม่ — หน้าแชตเรียกทุกไม่กี่วินาที จึงต้องเบาที่สุด */
@@ -749,7 +789,7 @@ async function offerId(postId, techId) {
 function postOut(p, extra) {
   return { id: p.id, status: p.status, test: !!p.test, car: p.car, symptom: p.symptom, cat: p.cat,
     lat: p.lat, lng: p.lng, area: p.area, requestedTime: p.requested_time, mode: p.mode, urgent: !!p.urgent,
-    createdAt: p.created_at, expiresAt: p.created_at + POST_TTL, ...(extra || {}) };
+    note: p.note || '', createdAt: p.created_at, expiresAt: p.created_at + POST_TTL, ...(extra || {}) };
 }
 
 async function createPost(env, me, b) {
@@ -763,13 +803,26 @@ async function createPost(env, me, b) {
     .bind(me.uid, now() - POST_TTL).first();
   if (open.n >= 3 && !me.staff) fail(429, 'มีประกาศที่เปิดอยู่ 3 รายการแล้ว ปิดอันเก่าก่อน');
   const ts = now();
+  const photos = mediaIn(b);
   /* ประกาศของทีมงานเป็นงานทดสอบ — ช่างจริงไม่เห็น เห็นเฉพาะช่างทีมงาน */
-  await env.DB.prepare(`INSERT INTO tech_posts (id,customer_uid,status,test,car,symptom,cat,lat,lng,area,address,phone,requested_time,mode,urgent,created_at,updated_at)
-    VALUES (?,?,'open',?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(id, me.uid, me.staff ? 1 : 0,
+  await env.DB.prepare(`INSERT INTO tech_posts (id,customer_uid,status,test,car,symptom,cat,lat,lng,area,address,phone,requested_time,mode,urgent,created_at,updated_at,note)
+    VALUES (?,?,'open',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(id, me.uid, me.staff ? 1 : 0,
     str(b.car, 'รถ / รุ่น / ปี', 2, 200), str(b.symptom, 'อาการ', 10, 2000), cat, c.lat, c.lng,
     str(b.area, 'พื้นที่', 3, 160), str(b.address, 'ที่อยู่', 4, 500), phone(b.phone, 'เบอร์โทร'),
-    str(b.requestedTime, 'วันและเวลา', 2, 160), b.mode === 'shop' ? 'shop' : 'mobile', b.urgent ? 1 : 0, ts, ts).run();
+    str(b.requestedTime, 'วันและเวลา', 2, 160), b.mode === 'shop' ? 'shop' : 'mobile', b.urgent ? 1 : 0, ts, ts, noteIn(b)).run();
+  await saveMedia(env, id, me.uid, photos);
   return { id };
+}
+
+/* รายละเอียดประกาศพร้อมรูป — เจ้าของประกาศ หรือช่างที่มองเห็นประกาศนี้ได้ */
+async function postDetail(env, me, id) {
+  const p = await env.DB.prepare('SELECT * FROM tech_posts WHERE id = ?').bind(id).first();
+  if (!p) fail(404, 'ไม่พบประกาศ');
+  if (p.customer_uid !== me.uid) {
+    const t = await env.DB.prepare('SELECT test, suspended FROM tech_profiles WHERE uid = ?').bind(me.uid).first();
+    if (!t || t.suspended || (p.test && !t.test)) fail(404, 'ไม่พบประกาศ');
+  }
+  return { post: postOut(p, { photos: await mediaOf(env, [p.id]) }) };
 }
 
 async function myPosts(env, me) {
@@ -796,13 +849,18 @@ async function nearPosts(env, me) {
   const mine = {};
   if (results.length) {
     const ids = await Promise.all(results.map(p => offerId(p.id, t.id)));
-    const { results: js } = await env.DB.prepare(`SELECT id, group_id, status, quote FROM tech_jobs WHERE id IN (${ids.map(() => '?').join(',')})`).bind(...ids).all();
+    const js = await inAll(env, 'SELECT id, group_id, status, quote FROM tech_jobs WHERE id IN ({IN})', ids);
     js.forEach(j => { mine[j.group_id] = { status: j.status, total: (parse(j.quote) || {}).total }; });
+  }
+  const pc = {};
+  if (results.length) {
+    const mc = await inAll(env, 'SELECT owner, COUNT(*) AS n FROM tech_media WHERE owner IN ({IN}) GROUP BY owner', results.map(p => p.id));
+    mc.forEach(r => { pc[r.owner] = r.n; });
   }
   const posts = results.map(p => ({ p, dist: km(d.lat, d.lng, p.lat, p.lng) }))
     .filter(x => x.dist <= radius && (!x.p.cat || (d.cats || []).includes(x.p.cat) || t.test))
     .sort((a, b) => (b.p.urgent - a.p.urgent) || a.dist - b.dist)
-    .map(x => postOut(x.p, { dist: x.dist, mine: mine[x.p.id] || null }));
+    .map(x => postOut(x.p, { dist: x.dist, mine: mine[x.p.id] || null, photos: pc[x.p.id] || 0 }));
   return { posts, radius, center: { lat: d.lat, lng: d.lng } };
 }
 
@@ -829,11 +887,11 @@ async function offer(env, me, postId, b) {
     return { id, updated: true };
   }
   const d = parse(t.data) || {};
-  await env.DB.prepare(`INSERT INTO tech_jobs (id,tech_id,customer_uid,status,test,car,symptom,area,address,phone,requested_time,mode,quote,history,revision,created_at,updated_at,group_id)
-    VALUES (?,?,?,'quoted',?,?,?,?,?,?,?,?,?,?,1,?,?,?)`).bind(id, t.id, p.customer_uid, p.test || t.test ? 1 : 0,
+  await env.DB.prepare(`INSERT INTO tech_jobs (id,tech_id,customer_uid,status,test,car,symptom,area,address,phone,requested_time,mode,quote,history,revision,created_at,updated_at,group_id,note)
+    VALUES (?,?,?,'quoted',?,?,?,?,?,?,?,?,?,?,1,?,?,?,?)`).bind(id, t.id, p.customer_uid, p.test || t.test ? 1 : 0,
     p.car, p.symptom, p.area, p.address + ` · แผนที่ https://maps.google.com/?q=${p.lat},${p.lng}`, p.phone, p.requested_time,
     p.mode === 'mobile' && d.mobile ? 'mobile' : 'shop', quote,
-    JSON.stringify([{ status: 'requested', at: p.created_at, by: 'customer' }, { status: 'quoted', at: ts, by: 'technician' }]), ts, ts, p.id).run();
+    JSON.stringify([{ status: 'requested', at: p.created_at, by: 'customer' }, { status: 'quoted', at: ts, by: 'technician' }]), ts, ts, p.id, p.note || '').run();
   await env.DB.prepare('UPDATE tech_posts SET updated_at = ? WHERE id = ?').bind(ts, p.id).run();
   return { id };
 }
@@ -1010,6 +1068,8 @@ async function route(request, env) {
   if (p === '/api/tech/shop' && m === 'POST') return editShop(env, me, await body());
   if (p === '/api/tech/stats' && m === 'GET') return stats(env, me);
   if (p === '/api/tech/advice' && m === 'GET') return advice(env, me);
+  const pd = p.match(/^\/api\/tech\/posts\/([0-9a-f-]{36})$/i);
+  if (pd && m === 'GET') return postDetail(env, me, pd[1]);
   let pm = p.match(/^\/api\/tech\/posts\/([0-9a-f-]{36})\/(offer|close)$/i);
   if (pm && m === 'POST') return pm[2] === 'offer' ? offer(env, me, pm[1], await body()) : closePost(env, me, pm[1]);
   let mm = p.match(/^\/api\/tech\/jobs\/([0-9a-f-]{36})$/i);
