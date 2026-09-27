@@ -21,7 +21,7 @@ const CHECKS = ['identity', 'phone', 'work', 'skills', 'shop', 'terms'];
    ใบรับรองฝีมือไม่บังคับ — ช่างเก่งจำนวนมากไม่มีใบ ทีมงานสัมภาษณ์ทักษะแทนได้ */
 const DOCS = [['id', 1, 1], ['selfie', 1, 1], ['shop', 1, 3], ['work', 3, 6], ['cert', 0, 2]];
 const PRIVATE_DOCS = ['id', 'selfie', 'cert'];
-const API_VERSION = 2;
+const API_VERSION = 3;
 const PHONE = /^0\d{8,9}$/;
 const now = () => Date.now();
 
@@ -104,10 +104,16 @@ const TECH_SQL = [
   PRIMARY KEY (job_id, uid)
 )`
 ];
+/* คอลัมน์ที่เพิ่มทีหลัง — ALTER ซ้ำจะ error ว่ามีอยู่แล้ว ซึ่งเป็นเรื่องปกติ ข้ามไปได้ */
+const TECH_ALTER = [
+  `ALTER TABLE tech_jobs ADD COLUMN group_id TEXT`,
+  `CREATE INDEX IF NOT EXISTS tech_jobs_group ON tech_jobs(group_id)`,
+];
 let techReady = false;
 async function ensureTech(env) {
   if (techReady) return;
   for (const sql of TECH_SQL) await env.DB.prepare(sql).run();
+  for (const sql of TECH_ALTER) { try { await env.DB.prepare(sql).run(); } catch (e) { /* มีอยู่แล้ว */ } }
   techReady = true;
 }
 
@@ -279,6 +285,15 @@ async function meInfo(env, me) {
   };
 }
 
+/* เลขบัตรประชาชนไทย 13 หลัก ตรวจหลักสุดท้ายตามสูตรของกรมการปกครอง
+   กันพิมพ์ผิดหนึ่งหลักได้เกือบทุกกรณี */
+function thaiId(s) {
+  if (!/^\d{13}$/.test(s)) return false;
+  let sum = 0;
+  for (let i = 0; i < 12; i++) sum += Number(s[i]) * (13 - i);
+  return (11 - (sum % 11)) % 10 === Number(s[12]);
+}
+
 /* พิกัดต้องอยู่ในไทย (เผื่อขอบ) — กันพิกัดศูนย์ศูนย์จาก GPS ที่ยังจับไม่ได้ */
 function coord(b) {
   const lat = Number(b.lat), lng = Number(b.lng);
@@ -344,6 +359,8 @@ async function apply(env, me, b) {
   const cats = [...new Set((Array.isArray(b.cats) ? b.cats : []).filter(c => CATS.includes(c)))];
   if (!cats.length) fail(400, 'เลือกงานที่รับอย่างน้อย 1 อย่าง');
   if (b.consent !== true) fail(400, 'ต้องกดยินยอมก่อนส่งใบสมัคร');
+  const idNo = String(b.idNo || '').replace(/\D/g, '');
+  if (!thaiId(idNo)) fail(400, 'เลขประจำตัวประชาชนไม่ถูกต้อง');
   const c = coord(b);
   const d = {
     name: str(b.name, 'ชื่อ-นามสกุล (ตรงบัตร)', 4, 100), shop: String(b.shop || '').trim().slice(0, 120),
@@ -353,6 +370,9 @@ async function apply(env, me, b) {
     from: num(b.from, 'ราคาเริ่มต้น', 1, 1000000), warranty: num(b.warranty, 'รับประกัน', 7, 365),
     radius: num(b.radius, 'รัศมีบริการ', 0, 200), lat: c.lat, lng: c.lng,
     cats, mobile: !!b.mobile, urgent: !!b.urgent, hasCert: false, consentAt: t,
+    title: ['นาย', 'นาง', 'นางสาว'].includes(b.title) ? b.title : '', idNo,
+    birth: /^\d{4}-\d{2}-\d{2}$/.test(String(b.birth || '')) ? b.birth : '',
+    appNo: 'CP-' + (await sha(me.uid)).slice(0, 6).toUpperCase(), submittedAt: t,
   };
   const docs = docList(b);
   d.hasCert = docs.some(x => x.kind === 'cert');
@@ -410,8 +430,11 @@ async function review(env, me, b) {
   if (decision === 'approve' && !CHECKS.every(k => checks[k])) fail(400, 'อนุมัติได้เมื่อตรวจครบทุกข้อเท่านั้น');
   const t = now();
   const rv = JSON.stringify({ by: me.email, note, checks, decision, at: t });
-  const stmts = [env.DB.prepare('UPDATE tech_applications SET status=?, review=?, updated_at=? WHERE uid=?')
-    .bind(decision === 'approve' ? 'approved' : 'rejected', rv, t, a.uid),
+  /* ตรวจเสร็จแล้วเก็บเลขบัตรไว้แค่ 4 หลักท้าย พอให้ย้อนตรวจได้ แต่ไม่พอเอาไปใช้ปลอมตัว */
+  const dd = parse(a.data) || {};
+  if (dd.idNo) dd.idNo = 'x-xxxx-xxxxx-' + String(dd.idNo).slice(-3, -1) + '-' + String(dd.idNo).slice(-1);
+  const stmts = [env.DB.prepare('UPDATE tech_applications SET status=?, review=?, data=?, updated_at=? WHERE uid=?')
+    .bind(decision === 'approve' ? 'approved' : 'rejected', rv, JSON.stringify(dd), t, a.uid),
     /* ตรวจเสร็จแล้ว ลบรูปบัตร เซลฟี่ และใบรับรองทิ้งทันที ไม่เก็บไว้เกินจำเป็น (PDPA)
        เหลือแค่บันทึกว่าใครตรวจอะไรไปเมื่อไร */
     env.DB.prepare(`DELETE FROM tech_docs WHERE uid = ? AND kind IN (${PRIVATE_DOCS.map(() => '?').join(',')})`)
@@ -471,7 +494,7 @@ function jobOut(j, t, role, messages) {
   const d = parse(t && t.data) || {};
   const out = {
     id: j.id, status: j.status, test: !!j.test, role, revision: j.revision,
-    techId: j.tech_id, techName: d.shop || d.name || 'ช่าง',
+    techId: j.tech_id, techName: d.shop || d.name || 'ช่าง', group: j.group_id || null,
     car: j.car, symptom: j.symptom, area: j.area, requestedTime: j.requested_time, mode: j.mode,
     quote: parse(j.quote), completion: j.completion, dispute: j.dispute, resolution: j.resolution,
     review: parse(j.review), history: parse(j.history) || [],
@@ -522,7 +545,9 @@ async function myJobs(env, me, myTech, all) {
     /* งานไหนรอเราอยู่ — ใช้เรียงขึ้นบนสุดและนับบนปุ่ม */
     const needsMe = (tech && ['requested', 'accepted', 'enroute', 'working'].includes(j.status))
       || (cust && ['quoted', 'done'].includes(j.status));
-    return { id: j.id, status: j.status, test: !!j.test, techName: nm[j.tech_id] || 'ช่าง',
+    const q = parse(j.quote);
+    return { id: j.id, status: j.status, test: !!j.test, techName: nm[j.tech_id] || 'ช่าง', techId: j.tech_id,
+      group: j.group_id || null, total: q ? q.total : null,
       car: j.car, symptom: j.symptom, createdAt: j.created_at, updatedAt: j.updated_at,
       side: cust && tech ? 'both' : cust ? 'customer' : tech ? 'technician' : 'admin',
       needsMe, unread: un[j.id] || 0 };
@@ -550,14 +575,23 @@ async function createJob(env, me, b) {
       .bind(me.uid, now() - 86400000).first();
     if (c.n >= 10) fail(429, 'วันนี้ส่งคำขอครบ 10 ครั้งแล้ว ลองใหม่พรุ่งนี้');
   }
+  /* ขอราคาหลายร้านพร้อมกัน — ใบงานทุกใบในชุดเดียวกันมี group เดียวกัน
+     พอลูกค้ายืนยันร้านหนึ่ง ร้านอื่นในชุดถูกยกเลิกให้อัตโนมัติ */
+  const group = b.group ? String(b.group) : null;
+  if (group && !/^[0-9a-f-]{36}$/i.test(group)) fail(400, 'รหัสชุดคำขอไม่ถูกต้อง');
+  if (group) {
+    const g = await env.DB.prepare('SELECT COUNT(*) AS n, MIN(customer_uid) AS u FROM tech_jobs WHERE group_id = ?').bind(group).first();
+    if (g.n && g.u !== me.uid) fail(409, 'รหัสชุดคำขอซ้ำ');
+    if (g.n >= 5) fail(400, 'ขอราคาพร้อมกันได้ไม่เกิน 5 ร้าน');
+  }
   const ts = now();
-  await env.DB.prepare(`INSERT INTO tech_jobs (id,tech_id,customer_uid,status,test,car,symptom,area,address,phone,requested_time,mode,history,revision,created_at,updated_at)
-    VALUES (?,?,?,'requested',?,?,?,?,?,?,?,?,?,1,?,?)`).bind(
+  await env.DB.prepare(`INSERT INTO tech_jobs (id,tech_id,customer_uid,status,test,car,symptom,area,address,phone,requested_time,mode,history,revision,created_at,updated_at,group_id)
+    VALUES (?,?,?,'requested',?,?,?,?,?,?,?,?,?,1,?,?,?)`).bind(
     id, t.id, me.uid, t.test ? 1 : 0,
     str(b.car, 'รถ / รุ่น / ปี', 2, 200), str(b.symptom, 'อาการ', 10, 2000),
     str(b.area, 'พื้นที่', 4, 160), str(b.address, 'ที่อยู่', 8, 500), phone(b.phone, 'เบอร์โทร'),
     str(b.requestedTime, 'วันและเวลา', 4, 160), mode,
-    JSON.stringify([{ status: 'requested', at: ts, by: 'customer' }]), ts, ts).run();
+    JSON.stringify([{ status: 'requested', at: ts, by: 'customer' }]), ts, ts, group).run();
   return { id };
 }
 
@@ -659,8 +693,30 @@ async function updateJob(env, me, id, b) {
     `UPDATE tech_jobs SET ${cols.map(c => c + ' = ?').join(', ')}, revision = revision + 1 WHERE id = ? AND revision = ?`)
     .bind(...cols.map(c => set[c]), j.id, j.revision).run();
   if (!r.meta.changes) fail(409, 'ใบงานเพิ่งถูกอัปเดต กรุณารีเฟรชแล้วลองอีกครั้ง');
+  if (action === 'accept' && j.group_id) {
+    /* ลูกค้าเลือกร้านนี้แล้ว — ร้านอื่นในชุดเดียวกันที่ยังไม่ได้นัด ปิดให้เลย
+       ช่างร้านอื่นจะเห็นว่ายกเลิกพร้อมเหตุผล ไม่ต้องรอเก้อ */
+    const { results } = await env.DB.prepare(
+      "SELECT id, history FROM tech_jobs WHERE group_id = ? AND id != ? AND status IN ('requested','quoted')").bind(j.group_id, j.id).all();
+    for (const o of results) {
+      const h = parse(o.history) || []; h.push({ status: 'cancelled', at: ts, by: 'system' });
+      extra.push(env.DB.prepare("UPDATE tech_jobs SET status='cancelled', resolution=?, history=?, updated_at=?, revision=revision+1 WHERE id=?")
+        .bind('ลูกค้าเลือกร้านอื่นแล้ว', JSON.stringify(h), ts, o.id));
+    }
+  }
   if (extra.length) await env.DB.batch(extra);
   return { ok: true };
+}
+
+/* เทียบราคาหลายร้านในชุดเดียว — เจ้าของคำขอเท่านั้น */
+async function groupOf(env, me, gid) {
+  const { results } = await env.DB.prepare('SELECT * FROM tech_jobs WHERE group_id = ? AND customer_uid = ? ORDER BY created_at').bind(gid, me.uid).all();
+  if (!results.length) fail(404, 'ไม่พบคำขอ');
+  const techs = {};
+  for (const j of results) if (!techs[j.tech_id]) techs[j.tech_id] = await techById(env, j.tech_id);
+  return { jobs: results.map(j => { const t = techs[j.tech_id]; const pt = t ? publicTech(t) : {};
+    return { id: j.id, status: j.status, techId: j.tech_id, techName: pt.shop || pt.name || 'ช่าง', rating: pt.rating || 0,
+      reviewCount: pt.reviewCount || 0, quote: parse(j.quote), resolution: j.resolution }; }) };
 }
 
 /* ── เส้นทาง ── */
@@ -699,6 +755,8 @@ async function route(request, env) {
   let mm = p.match(/^\/api\/tech\/jobs\/([0-9a-f-]{36})$/i);
   if (mm && m === 'GET') return getJob(env, me, mm[1]);
   if (mm && m === 'POST') return updateJob(env, me, mm[1], await body());
+  mm = p.match(/^\/api\/tech\/groups\/([0-9a-f-]{36})$/i);
+  if (mm && m === 'GET') return groupOf(env, me, mm[1]);
   mm = p.match(/^\/api\/tech\/jobs\/([0-9a-f-]{36})\/messages$/i);
   if (mm && m === 'GET') return pollJob(env, me, mm[1], Number(url.searchParams.get('after')) || 0);
   fail(404, 'ไม่พบปลายทาง');
