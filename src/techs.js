@@ -21,7 +21,7 @@ const CHECKS = ['identity', 'phone', 'work', 'skills', 'shop', 'terms'];
    ใบรับรองฝีมือไม่บังคับ — ช่างเก่งจำนวนมากไม่มีใบ ทีมงานสัมภาษณ์ทักษะแทนได้ */
 const DOCS = [['id', 1, 1], ['selfie', 1, 1], ['shop', 1, 3], ['work', 3, 6], ['cert', 0, 2]];
 const PRIVATE_DOCS = ['id', 'selfie', 'cert'];
-const API_VERSION = 3;
+const API_VERSION = 4;
 const PHONE = /^0\d{8,9}$/;
 const now = () => Date.now();
 
@@ -107,6 +107,14 @@ const TECH_SQL = [
 /* คอลัมน์ที่เพิ่มทีหลัง — ALTER ซ้ำจะ error ว่ามีอยู่แล้ว ซึ่งเป็นเรื่องปกติ ข้ามไปได้ */
 const TECH_ALTER = [
   `ALTER TABLE tech_jobs ADD COLUMN group_id TEXT`,
+  `ALTER TABLE tech_profiles ADD COLUMN online INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE tech_profiles ADD COLUMN last_seen INTEGER`,
+  `CREATE TABLE IF NOT EXISTS tech_posts (
+  id TEXT PRIMARY KEY, customer_uid TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', test INTEGER NOT NULL DEFAULT 0,
+  car TEXT NOT NULL, symptom TEXT NOT NULL, cat TEXT, lat REAL NOT NULL, lng REAL NOT NULL, area TEXT NOT NULL,
+  address TEXT NOT NULL, phone TEXT NOT NULL, requested_time TEXT NOT NULL, mode TEXT NOT NULL, urgent INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+  `CREATE INDEX IF NOT EXISTS tech_posts_open ON tech_posts(status, created_at)`,
   `CREATE INDEX IF NOT EXISTS tech_jobs_group ON tech_jobs(group_id)`,
 ];
 let techReady = false;
@@ -226,7 +234,7 @@ function publicTech(r) {
     rating: r.review_count ? Math.round(r.rating_sum / r.review_count * 10) / 10 : 0,
     reviewCount: r.review_count, jobs: r.jobs,
     reply: null, verified: !!r.verified, test: !!r.test,
-    photos: r.photos || [],
+    photos: r.photos || [], online: !!r.online, hours: d.hours || '',
   };
 }
 /* แนบรูปอู่และรูปผลงาน (ไม่ใช่บัตร) ให้การ์ดช่าง — ดึงครั้งเดียวทั้งรายการ ไม่ใช่ทีละคน */
@@ -254,8 +262,8 @@ async function listTechs(env, me, url) {
   /* ทีมงานเห็นช่างทดสอบปนอยู่ในรายชื่อจริงด้วย (มีป้ายบอก) — ทดสอบได้เหมือนลูกค้าจริงทุกขั้น
      คนทั่วไปไม่เห็นช่างทดสอบเลย */
   const q = me && me.staff
-    ? 'SELECT * FROM tech_profiles WHERE suspended = 0 AND (verified = 1 OR test = 1) ORDER BY test DESC, created_at DESC LIMIT 500'
-    : 'SELECT * FROM tech_profiles WHERE test = 0 AND suspended = 0 AND verified = 1 ORDER BY created_at DESC LIMIT 500';
+    ? 'SELECT * FROM tech_profiles WHERE suspended = 0 AND (verified = 1 OR test = 1) ORDER BY test DESC, online DESC, created_at DESC LIMIT 500'
+    : 'SELECT * FROM tech_profiles WHERE test = 0 AND suspended = 0 AND verified = 1 ORDER BY online DESC, created_at DESC LIMIT 500';
   const { results } = await env.DB.prepare(q).all();
   return { techs: (await withPhotos(env, results)).map(publicTech) };
 }
@@ -694,6 +702,7 @@ async function updateJob(env, me, id, b) {
     .bind(...cols.map(c => set[c]), j.id, j.revision).run();
   if (!r.meta.changes) fail(409, 'ใบงานเพิ่งถูกอัปเดต กรุณารีเฟรชแล้วลองอีกครั้ง');
   if (action === 'accept' && j.group_id) {
+    extra.push(env.DB.prepare("UPDATE tech_posts SET status = 'matched', updated_at = ? WHERE id = ?").bind(ts, j.group_id));
     /* ลูกค้าเลือกร้านนี้แล้ว — ร้านอื่นในชุดเดียวกันที่ยังไม่ได้นัด ปิดให้เลย
        ช่างร้านอื่นจะเห็นว่ายกเลิกพร้อมเหตุผล ไม่ต้องรอเก้อ */
     const { results } = await env.DB.prepare(
@@ -717,6 +726,248 @@ async function groupOf(env, me, gid) {
   return { jobs: results.map(j => { const t = techs[j.tech_id]; const pt = t ? publicTech(t) : {};
     return { id: j.id, status: j.status, techId: j.tech_id, techName: pt.shop || pt.name || 'ช่าง', rating: pt.rating || 0,
       reviewCount: pt.reviewCount || 0, quote: parse(j.quote), resolution: j.resolution }; }) };
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   ประกาศหาช่าง — ลูกค้าไม่ต้องเลือกร้าน ช่างรอบตัวเห็นหมุดบนแผนที่แล้วเสนอราคาแข่งกัน
+   ข้อเสนอของช่างแต่ละคน = ใบงานหนึ่งใบที่มีราคาแล้ว (status quoted) group_id = รหัสประกาศ
+   จึงใช้หน้าเทียบราคา การยืนยัน แชต และการยกเลิกร้านอื่นอัตโนมัติชุดเดิมได้ทั้งหมด
+   ตำแหน่งจริงโชว์ให้ช่างเห็นตามที่เจ้าของแอปเลือก (งานรถเสียต้องไปให้ถูกที่)
+   แต่เบอร์โทรยังเปิดหลังลูกค้ายืนยันราคาเท่านั้น
+   ══════════════════════════════════════════════════════════════════ */
+const POST_TTL = 48 * 3600 * 1000;
+function km(a, b, c, d) {
+  const R = 6371, r = Math.PI / 180, dLa = (c - a) * r, dLo = (d - b) * r;
+  const h = Math.sin(dLa / 2) ** 2 + Math.cos(a * r) * Math.cos(c * r) * Math.sin(dLo / 2) ** 2;
+  return Math.round(R * 2 * Math.asin(Math.sqrt(h)) * 10) / 10;
+}
+/* รหัสใบงานของข้อเสนอ — คงที่ต่อ (ประกาศ, ช่าง) กดเสนอซ้ำจึงเป็นการแก้ราคา ไม่ใช่ใบใหม่ */
+async function offerId(postId, techId) {
+  const h = await sha(postId + ':' + techId);
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
+}
+function postOut(p, extra) {
+  return { id: p.id, status: p.status, test: !!p.test, car: p.car, symptom: p.symptom, cat: p.cat,
+    lat: p.lat, lng: p.lng, area: p.area, requestedTime: p.requested_time, mode: p.mode, urgent: !!p.urgent,
+    createdAt: p.created_at, expiresAt: p.created_at + POST_TTL, ...(extra || {}) };
+}
+
+async function createPost(env, me, b) {
+  const id = String(b.id || '');
+  if (!/^[0-9a-f-]{36}$/i.test(id)) fail(400, 'รหัสคำขอไม่ถูกต้อง');
+  const dup = await env.DB.prepare('SELECT customer_uid FROM tech_posts WHERE id = ?').bind(id).first();
+  if (dup) { if (dup.customer_uid !== me.uid) fail(409, 'รหัสคำขอซ้ำ'); return { id }; }
+  const c = coord(b);
+  const cat = CATS.includes(b.cat) ? b.cat : '';
+  const open = await env.DB.prepare("SELECT COUNT(*) AS n FROM tech_posts WHERE customer_uid = ? AND status = 'open' AND created_at > ?")
+    .bind(me.uid, now() - POST_TTL).first();
+  if (open.n >= 3 && !me.staff) fail(429, 'มีประกาศที่เปิดอยู่ 3 รายการแล้ว ปิดอันเก่าก่อน');
+  const ts = now();
+  /* ประกาศของทีมงานเป็นงานทดสอบ — ช่างจริงไม่เห็น เห็นเฉพาะช่างทีมงาน */
+  await env.DB.prepare(`INSERT INTO tech_posts (id,customer_uid,status,test,car,symptom,cat,lat,lng,area,address,phone,requested_time,mode,urgent,created_at,updated_at)
+    VALUES (?,?,'open',?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(id, me.uid, me.staff ? 1 : 0,
+    str(b.car, 'รถ / รุ่น / ปี', 2, 200), str(b.symptom, 'อาการ', 10, 2000), cat, c.lat, c.lng,
+    str(b.area, 'พื้นที่', 3, 160), str(b.address, 'ที่อยู่', 4, 500), phone(b.phone, 'เบอร์โทร'),
+    str(b.requestedTime, 'วันและเวลา', 2, 160), b.mode === 'shop' ? 'shop' : 'mobile', b.urgent ? 1 : 0, ts, ts).run();
+  return { id };
+}
+
+async function myPosts(env, me) {
+  const { results } = await env.DB.prepare('SELECT * FROM tech_posts WHERE customer_uid = ? ORDER BY created_at DESC LIMIT 30').bind(me.uid).all();
+  const out = [];
+  for (const p of results) {
+    const o = await env.DB.prepare("SELECT COUNT(*) AS n, MIN(CASE WHEN quote IS NOT NULL THEN json_extract(quote,'$.total') END) AS lo FROM tech_jobs WHERE group_id = ? AND status != 'cancelled'").bind(p.id).first();
+    const expired = p.status === 'open' && p.created_at + POST_TTL < now();
+    out.push(postOut({ ...p, status: expired ? 'expired' : p.status }, { offers: o.n, lowest: o.lo, address: p.address }));
+  }
+  return { posts: out };
+}
+
+/* งานรอบตัวช่าง — เฉพาะประกาศที่ยังเปิด ไม่หมดอายุ อยู่ในรัศมีรับงาน และหมวดตรง (หรือไม่ระบุหมวด) */
+async function nearPosts(env, me) {
+  const t = await env.DB.prepare('SELECT * FROM tech_profiles WHERE uid = ?').bind(me.uid).first();
+  if (!t || t.suspended) fail(403, 'ต้องเป็นช่างในระบบก่อน');
+  const d = parse(t.data) || {};
+  if (d.lat == null) fail(400, 'ตั้งตำแหน่งร้านก่อน');
+  const radius = Math.max(Number(d.radius) || 0, 30);
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM tech_posts WHERE status = 'open' AND created_at > ? AND customer_uid != ? AND (test = 0 OR ? = 1) ORDER BY created_at DESC LIMIT 300`)
+    .bind(now() - POST_TTL, me.uid, t.test ? 1 : 0).all();
+  const mine = {};
+  if (results.length) {
+    const ids = await Promise.all(results.map(p => offerId(p.id, t.id)));
+    const { results: js } = await env.DB.prepare(`SELECT id, group_id, status, quote FROM tech_jobs WHERE id IN (${ids.map(() => '?').join(',')})`).bind(...ids).all();
+    js.forEach(j => { mine[j.group_id] = { status: j.status, total: (parse(j.quote) || {}).total }; });
+  }
+  const posts = results.map(p => ({ p, dist: km(d.lat, d.lng, p.lat, p.lng) }))
+    .filter(x => x.dist <= radius && (!x.p.cat || (d.cats || []).includes(x.p.cat) || t.test))
+    .sort((a, b) => (b.p.urgent - a.p.urgent) || a.dist - b.dist)
+    .map(x => postOut(x.p, { dist: x.dist, mine: mine[x.p.id] || null }));
+  return { posts, radius, center: { lat: d.lat, lng: d.lng } };
+}
+
+async function offer(env, me, postId, b) {
+  const p = await env.DB.prepare('SELECT * FROM tech_posts WHERE id = ?').bind(postId).first();
+  if (!p) fail(404, 'ไม่พบประกาศ');
+  if (p.status !== 'open' || p.created_at + POST_TTL < now()) fail(409, 'ประกาศนี้ปิดแล้ว');
+  const t = await env.DB.prepare('SELECT * FROM tech_profiles WHERE uid = ?').bind(me.uid).first();
+  if (!t || t.suspended) fail(403, 'ต้องเป็นช่างในระบบก่อน');
+  if (p.test && !t.test) fail(404, 'ไม่พบประกาศ');
+  if (p.customer_uid === me.uid) fail(400, 'เสนอราคาให้ประกาศของตัวเองไม่ได้');
+  const labor = num(b.labor, 'ค่าแรง', 0, 1000000), parts = num(b.parts, 'อะไหล่', 0, 1000000), travel = num(b.travel, 'ค่าเดินทาง', 0, 100000);
+  if (labor + parts + travel <= 0) fail(400, 'ราคารวมต้องมากกว่า 0');
+  const ts = now();
+  const quote = JSON.stringify({ labor, parts, travel, total: Math.round((labor + parts + travel) * 100) / 100,
+    scope: str(b.scope, 'ขอบเขตงาน', 10, 2000), appointment: str(b.appointment, 'วันเวลานัด', 4, 200),
+    warranty: num(b.warranty, 'รับประกัน', 0, 365), at: ts });
+  const id = await offerId(p.id, t.id);
+  const ex = await env.DB.prepare('SELECT status, history FROM tech_jobs WHERE id = ?').bind(id).first();
+  if (ex) {
+    if (!['requested', 'quoted'].includes(ex.status)) fail(409, 'ข้อเสนอนี้ถูกตอบรับหรือปิดไปแล้ว');
+    const h = parse(ex.history) || []; h.push({ status: 'quoted', at: ts, by: 'technician' });
+    await env.DB.prepare("UPDATE tech_jobs SET quote=?, status='quoted', history=?, updated_at=?, revision=revision+1 WHERE id=?").bind(quote, JSON.stringify(h), ts, id).run();
+    return { id, updated: true };
+  }
+  const d = parse(t.data) || {};
+  await env.DB.prepare(`INSERT INTO tech_jobs (id,tech_id,customer_uid,status,test,car,symptom,area,address,phone,requested_time,mode,quote,history,revision,created_at,updated_at,group_id)
+    VALUES (?,?,?,'quoted',?,?,?,?,?,?,?,?,?,?,1,?,?,?)`).bind(id, t.id, p.customer_uid, p.test || t.test ? 1 : 0,
+    p.car, p.symptom, p.area, p.address + ` · แผนที่ https://maps.google.com/?q=${p.lat},${p.lng}`, p.phone, p.requested_time,
+    p.mode === 'mobile' && d.mobile ? 'mobile' : 'shop', quote,
+    JSON.stringify([{ status: 'requested', at: p.created_at, by: 'customer' }, { status: 'quoted', at: ts, by: 'technician' }]), ts, ts, p.id).run();
+  await env.DB.prepare('UPDATE tech_posts SET updated_at = ? WHERE id = ?').bind(ts, p.id).run();
+  return { id };
+}
+
+async function closePost(env, me, postId) {
+  const p = await env.DB.prepare('SELECT customer_uid, status FROM tech_posts WHERE id = ?').bind(postId).first();
+  if (!p || p.customer_uid !== me.uid) fail(404, 'ไม่พบประกาศ');
+  const ts = now();
+  const { results } = await env.DB.prepare("SELECT id, history FROM tech_jobs WHERE group_id = ? AND status IN ('requested','quoted')").bind(postId).all();
+  await env.DB.batch([
+    env.DB.prepare("UPDATE tech_posts SET status = 'closed', updated_at = ? WHERE id = ?").bind(ts, postId),
+    ...results.map(o => { const h = parse(o.history) || []; h.push({ status: 'cancelled', at: ts, by: 'customer' });
+      return env.DB.prepare("UPDATE tech_jobs SET status='cancelled', resolution=?, history=?, updated_at=?, revision=revision+1 WHERE id=?")
+        .bind('ลูกค้าปิดประกาศแล้ว', JSON.stringify(h), ts, o.id); }),
+  ]);
+  return { ok: true };
+}
+
+/* ══ ร้านของช่าง: ออนไลน์ แก้ข้อมูล สถิติ ══ */
+async function myShop(env, me) {
+  const t = await env.DB.prepare('SELECT * FROM tech_profiles WHERE uid = ?').bind(me.uid).first();
+  if (!t) fail(403, 'ต้องเป็นช่างในระบบก่อน');
+  return t;
+}
+async function setOnline(env, me, b) {
+  const t = await myShop(env, me);
+  await env.DB.prepare('UPDATE tech_profiles SET online = ?, last_seen = ? WHERE id = ?').bind(b.online ? 1 : 0, now(), t.id).run();
+  return { ok: true, online: !!b.online };
+}
+async function editShop(env, me, b) {
+  const t = await myShop(env, me);
+  const d = parse(t.data) || {};
+  if (b.shop != null) d.shop = String(b.shop).trim().slice(0, 120);
+  if (b.about != null) d.about = String(b.about).trim().slice(0, 1000);
+  if (b.from != null) d.from = num(b.from, 'ราคาเริ่มต้น', 0, 1000000);
+  if (b.warranty != null) d.warranty = num(b.warranty, 'รับประกัน', 0, 365);
+  if (b.radius != null) d.radius = num(b.radius, 'รัศมีบริการ', 0, 200);
+  if (b.hours != null) d.hours = String(b.hours).trim().slice(0, 120);
+  if (Array.isArray(b.cats)) { const c = [...new Set(b.cats.filter(x => CATS.includes(x)))]; if (!c.length) fail(400, 'เลือกงานที่รับอย่างน้อย 1 อย่าง'); d.cats = c; }
+  if (b.mobile != null) d.mobile = !!b.mobile;
+  if (b.urgent != null) d.urgent = !!b.urgent;
+  if (b.lat != null || b.lng != null) Object.assign(d, coord(b));
+  const stmts = [env.DB.prepare('UPDATE tech_profiles SET data = ?, updated_at = ? WHERE id = ?').bind(JSON.stringify(d), now(), t.id)];
+  /* รูปใหม่ต่อท้าย รูปที่ลบคือรหัสรูปของร้านนี้เท่านั้น — ลบรูปร้านอื่นผ่านทางนี้ไม่ได้ */
+  if (Array.isArray(b.removePhotos)) b.removePhotos.slice(0, 20).forEach(id =>
+    stmts.push(env.DB.prepare("DELETE FROM tech_docs WHERE id = ? AND uid = ? AND kind IN ('shop','work')").bind(Number(id), me.uid)));
+  if (Array.isArray(b.addPhotos)) {
+    const have = await env.DB.prepare("SELECT COUNT(*) AS n FROM tech_docs WHERE uid = ? AND kind IN ('shop','work')").bind(me.uid).first();
+    if (have.n + b.addPhotos.length > 12) fail(400, 'รูปร้านและผลงานรวมกันได้ไม่เกิน 12 รูป');
+    b.addPhotos.forEach(x => {
+      const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(x && x.data || ''));
+      if (!m || m[2].length > 1400000) fail(400, 'ไฟล์ต้องเป็นรูปภาพ');
+      stmts.push(env.DB.prepare('INSERT INTO tech_docs (uid, kind, mime, data, created_at) VALUES (?,?,?,?,?)')
+        .bind(me.uid, x.kind === 'shop' ? 'shop' : 'work', m[1], m[2], now()));
+    });
+  }
+  await env.DB.batch(stmts);
+  return { ok: true };
+}
+
+async function stats(env, me) {
+  const t = await myShop(env, me);
+  const { results } = await env.DB.prepare('SELECT status, quote, history, created_at, updated_at, review FROM tech_jobs WHERE tech_id = ?').bind(t.id).all();
+  const day = 86400000, ts = now();
+  const start = new Date(); start.setHours(0, 0, 0, 0);
+  const today = start.getTime();
+  const month = new Date(start.getFullYear(), start.getMonth(), 1).getTime();
+  let earnToday = 0, earnMonth = 0, done = 0, quoted = 0, requested = results.length, won = 0, respSum = 0, respN = 0;
+  const daily = Array.from({ length: 14 }, (_, i) => ({ d: today - (13 - i) * day, v: 0 }));
+  const reviews = [];
+  for (const j of results) {
+    const q = parse(j.quote), h = parse(j.history) || [];
+    const fq = h.find(x => x.status === 'quoted');
+    if (fq) { quoted++; respSum += fq.at - j.created_at; respN++; }
+    if (['accepted', 'enroute', 'working', 'done', 'completed'].includes(j.status)) won++;
+    if (j.status === 'completed' && q) {
+      done++;
+      const at = (h.find(x => x.status === 'completed') || {}).at || j.updated_at;
+      if (at >= today) earnToday += q.total;
+      if (at >= month) earnMonth += q.total;
+      const slot = daily.find(x => at >= x.d && at < x.d + day); if (slot) slot.v += q.total;
+    }
+    const rv = parse(j.review); if (rv) reviews.push(rv);
+  }
+  reviews.sort((a, b) => b.at - a.at);
+  const pt = publicTech(t);
+  return {
+    online: !!t.online, earnToday, earnMonth, done, requested, quoted, won,
+    winRate: quoted ? Math.round(won / quoted * 100) : 0,
+    replyMin: respN ? Math.round(respSum / respN / 60000) : null,
+    rating: pt.rating, reviewCount: pt.reviewCount, daily, reviews: reviews.slice(0, 5),
+  };
+}
+
+/* ══ AI แนะนำร้าน ══
+   คำแนะนำหลักมาจากข้อมูลจริงของร้านเสมอ (ไม่ต้องพึ่ง AI) แล้วถ้ามี Gemini ค่อยให้ช่วยเรียบเรียงเพิ่ม
+   AI ล่มหรือหมดโควตา ช่างยังได้คำแนะนำที่ใช้ได้ */
+async function advice(env, me) {
+  const t = await myShop(env, me);
+  const d = parse(t.data) || {};
+  const s = await stats(env, me);
+  const { results: ph } = await env.DB.prepare("SELECT kind FROM tech_docs WHERE uid = ? AND kind IN ('shop','work')").bind(me.uid).all();
+  const { results: peers } = await env.DB.prepare('SELECT data FROM tech_profiles WHERE verified = 1 AND test = 0 AND suspended = 0 AND id != ? LIMIT 300').bind(t.id).all();
+  const same = peers.map(x => parse(x.data) || {}).filter(x => (x.cats || []).some(c => (d.cats || []).includes(c)) && x.from);
+  const med = same.length ? same.map(x => x.from).sort((a, b) => a - b)[Math.floor(same.length / 2)] : null;
+  const tips = [];
+  const add = (level, title, text, action) => tips.push({ level, title, text, action });
+  if (ph.filter(x => x.kind === 'work').length < 3) add('high', 'เพิ่มรูปผลงาน', 'ร้านที่มีรูปผลงานอย่างน้อย 3 รูป ลูกค้าเชื่อใจมากกว่า ลองถ่ายก่อน-หลังซ่อม', 'photos');
+  if (!ph.some(x => x.kind === 'shop')) add('mid', 'เพิ่มรูปหน้าร้าน', 'ให้ลูกค้าเห็นว่าอู่มีอยู่จริง หาเจอง่าย', 'photos');
+  if (!d.about || d.about.length < 40) add('mid', 'เขียนความถนัดให้ชัด', 'บอกรุ่นรถที่ถนัด เครื่องมือที่มี และงานที่ไม่รับ ช่วยให้ AI จับคู่ลูกค้าให้ตรงขึ้น', 'about');
+  if (!t.online) add('high', 'เปิดรับงาน', 'ตอนนี้คุณออฟไลน์ ประกาศงานใหม่จะไม่แจ้งเตือน', 'online');
+  if (s.replyMin != null && s.replyMin > 30) add('high', 'ตอบให้เร็วขึ้น', `เฉลี่ยคุณเสนอราคาใน ${s.replyMin} นาที ร้านที่ตอบภายใน 15 นาทีมักได้งานมากกว่า`, 'queue');
+  if (s.quoted >= 3 && s.winRate < 30) add('mid', 'ราคาอาจสูงไป', `ได้งาน ${s.winRate}% ของที่เสนอ ลองเขียนขอบเขตงานให้ละเอียดขึ้น หรือทบทวนราคา`, 'shop');
+  if (med && d.from > med * 1.4) add('mid', 'ราคาเริ่มต้นสูงกว่าร้านอื่น', `ร้านหมวดเดียวกันเริ่มราว ฿${med.toLocaleString()} ของคุณ ฿${Number(d.from).toLocaleString()}`, 'shop');
+  if (!d.mobile) add('low', 'ลองรับงานนอกสถานที่', 'ประกาศหาช่างส่วนใหญ่เป็นรถที่ขับมาไม่ได้', 'shop');
+  if ((d.radius || 0) < 10) add('low', 'ขยายรัศมีรับงาน', 'รัศมีแคบ เห็นประกาศน้อย', 'shop');
+  if (!d.hours) add('low', 'ใส่เวลาทำการ', 'ลูกค้าจะรู้ว่าติดต่อได้ช่วงไหน', 'shop');
+  if (s.reviewCount && s.rating < 4) add('high', 'ดูรีวิวล่าสุด', 'คะแนนต่ำกว่า 4 ลองอ่านสิ่งที่ลูกค้าบอก แล้วแก้จุดนั้นก่อน', 'reviews');
+  if (!tips.length) add('low', 'ร้านของคุณพร้อมมาก', 'ข้อมูลครบ ตอบไว คงมาตรฐานนี้ไว้', null);
+  let summary = null;
+  if (env.GEMINI_KEY) {
+    try {
+      const model = env.GEMINI_MODEL || 'gemini-3.6-flash';
+      const r = await fetch(`${env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com'}/v1beta/models/${model}:generateContent?key=${env.GEMINI_KEY}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text:
+          `คุณเป็นที่ปรึกษาธุรกิจอู่ซ่อมรถ เขียนสรุปสั้น 2-3 ประโยค ภาษาไทย เป็นกันเอง ว่าร้านนี้ควรปรับอะไรก่อนเพื่อได้งานมากขึ้น ห้ามแต่งตัวเลขเอง ใช้เฉพาะข้อมูลนี้:\n` +
+          JSON.stringify({ ร้าน: d.shop, หมวด: d.cats, ราคาเริ่ม: d.from, ราคากลางร้านอื่น: med, ความถนัด: d.about, สถิติ: { งานเสร็จ: s.done, เสนอราคา: s.quoted, ได้งานเปอร์เซ็นต์: s.winRate, ตอบเฉลี่ยนาที: s.replyMin, คะแนน: s.rating, รีวิว: s.reviewCount }, จุดที่ระบบพบ: tips.map(x => x.title) }) }] }],
+          generationConfig: { temperature: 0.4, maxOutputTokens: 300 } }),
+      });
+      if (r.ok) { const j = await r.json(); summary = ((j.candidates || [])[0]?.content?.parts || []).map(p => p.text || '').join('').trim() || null; }
+    } catch (e) { summary = null; }
+  }
+  return { tips, summary, median: med };
 }
 
 /* ── เส้นทาง ── */
@@ -752,6 +1003,15 @@ async function route(request, env) {
     return { jobs };
   }
   if (p === '/api/tech/jobs' && m === 'POST') return createJob(env, me, await body());
+  if (p === '/api/tech/posts' && m === 'POST') return createPost(env, me, await body());
+  if (p === '/api/tech/posts' && m === 'GET') return myPosts(env, me);
+  if (p === '/api/tech/posts/near' && m === 'GET') return nearPosts(env, me);
+  if (p === '/api/tech/online' && m === 'POST') return setOnline(env, me, await body());
+  if (p === '/api/tech/shop' && m === 'POST') return editShop(env, me, await body());
+  if (p === '/api/tech/stats' && m === 'GET') return stats(env, me);
+  if (p === '/api/tech/advice' && m === 'GET') return advice(env, me);
+  let pm = p.match(/^\/api\/tech\/posts\/([0-9a-f-]{36})\/(offer|close)$/i);
+  if (pm && m === 'POST') return pm[2] === 'offer' ? offer(env, me, pm[1], await body()) : closePost(env, me, pm[1]);
   let mm = p.match(/^\/api\/tech\/jobs\/([0-9a-f-]{36})$/i);
   if (mm && m === 'GET') return getJob(env, me, mm[1]);
   if (mm && m === 'POST') return updateJob(env, me, mm[1], await body());
