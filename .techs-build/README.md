@@ -1,0 +1,1 @@
+This folder contains the built output assets for the worker "spireone-techs" generated at 2026-09-07T12:52:58.100Z.

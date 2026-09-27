@@ -1,4 +1,5 @@
 import { verifyFirebaseToken } from './auth.js';
+import { handleTech } from './techs.js';
 
 /*
  * SpireONE backend — security-hardened.
@@ -3301,6 +3302,9 @@ export default {
 
     /* สร้าง/อัปเดตตารางเองถ้ายังไม่ครบ — เจ้าของแอปไม่ต้องรัน migration ด้วยมือ */
     await ensureSchema(env);
+
+    /* ระบบช่าง (Cendon Care) อยู่ในไฟล์ techs.js ทั้งหมด */
+    if (/^\/api\/tech(\/|$)/.test(url.pathname)) return handleTech(request, env, cors);
 
     // Wraps a handler with auth + minimum-role + ban checks.
     const guarded = (minRole, handler) => async () => {

@@ -1,0 +1,16 @@
+{
+  "name": "spireone-techs",
+  "main": "src/techs-worker.mjs",
+  "compatibility_date": "2026-08-01",
+  "workers_dev": true,
+  "vars": {
+    "FIREBASE_PROJECT_ID": "sp1p-82396",
+    "OWNERS": "anapatmaliwong@gmail.com,carspirethailand@gmail.com",
+    "ALLOWED_ORIGINS": "*"
+  },
+  "d1_databases": [{
+    "binding": "DB", "database_name": "spireone",
+    "database_id": "bf9b1815-2ef6-4463-8b35-6b97717b5d9a",
+    "migrations_dir": "migrations"
+  }]
+}
