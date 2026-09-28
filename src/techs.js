@@ -350,7 +350,13 @@ async function apply(env, me, b) {
     /* ช่างทดสอบของทีมงาน — ใช้แค่ตำแหน่งอู่ ข้ามเกณฑ์และเอกสารทั้งหมด
        เห็นได้เฉพาะทีมงาน คนทั่วไปไม่เห็น รีวิวไม่ถูกนับ */
     adminOnly(me);
-    const c = coord(b);
+    /* ทีมงานกด "ข้าม" ได้โดยไม่ส่งตำแหน่ง — ใช้ตำแหน่งเดิมของร้านทีมงาน ถ้าไม่มีใช้กลางกรุงเทพฯ แก้ทีหลังในแท็บร้าน */
+    let c;
+    if (b.lat == null || b.lng == null) {
+      const old = await env.DB.prepare('SELECT data FROM tech_profiles WHERE uid = ?').bind(me.uid).first();
+      const od = old && parse(old.data);
+      c = od && od.lat ? { lat: od.lat, lng: od.lng } : { lat: 13.7563, lng: 100.5018 };
+    } else c = coord(b);
     const nick = (me.email.split('@')[0] || 'staff').slice(0, 30);
     const d = {
       name: String(b.name || '').trim().slice(0, 100) || 'ช่างทดสอบ ' + nick,
@@ -818,7 +824,8 @@ async function createPost(env, me, b) {
 async function postDetail(env, me, id) {
   const p = await env.DB.prepare('SELECT * FROM tech_posts WHERE id = ?').bind(id).first();
   if (!p) fail(404, 'ไม่พบประกาศ');
-  if (p.customer_uid !== me.uid) {
+  /* ทีมงานเปิดดูประกาศได้ทุกอัน เพื่อตรวจความเรียบร้อย */
+  if (p.customer_uid !== me.uid && !me.staff) {
     const t = await env.DB.prepare('SELECT test, suspended FROM tech_profiles WHERE uid = ?').bind(me.uid).first();
     if (!t || t.suspended || (p.test && !t.test)) fail(404, 'ไม่พบประกาศ');
   }
