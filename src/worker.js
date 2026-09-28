@@ -1738,7 +1738,74 @@ async function executeDescribeMediaTool(env, messages, prompt) {
     }
   }
 
+  // Tier 2 Fallback: OpenRouter Multimodal Vision Proxy (Bypasses Google API geo-blocking)
+  if (env.OPENROUTER_API_KEY) {
+    console.log('[media] Google Direct Media Reader ล้มเหลวหรือติดข้อจำกัดพื้นที่ — สลับไป OpenRouter Multimodal Vision...');
+    const orText = await describeMediaViaOpenRouter(env, parts, prompt);
+    if (orText) return orText;
+  }
+
   throw lastErr || new Error('Failed to analyze media file with Gemini API');
+}
+
+async function describeMediaViaOpenRouter(env, rawParts, prompt) {
+  const apiKey = env.OPENROUTER_API_KEY;
+  if (!apiKey) return '';
+  const baseUrl = env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
+
+  const content = [{ type: 'text', text: prompt || 'อธิบายรูปภาพหรือสื่อที่แนบมานี้อย่างละเอียด เน้นรายละเอียดเกี่ยวกับสภาพรถยนต์' }];
+
+  for (const p of rawParts) {
+    if (p.inlineData && p.inlineData.data) {
+      const mime = p.inlineData.mimeType || 'image/jpeg';
+      if (mime.startsWith('image/')) {
+        content.push({
+          type: 'image_url',
+          image_url: {
+            url: `data:${mime};base64,${p.inlineData.data}`
+          }
+        });
+      }
+    }
+  }
+
+  const visionModels = [
+    'google/gemini-2.0-flash-exp:free',
+    'meta-llama/llama-3.2-11b-vision-instruct:free',
+    'openrouter/free'
+  ];
+
+  for (const vModel of visionModels) {
+    try {
+      const res = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': 'https://carspirethailand.com',
+          'X-Title': 'Cendon'
+        },
+        body: JSON.stringify({
+          model: vModel,
+          messages: [{ role: 'user', content }],
+          temperature: 0.2
+        })
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        const msg = (data.choices && data.choices[0] && data.choices[0].message) || {};
+        const text = (typeof msg.content === 'string' ? msg.content : msg.reasoning || '').trim();
+        if (text) {
+          console.log(`[media] อ่านภาพสำเร็จด้วย OpenRouter Vision Proxy (${vModel})`);
+          return text;
+        }
+      }
+    } catch (err) {
+      console.warn(`[media] OpenRouter vision model ${vModel} error:`, err.message);
+    }
+  }
+  return '';
 }
 
 /* ── ค้นเน็ตผ่าน Gemini ──
@@ -1748,22 +1815,21 @@ async function executeDescribeMediaTool(env, messages, prompt) {
    ถ้าไม่ได้จริง ๆ จะคืนค่าว่างพร้อมบอกผู้เรียกให้จัดการอย่างซื่อสัตย์ */
 async function executeGoogleSearchTool(env, query) {
   const geminiKey = env.GEMINI_KEY;
-  if (!geminiKey) { console.warn('[search] ไม่มี GEMINI_KEY'); return '' }
   const baseUrl = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
-  /* เรียงจากที่น่าจะรองรับการค้นดีที่สุด ถ้าตัวไหนไม่มีจริงจะข้ามไปตัวถัดไปเอง */
   const models = [];
-  if (env.GEMINI_SEARCH_MODEL) models.push(env.GEMINI_SEARCH_MODEL);
+  if (env.GEMINI_SEARCH_MODEL && !env.GEMINI_SEARCH_MODEL.startsWith('gemma')) {
+    models.push(env.GEMINI_SEARCH_MODEL);
+  }
   models.push(
-    'gemini-2.5-flash',
-    'gemini-2.0-flash',
-    'gemini-2.0-flash-001',
-    'gemini-1.5-flash',
-    'gemini-1.5-flash-latest'
+    'gemini-3.5-flash-lite',
+    'gemini-3.1-flash-lite',
+    'gemini-3.8-flash',
+    'gemini-3.6-flash'
   );
-  if (env.GEMINI_MODEL && !models.includes(env.GEMINI_MODEL)) models.push(env.GEMINI_MODEL);
+  if (env.GEMINI_MODEL && !env.GEMINI_MODEL.startsWith('gemma') && !models.includes(env.GEMINI_MODEL)) {
+    models.push(env.GEMINI_MODEL);
+  }
 
-  /* บอกแหล่งที่ยอมรับให้ชัด ไม่งั้นมันไปหยิบบล็อกหรือเว็บรวมข่าวที่คัดลอกกันมา
-     ซึ่งมั่วบ่อยมากโดยเฉพาะเรื่องรถที่เพิ่งเปิดตัว */
   const prompt = `ค้นข้อมูลล่าสุดในอินเทอร์เน็ตเรื่องนี้ แล้วสรุปเฉพาะข้อเท็จจริงที่ยืนยันได้: ${query}
 
 แหล่งที่ยอมรับ เรียงตามลำดับความน่าเชื่อถือ:
@@ -1782,42 +1848,90 @@ async function executeGoogleSearchTool(env, query) {
 
   const toolShapes = [
     { google_search: {} },
-    { googleSearch: {} },
-    { google_search_retrieval: {} },
+    { googleSearch: {} }
   ];
 
-  for (const model of models) {
-    for (const toolShape of toolShapes) {
-      try {
-        const res = await fetch(`${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ role: 'user', parts: [{ text: prompt }] }],
-            tools: [toolShape],
-            generationConfig: { temperature: 0.2 },
-          }),
-        });
-        if (!res.ok) {
-          const errBody = await res.text().catch(() => '');
-          console.warn(`[search] ${model} ตอบ ${res.status}: ${errBody.slice(0, 120)}`);
-          continue;
+  if (geminiKey) {
+    for (const model of [...new Set(models)]) {
+      for (const toolShape of toolShapes) {
+        try {
+          const res = await fetch(`${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{ role: 'user', parts: [{ text: prompt }] }],
+              tools: [toolShape],
+              generationConfig: { temperature: 0.2 },
+            }),
+          });
+          if (!res.ok) {
+            const errBody = await res.text().catch(() => '');
+            console.warn(`[search] ${model} ตอบ ${res.status}: ${errBody.slice(0, 150)}`);
+            continue;
+          }
+          const data = await res.json();
+          const cand = (data.candidates && data.candidates[0]) || {};
+          const txt = cleanSearch(((cand.content && cand.content.parts) || [])
+            .map(x => x.text || '').join('').trim());
+          if (txt && !/^ไม่พบข้อมูลยืนยัน/.test(txt)) {
+            console.log(`[search] สำเร็จด้วย Google Search Grounding (${model})`);
+            return txt;
+          }
+          if (/^ไม่พบข้อมูลยืนยัน/.test(txt)) return '';
+        } catch (e) {
+          console.warn(`[search] ${model} ล้มเหลว: ${e.message}`);
         }
-        const data = await res.json();
-        const cand = (data.candidates && data.candidates[0]) || {};
-        const txt = cleanSearch(((cand.content && cand.content.parts) || [])
-          .map(x => x.text || '').join('').trim());
-        if (txt && !/^ไม่พบข้อมูลยืนยัน/.test(txt)) {
-          console.log(`[search] สำเร็จด้วย ${model}`);
-          return txt;
-        }
-        if (/^ไม่พบข้อมูลยืนยัน/.test(txt)) return '';
-      } catch (e) {
-        console.warn(`[search] ${model} ล้มเหลว: ${e.message}`);
       }
     }
   }
-  console.warn('[search] ค้นไม่สำเร็จทุกโมเดล');
+
+  // Tier 2 Fallback: OpenRouter Web Search Engine (Bypasses Google API geo-blocking and quota limits)
+  if (env.OPENROUTER_API_KEY) {
+    console.log('[search] Google Direct Search ล้มเหลวหรือติดข้อจำกัด — ลองค้นผ่าน OpenRouter Web Search Engine...');
+    const orTxt = await executeOpenRouterSearch(env, query);
+    if (orTxt) return orTxt;
+  }
+
+  console.warn('[search] ค้นไม่สำเร็จทุกช่องทาง');
+  return '';
+}
+
+async function executeOpenRouterSearch(env, query) {
+  const apiKey = env.OPENROUTER_API_KEY;
+  if (!apiKey) return '';
+  const baseUrl = env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
+
+  const prompt = `ค้นหาข้อมูลล่าสุดทางอินเทอร์เน็ตเกี่ยวกับเรื่องนี้อย่างกระชับ: ${query}\nระบุข้อเท็จจริง สเปก ราคา หรือข่าวที่ยืนยันได้ ตอบเป็นข้อ ๆ สั้น ๆ`;
+
+  try {
+    const res = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://carspirethailand.com',
+        'X-Title': 'Cendon'
+      },
+      body: JSON.stringify({
+        model: 'openrouter/free',
+        messages: [{ role: 'user', content: prompt }],
+        plugins: [{ id: 'web' }],
+        temperature: 0.2
+      })
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      const msg = (data.choices && data.choices[0] && data.choices[0].message) || {};
+      const txt = cleanSearch((typeof msg.content === 'string' ? msg.content : msg.reasoning || '').trim());
+      if (txt && !/^ไม่พบข้อมูลยืนยัน/.test(txt)) {
+        console.log('[search] สำเร็จด้วย OpenRouter Web Search');
+        return txt;
+      }
+    }
+  } catch (err) {
+    console.warn('[search] OpenRouter web search error:', err.message);
+  }
   return '';
 }
 
@@ -4931,8 +5045,7 @@ ${convo}`;
           const baseUrl = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
           const q = url.searchParams.get('q') || 'Lamborghini Revuelto ล่าสุด';
           const models = [];
-          if (env.GEMINI_SEARCH_MODEL) models.push(env.GEMINI_SEARCH_MODEL);
-          models.push('gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash');
+          models.push('gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.8-flash', 'gemini-3.6-flash');
           if (env.GEMINI_MODEL && !models.includes(env.GEMINI_MODEL)) models.push(env.GEMINI_MODEL);
 
           for (const model of models) {

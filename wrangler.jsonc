@@ -4,6 +4,7 @@
   "workers_dev": true,
   "preview_urls": false,
   "compatibility_date": "2026-06-27",
+  "account_id": "52520dc663debd04386a69a5ebe76c93",
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1,
@@ -21,8 +22,8 @@
   },
   "vars": {
     "FIREBASE_PROJECT_ID": "sp1p-82396",
-    "GEMINI_MODEL": "gemini-3.6-flash",
-    "GEMINI_SEARCH_MODEL": "gemma-4-31b-it",
+    "GEMINI_MODEL": "gemini-3.8-flash",
+    "GEMINI_SEARCH_MODEL": "gemini-3.5-flash-lite",
     "GEMINI_LIVE_MODEL": "gemini-3.1-flash-live-preview",
     "GEMINI_BASE_URL": "https://generativelanguage.googleapis.com",
     "OWNERS": "anapatmaliwong@gmail.com,carspirethailand@gmail.com",
