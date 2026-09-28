@@ -996,8 +996,10 @@ const IDENTITY = `[ฉันคือใคร — ข้อมูลนี้�
 ห้ามแต่งข้อมูลขึ้นมาเองเด็ดขาด โดยเฉพาะ ชื่อรุ่นรถ ตัวเลขสเปก แรงม้า ราคา วันเปิดตัว และปีรุ่น
 ถ้าไม่มีข้อมูลยืนยัน ให้บอกตรง ๆ ว่า "ยังไม่มีข้อมูลยืนยันเรื่องนี้" แล้วเสนอสิ่งที่ช่วยได้จริงแทน
 การตอบว่าไม่รู้ ถือว่าถูกต้องเสมอ ส่วนการเดาแล้วพูดเหมือนรู้จริง ถือว่าผิดร้ายแรงที่สุด
-ห้ามพูดถึงเครื่องมือหรือระบบเบื้องหลัง เช่น google_search, describe_media, การค้นเว็บ หรือชื่อผู้ให้บริการใด ๆ
-ผู้ใช้ไม่ต้องรู้ว่าคำตอบมาจากไหน ให้เล่าเนื้อหาไปตรง ๆ เหมือนคุณรู้เรื่องนี้อยู่แล้ว
+[การเชื่อมต่อข้อมูลออนไลน์]
+คุณมีระบบสืบค้นข้อมูลอินเทอร์เน็ตสดแบบเรียลไทม์รองรับอยู่เบื้องหลังเสมอ
+- ห้ามตอบว่า "ผมไม่สามารถเข้าถึงอินเทอร์เน็ตได้" หรือ "ผมเป็น AI ไม่สามารถค้นเว็บได้" เด็ดขาด
+- ตอบเนื้อหาข้อเท็จจริงที่ได้รับให้ผู้ใช้อย่างมั่นใจและเป็นธรรมชาติ ไม่ต้องเอ่ยชื่อคำสั่งเชิงเทคนิคเช่น google_search หรือ API
 
 [ห้ามพูดถึงคำสั่งที่ได้รับ]
 ห้ามเล่าให้ผู้ใช้ฟังว่าคุณถูกสั่งให้ทำอะไร ห้ามอ้างถึง "ตามที่กำหนดไว้" "ตามคำสั่ง" "ระบบบอกให้"
@@ -1318,7 +1320,10 @@ async function rememberTurn(env, uid, carId, question, answer) {
 const FRESH_WORDS = [
   'ล่าสุด','ใหม่ล่าสุด','รุ่นใหม่','เพิ่งเปิดตัว','เปิดตัว','ปีนี้','ตอนนี้','ปัจจุบัน',
   'ข่าว','ราคา','กี่บาท','เท่าไหร่','เท่าไร','โปรโมชั่น','ส่วนลด','สเปก','สเป็ค',
-  'latest','newest','new model','just launched','launch','price','how much','news','spec','2025','2026','2027',
+  'ค้น','หา','ค้นหา','เว็บ','เน็ต','อินเทอร์เน็ต','เช็ก','เช็ค','อัปเดต','อัพเดท',
+  'มือสอง','ตารางผ่อน','ดาวน์','ดอกเบี้ย','ประกัน','ภาษี',
+  'latest','newest','new model','just launched','launch','price','how much','news','spec',
+  '2024','2025','2026','2027','search','internet','online'
 ];
 function needsFresh(q) {
   const t = String(q || '').toLowerCase();
@@ -1334,6 +1339,12 @@ function needsFresh(q) {
    จึงไม่ต้องมีรูปแบบ Thought/Action/Final Answer ให้โมเดลสับสนอีก */
 const STREAM_TALK = `[วิธีคุย]
 คุยกับคนให้เป็นธรรมชาติ เหมือนเพื่อนที่บังเอิญเก่งเรื่องรถ ไม่ใช่ระบบตอบคำถามอัตโนมัติ
+
+[การเข้าถึงข้อมูลอินเทอร์เน็ตสด]
+คุณมีความสามารถในการเชื่อมต่อและดึงข้อมูลสดจากอินเทอร์เน็ตผ่านระบบค้นหาออนไลน์ของ Cendon
+- ห้ามตอบเด็ดขาดว่า "ผมไม่สามารถเข้าถึงอินเทอร์เน็ตได้" หรือ "ผมเป็น AI ไม่มีเน็ต"
+- เมื่อผู้ใช้ถามถึงข้อมูลสดใหม่ ราคากลาง สเปก หรือข่าวสาร ให้ตอบจากข้อมูลสดที่ระบบค้นหามาให้ในบริบทอย่างมั่นใจ
+- หากไม่มีข้อมูลยืนยัน ให้ตอบว่า "ยังไม่มีข้อมูลยืนยันอย่างเป็นทางการในขณะนี้ครับ" ห้ามบอกว่าเข้าถึงอินเทอร์เน็ตไม่ได้
 
 เรื่องที่ไม่ใช่รถ (ทักทาย เล่าเรื่องทั่วไป หยอกเล่น):
 - คุยด้วยตามปกติสั้น ๆ ตอบเรื่องนั้นจริง ๆ
@@ -1364,70 +1375,129 @@ function askBlockText() {
 }
 
 /* ── เรียกโมเดลแบบสตรีม ──
-   OpenRouter ส่งกลับเป็น SSE ทีละก้อน แยก reasoning กับ content คนละฟิลด์
-   ส่งต่อออกไปให้หน้าเว็บทันทีที่ได้ ผู้ใช้จึงเห็นความคิดไหลออกมาสด ๆ */
+   ลำดับที่ 1: Cerebras (gpt-oss-120b) ตอบสนองเร็วระดับ 1,000+ tokens/sec
+   ลำดับที่ 2: OpenRouter SSE Streaming
+   ลำดับที่ 3: Cloudflare Workers AI */
 async function streamModel(env, messages, meter, send) {
-  const key = env.OPENROUTER_API_KEY;
-  if (!key) {
-    /* ไม่มีคีย์สตรีม ใช้ทางเดิมแบบรอจนจบ อย่างน้อยยังตอบได้ */
-    const r = await callReasoningModel(env, messages, meter);
-    const t = (r && r.text) || '';
-    if (r && r.reasoning) await send({ type: 'reasoning', delta: r.reasoning });
-    await send({ type: 'text', delta: t });
-    return { text: t };
-  }
-  const model = env.OPENROUTER_MODEL || 'openai/gpt-oss-20b:free';
-  const baseUrl = env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
-  const res = await fetch(`${baseUrl}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${key}`,
-      'HTTP-Referer': 'https://carspirethailand.com',
-      'X-Title': 'Cendon',
-    },
-    body: JSON.stringify({ model, messages, temperature: 0.3, stream: true }),
-  });
-  if (!res.ok || !res.body) {
-    const txt = await res.text().catch(() => '');
-    console.error('[stream model]', res.status, txt.slice(0, 200));
-    const r = await callReasoningModel(env, messages, meter);
-    const t = (r && r.text) || '';
-    if (r && r.reasoning) await send({ type: 'reasoning', delta: r.reasoning });
-    await send({ type: 'text', delta: t });
-    return { text: t };
-  }
+  // Tier 1: Cerebras GPT-OSS 120B Streaming
+  const cerebrasKey = env.CEREBRAS_API_KEY;
+  if (cerebrasKey) {
+    const cerebrasModel = env.CEREBRAS_MODEL || 'gpt-oss-120b';
+    const cerebrasBase = env.CEREBRAS_BASE_URL || 'https://api.cerebras.ai/v1';
+    try {
+      const res = await fetch(`${cerebrasBase}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${cerebrasKey}`,
+        },
+        body: JSON.stringify({
+          model: cerebrasModel,
+          messages,
+          temperature: 0.3,
+          stream: true,
+        }),
+      });
 
-  const reader = res.body.getReader();
-  const dec = new TextDecoder();
-  let buf = '', text = '', reasoning = '';
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    const lines = buf.split('\n');
-    buf = lines.pop() || '';
-    for (const line of lines) {
-      const t = line.trim();
-      if (!t.startsWith('data:')) continue;
-      const payload = t.slice(5).trim();
-      if (payload === '[DONE]') continue;
-      let d = null;
-      try { d = JSON.parse(payload) } catch (e) { continue }
-      if (d.usage) readUsage(meter, d, 'openrouter-stream');
-      const delta = (d.choices && d.choices[0] && d.choices[0].delta) || {};
-      const rDelta = delta.reasoning || delta.reasoning_content;
-      if (rDelta) { reasoning += rDelta; await send({ type: 'reasoning', delta: rDelta }) }
-      if (delta.content) { text += delta.content; await send({ type: 'text', delta: delta.content }) }
+      if (res.ok && res.body) {
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        let buf = '', text = '', reasoning = '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          const lines = buf.split('\n');
+          buf = lines.pop() || '';
+          for (const line of lines) {
+            const t = line.trim();
+            if (!t.startsWith('data:')) continue;
+            const payload = t.slice(5).trim();
+            if (payload === '[DONE]') continue;
+            let d = null;
+            try { d = JSON.parse(payload) } catch (e) { continue }
+            if (d.usage) readUsage(meter, d, 'cerebras-stream');
+            const delta = (d.choices && d.choices[0] && d.choices[0].delta) || {};
+            const rDelta = delta.reasoning || delta.reasoning_content;
+            if (rDelta) { reasoning += rDelta; await send({ type: 'reasoning', delta: rDelta }) }
+            if (delta.content) { text += delta.content; await send({ type: 'text', delta: delta.content }) }
+          }
+        }
+        if (!text.trim() && reasoning.trim()) {
+          const fa = reasoning.match(/Final Answer:\s*([\s\S]+)$/i);
+          text = fa ? fa[1].trim() : reasoning.trim();
+          await send({ type: 'text', delta: text });
+        }
+        if (text.trim()) {
+          if (!meter.calls) { meter.calls = 1; meter.src.push('cerebras-stream') }
+          return { text, reasoning };
+        }
+      }
+    } catch (err) {
+      console.warn('[stream cerebras error]', err.message);
     }
   }
-  /* บางรอบโมเดลคิดอย่างเดียวไม่ยอมตอบ ให้ดึงคำตอบจากในความคิดมาใช้ */
-  if (!text.trim() && reasoning.trim()) {
-    const fa = reasoning.match(/Final Answer:\s*([\s\S]+)$/i);
-    if (fa) { text = fa[1].trim(); await send({ type: 'text', delta: text }) }
+
+  // Tier 2: OpenRouter SSE Streaming
+  const key = env.OPENROUTER_API_KEY;
+  if (key) {
+    const model = env.OPENROUTER_MODEL || 'openai/gpt-oss-20b:free';
+    const baseUrl = env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
+    try {
+      const res = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${key}`,
+          'HTTP-Referer': 'https://carspirethailand.com',
+          'X-Title': 'Cendon',
+        },
+        body: JSON.stringify({ model, messages, temperature: 0.3, stream: true }),
+      });
+      if (res.ok && res.body) {
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        let buf = '', text = '', reasoning = '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          const lines = buf.split('\n');
+          buf = lines.pop() || '';
+          for (const line of lines) {
+            const t = line.trim();
+            if (!t.startsWith('data:')) continue;
+            const payload = t.slice(5).trim();
+            if (payload === '[DONE]') continue;
+            let d = null;
+            try { d = JSON.parse(payload) } catch (e) { continue }
+            if (d.usage) readUsage(meter, d, 'openrouter-stream');
+            const delta = (d.choices && d.choices[0] && d.choices[0].delta) || {};
+            const rDelta = delta.reasoning || delta.reasoning_content;
+            if (rDelta) { reasoning += rDelta; await send({ type: 'reasoning', delta: rDelta }) }
+            if (delta.content) { text += delta.content; await send({ type: 'text', delta: delta.content }) }
+          }
+        }
+        if (!text.trim() && reasoning.trim()) {
+          const fa = reasoning.match(/Final Answer:\s*([\s\S]+)$/i);
+          if (fa) { text = fa[1].trim(); await send({ type: 'text', delta: text }) }
+        }
+        if (text.trim()) {
+          if (!meter.calls) { meter.calls = 1; meter.src.push('openrouter-stream') }
+          return { text, reasoning };
+        }
+      }
+    } catch (err) {
+      console.warn('[stream openrouter error]', err.message);
+    }
   }
-  if (!meter.calls) { meter.calls = 1; meter.src.push('openrouter-stream') }
-  return { text, reasoning };
+
+  // Tier 3: Non-streaming fallback
+  const r = await callReasoningModel(env, messages, meter);
+  const t = (r && r.text) || '';
+  if (r && r.reasoning) await send({ type: 'reasoning', delta: r.reasoning });
+  await send({ type: 'text', delta: t });
+  return { text: t };
 }
 
 async function runReActAgent(env, carInfo, messages, meter, style, customStyle, skillPrompt, extra) {
@@ -1509,8 +1579,22 @@ Thought: [เหตุผลสั้น ๆ ว่าต้องค้นห�
 Action: google_search("คำค้นที่กระชับและตรงประเด็น")
 (แล้วหยุดพิมพ์ทันที ระบบจะป้อน Observation กลับมาให้เอง)
 
-เมื่อได้ Observation แล้ว ให้สรุปคำตอบให้ผู้ใช้โดยขึ้นต้นว่า
-Final Answer: [คำตอบที่สมบูรณ์ เป็นมิตร และตรงประเด็น]
+ตัวอย่างที่ 1 (ถามราคากลางหรือข้อมูลสดใหม่):
+User: ราคากลาง Civic FE ปี 2023 ตอนนี้อยู่ที่เท่าไหร่
+Assistant:
+Thought: ผู้ใช้ถามหาราคากลางปัจจุบันของ Civic FE 2023 ซึ่งต้องใช้ข้อมูลราคาล่าสุดในตลาดมือสอง
+Action: google_search("ราคากลาง Honda Civic FE 2023 มือสอง ล่าสุด")
+
+ตัวอย่างที่ 2 (ถามสเปกรถรุ่นใหม่หรือรถเพิ่งเปิดตัว):
+User: BYD Sealion 7 สเปกแบตเตอรี่วิ่งได้กี่กิโล
+Assistant:
+Thought: ต้องค้นหาสเปกทางการของ BYD Sealion 7 เรื่องระยะทางวิ่งและแบตเตอรี่
+Action: google_search("BYD Sealion 7 สเปก แบตเตอรี่ ระยะทางวิ่ง")
+
+ตัวอย่างที่ 3 (คำถามทั่วไปที่ไม่ต้องค้น):
+User: ขับรถลุยน้ำแล้วเครื่องดับ ควรทำอย่างไร
+Assistant:
+Final Answer: หากเครื่องยนต์ดับขณะลุยน้ำ ห้ามสตาร์ตรถซ้ำเด็ดขาด เพราะน้ำอาจเข้าท่อไอดีทำให้เครื่องยนต์พังเสียหายได้ ให้รีบเข้าเกียร์ว่างแล้วเข็นเข้าที่ปลอดภัย...
 
 สำคัญ:
 - คำทักทายหรือคำถามทั่วไปที่ไม่เกี่ยวกับข้อมูลสด ให้ตอบ "Final Answer: [คำตอบ]" ทันที
@@ -1742,7 +1826,74 @@ async function executeDescribeMediaTool(env, messages, prompt) {
     }
   }
 
+  // Tier 2 Fallback: OpenRouter Multimodal Vision Proxy (Bypasses Google API geo-blocking)
+  if (env.OPENROUTER_API_KEY) {
+    console.log('[media] Google Direct Media Reader ล้มเหลวหรือติดข้อจำกัดพื้นที่ — สลับไป OpenRouter Multimodal Vision...');
+    const orText = await describeMediaViaOpenRouter(env, parts, prompt);
+    if (orText) return orText;
+  }
+
   throw lastErr || new Error('Failed to analyze media file with Gemini API');
+}
+
+async function describeMediaViaOpenRouter(env, rawParts, prompt) {
+  const apiKey = env.OPENROUTER_API_KEY;
+  if (!apiKey) return '';
+  const baseUrl = env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
+
+  const content = [{ type: 'text', text: prompt || 'อธิบายรูปภาพหรือสื่อที่แนบมานี้อย่างละเอียด เน้นรายละเอียดเกี่ยวกับสภาพรถยนต์' }];
+
+  for (const p of rawParts) {
+    if (p.inlineData && p.inlineData.data) {
+      const mime = p.inlineData.mimeType || 'image/jpeg';
+      if (mime.startsWith('image/')) {
+        content.push({
+          type: 'image_url',
+          image_url: {
+            url: `data:${mime};base64,${p.inlineData.data}`
+          }
+        });
+      }
+    }
+  }
+
+  const visionModels = [
+    'google/gemini-2.0-flash-exp:free',
+    'meta-llama/llama-3.2-11b-vision-instruct:free',
+    'openrouter/free'
+  ];
+
+  for (const vModel of visionModels) {
+    try {
+      const res = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': 'https://carspirethailand.com',
+          'X-Title': 'Cendon'
+        },
+        body: JSON.stringify({
+          model: vModel,
+          messages: [{ role: 'user', content }],
+          temperature: 0.2
+        })
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        const msg = (data.choices && data.choices[0] && data.choices[0].message) || {};
+        const text = (typeof msg.content === 'string' ? msg.content : msg.reasoning || '').trim();
+        if (text) {
+          console.log(`[media] อ่านภาพสำเร็จด้วย OpenRouter Vision Proxy (${vModel})`);
+          return text;
+        }
+      }
+    } catch (err) {
+      console.warn(`[media] OpenRouter vision model ${vModel} error:`, err.message);
+    }
+  }
+  return '';
 }
 
 /* ── ค้นเน็ตผ่าน Gemini ──
@@ -1752,14 +1903,27 @@ async function executeDescribeMediaTool(env, messages, prompt) {
    ถ้าไม่ได้จริง ๆ จะคืนค่าว่างพร้อมบอกผู้เรียกให้จัดการอย่างซื่อสัตย์ */
 async function executeGoogleSearchTool(env, query) {
   const geminiKey = env.GEMINI_KEY;
-  if (!geminiKey) { console.warn('[search] ไม่มี GEMINI_KEY'); return '' }
   const baseUrl = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
+<<<<<<< HEAD
   /* ของเดิมไล่ Gemma (ค้นเว็บไม่ได้) และรุ่น 1.5/2.0 ที่ Google ปิดไปแล้ว คูณสามรูปแบบเครื่องมือ
      ได้ถึง 21 ครั้งต่อหนึ่งคำถาม ทั้งช้าและพลาด — เหลือเฉพาะรุ่นที่ค้นได้จริง รูปแบบเดียว */
   const models = chatModels(env);
+=======
+  const models = [];
+  if (env.GEMINI_SEARCH_MODEL && !env.GEMINI_SEARCH_MODEL.startsWith('gemma')) {
+    models.push(env.GEMINI_SEARCH_MODEL);
+  }
+  models.push(
+    'gemini-3.5-flash-lite',
+    'gemini-3.1-flash-lite',
+    'gemini-3.8-flash',
+    'gemini-3.6-flash'
+  );
+  if (env.GEMINI_MODEL && !env.GEMINI_MODEL.startsWith('gemma') && !models.includes(env.GEMINI_MODEL)) {
+    models.push(env.GEMINI_MODEL);
+  }
+>>>>>>> 6940c91d6b6bf03a30a9e5d7b43086ff65aa76d4
 
-  /* บอกแหล่งที่ยอมรับให้ชัด ไม่งั้นมันไปหยิบบล็อกหรือเว็บรวมข่าวที่คัดลอกกันมา
-     ซึ่งมั่วบ่อยมากโดยเฉพาะเรื่องรถที่เพิ่งเปิดตัว */
   const prompt = `ค้นข้อมูลล่าสุดในอินเทอร์เน็ตเรื่องนี้ แล้วสรุปเฉพาะข้อเท็จจริงที่ยืนยันได้: ${query}
 
 แหล่งที่เชื่อได้: เว็บผู้ผลิตและศูนย์บริการ สื่อรถยนต์ที่มีกองบรรณาธิการ (ไทยและต่างประเทศ)
@@ -1772,40 +1936,96 @@ async function executeGoogleSearchTool(env, query) {
 - ถ้าค้นแล้วไม่พบข้อมูลที่ยืนยันได้จากแหล่งเหล่านี้เลย ให้ตอบว่า "ไม่พบข้อมูลยืนยัน" คำเดียว
   ห้ามเดา ห้ามแต่งตัวเลข และห้ามเอาข่าวลือมาตอบ`;
 
+<<<<<<< HEAD
   const toolShapes = [{ google_search: {} }];
+=======
+  const toolShapes = [
+    { google_search: {} },
+    { googleSearch: {} }
+  ];
+>>>>>>> 6940c91d6b6bf03a30a9e5d7b43086ff65aa76d4
 
-  for (const model of models) {
-    for (const toolShape of toolShapes) {
-      try {
-        const res = await fetch(`${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ role: 'user', parts: [{ text: prompt }] }],
-            tools: [toolShape],
-            generationConfig: { temperature: 0.2 },
-          }),
-        });
-        if (!res.ok) {
-          const errBody = await res.text().catch(() => '');
-          console.warn(`[search] ${model} ตอบ ${res.status}: ${errBody.slice(0, 120)}`);
-          continue;
+  if (geminiKey) {
+    for (const model of [...new Set(models)]) {
+      for (const toolShape of toolShapes) {
+        try {
+          const res = await fetch(`${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{ role: 'user', parts: [{ text: prompt }] }],
+              tools: [toolShape],
+              generationConfig: { temperature: 0.2 },
+            }),
+          });
+          if (!res.ok) {
+            const errBody = await res.text().catch(() => '');
+            console.warn(`[search] ${model} ตอบ ${res.status}: ${errBody.slice(0, 150)}`);
+            continue;
+          }
+          const data = await res.json();
+          const cand = (data.candidates && data.candidates[0]) || {};
+          const txt = cleanSearch(((cand.content && cand.content.parts) || [])
+            .map(x => x.text || '').join('').trim());
+          if (txt && !/^ไม่พบข้อมูลยืนยัน/.test(txt)) {
+            console.log(`[search] สำเร็จด้วย Google Search Grounding (${model})`);
+            return txt;
+          }
+          if (/^ไม่พบข้อมูลยืนยัน/.test(txt)) return '';
+        } catch (e) {
+          console.warn(`[search] ${model} ล้มเหลว: ${e.message}`);
         }
-        const data = await res.json();
-        const cand = (data.candidates && data.candidates[0]) || {};
-        const txt = cleanSearch(((cand.content && cand.content.parts) || [])
-          .map(x => x.text || '').join('').trim());
-        if (txt && !/^ไม่พบข้อมูลยืนยัน/.test(txt)) {
-          console.log(`[search] สำเร็จด้วย ${model}`);
-          return txt;
-        }
-        if (/^ไม่พบข้อมูลยืนยัน/.test(txt)) return '';
-      } catch (e) {
-        console.warn(`[search] ${model} ล้มเหลว: ${e.message}`);
       }
     }
   }
-  console.warn('[search] ค้นไม่สำเร็จทุกโมเดล');
+
+  // Tier 2 Fallback: OpenRouter Web Search Engine (Bypasses Google API geo-blocking and quota limits)
+  if (env.OPENROUTER_API_KEY) {
+    console.log('[search] Google Direct Search ล้มเหลวหรือติดข้อจำกัด — ลองค้นผ่าน OpenRouter Web Search Engine...');
+    const orTxt = await executeOpenRouterSearch(env, query);
+    if (orTxt) return orTxt;
+  }
+
+  console.warn('[search] ค้นไม่สำเร็จทุกช่องทาง');
+  return '';
+}
+
+async function executeOpenRouterSearch(env, query) {
+  const apiKey = env.OPENROUTER_API_KEY;
+  if (!apiKey) return '';
+  const baseUrl = env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
+
+  const prompt = `ค้นหาข้อมูลล่าสุดทางอินเทอร์เน็ตเกี่ยวกับเรื่องนี้อย่างกระชับ: ${query}\nระบุข้อเท็จจริง สเปก ราคา หรือข่าวที่ยืนยันได้ ตอบเป็นข้อ ๆ สั้น ๆ`;
+
+  try {
+    const res = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://carspirethailand.com',
+        'X-Title': 'Cendon'
+      },
+      body: JSON.stringify({
+        model: 'openrouter/free',
+        messages: [{ role: 'user', content: prompt }],
+        plugins: [{ id: 'web' }],
+        temperature: 0.2
+      })
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      const msg = (data.choices && data.choices[0] && data.choices[0].message) || {};
+      const txt = cleanSearch((typeof msg.content === 'string' ? msg.content : msg.reasoning || '').trim());
+      if (txt && !/^ไม่พบข้อมูลยืนยัน/.test(txt)) {
+        console.log('[search] สำเร็จด้วย OpenRouter Web Search');
+        return txt;
+      }
+    }
+  } catch (err) {
+    console.warn('[search] OpenRouter web search error:', err.message);
+  }
   return '';
 }
 
@@ -4888,7 +5108,13 @@ ${convo}`;
           /* ลองทีละโมเดลและทีละรูปแบบเครื่องมือ แล้วรายงานผลจริงของแต่ละตัว */
           const baseUrl = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
           const q = url.searchParams.get('q') || 'Lamborghini Revuelto ล่าสุด';
+<<<<<<< HEAD
           const models = chatModels(env);
+=======
+          const models = [];
+          models.push('gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.8-flash', 'gemini-3.6-flash');
+          if (env.GEMINI_MODEL && !models.includes(env.GEMINI_MODEL)) models.push(env.GEMINI_MODEL);
+>>>>>>> 6940c91d6b6bf03a30a9e5d7b43086ff65aa76d4
 
           for (const model of models) {
             for (const shape of ['google_search']) {
