@@ -1,5 +1,7 @@
 import { verifyFirebaseToken } from './auth.js';
 import { handleTech } from './techs.js';
+import { handleVec, kbScores, refreshKb } from './vectors.js';
+import { fastAnswer, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels } from './fastai.js';
 
 /*
  * SpireONE backend — security-hardened.
@@ -43,6 +45,11 @@ async function getAuthenticatedUser(request, env) {
   const token = authHeader.split('Bearer ')[1];
   const projectId = env.FIREBASE_PROJECT_ID;
   if (!projectId) throw new Error('FIREBASE_PROJECT_ID is not configured');
+  /* ทดสอบในเครื่องเท่านั้น (DEV_AUTH ไม่มีในเซิร์ฟเวอร์จริง) — ใช้แบบเดียวกับ techs.js */
+  if (env.DEV_AUTH === '1' && token.startsWith('dev:')) {
+    const [, sub, email] = token.split(':');
+    return { sub, email, name: email.split('@')[0] };
+  }
   return await verifyFirebaseToken(token, projectId);
 }
 
@@ -420,14 +427,22 @@ async function ensureSchema(env) {
 }
 
 
+/* ค่าตั้งระบบถูกอ่านหลายครั้งต่อข้อความแชต (ปิดปรับปรุง แผน โควตา) แต่แทบไม่เปลี่ยน
+   จำไว้ในเครื่องที่รัน 15 วินาที — แอดมินแก้ค่าแล้วมีผลภายใน 15 วินาที */
+const CONFIG_CACHE = new Map();
 async function getConfig(env, key, fallback) {
+  const hit = CONFIG_CACHE.get(key);
+  if (hit && Date.now() - hit.t < 15000) return hit.v === undefined ? fallback : hit.v;
   try {
     const row = await env.DB.prepare('SELECT value FROM config WHERE key = ?').bind(key).first();
-    return row && row.value ? JSON.parse(row.value) : fallback;
+    const v = row && row.value ? JSON.parse(row.value) : undefined;
+    CONFIG_CACHE.set(key, { v, t: Date.now() });
+    return v === undefined ? fallback : v;
   } catch { return fallback; }
 }
 
 async function setConfig(env, key, value) {
+  CONFIG_CACHE.delete(key);
   await env.DB.prepare(
     'INSERT INTO config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
   ).bind(key, JSON.stringify(value)).run();
@@ -578,13 +593,13 @@ async function tokensWindow(env, uid) {
 /* สรุปสถานะโควตาชุดเดียว ใช้ร่วมกันทุกเส้นทางที่ต้องบอกผู้ใช้ */
 async function quotaState(env, uid, role) {
   const unlimited = rank(role) >= rank('admin');
-  const limit = await tokenLimit(env, uid);
-  const used = await tokensWindow(env, uid);
+  /* สี่คำถามนี้ไม่ขึ้นต่อกัน ถามพร้อมกัน (ของเดิมรอทีละอัน ทุกข้อความแชต) */
+  const [limit, used, plan, plans] = await Promise.all([
+    tokenLimit(env, uid), tokensWindow(env, uid), userPlan(env, uid), getConfig(env, 'plans', DEFAULT_PLANS)]);
   return {
     used, limit, left: Math.max(0, limit - used), unlimited,
     resetAt: winResetAt(), windowHours: QUOTA_WINDOW_MS / 3600000,
-    plan: await userPlan(env, uid),
-    plans: await getConfig(env, 'plans', DEFAULT_PLANS),
+    plan, plans,
   };
 }
 
@@ -1163,12 +1178,14 @@ async function kbFor(env, carInfo, question) {
       WHERE enabled = 1 AND (make = '' OR make = ?) AND (model = '' OR model = ?)
       ORDER BY updated_at DESC LIMIT 120
     `).bind(make, model).all();
+    const sem = await kbScores(env, question);       /* ความหมายใกล้กัน แม้ไม่มีคำซ้ำ */
     const scored = [];
     for (const r of (rs.results || [])) {
       const keys = String(r.keywords || '').split(',').map(x => normQ(x)).filter(Boolean);
       let sc = 0;
       for (const k of keys) if (k.length >= 3 && qn.includes(k)) sc += 2;
       sc += similar(qn, normQ(r.title)) * 3;
+      if (sem.has(r.id)) sc += sem.get(r.id) * 4;
       if (r.model) sc += 0.5;                        /* ตรงรุ่นได้แต้มพิเศษ */
       if (sc > 0) scored.push([sc, r]);
     }
@@ -1201,17 +1218,22 @@ async function stateOf(env, uid, key) {
 
 async function userContext(env, uid, carId, hint) {
   const parts = [];
-  const [setup, gar, sel] = await Promise.all([
+  /* ทุกคำถามในฟังก์ชันนี้ไม่ขึ้นต่อกัน ยิงพร้อมกันทีเดียว (ของเดิมรอทีละคำสั่งราวเจ็ดรอบ) */
+  const q = (sql, ...a) => env.DB.prepare(sql).bind(...a);
+  const [setup, gar, sel, uRow, carRs, maintRs, sparesRs, memRs] = await Promise.all([
     stateOf(env, uid, 'setup'), stateOf(env, uid, 'garage'), stateOf(env, uid, 'selCar'),
+    q('SELECT name, email FROM users WHERE uid = ?', uid).first().catch(() => null),
+    q('SELECT id, make, model, year, mileage FROM cars WHERE uid = ? ORDER BY created_at DESC LIMIT 8', uid).all().catch(() => null),
+    carId ? q(`SELECT part, last_km, last_at, interval_km FROM maint_item
+        WHERE uid = ? AND car_id = ? AND last_at IS NOT NULL ORDER BY last_at DESC LIMIT 10`, uid, String(carId)).all().catch(() => null) : null,
+    q('SELECT k FROM spares_cache WHERE uid = ? ORDER BY t DESC LIMIT 8', uid).all().catch(() => null),
+    q('SELECT text FROM user_memory WHERE uid = ? ORDER BY created_at DESC LIMIT 12', uid).all().catch(() => null),
   ]);
 
   /* ── ชื่อ ── ชื่อเล่นที่ผู้ใช้ตั้งเองมาก่อนเสมอ ค่อยตกมาที่ชื่อบัญชี */
   let name = (setup && typeof setup === 'object' && setup.name) ? String(setup.name).trim() : '';
   let email = '';
-  try {
-    const u = await env.DB.prepare('SELECT name, email FROM users WHERE uid = ?').bind(uid).first();
-    if (u) { if (!name && u.name) name = String(u.name); email = String(u.email || '') }
-  } catch (e) {}
+  if (uRow) { if (!name && uRow.name) name = String(uRow.name); email = String(uRow.email || '') }
   /* หน้าเว็บส่งชื่อมาด้วยทุกครั้ง ใช้เป็นตัวสำรองกรณีข้อมูลยังซิงก์ขึ้นมาไม่ทัน */
   if (!name && hint && hint.userName) name = String(hint.userName).trim().slice(0, 60);
   if (name) parts.push(`ชื่อผู้ใช้ (เรียกเขาด้วยชื่อนี้ได้เลย): ${name}`);
@@ -1227,12 +1249,7 @@ async function userContext(env, uid, carId, hint) {
   /* ── รถ ── รวมจากตาราง cars กับการาจที่ซิงก์มา อันไหนมีก็ใช้อันนั้น
      บางบัญชีมีรถอยู่ในการาจแต่ยังไม่ทันขึ้นตาราง cars จึงต้องดูทั้งสองที่ */
   const byId = {};
-  try {
-    const rs = await env.DB.prepare(
-      'SELECT id, make, model, year, mileage FROM cars WHERE uid = ? ORDER BY created_at DESC LIMIT 8'
-    ).bind(uid).all();
-    (rs.results || []).forEach(c => { byId[String(c.id)] = c });
-  } catch (e) {}
+  ((carRs && carRs.results) || []).forEach(c => { byId[String(c.id)] = c });
   if (Array.isArray(gar)) {
     gar.slice(0, 8).forEach(c => {
       if (!c || !c.id) return;
@@ -1253,36 +1270,23 @@ async function userContext(env, uid, carId, hint) {
       `- ${[c.make, c.model].filter(Boolean).join(' ') || 'ไม่ระบุรุ่น'} ปี ${c.year || '-'} เลขไมล์ ${c.mileage || '-'} กม.`
       + (String(c.id) === curId ? '  ← คันที่กำลังถามถึงตอนนี้' : '')).join('\n'));
   }
-  if (carId) {
-    try {
-      const rs = await env.DB.prepare(`
-        SELECT part, last_km, last_at, interval_km FROM maint_item
-        WHERE uid = ? AND car_id = ? AND last_at IS NOT NULL
-        ORDER BY last_at DESC LIMIT 10
-      `).bind(uid, String(carId)).all();
-      const list = rs.results || [];
-      if (list.length) {
-        parts.push('ประวัติบำรุงรักษาที่บันทึกไว้:\n' + list.map(m =>
-          `- ${m.part} ครั้งล่าสุดที่ ${m.last_km || '-'} กม.`
-          + (m.last_at ? ` (${new Date(m.last_at).toISOString().slice(0, 10)})` : '')
-          + (m.interval_km ? ` · รอบเปลี่ยนทุก ${m.interval_km} กม.` : '')).join('\n'));
-      }
-    } catch (e) {}
+  {
+    const list = (maintRs && maintRs.results) || [];
+    if (list.length) {
+      parts.push('ประวัติบำรุงรักษาที่บันทึกไว้:\n' + list.map(m =>
+        `- ${m.part} ครั้งล่าสุดที่ ${m.last_km || '-'} กม.`
+        + (m.last_at ? ` (${new Date(m.last_at).toISOString().slice(0, 10)})` : '')
+        + (m.interval_km ? ` · รอบเปลี่ยนทุก ${m.interval_km} กม.` : '')).join('\n'));
+    }
   }
-  try {
-    const rs = await env.DB.prepare(
-      'SELECT k FROM spares_cache WHERE uid = ? ORDER BY t DESC LIMIT 8'
-    ).bind(uid).all();
-    const ks = (rs.results || []).map(r => String(r.k).split('|').slice(-1)[0]).filter(Boolean);
+  {
+    const ks = ((sparesRs && sparesRs.results) || []).map(r => String(r.k).split('|').slice(-1)[0]).filter(Boolean);
     if (ks.length) parts.push('อะไหล่ที่ผู้ใช้เคยค้นหา: ' + [...new Set(ks)].join(', '));
-  } catch (e) {}
-  try {
-    const rs = await env.DB.prepare(
-      'SELECT text FROM user_memory WHERE uid = ? ORDER BY created_at DESC LIMIT 12'
-    ).bind(uid).all();
-    const mem = (rs.results || []).map(r => r.text).filter(Boolean);
+  }
+  {
+    const mem = ((memRs && memRs.results) || []).map(r => r.text).filter(Boolean);
     if (mem.length) parts.push('สิ่งที่เคยคุยกันไว้ก่อนหน้านี้:\n' + mem.map(t => '- ' + t).join('\n'));
-  } catch (e) {}
+  }
   if (!parts.length) return '';
   return '\n\n[ข้อมูลของผู้ใช้คนนี้ — ใช้ตอบได้เลยโดยไม่ต้องถามซ้ำ]\n' + parts.join('\n');
 }
@@ -1750,29 +1754,17 @@ async function executeGoogleSearchTool(env, query) {
   const geminiKey = env.GEMINI_KEY;
   if (!geminiKey) { console.warn('[search] ไม่มี GEMINI_KEY'); return '' }
   const baseUrl = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
-  /* เรียงจากที่น่าจะรองรับการค้นดีที่สุด ถ้าตัวไหนไม่มีจริงจะข้ามไปตัวถัดไปเอง */
-  const models = [];
-  if (env.GEMINI_SEARCH_MODEL) models.push(env.GEMINI_SEARCH_MODEL);
-  models.push(
-    'gemini-2.5-flash',
-    'gemini-2.0-flash',
-    'gemini-2.0-flash-001',
-    'gemini-1.5-flash',
-    'gemini-1.5-flash-latest'
-  );
-  if (env.GEMINI_MODEL && !models.includes(env.GEMINI_MODEL)) models.push(env.GEMINI_MODEL);
+  /* ของเดิมไล่ Gemma (ค้นเว็บไม่ได้) และรุ่น 1.5/2.0 ที่ Google ปิดไปแล้ว คูณสามรูปแบบเครื่องมือ
+     ได้ถึง 21 ครั้งต่อหนึ่งคำถาม ทั้งช้าและพลาด — เหลือเฉพาะรุ่นที่ค้นได้จริง รูปแบบเดียว */
+  const models = chatModels(env);
 
   /* บอกแหล่งที่ยอมรับให้ชัด ไม่งั้นมันไปหยิบบล็อกหรือเว็บรวมข่าวที่คัดลอกกันมา
      ซึ่งมั่วบ่อยมากโดยเฉพาะเรื่องรถที่เพิ่งเปิดตัว */
   const prompt = `ค้นข้อมูลล่าสุดในอินเทอร์เน็ตเรื่องนี้ แล้วสรุปเฉพาะข้อเท็จจริงที่ยืนยันได้: ${query}
 
-แหล่งที่ยอมรับ เรียงตามลำดับความน่าเชื่อถือ:
-1. เว็บทางการของผู้ผลิตรถยี่ห้อนั้นเอง และห้องข่าว (press release / media center) ของเขา
-2. สื่อรถยนต์ที่มีกองบรรณาธิการจริง เช่น caranddriver.com, motortrend.com, roadandtrack.com,
-   autocar.co.uk, topgear.com, autoblog.com, carscoops.com, motor1.com, headlightmag.com, autospinn.com
-3. สำนักข่าวหลัก เช่น reuters.com, bloomberg.com
-
-ห้ามใช้ฟอรัม บล็อกส่วนตัว โซเชียลมีเดีย เว็บขายรถมือสอง หรือเว็บที่คัดลอกข่าวต่อกันมา
+แหล่งที่เชื่อได้: เว็บผู้ผลิตและศูนย์บริการ สื่อรถยนต์ที่มีกองบรรณาธิการ (ไทยและต่างประเทศ)
+สำนักข่าวหลัก และร้านอะไหล่/ร้านค้าที่แสดงราคาชัดเจน (สำหรับคำถามเรื่องราคาในไทย)
+เลี่ยงฟอรัม ข่าวลือ และเว็บที่คัดลอกข่าวต่อกันมา
 
 รูปแบบการตอบ:
 - เขียนเป็นข้อเท็จจริงสั้น ๆ เป็นข้อ ๆ พร้อมระบุว่ามาจากแหล่งไหน (ชื่อเว็บเฉย ๆ ไม่ต้องใส่ลิงก์)
@@ -1780,11 +1772,7 @@ async function executeGoogleSearchTool(env, query) {
 - ถ้าค้นแล้วไม่พบข้อมูลที่ยืนยันได้จากแหล่งเหล่านี้เลย ให้ตอบว่า "ไม่พบข้อมูลยืนยัน" คำเดียว
   ห้ามเดา ห้ามแต่งตัวเลข และห้ามเอาข่าวลือมาตอบ`;
 
-  const toolShapes = [
-    { google_search: {} },
-    { googleSearch: {} },
-    { google_search_retrieval: {} },
-  ];
+  const toolShapes = [{ google_search: {} }];
 
   for (const model of models) {
     for (const toolShape of toolShapes) {
@@ -4189,18 +4177,18 @@ export default {
          ═══════════════════════════════════════════════════════════════ */
       if (url.pathname === '/api/ai/stream' && request.method === 'POST') {
         return await guarded('user', async (actor) => {
-          const maintenance = await getConfig(env, 'maintenance', { enabled: false });
+          const uid = actor.payload.sub;
+          /* อ่านคำขอ ตรวจโหมดปิดปรับปรุง และโควตาไปพร้อมกัน ไม่ต่อคิวทีละอย่าง */
+          const [maintenance, body, quota] = await Promise.all([
+            getConfig(env, 'maintenance', { enabled: false }),
+            readBody(),
+            rank(actor.role) < rank('admin') ? quotaState(env, uid, actor.role) : null,
+          ]);
           if (maintenance.enabled && rank(actor.role) < rank('moderator')) return deny('maintenance', 503);
-          const body = await readBody();
           if (!body) return deny('Invalid JSON body', 400);
           try { validateContents(body.contents); }
           catch (e) { return deny(e.message, 400); }
-
-          const uid = actor.payload.sub;
-          if (rank(actor.role) < rank('admin')) {
-            const q = await quotaState(env, uid, actor.role);
-            if (q.used >= q.limit) return json({ error: 'quota', quota: q }, 429);
-          }
+          if (quota && quota.used >= quota.limit) return json({ error: 'quota', quota }, 429);
 
           const { readable, writable } = new TransformStream();
           const writer = writable.getWriter();
@@ -4212,135 +4200,116 @@ export default {
           /* งานหลักทำเบื้องหลัง ปล่อยให้ตอบกลับทันทีเพื่อให้สตรีมเริ่มไหลเลย */
           const work = (async () => {
             const meter = newMeter();
+            const t0 = Date.now();
+            let text = '', question = '', hasMedia = false, carInfo = null;
             try {
-              /* ── รวบรวมบริบท ── */
+              const msgs = body.contents || [];
+              const lastMsg = msgs.length ? msgs[msgs.length - 1] : null;
+              question = (lastMsg && lastMsg.parts) ? lastMsg.parts.map(x => x.text || '').join(' ').trim() : '';
+              hasMedia = msgs.some(m => m.parts && m.parts.some(x => x.inline_data || x.inlineData));
               await send({ type: 'status', key: 'context', text: 'กำลังดูข้อมูลรถและประวัติของคุณ' });
 
-              let carInfo = { make: '', model: '', year: '', mileage: '' };
-              if (body.carId && env.DB) {
-                try {
-                  const car = await env.DB.prepare(
-                    'SELECT make, model, year, mileage FROM cars WHERE id = ? AND uid = ?')
-                    .bind(String(body.carId), uid).first();
-                  if (car) carInfo = car;
-                } catch (e) {}
-                if (!carInfo.make && !carInfo.model) {
+              /* ── รวบรวมบริบททั้งหมดพร้อมกัน ── (ของเดิมรอทีละคำสั่ง ราวสิบรอบก่อนเริ่มคิด) */
+              const carP = (async () => {
+                let ci = { make: '', model: '', year: '', mileage: '' };
+                if (body.carId) {
                   try {
+                    const car = await env.DB.prepare('SELECT make, model, year, mileage FROM cars WHERE id = ? AND uid = ?')
+                      .bind(String(body.carId), uid).first();
+                    if (car) ci = car;
+                  } catch (e) {}
+                  if (!ci.make && !ci.model) {
                     const gar = await stateOf(env, uid, 'garage');
                     const c = Array.isArray(gar) ? gar.find(x => x && String(x.id) === String(body.carId)) : null;
-                    if (c) carInfo = { make: c.make || '', model: c.model || c.name || '',
-                                       year: c.year != null ? String(c.year) : '',
-                                       mileage: c.mileage != null ? String(c.mileage) : '' };
-                  } catch (e) {}
+                    if (c) ci = { make: c.make || '', model: c.model || c.name || '',
+                                  year: c.year != null ? String(c.year) : '', mileage: c.mileage != null ? String(c.mileage) : '' };
+                  }
                 }
-              }
-              if (!carInfo.make && !carInfo.model) {
-                carInfo = { make: String(body.make || '').slice(0, 60), model: String(body.model || '').slice(0, 60),
-                            year: String(body.year || '').slice(0, 8), mileage: String(body.mileage || '').slice(0, 12) };
-              }
-
-              const msgs = body.contents || [];
-              const last = msgs.length ? msgs[msgs.length - 1] : null;
-              const question = (last && last.parts) ? last.parts.map(x => x.text || '').join(' ').trim() : '';
-              const hasMedia = msgs.some(m => m.parts && m.parts.some(x => x.inline_data));
-
-              const prefs = await getChatPrefs(env, uid);
-              const activeStyle = (body.style && (CHAT_STYLES[body.style] || body.style === 'custom'))
-                ? body.style : prefs.style;
-              const activeCustom = body.customStyle !== undefined ? String(body.customStyle) : prefs.customStyle;
-
-              const [userBlock, kbBlock, skillBlock] = await Promise.all([
+                if (!ci.make && !ci.model) {
+                  ci = { make: String(body.make || '').slice(0, 60), model: String(body.model || '').slice(0, 60),
+                         year: String(body.year || '').slice(0, 8), mileage: String(body.mileage || '').slice(0, 12) };
+                }
+                return ci;
+              })();
+              const [ci, kbBlock, userBlock, prefs, skillBlock] = await Promise.all([
+                carP,
+                carP.then(c => kbFor(env, c, question)),
                 userContext(env, uid, body.carId, { userName: body.userName }),
-                kbFor(env, carInfo, question),
+                getChatPrefs(env, uid),
                 skillsPrompt(env, uid, body.skillIds),
               ]);
+              carInfo = ci;
+              const activeStyle = (body.style && (CHAT_STYLES[body.style] || body.style === 'custom')) ? body.style : prefs.style;
+              const activeCustom = body.customStyle !== undefined ? String(body.customStyle) : prefs.customStyle;
 
-              /* ── ดูรูป/วิดีโอที่แนบมา ── */
-              let mediaBlock = '';
-              if (hasMedia) {
-                await send({ type: 'status', key: 'media', text: 'กำลังดูรูปที่แนบมา' });
-                try {
-                  const desc = await executeDescribeMediaTool(env, msgs,
-                    'อธิบายสิ่งที่เห็นในสื่อนี้อย่างละเอียด เน้นรายละเอียดที่เกี่ยวกับสภาพรถ ความเสียหาย รอยรั่ว หรือตัวเลขที่อ่านได้');
-                  if (desc) mediaBlock = '\n\n[สิ่งที่เห็นในไฟล์ที่ผู้ใช้แนบมา]\n' + String(desc).slice(0, 4000);
-                } catch (e) { console.error('[stream media]', e) }
-              }
-
-              /* ── ค้นข้อมูลสด ── */
-              let freshBlock = '';
-              if (question && needsFresh(question)) {
-                await send({ type: 'status', key: 'search', text: 'กำลังค้นข้อมูลล่าสุดจากอินเทอร์เน็ต' });
-                try {
-                  const carName = [carInfo.make, carInfo.model].filter(Boolean).join(' ');
-                  const found = await executeGoogleSearchTool(env,
-                    carName ? `${question.slice(0, 180)} (บริบท: ${carName})` : question.slice(0, 180));
-                  if (found && found.length > 20) {
-                    freshBlock = '\n\n[ข้อมูลสดจากอินเทอร์เน็ต ณ ตอนนี้ — เชื่อชุดนี้ก่อนความจำของคุณเสมอ]\n'
-                      + found.slice(0, 4000)
-                      + '\n\nวิธีใช้: เรียบเรียงใหม่ด้วยคำของคุณเอง ห้ามคัดลอกทั้งก้อน ห้ามใส่ลิงก์หรือเลขเชิงอรรถ '
-                      + 'ห้ามเขียนว่า "จากข้อมูลที่ค้นมา" และเรื่องไหนที่ชุดนี้ไม่ได้พูดถึง ห้ามเติมเอง';
-                  }
-                } catch (e) { console.error('[stream search]', e) }
-                if (!freshBlock) {
-                  /* ค้นไม่ได้ = ต้องบอกผู้ใช้ตรง ๆ ไม่ใช่ปล่อยให้เดา
-                     บอกหน้าเว็บด้วย จะได้ไม่เข้าใจว่าค้นสำเร็จแล้ว */
-                  await send({ type: 'status', key: 'nodata', text: 'ยังไม่มีข้อมูลยืนยันเรื่องนี้' });
-                  freshBlock = '\n\n[หมายเหตุสำคัญ]\n'
-                    + 'คำถามนี้ต้องใช้ข้อมูลล่าสุด แต่ระบบยังไม่มีข้อมูลยืนยันในตอนนี้\n'
-                    + 'ห้ามเดา ห้ามแต่งตัวเลข สเปก ราคา หรือวันเปิดตัวขึ้นมาเอง\n'
-                    + 'ให้บอกตรง ๆ ว่ายังไม่มีข้อมูลยืนยัน แล้วเสนอสิ่งที่ช่วยได้จริงแทน';
-                }
-              }
-
-              await send({ type: 'status', key: 'think', text: 'กำลังเรียบเรียงคำตอบ' });
-
+              const fresh = !!question && needsFresh(question);
               const carContext = (carInfo.make || carInfo.model)
                 ? `\nรถของผู้ใช้: ${carInfo.make || ''} ${carInfo.model || ''} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` : '';
+              /* ส่วนที่เหมือนกันทุกข้อความไว้หน้า ส่วนที่เปลี่ยนไว้หลัง — Gemini จำส่วนหน้าไว้ได้ ตอบรอบถัดไปเร็วขึ้น */
               const sys = `${IDENTITY}
 
-${STREAM_TALK}
-${carContext ? `\n[รถที่กำลังคุยถึง]${carContext}` : ''}${userBlock}${mediaBlock}${freshBlock}${kbBlock}${skillBlock}${askBlockText()}${stylePrompt(activeStyle, activeCustom)}`;
+${STREAM_TALK}${askBlockText()}${smartBlock()}${stylePrompt(activeStyle, activeCustom)}
+${carContext ? `\n[รถที่กำลังคุยถึง]${carContext}` : ''}${userBlock}${kbBlock}${skillBlock}${fresh ? FORCE_SEARCH : ''}`;
 
-              const history = msgs.map(m => {
-                const o = { role: m.role === 'user' ? 'user' : 'assistant', content: '' };
-                (m.parts || []).forEach(x => {
-                  if (x.text) o.content += x.text;
-                  if (x.inline_data) o.content += ' [ผู้ใช้แนบไฟล์สื่อมาด้วย ดูคำอธิบายในคำสั่งระบบ]';
+              await send({ type: 'status', key: fresh ? 'search' : (hasMedia ? 'media' : 'think'),
+                text: fresh ? 'กำลังค้นข้อมูลล่าสุด' : hasMedia ? 'กำลังดูไฟล์ที่แนบมา' : 'กำลังคิด' });
+
+              /* ── คำตอบ: เรียก Gemini ครั้งเดียว ค้นเว็บ ดูรูป คิด และสตรีมออกมาในตัว ── */
+              let firstText = true;
+              try {
+                const r = await fastAnswer(env, {
+                  system: sys, contents: toGeminiContents(msgs), search: true,
+                  level: thinkingFor(question, hasMedia, body.skillIds), meter,
+                  onThought: d => send({ type: 'reasoning', delta: d }),
+                  onSearch: q => send({ type: 'status', key: 'search', text: 'กำลังค้น: ' + String(q).slice(0, 60) }),
+                  onText: async d => {
+                    if (firstText) { firstText = false; await send({ type: 'status', key: 'write', text: 'กำลังเขียนคำตอบ' }); }
+                    await send({ type: 'text', delta: d });
+                  },
                 });
-                return o;
-              });
+                text = r.text;
+              } catch (e) {
+                /* Gemini ใช้ไม่ได้ทั้งหมด (คีย์/โควตา/ชื่อรุ่น) — ถอยไปทางเดิม ผู้ใช้ยังได้คำตอบ */
+                console.error('[stream fast]', e.message);
+                const history = msgs.map(m => ({ role: m.role === 'user' ? 'user' : 'assistant',
+                  content: (m.parts || []).map(x => x.text || (x.inline_data || x.inlineData ? ' [แนบไฟล์]' : '')).join('') }));
+                const full = await streamModel(env, [{ role: 'system', content: sys }, ...history], meter, send);
+                text = full.text || '';
+              }
 
-              const full = await streamModel(env, [{ role: 'system', content: sys }, ...history], meter, send);
-
-              /* ── เก็บกวาดหลังจบ ── */
-              const text = cleanReply(full.text || '');
+              /* ── ปิดสตรีมให้เร็วที่สุด แล้วค่อยเก็บบัญชี ── */
+              text = cleanReply(text);
               await send({ type: 'text_done', text });
-
               let usage = null;
               try {
                 await meterTokens(env, uid, meter);
-                usage = Object.assign({ cost: meter.in + meter.out, in: meter.in, out: meter.out, src: meter.src },
+                usage = Object.assign({ cost: meter.in + meter.out, in: meter.in, out: meter.out, src: meter.src, ms: Date.now() - t0 },
                                       await quotaState(env, uid, actor.role));
               } catch (e) {}
               await send({ type: 'done', usage });
-
-              try {
-                if (!hasMedia && !(body.skillIds && body.skillIds.length) && !needsFresh(question))
-                  await cacheSave(env, carInfo, question, text);
-                await rememberTurn(env, uid, body.carId, question, text);
-                const day = new Date().toISOString().slice(0, 10);
-                await env.DB.prepare(`
-                  INSERT INTO chat_logs (uid, car_id, prompt, response, in_tok, out_tok, total_tok, model, day, created_at)
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                `).bind(uid, body.carId || null, question.slice(0, 4000), text.slice(0, 8000),
-                  meter.in, meter.out, meter.in + meter.out,
-                  (meter.src && meter.src.join(',')) || 'stream', day, Date.now()).run();
-              } catch (e) { console.error('[stream save]', e) }
             } catch (err) {
               console.error('[stream]', err);
               await send({ type: 'error', message: String((err && err.message) || err).slice(0, 200) });
             }
             try { await writer.close() } catch (e) {}
+
+            /* งานเก็บกวาด — ผู้ใช้ได้คำตอบครบไปแล้ว ไม่ต้องรอส่วนนี้ */
+            if (text && carInfo) {
+              try {
+                const day = new Date().toISOString().slice(0, 10);
+                await Promise.all([
+                  (!hasMedia && !(body.skillIds && body.skillIds.length) && !needsFresh(question))
+                    ? cacheSave(env, carInfo, question, text) : null,
+                  rememberTurn(env, uid, body.carId, question, text),
+                  env.DB.prepare(`
+                    INSERT INTO chat_logs (uid, car_id, prompt, response, in_tok, out_tok, total_tok, model, day, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  `).bind(uid, body.carId || null, question.slice(0, 4000), text.slice(0, 8000),
+                    meter.in, meter.out, meter.in + meter.out,
+                    (meter.src && meter.src.join(',')) || 'stream', day, Date.now()).run(),
+                ]);
+              } catch (e) { console.error('[stream save]', e) }
+            }
           })();
           ctx.waitUntil(work);
 
@@ -4354,25 +4323,21 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
       /* ===== AI PROXY (login required, quota enforced) ===== */
       if (url.pathname === '/api/ai/chat' && request.method === 'POST') {
         return await guarded('user', async (actor) => {
-          const maintenance = await getConfig(env, 'maintenance', { enabled: false });
+          const [maintenance, body, quota0] = await Promise.all([
+            getConfig(env, 'maintenance', { enabled: false }), readBody(),
+            rank(actor.role) < rank('admin') ? quotaState(env, actor.payload.sub, actor.role) : null]);
           if (maintenance.enabled && rank(actor.role) < rank('moderator')) {
             return deny('maintenance', 503);
           }
-          const body = await readBody();
           if (!body) return deny('Invalid JSON body', 400);
           try { validateContents(body.contents); }
           catch (e) { return deny(e.message, 400); }
 
           /* โควตารายวันคิดเป็น 10,000 TPD (หรืออ่านตาม tpd_limit ของผู้ใช้)
              ผู้ดูแลกับเจ้าของระบบไม่ติดโควตา */
-          if (rank(actor.role) < rank('admin')) {
-            const q = await quotaState(env, actor.payload.sub, actor.role);
-            /* ส่งรายละเอียดกลับไปด้วย หน้าเว็บจะได้เด้งกล่องบอกว่าหมดตอนไหน
-               รีเซ็ตกี่โมง และมีแผนอะไรให้เติมบ้าง โดยไม่ต้องยิงถามอีกรอบ */
-            if (q.used >= q.limit) {
-              return json({ error: 'quota', quota: q }, 429);
-            }
-          }
+          /* ส่งรายละเอียดกลับไปด้วย หน้าเว็บจะได้เด้งกล่องบอกว่าหมดตอนไหน
+             รีเซ็ตกี่โมง และมีแผนอะไรให้เติมบ้าง โดยไม่ต้องยิงถามอีกรอบ */
+          if (quota0 && quota0.used >= quota0.limit) return json({ error: 'quota', quota: quota0 }, 429);
 
           let carInfo = { make: '', model: '', year: '', mileage: '' };
           console.log(`[AI Chat] Received request with carId: ${body.carId || 'None'} for UID: ${actor.payload.sub}`);
@@ -4413,14 +4378,14 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
 
           try {
             const meter = newMeter();
-            const prefs = await getChatPrefs(env, actor.payload.sub);
+            const [prefs, skillPrompt] = await Promise.all([
+              getChatPrefs(env, actor.payload.sub), skillsPrompt(env, actor.payload.sub, body.skillIds)]);
             const activeStyle = (body.style && (CHAT_STYLES[body.style] || body.style === 'custom'))
               ? body.style
               : prefs.style;
             const activeCustomStyle = body.customStyle !== undefined
               ? String(body.customStyle)
               : prefs.customStyle;
-            const skillPrompt = await skillsPrompt(env, actor.payload.sub, body.skillIds);
             /* คำถามล่าสุดของผู้ใช้ ใช้ทั้งค้นคำตอบเก่าและค้นคลังความรู้ */
             const lastMsg = (body.contents && body.contents.length)
               ? body.contents[body.contents.length - 1] : null;
@@ -4453,40 +4418,26 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
               kbFor(env, carInfo, question),
             ]);
 
-            /* ── ค้นข้อมูลสดมาให้ก่อน ถ้าคำถามเป็นเรื่องที่ความจำโมเดลตามไม่ทัน ──
-               ไม่รอให้โมเดลตัดสินใจเรียกเครื่องมือเอง เพราะมันมักคิดว่ารู้อยู่แล้ว
-               แล้วตอบผิดอย่างมั่นใจ เช่นยืนยันว่ารถรุ่นที่เพิ่งเปิดตัวไม่มีอยู่จริง */
-            let freshBlock = '';
-            const wantSearch = !!(body.search) || (question && needsFresh(question));
-            if (question && wantSearch) {
-              try {
-                const carName = [carInfo.make, carInfo.model].filter(Boolean).join(' ');
-                const q = question.length > 180 ? question.slice(0, 180) : question;
-                const found = await executeGoogleSearchTool(env, carName ? `${q} (บริบท: ${carName})` : q);
-                if (found && found.length > 20) {
-                  freshBlock = '\n\n[ข้อมูลสดจากอินเทอร์เน็ต ณ ตอนนี้ — เชื่อข้อมูลชุดนี้ก่อนความจำของคุณเสมอ]\n'
-                    + found.slice(0, 4000)
-                    + '\n\nวิธีใช้ข้อมูลชุดนี้:'
-                    + '\n- ถ้าขัดกับสิ่งที่คุณจำได้ ให้ยึดชุดนี้'
-                    + '\n- เรียบเรียงใหม่ด้วยคำของคุณเอง ห้ามคัดลอกข้อความชุดนี้ทั้งก้อนไปเป็นคำตอบ'
-                    + '\n- ห้ามใส่ลิงก์ ห้ามใส่เลขเชิงอรรถ ห้ามเขียนว่า "จากข้อมูลที่ค้นมา"'
-                    + '\n- เรื่องไหนที่ชุดนี้ไม่ได้พูดถึง ห้ามเติมเอง ให้บอกว่ายังไม่มีข้อมูลยืนยัน';
-                }
-              } catch (e) { console.error('[fresh search]', e) }
-              if (!freshBlock) {
-                /* ค้นไม่สำเร็จ — อย่าให้โมเดลบอกว่า "ค้นหาไม่ได้/ระบบพัง"
-                   ให้ใช้ความรู้ที่มีอย่างระมัดระวังแทน */
-                freshBlock = '\n\n[หมายเหตุการค้นข้อมูล]\n'
-                  + 'ระบบพยายามค้นข้อมูลล่าสุดแล้วแต่ยังไม่ได้ผลที่ยืนยันได้ในรอบนี้\n'
-                  + 'ห้ามตอบว่า "ค้นหาไม่ได้" หรือ "ระบบค้นเว็บไม่ได้"\n'
-                  + 'ให้ตอบจากความรู้ที่มีอย่างระมัดระวัง ระบุว่าอาจไม่ใช่ข้อมูลฉบับล่าสุด\n'
-                  + 'และแนะนำแหล่งที่ผู้ใช้ตรวจเองได้ เช่น เว็บผู้ผลิตหรือตัวแทนจำหน่าย\n'
-                  + 'ห้ามแต่งตัวเลข สเปก ราคา หรือวันเปิดตัวที่ไม่มีในความรู้ของคุณ';
-              }
+            /* ── เครื่องตอบเร็ว: Gemini ค้นเว็บ ดูรูป และตอบในการเรียกครั้งเดียว ──
+               ทางเดิม (ค้นแยก + ReAct หลายรอบกับโมเดลฟรี) เก็บไว้เป็นทางสำรองสุดท้ายเท่านั้น */
+            const fresh = !!(body.search === true && needsFresh(question)) || (question && needsFresh(question));
+            let agentOut = null;
+            try {
+              const carContext = (carInfo.make || carInfo.model)
+                ? `\nรถของผู้ใช้: ${carInfo.make || ''} ${carInfo.model || ''} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` : '';
+              const sys = `${IDENTITY}
+
+${STREAM_TALK}${askBlockText()}${smartBlock()}${stylePrompt(activeStyle, activeCustomStyle)}
+${carContext ? `\n[รถที่กำลังคุยถึง]${carContext}` : ''}${userBlock}${kbBlock}${skillPrompt || ''}${fresh ? FORCE_SEARCH : ''}`;
+              const r = await fastAnswer(env, { system: sys, contents: toGeminiContents(body.contents), search: true,
+                level: thinkingFor(question, hasMedia, body.skillIds), meter });
+              agentOut = { text: cleanReply(r.text), reasoning: (r.thoughts || '').slice(0, 6000) };
+            } catch (e) {
+              console.error('[chat fast]', e.message);
+              agentOut = await runReActAgent(env, carInfo, body.contents, meter,
+                                             activeStyle, activeCustomStyle, skillPrompt,
+                                             { user: userBlock, kb: kbBlock, fresh: '' });
             }
-            const agentOut = await runReActAgent(env, carInfo, body.contents, meter,
-                                                activeStyle, activeCustomStyle, skillPrompt,
-                                                { user: userBlock, kb: kbBlock, fresh: freshBlock });
             const text = (agentOut && agentOut.text) || '';
             const reasoning = (agentOut && agentOut.reasoning) || '';
             /* เก็บไว้ตอบซ้ำครั้งหน้า และจำไว้ว่าเคยคุยเรื่องนี้กัน */
@@ -4912,6 +4863,13 @@ ${convo}`;
       /* ═══ ตรวจว่าการค้นเน็ตกับ AI ใช้งานได้จริงไหม ═══
          เวลาผู้ใช้บอกว่า "ค้นไม่ได้" จะได้รู้ทันทีว่าติดที่คีย์ ที่โมเดล หรือที่อื่น
          ไม่ต้องเดาและไม่ต้องไปนั่งอ่าน log */
+      /* สมองเวกเตอร์ (ค้นตามความหมาย) อยู่ใน vectors.js */
+      if (url.pathname.startsWith('/api/admin/vectorize/')) {
+        return await guarded('admin', async () => {
+          const r = await handleVec(request, env, url);
+          return r ? json(r) : deny('Not found', 404);
+        })();
+      }
       if (url.pathname === '/api/admin/diag' && request.method === 'GET') {
         return await guarded('moderator', async () => {
           const out = { keys: {}, search: {}, models: [] };
@@ -4930,13 +4888,10 @@ ${convo}`;
           /* ลองทีละโมเดลและทีละรูปแบบเครื่องมือ แล้วรายงานผลจริงของแต่ละตัว */
           const baseUrl = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
           const q = url.searchParams.get('q') || 'Lamborghini Revuelto ล่าสุด';
-          const models = [];
-          if (env.GEMINI_SEARCH_MODEL) models.push(env.GEMINI_SEARCH_MODEL);
-          models.push('gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash');
-          if (env.GEMINI_MODEL && !models.includes(env.GEMINI_MODEL)) models.push(env.GEMINI_MODEL);
+          const models = chatModels(env);
 
           for (const model of models) {
-            for (const shape of ['google_search', 'google_search_retrieval']) {
+            for (const shape of ['google_search']) {
               const row = { model, tool: shape };
               try {
                 const res = await fetch(`${baseUrl}/v1beta/models/${model}:generateContent?key=${env.GEMINI_KEY}`, {
@@ -5455,6 +5410,7 @@ ${convo}`;
       ctx.waitUntil(fetchAndSaveNews(env));
       ctx.waitUntil(runPushRound(env));
       ctx.waitUntil(runOdoRound(env));
+      ctx.waitUntil(refreshKb(env).catch(() => {}));
     }
   }
 };

@@ -427,9 +427,11 @@ async function appDocs(env, me, uid) {
    บัตรประชาชนกับเซลฟี่ไม่มีทางออกทางนี้ไม่ว่ากรณีใด */
 async function image(env, request, id) {
   const d = await env.DB.prepare(
-    `SELECT d.mime, d.data, p.verified FROM tech_docs d JOIN tech_profiles p ON p.uid = d.uid
+    `SELECT d.mime, d.data, p.verified, p.test FROM tech_docs d JOIN tech_profiles p ON p.uid = d.uid
      WHERE d.id = ? AND d.kind IN ('shop','work') AND p.suspended = 0`).bind(id).first();
-  if (!d || !d.verified) return new Response('Not found', { status: 404 });
+  /* ร้านทีมงาน (test) ยังไม่ผ่านการตรวจแต่ทีมงานเห็นในรายชื่อ — ถ้าไม่ให้รูปผ่าน ทีมงานเห็นรูปแตก
+     แท็ก <img> ส่งโทเคนไม่ได้ จึงเปิดเฉพาะรูปอู่/ผลงาน (ไม่ใช่บัตร) และรหัสรูปมีแค่ในรายชื่อที่ทีมงานเห็น */
+  if (!d || !(d.verified || d.test)) return new Response('Not found', { status: 404 });
   const bin = Uint8Array.from(atob(d.data), c => c.charCodeAt(0));
   return new Response(bin, { headers: { 'Content-Type': d.mime, 'Cache-Control': 'public, max-age=86400',
     'Access-Control-Allow-Origin': '*' } });
@@ -1024,6 +1026,8 @@ async function advice(env, me) {
       const model = env.GEMINI_MODEL || 'gemini-3.6-flash';
       const r = await fetch(`${env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com'}/v1beta/models/${model}:generateContent?key=${env.GEMINI_KEY}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
+        /* สรุปจาก AI เป็นของเสริม — ช้าเกิน 8 วินาทีก็ตัดทิ้ง ช่างยังได้คำแนะนำจากระบบครบ */
+        signal: AbortSignal.timeout(8000),
         body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text:
           `คุณเป็นที่ปรึกษาธุรกิจอู่ซ่อมรถ เขียนสรุปสั้น 2-3 ประโยค ภาษาไทย เป็นกันเอง ว่าร้านนี้ควรปรับอะไรก่อนเพื่อได้งานมากขึ้น ห้ามแต่งตัวเลขเอง ใช้เฉพาะข้อมูลนี้:\n` +
           JSON.stringify({ ร้าน: d.shop, หมวด: d.cats, ราคาเริ่ม: d.from, ราคากลางร้านอื่น: med, ความถนัด: d.about, สถิติ: { งานเสร็จ: s.done, เสนอราคา: s.quoted, ได้งานเปอร์เซ็นต์: s.winRate, ตอบเฉลี่ยนาที: s.replyMin, คะแนน: s.rating, รีวิว: s.reviewCount }, จุดที่ระบบพบ: tips.map(x => x.title) }) }] }],
