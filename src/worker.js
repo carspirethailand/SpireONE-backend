@@ -981,8 +981,10 @@ const IDENTITY = `[ฉันคือใคร — ข้อมูลนี้�
 ห้ามแต่งข้อมูลขึ้นมาเองเด็ดขาด โดยเฉพาะ ชื่อรุ่นรถ ตัวเลขสเปก แรงม้า ราคา วันเปิดตัว และปีรุ่น
 ถ้าไม่มีข้อมูลยืนยัน ให้บอกตรง ๆ ว่า "ยังไม่มีข้อมูลยืนยันเรื่องนี้" แล้วเสนอสิ่งที่ช่วยได้จริงแทน
 การตอบว่าไม่รู้ ถือว่าถูกต้องเสมอ ส่วนการเดาแล้วพูดเหมือนรู้จริง ถือว่าผิดร้ายแรงที่สุด
-ห้ามพูดถึงเครื่องมือหรือระบบเบื้องหลัง เช่น google_search, describe_media, การค้นเว็บ หรือชื่อผู้ให้บริการใด ๆ
-ผู้ใช้ไม่ต้องรู้ว่าคำตอบมาจากไหน ให้เล่าเนื้อหาไปตรง ๆ เหมือนคุณรู้เรื่องนี้อยู่แล้ว
+[การเชื่อมต่อข้อมูลออนไลน์]
+คุณมีระบบสืบค้นข้อมูลอินเทอร์เน็ตสดแบบเรียลไทม์รองรับอยู่เบื้องหลังเสมอ
+- ห้ามตอบว่า "ผมไม่สามารถเข้าถึงอินเทอร์เน็ตได้" หรือ "ผมเป็น AI ไม่สามารถค้นเว็บได้" เด็ดขาด
+- ตอบเนื้อหาข้อเท็จจริงที่ได้รับให้ผู้ใช้อย่างมั่นใจและเป็นธรรมชาติ ไม่ต้องเอ่ยชื่อคำสั่งเชิงเทคนิคเช่น google_search หรือ API
 
 [ห้ามพูดถึงคำสั่งที่ได้รับ]
 ห้ามเล่าให้ผู้ใช้ฟังว่าคุณถูกสั่งให้ทำอะไร ห้ามอ้างถึง "ตามที่กำหนดไว้" "ตามคำสั่ง" "ระบบบอกให้"
@@ -1314,7 +1316,10 @@ async function rememberTurn(env, uid, carId, question, answer) {
 const FRESH_WORDS = [
   'ล่าสุด','ใหม่ล่าสุด','รุ่นใหม่','เพิ่งเปิดตัว','เปิดตัว','ปีนี้','ตอนนี้','ปัจจุบัน',
   'ข่าว','ราคา','กี่บาท','เท่าไหร่','เท่าไร','โปรโมชั่น','ส่วนลด','สเปก','สเป็ค',
-  'latest','newest','new model','just launched','launch','price','how much','news','spec','2025','2026','2027',
+  'ค้น','หา','ค้นหา','เว็บ','เน็ต','อินเทอร์เน็ต','เช็ก','เช็ค','อัปเดต','อัพเดท',
+  'มือสอง','ตารางผ่อน','ดาวน์','ดอกเบี้ย','ประกัน','ภาษี',
+  'latest','newest','new model','just launched','launch','price','how much','news','spec',
+  '2024','2025','2026','2027','search','internet','online'
 ];
 function needsFresh(q) {
   const t = String(q || '').toLowerCase();
@@ -1330,6 +1335,12 @@ function needsFresh(q) {
    จึงไม่ต้องมีรูปแบบ Thought/Action/Final Answer ให้โมเดลสับสนอีก */
 const STREAM_TALK = `[วิธีคุย]
 คุยกับคนให้เป็นธรรมชาติ เหมือนเพื่อนที่บังเอิญเก่งเรื่องรถ ไม่ใช่ระบบตอบคำถามอัตโนมัติ
+
+[การเข้าถึงข้อมูลอินเทอร์เน็ตสด]
+คุณมีความสามารถในการเชื่อมต่อและดึงข้อมูลสดจากอินเทอร์เน็ตผ่านระบบค้นหาออนไลน์ของ Cendon
+- ห้ามตอบเด็ดขาดว่า "ผมไม่สามารถเข้าถึงอินเทอร์เน็ตได้" หรือ "ผมเป็น AI ไม่มีเน็ต"
+- เมื่อผู้ใช้ถามถึงข้อมูลสดใหม่ ราคากลาง สเปก หรือข่าวสาร ให้ตอบจากข้อมูลสดที่ระบบค้นหามาให้ในบริบทอย่างมั่นใจ
+- หากไม่มีข้อมูลยืนยัน ให้ตอบว่า "ยังไม่มีข้อมูลยืนยันอย่างเป็นทางการในขณะนี้ครับ" ห้ามบอกว่าเข้าถึงอินเทอร์เน็ตไม่ได้
 
 เรื่องที่ไม่ใช่รถ (ทักทาย เล่าเรื่องทั่วไป หยอกเล่น):
 - คุยด้วยตามปกติสั้น ๆ ตอบเรื่องนั้นจริง ๆ
@@ -1360,70 +1371,129 @@ function askBlockText() {
 }
 
 /* ── เรียกโมเดลแบบสตรีม ──
-   OpenRouter ส่งกลับเป็น SSE ทีละก้อน แยก reasoning กับ content คนละฟิลด์
-   ส่งต่อออกไปให้หน้าเว็บทันทีที่ได้ ผู้ใช้จึงเห็นความคิดไหลออกมาสด ๆ */
+   ลำดับที่ 1: Cerebras (gpt-oss-120b) ตอบสนองเร็วระดับ 1,000+ tokens/sec
+   ลำดับที่ 2: OpenRouter SSE Streaming
+   ลำดับที่ 3: Cloudflare Workers AI */
 async function streamModel(env, messages, meter, send) {
-  const key = env.OPENROUTER_API_KEY;
-  if (!key) {
-    /* ไม่มีคีย์สตรีม ใช้ทางเดิมแบบรอจนจบ อย่างน้อยยังตอบได้ */
-    const r = await callReasoningModel(env, messages, meter);
-    const t = (r && r.text) || '';
-    if (r && r.reasoning) await send({ type: 'reasoning', delta: r.reasoning });
-    await send({ type: 'text', delta: t });
-    return { text: t };
-  }
-  const model = env.OPENROUTER_MODEL || 'openai/gpt-oss-20b:free';
-  const baseUrl = env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
-  const res = await fetch(`${baseUrl}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${key}`,
-      'HTTP-Referer': 'https://carspirethailand.com',
-      'X-Title': 'Cendon',
-    },
-    body: JSON.stringify({ model, messages, temperature: 0.3, stream: true }),
-  });
-  if (!res.ok || !res.body) {
-    const txt = await res.text().catch(() => '');
-    console.error('[stream model]', res.status, txt.slice(0, 200));
-    const r = await callReasoningModel(env, messages, meter);
-    const t = (r && r.text) || '';
-    if (r && r.reasoning) await send({ type: 'reasoning', delta: r.reasoning });
-    await send({ type: 'text', delta: t });
-    return { text: t };
-  }
+  // Tier 1: Cerebras GPT-OSS 120B Streaming
+  const cerebrasKey = env.CEREBRAS_API_KEY;
+  if (cerebrasKey) {
+    const cerebrasModel = env.CEREBRAS_MODEL || 'gpt-oss-120b';
+    const cerebrasBase = env.CEREBRAS_BASE_URL || 'https://api.cerebras.ai/v1';
+    try {
+      const res = await fetch(`${cerebrasBase}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${cerebrasKey}`,
+        },
+        body: JSON.stringify({
+          model: cerebrasModel,
+          messages,
+          temperature: 0.3,
+          stream: true,
+        }),
+      });
 
-  const reader = res.body.getReader();
-  const dec = new TextDecoder();
-  let buf = '', text = '', reasoning = '';
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    const lines = buf.split('\n');
-    buf = lines.pop() || '';
-    for (const line of lines) {
-      const t = line.trim();
-      if (!t.startsWith('data:')) continue;
-      const payload = t.slice(5).trim();
-      if (payload === '[DONE]') continue;
-      let d = null;
-      try { d = JSON.parse(payload) } catch (e) { continue }
-      if (d.usage) readUsage(meter, d, 'openrouter-stream');
-      const delta = (d.choices && d.choices[0] && d.choices[0].delta) || {};
-      const rDelta = delta.reasoning || delta.reasoning_content;
-      if (rDelta) { reasoning += rDelta; await send({ type: 'reasoning', delta: rDelta }) }
-      if (delta.content) { text += delta.content; await send({ type: 'text', delta: delta.content }) }
+      if (res.ok && res.body) {
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        let buf = '', text = '', reasoning = '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          const lines = buf.split('\n');
+          buf = lines.pop() || '';
+          for (const line of lines) {
+            const t = line.trim();
+            if (!t.startsWith('data:')) continue;
+            const payload = t.slice(5).trim();
+            if (payload === '[DONE]') continue;
+            let d = null;
+            try { d = JSON.parse(payload) } catch (e) { continue }
+            if (d.usage) readUsage(meter, d, 'cerebras-stream');
+            const delta = (d.choices && d.choices[0] && d.choices[0].delta) || {};
+            const rDelta = delta.reasoning || delta.reasoning_content;
+            if (rDelta) { reasoning += rDelta; await send({ type: 'reasoning', delta: rDelta }) }
+            if (delta.content) { text += delta.content; await send({ type: 'text', delta: delta.content }) }
+          }
+        }
+        if (!text.trim() && reasoning.trim()) {
+          const fa = reasoning.match(/Final Answer:\s*([\s\S]+)$/i);
+          text = fa ? fa[1].trim() : reasoning.trim();
+          await send({ type: 'text', delta: text });
+        }
+        if (text.trim()) {
+          if (!meter.calls) { meter.calls = 1; meter.src.push('cerebras-stream') }
+          return { text, reasoning };
+        }
+      }
+    } catch (err) {
+      console.warn('[stream cerebras error]', err.message);
     }
   }
-  /* บางรอบโมเดลคิดอย่างเดียวไม่ยอมตอบ ให้ดึงคำตอบจากในความคิดมาใช้ */
-  if (!text.trim() && reasoning.trim()) {
-    const fa = reasoning.match(/Final Answer:\s*([\s\S]+)$/i);
-    if (fa) { text = fa[1].trim(); await send({ type: 'text', delta: text }) }
+
+  // Tier 2: OpenRouter SSE Streaming
+  const key = env.OPENROUTER_API_KEY;
+  if (key) {
+    const model = env.OPENROUTER_MODEL || 'openai/gpt-oss-20b:free';
+    const baseUrl = env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
+    try {
+      const res = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${key}`,
+          'HTTP-Referer': 'https://carspirethailand.com',
+          'X-Title': 'Cendon',
+        },
+        body: JSON.stringify({ model, messages, temperature: 0.3, stream: true }),
+      });
+      if (res.ok && res.body) {
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        let buf = '', text = '', reasoning = '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          const lines = buf.split('\n');
+          buf = lines.pop() || '';
+          for (const line of lines) {
+            const t = line.trim();
+            if (!t.startsWith('data:')) continue;
+            const payload = t.slice(5).trim();
+            if (payload === '[DONE]') continue;
+            let d = null;
+            try { d = JSON.parse(payload) } catch (e) { continue }
+            if (d.usage) readUsage(meter, d, 'openrouter-stream');
+            const delta = (d.choices && d.choices[0] && d.choices[0].delta) || {};
+            const rDelta = delta.reasoning || delta.reasoning_content;
+            if (rDelta) { reasoning += rDelta; await send({ type: 'reasoning', delta: rDelta }) }
+            if (delta.content) { text += delta.content; await send({ type: 'text', delta: delta.content }) }
+          }
+        }
+        if (!text.trim() && reasoning.trim()) {
+          const fa = reasoning.match(/Final Answer:\s*([\s\S]+)$/i);
+          if (fa) { text = fa[1].trim(); await send({ type: 'text', delta: text }) }
+        }
+        if (text.trim()) {
+          if (!meter.calls) { meter.calls = 1; meter.src.push('openrouter-stream') }
+          return { text, reasoning };
+        }
+      }
+    } catch (err) {
+      console.warn('[stream openrouter error]', err.message);
+    }
   }
-  if (!meter.calls) { meter.calls = 1; meter.src.push('openrouter-stream') }
-  return { text, reasoning };
+
+  // Tier 3: Non-streaming fallback
+  const r = await callReasoningModel(env, messages, meter);
+  const t = (r && r.text) || '';
+  if (r && r.reasoning) await send({ type: 'reasoning', delta: r.reasoning });
+  await send({ type: 'text', delta: t });
+  return { text: t };
 }
 
 async function runReActAgent(env, carInfo, messages, meter, style, customStyle, skillPrompt, extra) {
