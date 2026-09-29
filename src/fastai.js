@@ -21,7 +21,7 @@ function userTokens(contents) {
    Gemma ใช้เครื่องมือค้นเว็บไม่ได้ จึงไม่เอามาใช้ในงานนี้ แม้จะตั้งไว้ในตัวแปร */
 export function chatModels(env) {
   /* ท้ายรายการเป็นรุ่นที่ Google เปิดให้ใช้มานานและเสถียร — กันกรณีชื่อรุ่นที่ตั้งไว้ใช้ไม่ได้ทั้งหมด แชตจะไม่ล่มทั้งระบบ */
-  const list = [env.GEMINI_CHAT_MODEL, env.GEMINI_SEARCH_MODEL, DEFAULT_MODEL, env.GEMINI_MODEL, 'gemini-2.5-flash', 'gemini-2.0-flash']
+  const list = [env.GEMINI_CHAT_MODEL, env.GEMINI_SEARCH_MODEL, DEFAULT_MODEL, env.GEMINI_MODEL, 'gemini-2.5-flash']   /* 2.0-flash ถูก Google ยกเลิกแล้ว (404) */
     .map(m => String(m || '').trim())
     .filter(m => m && !/^gemma/i.test(m));
   return [...new Set(list)];
@@ -185,6 +185,8 @@ export async function fastAnswer(env, opts) {
   const want = opts.level || 'low';
   const ladder = want === 'medium' ? ['medium', 'low', null] : want === 'minimal' ? ['minimal', 'low', null] : ['low', null];
   /* งบเวลารวมก่อนได้คำแรก 14 วินาที — เกินนั้นไปทางสำรองเลย ผู้ใช้ไม่ต้องนั่งรอไล่ลองทีละรุ่น */
+  /* โควตาทั้งคีย์หมด ("exceeded your current quota") — ทุกรุ่นใช้โควตาก้อนเดียวกัน ไม่ต้องไล่ลองทีละรุ่น */
+  if (bad('gemini|quota')) throw new Error('gemini: key quota exhausted (parked)');
   const until = Date.now() + 14000;
   for (const model of chatModels(env)) {
     if (bad(model)) continue;
@@ -203,6 +205,7 @@ export async function fastAnswer(env, opts) {
         trail(opts.meter, { model, level, search, ok: false, ms: Date.now() - t0, err: String(e.message || e).slice(0, 160) });
         last = e;
         if (e.partial) return { text: e.partial, thoughts: '', grounded: false, queries: [], model, cut: true };
+        if (e.quota && /exceeded your current quota|RESOURCE_EXHAUSTED/i.test(e.message || '') && !/grounding/i.test(e.message || '')) { markBad('gemini|quota', 600000); throw e; }
         if (e.thinking && level) { markBad(model + '|' + level); continue; }     /* ลดระดับการคิด รุ่นเดิม */
         /* ค้นเว็บใช้ไม่ได้ในรุ่นนี้ — ลองรุ่นเดิมแบบไม่ค้น (โควตาค้นเต็มจำไว้แค่ 1 นาที) */
         if (e.tool && search && !(e.quota && !opts.search)) { markBad(model + '|search', e.quota ? 60000 : 600000); search = false; i--; continue; }
@@ -320,10 +323,14 @@ export function fallbackProviders(env, media) {
       headers: { 'HTTP-Referer': 'https://carspirethailand.com', 'X-Title': 'Cendon' } });
     return L.filter(p => !bad('fb|' + p.src));
   }
+  /* Groq ก่อน (ฟรี เร็ว) — ถ้าชื่อรุ่นหลักใช้ไม่ได้กับคีย์นี้ มีรุ่นสำรอง (ตัวเดียวกับที่ใช้ดูรูป) */
+  if (env.GROQ_API_KEY) {
+    const gu = `${env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1'}/chat/completions`;
+    L.push({ src: 'groq', url: gu, key: env.GROQ_API_KEY, model: env.GROQ_MODEL || 'openai/gpt-oss-120b' });
+    L.push({ src: 'groq-alt', url: gu, key: env.GROQ_API_KEY, model: 'meta-llama/llama-4-scout-17b-16e-instruct' });
+  }
   if (env.CEREBRAS_API_KEY) L.push({ src: 'cerebras', url: `${env.CEREBRAS_BASE_URL || 'https://api.cerebras.ai/v1'}/chat/completions`,
     key: env.CEREBRAS_API_KEY, model: env.CEREBRAS_MODEL || 'gpt-oss-120b', extra: { reasoning_effort: 'low' } });
-  if (env.GROQ_API_KEY) L.push({ src: 'groq', url: `${env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1'}/chat/completions`,
-    key: env.GROQ_API_KEY, model: env.GROQ_MODEL || 'llama-3.3-70b-versatile' });
   if (env.AI) L.push({ src: 'workers-ai', ai: true, model: env.CF_AI_FALLBACK_MODEL || '@cf/meta/llama-3.3-70b-instruct-fp8-fast' });
   if (env.OPENROUTER_API_KEY) L.push({ src: 'openrouter', url: `${env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1'}/chat/completions`,
     key: env.OPENROUTER_API_KEY, model: env.OPENROUTER_MODEL || 'openrouter/free',   /* รุ่นฟรีเฉพาะชื่อถูกถอดบ่อย ใช้ตัวเลือกฟรีอัตโนมัติ แล้วกรองคำตอบขยะด้วย isJunk */
@@ -385,7 +392,7 @@ export async function fallbackAnswer(env, system, history, opts) {
         last = e;
         if (/ 40[134]:/.test(e.message || '')) markBad('fb|' + p.src);   /* คีย์ผิด/ไม่มีสิทธิ์/ไม่มีรุ่นนี้ */
         /* โควตารายวันหมด (Workers AI 4006 / 429) — พักเจ้านี้ 6 ชั่วโมง ไม่ต้องลองทุกข้อความ */
-        if (/4006|neurons/i.test(e.message || '')) markBad('fb|' + p.src, 6 * 3600000);          /* โควตารายวันหมดจริง */
+        if (/4006|neurons| 402:|payment required/i.test(e.message || '')) markBad('fb|' + p.src, 6 * 3600000);   /* โควตารายวันหมด / ต้องจ่ายเงิน */
         else if (/ 429:|rate.?limit/i.test(e.message || '')) markBad('fb|' + p.src, 60000);      /* แค่ถี่ไป พักนาทีเดียว */
         break;
       }
