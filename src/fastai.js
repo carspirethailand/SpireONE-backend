@@ -363,6 +363,8 @@ export async function fallbackAnswer(env, system, history, opts) {
       } catch (e) {
         last = e;
         if (/ 40[134]:/.test(e.message || '')) markBad('fb|' + p.src);   /* คีย์ผิด/ไม่มีสิทธิ์/ไม่มีรุ่นนี้ */
+        /* โควตารายวันหมด (Workers AI 4006 / 429) — พักเจ้านี้ 6 ชั่วโมง ไม่ต้องลองทุกข้อความ */
+        if (/4006|neurons|daily|quota|rate limit| 429:/i.test(e.message || '')) markBad('fb|' + p.src, 6 * 3600000);
         break;
       }
     }

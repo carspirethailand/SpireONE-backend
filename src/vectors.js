@@ -136,13 +136,16 @@ async function probe(env, url) {
 
 /* ใช้ใน kbFor: คะแนนความหมายของความรู้แต่ละชิ้น (เฉพาะที่ผ่านเกณฑ์)
    อยู่บนทางก่อนเริ่มตอบ จึงให้เวลาแค่ 0.7 วินาที ช้ากว่านั้นถอยไปจับคำเหมือนเดิม */
+/* โควตา Workers AI ฟรีมีจำกัดต่อวัน และใช้ร่วมกับทางสำรองของแชต — ถ้าหมดแล้วพักการค้นความหมาย 6 ชั่วโมง
+   ระหว่างนั้นใช้วิธีจับคำแทน (ผลลัพธ์ยังใช้ได้ แค่ไม่ฉลาดเท่า) */
+let aiOffUntil = 0;
 export async function kbScores(env, question) {
-  if (!env.AI) return new Map();
+  if (!env.AI || Date.now() < aiOffUntil) return new Map();
   try {
     const hits = await Promise.race([search(env, 'kb', question, 12),
       new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 700))]);
     return new Map(hits.filter(h => h.score >= MIN_SCORE.kb).map(h => [h.id, h.score]));
-  } catch { return new Map(); }
+  } catch (e) { if (/4006|neurons|quota|429/i.test(String(e && e.message || e))) aiOffUntil = Date.now() + 6 * 3600000; return new Map(); }
 }
 
 /* งานประจำวัน: สร้างเวกเตอร์ให้ความรู้ที่เพิ่ม/แก้ใหม่ ทีมงานไม่ต้องกดเอง */
