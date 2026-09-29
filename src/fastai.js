@@ -8,6 +8,15 @@
 
 const DEFAULT_MODEL = 'gemini-3.8-flash';
 
+/* โทเคนโดยประมาณของข้อความล่าสุดที่ผู้ใช้ส่ง (ตัวอักษร/3 + รูปละ 300) — ใช้คิดโควตา */
+function userTokens(contents) {
+  const u = [...(contents || [])].reverse().find(c => c && c.role === 'user');
+  if (!u) return 0;
+  let n = 0;
+  for (const p of u.parts || []) n += p.text ? Math.ceil(p.text.length / 3) : 300;
+  return n;
+}
+
 /* โมเดลที่ใช้ตอบ + ค้นเว็บ เรียงตามลำดับที่จะลอง
    Gemma ใช้เครื่องมือค้นเว็บไม่ได้ จึงไม่เอามาใช้ในงานนี้ แม้จะตั้งไว้ในตัวแปร */
 export function chatModels(env) {
@@ -149,9 +158,11 @@ async function streamOnce(env, model, { system, contents, search, level, onText,
   if (usage && meter) {
     /* ส่วนที่ Gemini จำไว้แล้ว (คำสั่งระบบที่ซ้ำทุกข้อความ) Google คิดราคาราวหนึ่งในสี่
        คิดโควตาผู้ใช้ตามต้นทุนจริงแบบเดียวกัน คุยต่อเนื่องจะไม่เผาโควตาเร็วเกินจริง */
-    const cached = usage.cachedContentTokenCount || 0;
-    meter.in += Math.round((usage.promptTokenCount || 0) - cached * 0.75);
-    meter.out += (usage.candidatesTokenCount || 0) + (usage.thoughtsTokenCount || 0);
+    /* คิดโควตาผู้ใช้เฉพาะสิ่งที่เขาพิมพ์ + คำตอบที่เขาได้อ่าน
+       ของเดิมนับคำสั่งระบบ ข้อมูลรถ ความจำ ผลค้นเว็บ และความคิดของโมเดลด้วย ทักว่า "hi" ครั้งเดียวก็กินไปหลายพันโทเคน
+       โควตาจึงหมดใน 1–2 ข้อความ — ต้นทุนเบื้องหลังเป็นเรื่องของระบบ ไม่ใช่ของผู้ใช้ */
+    meter.in += userTokens(contents);
+    meter.out += usage.candidatesTokenCount || Math.ceil(text.length / 3);
     meter.calls += 1; meter.src.push(model + (grounded ? '+search' : ''));
   }
   if (!text.trim()) { const err = new Error(`${model}: empty answer`); err.retryable = true; throw err; }
@@ -285,8 +296,9 @@ async function streamProvider(env, p, messages, { onText, onThought, meter }) {
   } finally { clearTimeout(idle); }
   const g = await guard.end();
   if (meter) {
-    meter.in += (usage && (usage.prompt_tokens || 0)) || 0;
-    meter.out += (usage && (usage.completion_tokens || 0)) || Math.ceil((g.text.length + thoughts.length) / 3);
+    const lastUser = [...messages].reverse().find(m => m.role === 'user');
+    meter.in += lastUser ? Math.ceil(String(Array.isArray(lastUser.content) ? lastUser.content.map(c => c.text || '').join('') : lastUser.content).length / 3) + (Array.isArray(lastUser.content) ? lastUser.content.filter(c => c.type === 'image_url').length * 300 : 0) : 0;
+    meter.out += Math.ceil(g.text.length / 3);
     meter.calls += 1; meter.src.push(p.src);
   }
   return { text: g.text, thoughts, toolCall: g.toolCall };
