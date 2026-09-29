@@ -11,7 +11,8 @@ const DEFAULT_MODEL = 'gemini-3.8-flash';
 /* โมเดลที่ใช้ตอบ + ค้นเว็บ เรียงตามลำดับที่จะลอง
    Gemma ใช้เครื่องมือค้นเว็บไม่ได้ จึงไม่เอามาใช้ในงานนี้ แม้จะตั้งไว้ในตัวแปร */
 export function chatModels(env) {
-  const list = [env.GEMINI_CHAT_MODEL, env.GEMINI_SEARCH_MODEL, DEFAULT_MODEL, env.GEMINI_MODEL]
+  /* ท้ายรายการเป็นรุ่นที่ Google เปิดให้ใช้มานานและเสถียร — กันกรณีชื่อรุ่นที่ตั้งไว้ใช้ไม่ได้ทั้งหมด แชตจะไม่ล่มทั้งระบบ */
+  const list = [env.GEMINI_CHAT_MODEL, env.GEMINI_SEARCH_MODEL, DEFAULT_MODEL, env.GEMINI_MODEL, 'gemini-2.5-flash', 'gemini-2.0-flash']
     .map(m => String(m || '').trim())
     .filter(m => m && !/^gemma/i.test(m));
   return [...new Set(list)];
@@ -347,7 +348,9 @@ export async function fallbackAnswer(env, system, history, opts) {
   const clean = history.map(({ media, ...m }) => m);
   /* ย้ำให้ตอบคำถามล่าสุดตรง ๆ — รุ่นสำรองชอบหยิบข้อมูลรถในคำสั่งระบบมาตอบแทนสิ่งที่ถูกถาม */
   const FOCUS = '\n\n[สำคัญที่สุด] ตอบ "ข้อความล่าสุดของผู้ใช้" ให้ตรงประเด็น ข้อมูลรถของผู้ใช้ใช้ประกอบเท่านั้น ห้ามตอบแค่ข้อมูลรถถ้าเขาไม่ได้ถาม';
-  const list = media ? fallbackProviders(env, true).concat(fallbackProviders(env)) : fallbackProviders(env);
+  let list = media ? fallbackProviders(env, true).concat(fallbackProviders(env)) : fallbackProviders(env);
+  /* ทุกเจ้าถูกพักไว้หมด — ดีกว่าตอบว่าไม่มีทางสำรอง ให้ลองทุกเจ้าอีกรอบ (อาจหายแล้ว) */
+  if (!list.length) { BAD.forEach((_, k) => { if (k.startsWith('fb|')) BAD.delete(k) }); list = fallbackProviders(env, media).concat(media ? fallbackProviders(env) : []) }
   for (const p of list) {
     let sys = system + NO_TOOLS + FOCUS;
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -364,7 +367,8 @@ export async function fallbackAnswer(env, system, history, opts) {
         last = e;
         if (/ 40[134]:/.test(e.message || '')) markBad('fb|' + p.src);   /* คีย์ผิด/ไม่มีสิทธิ์/ไม่มีรุ่นนี้ */
         /* โควตารายวันหมด (Workers AI 4006 / 429) — พักเจ้านี้ 6 ชั่วโมง ไม่ต้องลองทุกข้อความ */
-        if (/4006|neurons|daily|quota|rate limit| 429:/i.test(e.message || '')) markBad('fb|' + p.src, 6 * 3600000);
+        if (/4006|neurons/i.test(e.message || '')) markBad('fb|' + p.src, 6 * 3600000);          /* โควตารายวันหมดจริง */
+        else if (/ 429:|rate.?limit/i.test(e.message || '')) markBad('fb|' + p.src, 60000);      /* แค่ถี่ไป พักนาทีเดียว */
         break;
       }
     }
