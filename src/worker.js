@@ -1,7 +1,7 @@
 import { verifyFirebaseToken } from './auth.js';
 import { handleTech } from './techs.js';
 import { handleVec, kbScores, refreshKb } from './vectors.js';
-import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels, toChatHistory } from './fastai.js';
+import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels, toChatHistory, levelFor, depthNote, featuresBlock } from './fastai.js';
 
 /*
  * SpireONE backend — security-hardened.
@@ -4266,7 +4266,7 @@ export default {
               /* ส่วนที่เหมือนกันทุกข้อความไว้หน้า ส่วนที่เปลี่ยนไว้หลัง — Gemini จำส่วนหน้าไว้ได้ ตอบรอบถัดไปเร็วขึ้น */
               const sys = `${IDENTITY}
 
-${STREAM_TALK}${askBlockText()}${smartBlock()}${stylePrompt(activeStyle, activeCustom)}
+${STREAM_TALK}${featuresBlock()}${smartBlock()}${stylePrompt(activeStyle, activeCustom)}${depthNote(body.depth)}
 ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext}` : ''}${userBlock}${kbBlock}${skillBlock}${fresh ? FORCE_SEARCH : ''}`;
 
               await send({ type: 'status', key: fresh ? 'search' : (hasMedia ? 'media' : 'think'),
@@ -4277,9 +4277,9 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
               try {
                 const r = await fastAnswer(env, {
                   system: sys, contents: toGeminiContents(msgs), search: true,
-                  level: thinkingFor(question, hasMedia, body.skillIds), meter,
+                  level: levelFor(body.depth, question, hasMedia, body.skillIds), meter,
                   onThought: d => send({ type: 'reasoning', delta: d }),
-                  onSearch: q => send({ type: 'status', key: 'search', text: 'กำลังค้น: ' + String(q).slice(0, 60) }),
+                  onSearch: async q => { await send({ type: 'research', q: String(q).slice(0, 120) }); await send({ type: 'status', key: 'search', text: 'กำลังค้น: ' + String(q).slice(0, 60) }) },
                   onText: async d => {
                     if (firstText) { firstText = false; await send({ type: 'status', key: 'write', text: 'กำลังเขียนคำตอบ' }); }
                     await send({ type: 'text', delta: d });
@@ -4449,11 +4449,11 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
               ? `\nรถของผู้ใช้: ${carInfo.make || ''} ${carInfo.model || ''} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` : '';
             const sys = `${IDENTITY}
 
-${STREAM_TALK}${askBlockText()}${smartBlock()}${stylePrompt(activeStyle, activeCustomStyle)}
+${STREAM_TALK}${featuresBlock()}${smartBlock()}${stylePrompt(activeStyle, activeCustomStyle)}${depthNote(body.depth)}
 ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext}` : ''}${userBlock}${kbBlock}${skillPrompt || ''}${fresh ? FORCE_SEARCH : ''}`;
             try {
               const r = await fastAnswer(env, { system: sys, contents: toGeminiContents(body.contents), search: true,
-                level: thinkingFor(question, hasMedia, body.skillIds), meter });
+                level: levelFor(body.depth, question, hasMedia, body.skillIds), meter });
               agentOut = { text: cleanReply(r.text), reasoning: (r.thoughts || '').slice(0, 6000) };
             } catch (e) {
               console.error('[chat fast]', e.message);
