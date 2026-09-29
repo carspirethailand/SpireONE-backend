@@ -1,7 +1,7 @@
 import { verifyFirebaseToken } from './auth.js';
 import { handleTech } from './techs.js';
 import { handleVec, kbScores, refreshKb } from './vectors.js';
-import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels } from './fastai.js';
+import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels, toChatHistory } from './fastai.js';
 
 /*
  * SpireONE backend — security-hardened.
@@ -1638,11 +1638,8 @@ Final Answer: [คำตอบที่สมบูรณ์ เป็นมิ�
 }
 
 /* ประวัติแชตสำหรับทางสำรอง (โมเดลพวกนี้รับแค่ข้อความ) */
-function historyOf(msgs) {
-  return (msgs || []).map(m => ({ role: m.role === 'user' ? 'user' : 'assistant',
-    content: (m.parts || []).map(x => x.text || (x.inline_data || x.inlineData ? ' [ผู้ใช้แนบไฟล์มา]' : '')).join('') }))
-    .filter(m => m.content.trim());
-}
+/* ส่งรูปล่าสุดไปด้วย ให้ทางสำรองที่ดูรูปได้เห็นของจริง (ดู toChatHistory ใน fastai.js) */
+function historyOf(msgs) { return toChatHistory(msgs) }
 /* จดสาเหตุล่าสุดที่ Gemini ใช้ไม่ได้ — ให้เจ้าของเห็นในหน้าตรวจระบบ จะได้รู้ว่าติดคีย์ โควตา หรือชื่อรุ่น
    จดไม่เกินนาทีละครั้ง ไม่ให้เขียนฐานข้อมูลทุกข้อความ */
 let aiErrAt = 0;

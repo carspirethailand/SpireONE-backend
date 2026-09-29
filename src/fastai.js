@@ -70,7 +70,7 @@ export function toGeminiContents(msgs, keepMediaTurns = 2) {
 /* ── เรียก Gemini แบบสตรีมหนึ่งครั้ง ──
    คืน { text, thoughts, grounded, queries } · เรียก onText/onThought ทันทีที่ได้แต่ละก้อน
    โยน error พร้อม e.retryable เพื่อบอกผู้เรียกว่าควรลองโมเดลถัดไปไหม (ยังไม่มีข้อความออกไปเลย) */
-async function streamOnce(env, model, { system, contents, search, level, onText, onThought, onSearch, meter, maxTokens }) {
+async function streamOnce(env, model, { system, contents, search, level, onText, onThought, onSearch, meter, maxTokens, headerMs }) {
   const base = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
   /* เพดานนี้นับรวมโทเคนที่ใช้คิดด้วย ตั้งให้พอ ไม่งั้นคิดเยอะแล้วคำตอบถูกตัดกลางประโยค */
   const gen = { maxOutputTokens: maxTokens || 8192 };
@@ -82,7 +82,7 @@ async function streamOnce(env, model, { system, contents, search, level, onText,
 
   /* รอหัวคำตอบไม่เกิน 12 วินาที (ช้ากว่านั้นไปทางสำรองดีกว่าให้ผู้ใช้รอ) และระหว่างสตรีมเงียบนานเกิน 30 วินาทีถือว่าค้าง */
   const ac = new AbortController();
-  let idle = setTimeout(() => ac.abort('timeout'), 12000);
+  let idle = setTimeout(() => ac.abort('timeout'), headerMs || 9000);
   let res;
   try {
     res = await fetch(`${base}/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${env.GEMINI_KEY}`, {
@@ -103,6 +103,7 @@ async function streamOnce(env, model, { system, contents, search, level, onText,
     err.tool = (res.status === 400 && /tool|search|grounding/i.test(t)) || res.status === 429;
     err.dead = res.status === 404 || (res.status === 400 && /not (be )?found|not supported for|unknown model|invalid model/i.test(t) && !err.thinking && !err.tool);
     err.quota = res.status === 429;
+    err.busy = res.status >= 500;
     throw err;
   }
 
@@ -161,28 +162,36 @@ async function streamOnce(env, model, { system, contents, search, level, onText,
    ถ้ามีข้อความออกไปแล้วบางส่วนแล้วสะดุด จะไม่เริ่มใหม่ (ผู้ใช้จะเห็นซ้ำ) แต่คืนเท่าที่ได้ */
 /* จำสิ่งที่ใช้ไม่ได้ไว้ 10 นาทีในเครื่องที่รัน — ไม่ต้องเสียเวลายิงของที่รู้แล้วว่าพังทุกข้อความ */
 const BAD = new Map();
-const bad = k => { const t = BAD.get(k); return t && Date.now() - t < 600000 };
-const markBad = k => BAD.set(k, Date.now());
+/* จำของเสียพร้อมอายุ: รุ่นที่ไม่มีอยู่จริงจำ 10 นาที · โควตาเต็ม/เซิร์ฟเวอร์ล่มชั่วคราวจำแค่ 1 นาที
+   ข้อความถัดไปจึงไม่ต้องเสียเวลายิงของที่เพิ่งพัง แต่ก็กลับมาลองใหม่เร็วเมื่อหายแล้ว */
+const bad = k => { const v = BAD.get(k); return v && Date.now() < v };
+const markBad = (k, ms = 600000) => BAD.set(k, Date.now() + ms);
 
 export async function fastAnswer(env, opts) {
   if (!env.GEMINI_KEY) throw new Error('AI is not configured');
   let last = null;
   const want = opts.level || 'low';
   const ladder = want === 'medium' ? ['medium', 'low', null] : want === 'minimal' ? ['minimal', 'low', null] : ['low', null];
+  /* งบเวลารวมก่อนได้คำแรก 14 วินาที — เกินนั้นไปทางสำรองเลย ผู้ใช้ไม่ต้องนั่งรอไล่ลองทีละรุ่น */
+  const until = Date.now() + 14000;
   for (const model of chatModels(env)) {
     if (bad(model)) continue;
     let search = !!opts.search && !bad(model + '|search');
     for (let i = 0; i < ladder.length; i++) {
       const level = ladder[i];
       if (level && bad(model + '|' + level)) continue;
+      const left = until - Date.now();
+      if (left < 1500) throw last || new Error('gemini: time budget used');
       try {
-        return await streamOnce(env, model, { ...opts, level, search });
+        return await streamOnce(env, model, { ...opts, level, search, headerMs: Math.min(9000, left) });
       } catch (e) {
         last = e;
         if (e.partial) return { text: e.partial, thoughts: '', grounded: false, queries: [], model, cut: true };
         if (e.thinking && level) { markBad(model + '|' + level); continue; }     /* ลดระดับการคิด รุ่นเดิม */
-        if (e.tool && search) { if (!e.quota) markBad(model + '|search'); search = false; i--; continue; }  /* รุ่นเดิม ไม่ค้น */
+        /* ค้นเว็บใช้ไม่ได้ในรุ่นนี้ — ลองรุ่นเดิมแบบไม่ค้น (โควตาค้นเต็มจำไว้แค่ 1 นาที) */
+        if (e.tool && search && !(e.quota && !opts.search)) { markBad(model + '|search', e.quota ? 60000 : 600000); search = false; i--; continue; }
         if (e.dead) markBad(model);
+        else if (e.quota || e.busy) markBad(model, 60000);                     /* ล่ม/เต็มชั่วคราว ข้ามรุ่นนี้ 1 นาที */
         break;                                                                 /* ข้ามไปรุ่นถัดไป */
       }
     }
@@ -196,7 +205,7 @@ export async function fastAnswer(env, opts) {
    ตอนนี้เรียงจากเร็วสุด: Cerebras → Groq → Workers AI → OpenRouter (ตัวไหนไม่มีคีย์ก็ข้าม)
    และมีตัวกันไม่ให้คำสั่งเรียกเครื่องมือหลุดถึงผู้ใช้ */
 const TOOL_RE = /<\|tool_call|<\|python_tag\|>|<tool_call>|<\/?function[=\s>]|\[TOOL_CALLS\]|^\s*\[?\s*\{\s*"(name|tool|function)"\s*:|\b(google|google_search|web_search|search|browser\.search)\s*\(\s*(query\s*=|["'])/im;
-const MAYBE_TOOL = /^\s*(<|\[|\{|google|search|web_|browser)/i;
+const MAYBE_TOOL = /^\s*(<|\[|\{|google|search|web_|browser|user|response|prompt|safe|unsafe|s\d)/i;
 
 export function stripToolCalls(t) {
   return String(t || '')
@@ -218,7 +227,7 @@ function toolGuard(onText) {
       if (toolCall) return;
       if (!open) {
         head += d;
-        if (TOOL_RE.test(head)) { toolCall = true; return; }
+        if (TOOL_RE.test(head) || JUNK_RE.test(head)) { toolCall = true; return; }   /* คำสั่งเครื่องมือ/ผลตรวจความปลอดภัย ห้ามถึงผู้ใช้ */
         if (MAYBE_TOOL.test(head) && head.length < 80) return;
         open = true; d = head;
       } else if (TOOL_RE.test(text.slice(-80) + d)) { toolCall = true; return; }
@@ -282,15 +291,26 @@ async function streamProvider(env, p, messages, { onText, onThought, meter }) {
   return { text: g.text, thoughts, toolCall: g.toolCall };
 }
 
-export function fallbackProviders(env) {
+export function fallbackProviders(env, media) {
   const L = [];
+  /* มีรูปแนบ: ใช้เฉพาะรุ่นที่ดูรูปได้จริง — ของเดิมส่งให้รุ่นที่อ่านได้แต่ข้อความ มันจึงตอบมั่วว่าดูรูปไม่ได้ */
+  if (media) {
+    if (env.GROQ_API_KEY) L.push({ src: 'groq-vision', vision: true, url: `${env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1'}/chat/completions`,
+      key: env.GROQ_API_KEY, model: env.GROQ_VISION_MODEL || 'meta-llama/llama-4-scout-17b-16e-instruct' });
+    if (env.AI) L.push({ src: 'workers-ai-vision', vision: true, ai: true, model: env.CF_AI_VISION_MODEL || '@cf/meta/llama-4-scout-17b-16e-instruct' });
+    if (env.OPENROUTER_API_KEY) L.push({ src: 'openrouter-vision', vision: true, url: `${env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1'}/chat/completions`,
+      key: env.OPENROUTER_API_KEY, model: env.OPENROUTER_VISION_MODEL || 'google/gemma-3-27b-it:free',
+      headers: { 'HTTP-Referer': 'https://carspirethailand.com', 'X-Title': 'Cendon' } });
+    return L.filter(p => !bad('fb|' + p.src));
+  }
   if (env.CEREBRAS_API_KEY) L.push({ src: 'cerebras', url: `${env.CEREBRAS_BASE_URL || 'https://api.cerebras.ai/v1'}/chat/completions`,
     key: env.CEREBRAS_API_KEY, model: env.CEREBRAS_MODEL || 'gpt-oss-120b', extra: { reasoning_effort: 'low' } });
   if (env.GROQ_API_KEY) L.push({ src: 'groq', url: `${env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1'}/chat/completions`,
     key: env.GROQ_API_KEY, model: env.GROQ_MODEL || 'llama-3.3-70b-versatile' });
   if (env.AI) L.push({ src: 'workers-ai', ai: true, model: env.CF_AI_FALLBACK_MODEL || '@cf/meta/llama-3.3-70b-instruct-fp8-fast' });
   if (env.OPENROUTER_API_KEY) L.push({ src: 'openrouter', url: `${env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1'}/chat/completions`,
-    key: env.OPENROUTER_API_KEY, model: env.OPENROUTER_MODEL || 'openrouter/free',
+    /* ห้ามใช้ openrouter/free — มันสุ่มรุ่นมาให้ รวมถึงรุ่นตรวจความปลอดภัยที่ตอบแค่ "User Safety: safe" */
+    key: env.OPENROUTER_API_KEY, model: env.OPENROUTER_MODEL && env.OPENROUTER_MODEL !== 'openrouter/free' ? env.OPENROUTER_MODEL : 'meta-llama/llama-3.3-70b-instruct:free',
     headers: { 'HTTP-Referer': 'https://carspirethailand.com', 'X-Title': 'Cendon' } });
   return L.filter(p => !bad('fb|' + p.src));
 }
@@ -301,13 +321,39 @@ const NO_TOOLS = `
 [สำคัญ] รอบนี้ไม่มีเครื่องมือใด ๆ ให้เรียกใช้ ห้ามเขียนคำสั่งเรียกฟังก์ชัน ห้ามเขียน google(...) หรือ <|tool_call|>
 ตอบเป็นภาษาคนออกมาเลย จากความรู้ที่มี เรื่องที่ต้องใช้ข้อมูลล่าสุดให้บอกตรง ๆ ว่ายังยืนยันข้อมูลล่าสุดไม่ได้ แล้วแนะนำแหล่งที่ตรวจเองได้`;
 
+/* คำตอบขยะที่ต้องทิ้งแล้วไปรุ่นถัดไป: ผลตรวจความปลอดภัย หรือข้อความสั้นกุดไม่มีเนื้อ */
+const JUNK_RE = /^\s*(user|response|prompt)\s*safety\s*:|^\s*(safe|unsafe)\s*(\n|$)|^\s*S\d+\s*$/im;
+export function isJunk(t) { return JUNK_RE.test(String(t || '')) }
+
+/* ประวัติแชตแบบ OpenAI: ข้อความล้วน ยกเว้นข้อความล่าสุดของผู้ใช้ที่มีรูป — ส่งรูปจริงไปด้วย (สำหรับรุ่นที่ดูรูปได้) */
+export function toChatHistory(msgs) {
+  const list = (msgs || []).filter(m => m && Array.isArray(m.parts));
+  let lastMedia = -1;
+  list.forEach((m, i) => { if (m.role === 'user' && m.parts.some(p => p && (p.inline_data || p.inlineData))) lastMedia = i });
+  return list.map((m, i) => {
+    const role = m.role === 'user' ? 'user' : 'assistant';
+    const text = m.parts.map(x => x.text || ((x.inline_data || x.inlineData) && i !== lastMedia ? ' [ผู้ใช้เคยแนบไฟล์ไว้]' : '')).join('').trim();
+    if (i !== lastMedia) return { role, content: text };
+    const imgs = m.parts.map(x => x.inline_data || x.inlineData).filter(d => d && d.data && /^image\//i.test(d.mime_type || d.mimeType || 'image/jpeg'))
+      .slice(0, 3).map(d => ({ type: 'image_url', image_url: { url: `data:${(d.mime_type || d.mimeType || 'image/jpeg').split(';')[0]};base64,${String(d.data).split(',').pop().replace(/\s/g, '')}` } }));
+    return { role, content: imgs.length ? [{ type: 'text', text: text || 'ดูรูปนี้ให้หน่อย' }, ...imgs] : text, media: imgs.length > 0 };
+  }).filter(m => (Array.isArray(m.content) ? m.content.length : String(m.content).trim()));
+}
+const flat = h => h.map(m => ({ role: m.role, content: Array.isArray(m.content) ? m.content.map(c => c.text || ' [ผู้ใช้แนบรูปมา]').join('') : m.content }));
+
 export async function fallbackAnswer(env, system, history, opts) {
   let last = null;
-  for (const p of fallbackProviders(env)) {
-    let sys = system + NO_TOOLS;
+  const media = history.some(m => m.media);
+  const clean = history.map(({ media, ...m }) => m);
+  /* ย้ำให้ตอบคำถามล่าสุดตรง ๆ — รุ่นสำรองชอบหยิบข้อมูลรถในคำสั่งระบบมาตอบแทนสิ่งที่ถูกถาม */
+  const FOCUS = '\n\n[สำคัญที่สุด] ตอบ "ข้อความล่าสุดของผู้ใช้" ให้ตรงประเด็น ข้อมูลรถของผู้ใช้ใช้ประกอบเท่านั้น ห้ามตอบแค่ข้อมูลรถถ้าเขาไม่ได้ถาม';
+  const list = media ? fallbackProviders(env, true).concat(fallbackProviders(env)) : fallbackProviders(env);
+  for (const p of list) {
+    let sys = system + NO_TOOLS + FOCUS;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const r = await streamProvider(env, p, [{ role: 'system', content: sys }, ...history], opts);
+        const r = await streamProvider(env, p, [{ role: 'system', content: sys }, ...(p.vision ? clean : flat(clean))], opts);
+        if (isJunk(r.text)) break;
         if (r.text.trim()) return { ...r, src: p.src };
         if (r.toolCall && attempt === 0) {
           /* มันยังพยายามเรียกเครื่องมือ — ย้ำอีกรอบ ถ้ายังดื้อก็ไปตัวถัดไป */
