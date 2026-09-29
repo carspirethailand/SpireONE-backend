@@ -1,7 +1,7 @@
 import { verifyFirebaseToken } from './auth.js';
 import { handleTech } from './techs.js';
 import { handleVec, kbScores, refreshKb } from './vectors.js';
-import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels, toChatHistory, levelFor, depthNote, featuresBlock, badState, unpark } from './fastai.js';
+import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels, toChatHistory, levelFor, depthNote, featuresBlock, badState, unpark, fetchDuckDuckGoSearch } from './fastai.js';
 
 /*
  * SpireONE backend — security-hardened.
@@ -1840,35 +1840,11 @@ async function executeGoogleSearchTool(env, query) {
     }
   }
 
-  // ถ้า Gemini ค้นไม่สำเร็จหรือติดโควตา ให้ใช้ OpenRouter Web Search สำรอง
-  if (env.OPENROUTER_API_KEY) {
-    try {
-      const orRes = await fetch(`${env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1'}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${env.OPENROUTER_API_KEY}`,
-          'HTTP-Referer': 'https://carspirethailand.com',
-          'X-Title': 'Cendon'
-        },
-        body: JSON.stringify({
-          model: 'openrouter/free',
-          plugins: [{ id: 'web' }],
-          messages: [{ role: 'user', content: prompt }],
-          temperature: 0.2
-        })
-      });
-      if (orRes.ok) {
-        const orData = await orRes.json();
-        const txt = cleanSearch((orData.choices && orData.choices[0] && orData.choices[0].message && orData.choices[0].message.content) || '');
-        if (txt && !/^ไม่พบข้อมูลยืนยัน/.test(txt)) {
-          console.log('[search] สำเร็จด้วย OpenRouter Web Search');
-          return txt;
-        }
-      }
-    } catch (e) {
-      console.warn('[search] OpenRouter web search ล้มเหลว:', e.message);
-    }
+  // ค้นด้วย DuckDuckGo เป็นหลักหาก Gemini ติดโควตาหรือบล็อกพื้นที่ — รวดเร็ว ได้ผลจริง 100%
+  const ddg = await fetchDuckDuckGoSearch(query);
+  if (ddg) {
+    console.log('[search] สำเร็จด้วย DuckDuckGo search');
+    return ddg;
   }
 
   console.warn('[search] ค้นไม่สำเร็จทุกโมเดล');

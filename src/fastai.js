@@ -206,12 +206,50 @@ export function needsFresh(q) {
   return false;
 }
 
+/* ── เครื่องมือค้นหาเว็บความเร็วสูงผ่าน DuckDuckGo (ทำงานได้จาก Edge ทุกที่ ไม่ติดโควตา Google) ── */
+export async function fetchDuckDuckGoSearch(query) {
+  try {
+    const qClean = String(query || '')
+      .replace(/^(ช่วย|ให้คุณ|ให้|รบกวน|อยากให้)?\s*(ค้นหา|หาข้อมูล|ค้นเน็ต|เสิร์ช|search)?\s*(ข้อมูล|ให้หน่อย|ตอนนี้เลย|ทีครับ|ทีค่ะ|หน่อย)?/gi, '')
+      .trim() || String(query || '');
+    const q = encodeURIComponent(qClean.slice(0, 150));
+    const url = `https://html.duckduckgo.com/html/?q=${q}`;
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'th-TH,th;q=0.9,en;q=0.8'
+      }
+    });
+    if (!res.ok) return '';
+    const html = await res.text();
+    const blocks = html.split(/<div class="result results_links/);
+    const items = [];
+    for (let i = 1; i < blocks.length && items.length < 6; i++) {
+      const b = blocks[i];
+      if (b.includes('result--ad') || b.includes('badge--ad')) continue;
+      const aM = b.match(/<a class="result__a"[^>]*>([\s\S]*?)<\/a>/i);
+      const snipM = b.match(/<a class="result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/i);
+      const title = aM ? aM[1].replace(/<[^>]+>/g, '').trim() : '';
+      const snippet = snipM ? snipM[1].replace(/<[^>]+>/g, '').replace(/&quot;/g, '"').replace(/&#x27;/g, "'").replace(/&amp;/g, '&').trim() : '';
+      if (snippet) {
+        items.push(`${items.length + 1}. ${title ? `[${title}] ` : ''}${snippet}`);
+      }
+    }
+    return items.join('\n');
+  } catch (e) {
+    console.warn('[ddg search error]', e.message || e);
+    return '';
+  }
+}
+
 /* ── ค้นหาข้อมูลฉุกเฉิน (กรณีไม่มีฟังก์ชันค้นหาภายนอกส่งเข้ามา) ── */
-async function defaultSearch(env, q) {
+export async function defaultSearch(env, q) {
   const geminiKey = env.GEMINI_KEY;
   const baseUrl = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
-  if (geminiKey) {
+  if (geminiKey && !bad('gemini|quota') && !bad('gemini|region')) {
     for (const m of chatModels(env)) {
+      if (bad(m)) continue;
       try {
         const res = await fetch(`${baseUrl}/v1beta/models/${m}:generateContent?key=${geminiKey}`, {
           method: 'POST',
@@ -227,17 +265,25 @@ async function defaultSearch(env, q) {
           const cand = (data.candidates && data.candidates[0]) || {};
           const txt = (((cand.content && cand.content.parts) || []).map(x => x.text || '').join('').trim());
           if (txt && !/^ไม่พบข้อมูลยืนยัน/i.test(txt)) return txt;
+        } else if (res.status === 429) {
+          markBad('gemini|quota', 60000);
+        } else if (res.status === 400) {
+          const errTxt = await res.text().catch(() => '');
+          if (/User location is not supported/i.test(errTxt)) markBad('gemini|region', 600000);
         }
       } catch (e) {}
     }
   }
+  // ค้นด้วย DuckDuckGo เป็นหลักหาก Gemini ติดโควตาหรือบล็อกพื้นที่ — ได้ผลจริง ทันที ไม่ติดโควตา
+  const ddg = await fetchDuckDuckGoSearch(q);
+  if (ddg) return ddg;
   return '';
 }
 
 /* ══ OpenRouter Tool-Calling Thinking Agent (โมเดลหลักตามคำสั่งผู้ใช้) ══
    - ใช้ openrouter/free (หรือ env.OPENROUTER_MODEL) เป็นสมองหลักในการคิด
-   - มีเครื่องมือ google_search และ describe_media ให้เรียกใช้
-   - รับ Thought / Action แล้วรันเครื่องมือ ป้อน Observation กลับให้โมเดลสรุปคำตอบ */
+   - เชื่อมต่อการค้นหาเว็บสด (DuckDuckGo + Google Search Grounding)
+   - สตรีมความคิด (reasoning) และคำตอบสด ๆ แบบเรียลไทม์ */
 async function openrouterAgent(env, opts) {
   if (!env.OPENROUTER_API_KEY) return null;
   const model = env.OPENROUTER_MODEL || 'openrouter/free';
@@ -245,39 +291,57 @@ async function openrouterAgent(env, opts) {
   const url = `${baseUrl}/chat/completions`;
   const t0 = Date.now();
 
-  const toolsPrompt = `
-
-[เครื่องมือที่คุณสามารถเรียกใช้ได้]
-1. google_search(query): ค้นหาข้อมูลล่าสุดจากอินเทอร์เน็ต เช่น ราคากลาง, สเปกรถปี 2024-2026, โปรโมชั่น, ข่าวสาร, ข้อมูลที่เปลี่ยนแปลงตามเวลา
-2. describe_media(prompt): ตรวจดูและอธิบายภาพถ่าย วิดีโอ หรือเสียงที่ผู้ใช้แนบมา
-
-[วิธีเรียกใช้เครื่องมือ]
-เมื่อต้องการค้นหาหรือดูภาพ ให้เขียนตามรูปแบบนี้:
-Thought: [เหตุผลสั้น ๆ ว่าต้องค้นหาอะไร]
-Action: google_search("คำค้นหาที่กระชับและตรงประเด็น")
-
-เมื่อระบบค้นหาและป้อน Observation กลับมาแล้ว ให้เขียนสรุปคำตอบโดยเริ่มจาก:
-Final Answer: [คำตอบที่สมบูรณ์ เป็นมิตร ตรงประเด็น และอ้างอิงจากข้อมูลจริงใน Observation]
-
-ข้อสำคัญ:
-- ห้ามตอบว่า "ฉันไม่สามารถเข้าถึงอินเทอร์เน็ตได้" หรือ "ไม่มี search tools" เพราะคุณมีเครื่องมือ google_search ให้เรียกใช้!
-- ข้อความหลัง Final Answer: คือสิ่งที่จะแสดงให้ผู้ใช้เห็น`;
-
-  const sys = (opts.system || '') + toolsPrompt;
   const history = opts.history || (opts.messages ? toChatHistory(opts.messages) : (opts.contents ? toChatHistory(opts.contents) : []));
+  const question = opts.question || (history.length ? String(history[history.length - 1].content || '') : '');
+  const isSearchQuery = /ค้นหา|หาข้อมูล|ค้นเน็ต|เสิร์ช|search|เช็คราคา|เช็กราคา|ล่าสุด|ปัจจุบัน|เปิดตัว|ปีนี้|ปีหน้า|202[4-9]|256[7-9]|โปรโมชั่น|แคมเปญ|ดอกเบี้ย|ผ่อน|ตารางผ่อน|มีขายไหม|เข้าไทย|มาไทย|ขายยัง|วางขาย|รุ่นใหม่|facelift|all new|all-new/i.test(question);
+  const fresh = (opts.search !== false) && (needsFresh(question) || (opts.carInfo && needsFresh(question)) || isSearchQuery);
 
+  const searchFn = opts.executeSearch || (q => defaultSearch(env, q));
+  let observation = '';
+  let searchTopic = '';
+
+  // 1. Pre-search Grounding: ถ้าคำถามต้องการข้อมูลสด ค้นหาเว็บล่วงหน้าทันที (< 1 วินาที)
+  // เพื่อให้โมเดลตอบรอบเดียวจบแบบ Single-turn Streaming เร็ว ไม่ติด timeout
+  if (fresh) {
+    const carPrefix = (opts.carInfo && (opts.carInfo.make || opts.carInfo.model)) ? `${opts.carInfo.make || ''} ${opts.carInfo.model || ''} ` : '';
+    const qClean = question.replace(/^(ช่วย|ให้คุณ|ให้|รบกวน|อยากให้)?\s*(ค้นหา|หาข้อมูล|เสิร์ช|search)?\s*(ข้อมูล|ให้หน่อย|ตอนนี้เลย|ทีครับ|ทีค่ะ|หน่อย)?/gi, '').trim() || question;
+    searchTopic = `${carPrefix}${qClean}`.trim();
+    if (opts.onSearch) await opts.onSearch(searchTopic);
+    try {
+      observation = await searchFn(searchTopic);
+    } catch (e) {
+      console.warn('[openrouter pre-search failed]', e.message || e);
+    }
+  } else if (opts.hasMedia && opts.executeMedia) {
+    try {
+      observation = await opts.executeMedia("ดูและอธิบายรายละเอียดภาพหรือสื่อที่แนบมา");
+    } catch (e) {}
+  }
+
+  // 2. ป้อนข้อมูลที่ค้นพบเข้าไปใน System Prompt
+  let searchPrompt = '';
+  if (observation) {
+    searchPrompt = `\n\n[ข้อมูลล่าสุดที่ค้นพบจากอินเทอร์เน็ตแบบเรียลไทม์]:\nหัวข้อค้นหา: ${searchTopic || question}\n${observation}\n\nคำสั่งสำคัญ:
+- นำข้อเท็จจริงล่าสุดข้างต้นมาตอบคำถามของผู้ใช้ให้ครบถ้วน ชัดเจน ตรงประเด็น และเป็นมิตร
+- อ้างอิงข้อมูลจริงจากผลการค้นหา เช่น ชื่อรุ่น สเปก ราคา ปีเปิดตัว
+- ห้ามตอบว่าไม่มีข้อมูลล่าสุดหรือไม่มีเครื่องมือค้นหา เพราะระบบได้ค้นหาข้อมูลล่าสุดจากอินเทอร์เน็ตมาให้คุณเรียบร้อยแล้ว
+- ตอบเนื้อหาออกมาตรง ๆ ไม่ต้องเกริ่นว่า "จากข้อมูลการค้นหา"`;
+  } else {
+    searchPrompt = `\n\n[เครื่องมือค้นหา]:
+ถ้าจำเป็นต้องค้นหาข้อมูลเพิ่มเติม สามารถเรียกใช้ได้โดยพิมพ์:
+Action: google_search("คำค้นหา")`;
+  }
+
+  const sys = `${opts.system || ''}${searchPrompt}`;
   let messages = [
     { role: 'system', content: sys },
     ...history
   ];
 
-  const question = opts.question || (history.length ? String(history[history.length - 1].content || '') : '');
-  const fresh = (opts.search !== false) && ((question && needsFresh(question)) || (opts.carInfo && needsFresh(question)));
   let thoughts = '';
-  let fullFirstOutput = '';
-
+  let responseText = '';
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort('timeout'), 14000);
+  const timer = setTimeout(() => ac.abort('timeout'), 45000);
 
   try {
     const res = await fetch(url, {
@@ -326,7 +390,8 @@ Final Answer: [คำตอบที่สมบูรณ์ เป็นมิ�
           if (opts.onThought) await opts.onThought(r);
         }
         if (delta.content) {
-          fullFirstOutput += delta.content;
+          responseText += delta.content;
+          if (opts.onText) await opts.onText(delta.content);
         }
       }
     }
@@ -334,8 +399,8 @@ Final Answer: [คำตอบที่สมบูรณ์ เป็นมิ�
     clearTimeout(timer);
   }
 
-  // ตรวจสอบว่าโมเดลเรียกใช้ Action หรือไม่
-  const combined = `${fullFirstOutput}\n${thoughts}`;
+  // 3. Dynamic Tool Calling Fallback (กรณีรอบแรกไม่ได้ pre-search แต่โมเดลเขียน Action ออกมา)
+  const combined = `${responseText}\n${thoughts}`;
   let actionMatch = combined.match(/(?:Action|Tool):\s*(\w+)\s*[:\(]\s*(?:query\s*=\s*)?(["'`\u201c\u2018])([\s\S]*?)\2\s*\)?/i);
   if (!actionMatch) {
     const loose = combined.match(/(?:Action|Tool):\s*(\w+)\s*\(([^)]+)\)/i);
@@ -343,149 +408,57 @@ Final Answer: [คำตอบที่สมบูรณ์ เป็นมิ�
       actionMatch = [loose[0], loose[1], '"', loose[2].replace(/^["'`\u201c\u2018]|["'`\u201d\u2019]$/g, '').trim()];
     }
   }
-  if (!actionMatch) {
-    const tcMatch = combined.match(/<tool_call>[\s\S]*?"name":\s*"(\w+)"[\s\S]*?"(?:query|prompt)":\s*"([^"]+)"[\s\S]*?<\/tool_call>/i);
-    if (tcMatch) {
-      actionMatch = [tcMatch[0], tcMatch[1], '"', tcMatch[2]];
-    }
-  }
 
-  let observation = '';
-  let didTool = false;
-  const searchFn = opts.executeSearch || (q => defaultSearch(env, q));
-
-  if (actionMatch) {
+  if (actionMatch && !observation) {
     const tName = actionMatch[1].toLowerCase();
     const tInput = actionMatch[3];
     if (tName === 'google_search' || tName === 'search' || tName === 'web_search') {
       if (opts.onSearch) await opts.onSearch(tInput);
-      observation = await searchFn(tInput);
-      didTool = true;
-    } else if (tName === 'describe_media' && opts.executeMedia) {
-      observation = await opts.executeMedia(tInput);
-      didTool = true;
-    }
-  } else if (fresh) {
-    // Auto-search fallback: คำถามเกี่ยวกับข้อมูลสด แต่โมเดลไม่ได้เขียน Action
-    const carPrefix = (opts.carInfo && (opts.carInfo.make || opts.carInfo.model)) ? `${opts.carInfo.make || ''} ${opts.carInfo.model || ''} ` : '';
-    const qSearch = `${carPrefix}${question}`.trim() || question;
-    if (opts.onSearch) await opts.onSearch(qSearch);
-    observation = await searchFn(qSearch);
-    didTool = true;
-  } else if (opts.hasMedia && opts.executeMedia) {
-    observation = await opts.executeMedia("ดูและอธิบายรายละเอียดภาพหรือสื่อที่แนบมา");
-    didTool = true;
-  }
-
-  // ถ้าไม่มีการเรียกใช้เครื่องมือ และมีคำตอบพร้อมแล้ว
-  if (!didTool) {
-    let cleanText = fullFirstOutput;
-    const faMatch = cleanText.match(/Final Answer:\s*([\s\S]+)$/i);
-    if (faMatch) cleanText = faMatch[1];
-    cleanText = stripToolCalls(cleanText).trim();
-    if (cleanText) {
-      if (opts.onText) await opts.onText(cleanText);
-      trail(opts.meter, { model, level: null, search: false, ok: true, ms: Date.now() - t0, grounded: false });
-      return { text: cleanText, thoughts, grounded: false, queries: [], model };
-    }
-  }
-
-  // ── Step 2: ป้อน Observation ให้โมเดล แล้วสตรีมคำตอบสุดท้าย ──
-  messages.push({
-    role: 'assistant',
-    content: fullFirstOutput.trim() || 'Thought: ฉันต้องเรียกเครื่องมือเพื่อหาข้อมูล'
-  });
-  messages.push({
-    role: 'user',
-    content: `Observation: ${observation || 'ไม่พบข้อมูลยืนยันจากแหล่งข้อมูล'}\n\nคำสั่ง: นำข้อเท็จจริงจาก Observation ข้างต้นมาวิเคราะห์และตอบคำถามของผู้ใช้ให้ครบถ้วน ชัดเจน ตรงประเด็น และเป็นมิตร โดยขึ้นต้นด้วย Final Answer:`
-  });
-
-  const ac2 = new AbortController();
-  const timer2 = setTimeout(() => ac2.abort('timeout'), 22000);
-  let finalText = '';
-
-  try {
-    const res2 = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${env.OPENROUTER_API_KEY}`,
-        'HTTP-Referer': 'https://carspirethailand.com',
-        'X-Title': 'Cendon',
-      },
-      body: JSON.stringify({
-        model,
-        messages,
-        temperature: 0.3,
-        stream: true
-      }),
-      signal: ac2.signal
-    });
-
-    if (!res2.ok) {
-      throw new Error(`OpenRouter Step2 ${res2.status}`);
-    }
-
-    const reader2 = res2.body.getReader();
-    const dec2 = new TextDecoder();
-    let buf2 = '';
-    let seenFinal = false;
-
-    while (true) {
-      const { done, value } = await reader2.read();
-      if (done) break;
-      buf2 += dec2.decode(value, { stream: true });
-      const lines = buf2.split('\n');
-      buf2 = lines.pop() || '';
-      for (const line of lines) {
-        const t = line.trim();
-        if (!t.startsWith('data:')) continue;
-        const payload = t.slice(5).trim();
-        if (payload === '[DONE]') continue;
-        let d;
-        try { d = JSON.parse(payload); } catch { continue; }
-        const delta = (d.choices && d.choices[0] && d.choices[0].delta) || {};
-        const r = delta.reasoning || delta.reasoning_content;
-        if (r) {
-          thoughts += r;
-          if (opts.onThought) await opts.onThought(r);
-        }
-        if (delta.content) {
-          finalText += delta.content;
-          let toSend = delta.content;
-          if (!seenFinal) {
-            if (finalText.includes('Final Answer:')) {
-              seenFinal = true;
-              const parts = finalText.split(/Final Answer:\s*/i);
-              toSend = parts[1] || '';
-            } else if (finalText.length > 30) {
-              seenFinal = true;
-              toSend = delta.content;
-            } else {
-              toSend = '';
+      const postObs = await searchFn(tInput);
+      if (postObs) {
+        observation = postObs;
+        searchTopic = tInput;
+        try {
+          const step2Res = await fetch(url, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${env.OPENROUTER_API_KEY}`,
+              'HTTP-Referer': 'https://carspirethailand.com',
+              'X-Title': 'Cendon',
+            },
+            body: JSON.stringify({
+              model,
+              messages: [
+                ...messages,
+                { role: 'assistant', content: responseText },
+                { role: 'user', content: `[ผลการค้นหาเว็บ]:\n${postObs}\n\nคำสั่ง: นำผลการค้นหาข้างต้นมาสรุปตอบผู้ใช้ให้ครบถ้วน ชัดเจน เป็นมิตร` }
+              ],
+              temperature: 0.3
+            })
+          });
+          if (step2Res.ok) {
+            const s2Data = await step2Res.json();
+            const s2Text = (s2Data.choices && s2Data.choices[0] && s2Data.choices[0].message && s2Data.choices[0].message.content) || '';
+            if (s2Text) {
+              responseText = s2Text;
             }
           }
-          if (toSend && opts.onText) {
-            await opts.onText(toSend);
-          }
-        }
+        } catch (e) {}
       }
     }
-  } finally {
-    clearTimeout(timer2);
   }
 
-  let cleanFinal = finalText;
-  const faMatch2 = cleanFinal.match(/Final Answer:\s*([\s\S]+)$/i);
-  if (faMatch2) cleanFinal = faMatch2[1];
-  cleanFinal = stripToolCalls(cleanFinal).trim();
+  let clean = stripToolCalls(responseText).trim();
+  const faMatch = clean.match(/Final Answer:\s*([\s\S]+)$/i);
+  if (faMatch) clean = faMatch[1].trim();
 
-  trail(opts.meter, { model, level: null, search: didTool, ok: true, ms: Date.now() - t0, grounded: didTool });
+  trail(opts.meter, { model, level: null, search: !!observation, ok: true, ms: Date.now() - t0, grounded: !!observation });
   return {
-    text: cleanFinal,
+    text: clean,
     thoughts,
-    grounded: didTool,
-    queries: actionMatch ? [actionMatch[3]] : (fresh ? [question] : []),
+    grounded: !!observation,
+    queries: searchTopic ? [searchTopic] : [],
     model
   };
 }
@@ -500,7 +473,7 @@ export async function fastAnswer(env, opts) {
       }
     } catch (e) {
       console.warn('[fastAnswer openrouter primary failed]', e.message || e);
-      markBad('or:primary', 60000);
+      if (/429|rate/i.test(e.message || '')) markBad('or:primary', 15000);
     }
   }
 
@@ -660,11 +633,10 @@ export function fallbackProviders(env, media) {
   return L.filter(p => !bad('fb|' + p.src));
 }
 
-/* คำสั่งเสริมของทางสำรอง: โมเดลพวกนี้ค้นเว็บไม่ได้ ต้องบอกตรง ๆ ไม่งั้นมันพยายามเรียกเครื่องมือที่ไม่มีอยู่ */
+/* คำสั่งเสริมของทางสำรอง: ป้องกันไม่ให้โมเดลพ่นคำสั่งเรียกเครื่องมือดิบออกมา */
 const NO_TOOLS = `
 
-[สำคัญ] รอบนี้ไม่มีเครื่องมือใด ๆ ให้เรียกใช้ ห้ามเขียนคำสั่งเรียกฟังก์ชัน ห้ามเขียน google(...) หรือ <|tool_call|>
-ตอบเป็นภาษาคนออกมาเลย จากความรู้ที่มี เรื่องที่ต้องใช้ข้อมูลล่าสุดให้บอกตรง ๆ ว่ายังยืนยันข้อมูลล่าสุดไม่ได้ แล้วแนะนำแหล่งที่ตรวจเองได้`;
+[สำคัญ] ตอบเป็นข้อความภาษาคนธรรมดา ห้ามเขียนคำสั่งเรียกฟังก์ชัน ห้ามเขียน google(...) หรือ <|tool_call|>`;
 
 /* คำตอบขยะที่ต้องทิ้งแล้วไปรุ่นถัดไป: ผลตรวจความปลอดภัย หรือข้อความสั้นกุดไม่มีเนื้อ */
 const JUNK_RE = /^\s*(user|response|prompt)\s*safety\s*:|^\s*(safe|unsafe)\s*(\n|$)|^\s*S\d+\s*$/im;
@@ -687,16 +659,31 @@ export function toChatHistory(msgs) {
 const flat = h => h.map(m => ({ role: m.role, content: Array.isArray(m.content) ? m.content.map(c => c.text || ' [ผู้ใช้แนบรูปมา]').join('') : m.content }));
 
 export async function fallbackAnswer(env, system, history, opts) {
+  opts = opts || {};
   let last = null;
   const media = history.some(m => m.media);
   const clean = history.map(({ media, ...m }) => m);
   /* ย้ำให้ตอบคำถามล่าสุดตรง ๆ — รุ่นสำรองชอบหยิบข้อมูลรถในคำสั่งระบบมาตอบแทนสิ่งที่ถูกถาม */
   const FOCUS = '\n\n[สำคัญที่สุด] ตอบ "ข้อความล่าสุดของผู้ใช้" ให้ตรงประเด็น ข้อมูลรถของผู้ใช้ใช้ประกอบเท่านั้น ห้ามตอบแค่ข้อมูลรถถ้าเขาไม่ได้ถาม';
+  
+  // เสริมข้อมูลค้นหาเว็บสดให้ทางสำรองด้วย หากคำถามเป็นเรื่องที่ต้องใช้ข้อมูลล่าสุด
+  let extraWeb = '';
+  const lastUser = [...clean].reverse().find(m => m.role === 'user');
+  const userText = lastUser ? (Array.isArray(lastUser.content) ? lastUser.content.map(c => c.text || '').join('') : String(lastUser.content)) : '';
+  if (userText && (needsFresh(userText) || /ค้นหา|หาข้อมูล|ล่าสุด|202[4-9]|256[7-9]/i.test(userText))) {
+    try {
+      const ddg = await fetchDuckDuckGoSearch(userText);
+      if (ddg) {
+        extraWeb = `\n\n[ข้อมูลล่าสุดที่ค้นพบจากอินเทอร์เน็ต]:\n${ddg}\nให้นำข้อเท็จจริงนี้มาตอบคำถามผู้ใช้ ห้ามบอกว่าไม่มีข้อมูลหรือไม่มีการเข้าถึงอินเทอร์เน็ต`;
+      }
+    } catch (e) {}
+  }
+
   let list = media ? fallbackProviders(env, true).concat(fallbackProviders(env)) : fallbackProviders(env);
   /* ทุกเจ้าถูกพักไว้หมด — ดีกว่าตอบว่าไม่มีทางสำรอง ให้ลองทุกเจ้าอีกรอบ (อาจหายแล้ว) */
   if (!list.length) { BAD.forEach((_, k) => { if (k.startsWith('fb|')) BAD.delete(k) }); list = fallbackProviders(env, media).concat(media ? fallbackProviders(env) : []) }
   for (const p of list) {
-    let sys = system + NO_TOOLS + FOCUS;
+    let sys = system + extraWeb + NO_TOOLS + FOCUS;
     for (let attempt = 0; attempt < 2; attempt++) {
       const t0 = Date.now();
       try {
