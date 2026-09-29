@@ -4291,8 +4291,9 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                    และจดสาเหตุไว้ให้เจ้าของดูในหน้าตรวจระบบ (ผู้ใช้ไม่เห็น) */
                 console.error('[stream fast]', e.message);
                 noteAiError(env, e);
+                /* ทางสำรองพังด้วย — แนบสาเหตุของ Gemini ไปด้วย ผู้ดูแลจะเห็นต้นเหตุจริง ไม่ใช่แค่ของทางสำรอง */
                 const r = await fallbackAnswer(env, sys, historyOf(msgs), {
-                  meter, onThought: d => send({ type: 'reasoning', delta: d }),
+                  geminiError: e, meter, onThought: d => send({ type: 'reasoning', delta: d }),
                   onText: async d => {
                     if (firstText) { firstText = false; await send({ type: 'status', key: 'write', text: 'กำลังเขียนคำตอบ' }); }
                     await send({ type: 'text', delta: d });

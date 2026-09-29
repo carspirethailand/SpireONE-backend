@@ -322,8 +322,7 @@ export function fallbackProviders(env, media) {
     key: env.GROQ_API_KEY, model: env.GROQ_MODEL || 'llama-3.3-70b-versatile' });
   if (env.AI) L.push({ src: 'workers-ai', ai: true, model: env.CF_AI_FALLBACK_MODEL || '@cf/meta/llama-3.3-70b-instruct-fp8-fast' });
   if (env.OPENROUTER_API_KEY) L.push({ src: 'openrouter', url: `${env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1'}/chat/completions`,
-    /* ห้ามใช้ openrouter/free — มันสุ่มรุ่นมาให้ รวมถึงรุ่นตรวจความปลอดภัยที่ตอบแค่ "User Safety: safe" */
-    key: env.OPENROUTER_API_KEY, model: env.OPENROUTER_MODEL && env.OPENROUTER_MODEL !== 'openrouter/free' ? env.OPENROUTER_MODEL : 'meta-llama/llama-3.3-70b-instruct:free',
+    key: env.OPENROUTER_API_KEY, model: env.OPENROUTER_MODEL || 'openrouter/free',   /* รุ่นฟรีเฉพาะชื่อถูกถอดบ่อย ใช้ตัวเลือกฟรีอัตโนมัติ แล้วกรองคำตอบขยะด้วย isJunk */
     headers: { 'HTTP-Referer': 'https://carspirethailand.com', 'X-Title': 'Cendon' } });
   return L.filter(p => !bad('fb|' + p.src));
 }
@@ -385,7 +384,9 @@ export async function fallbackAnswer(env, system, history, opts) {
       }
     }
   }
-  throw last || new Error('no fallback provider');
+  const g = opts && opts.geminiError;
+  const msg = (g ? 'Gemini: ' + String(g.message || g).slice(0, 180) + ' | ' : '') + 'สำรอง: ' + String((last && last.message) || 'no fallback provider').slice(0, 160);
+  const err = new Error(msg); err.status = last && last.status; throw err;
 }
 
 /* ส่วนของคำสั่งระบบที่ทำให้ "คิดฉลาด" — ใส่ไว้ท้ายตัวตน ก่อนข้อมูลของผู้ใช้ */
