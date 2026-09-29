@@ -194,9 +194,13 @@ export async function fastAnswer(env, opts) {
       if (level && bad(model + '|' + level)) continue;
       const left = until - Date.now();
       if (left < 1500) throw last || new Error('gemini: time budget used');
+      const t0 = Date.now();
       try {
-        return await streamOnce(env, model, { ...opts, level, search, headerMs: Math.min(9000, left) });
+        const r = await streamOnce(env, model, { ...opts, level, search, headerMs: Math.min(9000, left) });
+        trail(opts.meter, { model, level, search, ok: true, ms: Date.now() - t0, grounded: r.grounded });
+        return r;
       } catch (e) {
+        trail(opts.meter, { model, level, search, ok: false, ms: Date.now() - t0, err: String(e.message || e).slice(0, 160) });
         last = e;
         if (e.partial) return { text: e.partial, thoughts: '', grounded: false, queries: [], model, cut: true };
         if (e.thinking && level) { markBad(model + '|' + level); continue; }     /* ลดระดับการคิด รุ่นเดิม */
@@ -365,8 +369,10 @@ export async function fallbackAnswer(env, system, history, opts) {
   for (const p of list) {
     let sys = system + NO_TOOLS + FOCUS;
     for (let attempt = 0; attempt < 2; attempt++) {
+      const t0 = Date.now();
       try {
         const r = await streamProvider(env, p, [{ role: 'system', content: sys }, ...(p.vision ? clean : flat(clean))], opts);
+        trail(opts.meter, { model: p.src + ':' + p.model, ok: !!r.text.trim() && !isJunk(r.text), ms: Date.now() - t0, err: isJunk(r.text) ? 'junk answer' : (r.text.trim() ? '' : 'empty') });
         if (isJunk(r.text)) break;
         if (r.text.trim()) return { ...r, src: p.src };
         if (r.toolCall && attempt === 0) {
@@ -375,6 +381,7 @@ export async function fallbackAnswer(env, system, history, opts) {
         }
         break;
       } catch (e) {
+        trail(opts.meter, { model: p.src + ':' + p.model, ok: false, ms: Date.now() - t0, err: String(e.message || e).slice(0, 160) });
         last = e;
         if (/ 40[134]:/.test(e.message || '')) markBad('fb|' + p.src);   /* คีย์ผิด/ไม่มีสิทธิ์/ไม่มีรุ่นนี้ */
         /* โควตารายวันหมด (Workers AI 4006 / 429) — พักเจ้านี้ 6 ชั่วโมง ไม่ต้องลองทุกข้อความ */
@@ -491,3 +498,14 @@ export function featuresBlock() {
 ประเมินเป็นตาราง: รายการ · ช่วงราคาที่เหมาะสมในไทย · ราคาที่อู่เสนอ (ถ้ามี) · ความเห็น (สมเหตุสมผล/แพงไป/ไม่จำเป็น)
 แยกสิ่งที่เห็นในรูปกับสิ่งที่อนุมาน บอกว่าอะไรควรถามอู่เพิ่ม และค้นราคาอะไหล่ล่าสุดก่อนประเมิน`;
 }
+
+
+/* ══ ข้อมูลสดสำหรับแผงผู้ดูแล ══ */
+function trail(meter, step) { if (meter) (meter.trail = meter.trail || []).push({ at: Date.now(), ...step }) }
+/* รุ่น/ผู้ให้บริการที่ถูกพักไว้ตอนนี้ และจะกลับมาเมื่อไร */
+export function badState() {
+  const now = Date.now(), out = [];
+  BAD.forEach((until, k) => { if (until > now) out.push({ key: k, backInSec: Math.round((until - now) / 1000) }) });
+  return out;
+}
+export function unpark(key) { if (key) BAD.delete(key); else BAD.clear() }

@@ -1,7 +1,7 @@
 import { verifyFirebaseToken } from './auth.js';
 import { handleTech } from './techs.js';
 import { handleVec, kbScores, refreshKb } from './vectors.js';
-import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels, toChatHistory, levelFor, depthNote, featuresBlock } from './fastai.js';
+import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels, toChatHistory, levelFor, depthNote, featuresBlock, badState, unpark } from './fastai.js';
 
 /*
  * SpireONE backend — security-hardened.
@@ -1640,6 +1640,22 @@ Final Answer: [คำตอบที่สมบูรณ์ เป็นมิ�
 /* ประวัติแชตสำหรับทางสำรอง (โมเดลพวกนี้รับแค่ข้อความ) */
 /* ส่งรูปล่าสุดไปด้วย ให้ทางสำรองที่ดูรูปได้เห็นของจริง (ดู toChatHistory ใน fastai.js) */
 function historyOf(msgs) { return toChatHistory(msgs) }
+/* ── บันทึกทุกครั้งที่ AI ตอบ (สำหรับแผงผู้ดูแลแบบสด) ──
+   เก็บแค่ 300 แถวล่าสุด: เวลา · ผู้ใช้ (ย่อ) · รุ่นที่ลองตามลำดับ · ผล · เวลาที่ใช้ · ข้อผิดพลาด */
+let aiEvReady = false;
+async function logAiEvent(env, ev) {
+  try {
+    if (!aiEvReady) {
+      await env.DB.prepare(`CREATE TABLE IF NOT EXISTS ai_events (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER, uid TEXT, ok INTEGER, ms INTEGER, model TEXT, trail TEXT, err TEXT, q TEXT, depth INTEGER, cost INTEGER)`).run();
+      aiEvReady = true;
+    }
+    await env.DB.prepare('INSERT INTO ai_events (at, uid, ok, ms, model, trail, err, q, depth, cost) VALUES (?,?,?,?,?,?,?,?,?,?)')
+      .bind(Date.now(), String(ev.uid || '').slice(0, 10), ev.ok ? 1 : 0, ev.ms | 0, String(ev.model || '').slice(0, 80),
+        JSON.stringify(ev.trail || []).slice(0, 4000), String(ev.err || '').slice(0, 400), String(ev.q || '').slice(0, 80), ev.depth == null ? 1 : +ev.depth, ev.cost | 0).run();
+    if (Math.random() < 0.05) await env.DB.prepare('DELETE FROM ai_events WHERE id <= (SELECT MAX(id) - 300 FROM ai_events)').run();
+  } catch (e) { console.error('[ai_events]', e) }
+}
+
 /* จดสาเหตุล่าสุดที่ Gemini ใช้ไม่ได้ — ให้เจ้าของเห็นในหน้าตรวจระบบ จะได้รู้ว่าติดคีย์ โควตา หรือชื่อรุ่น
    จดไม่เกินนาทีละครั้ง ไม่ให้เขียนฐานข้อมูลทุกข้อความ */
 let aiErrAt = 0;
@@ -4311,9 +4327,13 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                                       await quotaState(env, uid, actor.role));
               } catch (e) {}
               await send({ type: 'done', usage });
+              const okStep = (meter.trail || []).filter(x => x.ok).pop();
+              logAiEvent(env, { uid, ok: true, ms: Date.now() - t0, model: okStep ? okStep.model + (okStep.grounded ? ' +ค้นเว็บ' : '') : (meter.src || []).join(','),
+                trail: meter.trail, q: question, depth: body.depth, cost: meter.in + meter.out });
             } catch (err) {
               console.error('[stream]', err);
               await send({ type: 'error', message: String((err && err.message) || err).slice(0, 200) });
+              logAiEvent(env, { uid, ok: false, ms: Date.now() - t0, model: '', trail: meter && meter.trail, err: String((err && err.message) || err), q: question, depth: body.depth });
             }
             try { await writer.close() } catch (e) {}
 
@@ -4893,6 +4913,30 @@ ${convo}`;
           const r = await handleVec(request, env, url);
           return r ? json(r) : deny('Not found', 404);
         })();
+      }
+      /* ── แผงผู้ดูแลแบบลอย: สถานะสดของ AI ── */
+      if (url.pathname === '/api/admin/live' && request.method === 'GET') {
+        return await guarded('admin', async () => {
+          let events = [], stats = { hour: 0, ok: 0, fail: 0, avgMs: 0 }, lastAiError = null;
+          try {
+            const since = Date.now() - 3600000;
+            const r = await env.DB.prepare('SELECT at, uid, ok, ms, model, trail, err, q, depth, cost FROM ai_events ORDER BY id DESC LIMIT 40').all();
+            events = (r.results || []).map(e => ({ ...e, trail: (() => { try { return JSON.parse(e.trail || '[]') } catch { return [] } })() }));
+            const h = events.filter(e => e.at > since);
+            stats = { hour: h.length, ok: h.filter(e => e.ok).length, fail: h.filter(e => !e.ok).length,
+              avgMs: h.length ? Math.round(h.reduce((a, e) => a + (e.ms || 0), 0) / h.length) : 0 };
+          } catch (e) {}
+          try { const le = await env.DB.prepare("SELECT value FROM config WHERE key = 'ai_last_error'").first(); lastAiError = le && le.value ? JSON.parse(le.value) : null } catch (e) {}
+          const parked = badState();
+          return json({ now: Date.now(),
+            chain: chatModels(env).map(m => ({ name: m, parked: parked.find(p => p.key === m) || null, searchParked: parked.find(p => p.key === m + '|search') || null })),
+            fallbacks: fallbackProviders(env).concat(fallbackProviders(env, true)).map(p => ({ name: p.src + ':' + p.model })),
+            keys: { gemini: !!env.GEMINI_KEY, groq: !!env.GROQ_API_KEY, cerebras: !!env.CEREBRAS_API_KEY, openrouter: !!env.OPENROUTER_API_KEY, workersAI: !!env.AI },
+            parked, stats, events, lastAiError });
+        })();
+      }
+      if (url.pathname === '/api/admin/unpark' && request.method === 'POST') {
+        return await guarded('admin', async () => { let b = {}; try { b = await request.json() } catch {} unpark(b.key); return json({ ok: true }) })();
       }
       if (url.pathname === '/api/admin/diag' && request.method === 'GET') {
         return await guarded('moderator', async () => {
