@@ -1839,6 +1839,38 @@ async function executeGoogleSearchTool(env, query) {
       }
     }
   }
+
+  // ถ้า Gemini ค้นไม่สำเร็จหรือติดโควตา ให้ใช้ OpenRouter Web Search สำรอง
+  if (env.OPENROUTER_API_KEY) {
+    try {
+      const orRes = await fetch(`${env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1'}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${env.OPENROUTER_API_KEY}`,
+          'HTTP-Referer': 'https://carspirethailand.com',
+          'X-Title': 'Cendon'
+        },
+        body: JSON.stringify({
+          model: 'openrouter/free',
+          plugins: [{ id: 'web' }],
+          messages: [{ role: 'user', content: prompt }],
+          temperature: 0.2
+        })
+      });
+      if (orRes.ok) {
+        const orData = await orRes.json();
+        const txt = cleanSearch((orData.choices && orData.choices[0] && orData.choices[0].message && orData.choices[0].message.content) || '');
+        if (txt && !/^ไม่พบข้อมูลยืนยัน/.test(txt)) {
+          console.log('[search] สำเร็จด้วย OpenRouter Web Search');
+          return txt;
+        }
+      }
+    } catch (e) {
+      console.warn('[search] OpenRouter web search ล้มเหลว:', e.message);
+    }
+  }
+
   console.warn('[search] ค้นไม่สำเร็จทุกโมเดล');
   return '';
 }
@@ -4292,7 +4324,16 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
               let firstText = true;
               try {
                 const r = await fastAnswer(env, {
-                  system: sys, contents: toGeminiContents(msgs), search: true,
+                  system: sys,
+                  contents: toGeminiContents(msgs),
+                  history: toChatHistory(msgs),
+                  messages: msgs,
+                  question,
+                  hasMedia,
+                  carInfo,
+                  search: true,
+                  executeSearch: async (q) => await executeGoogleSearchTool(env, q),
+                  executeMedia: async (p) => await executeDescribeMediaTool(env, msgs, p),
                   level: levelFor(body.depth, question, hasMedia, body.skillIds), meter,
                   onThought: d => send({ type: 'reasoning', delta: d }),
                   onSearch: async q => { await send({ type: 'research', q: String(q).slice(0, 120) }); await send({ type: 'status', key: 'search', text: 'กำลังค้น: ' + String(q).slice(0, 60) }) },
@@ -4473,8 +4514,20 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
 ${STREAM_TALK}${featuresBlock()}${smartBlock()}${stylePrompt(activeStyle, activeCustomStyle)}${depthNote(body.depth)}
 ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext}` : ''}${userBlock}${kbBlock}${skillPrompt || ''}${fresh ? FORCE_SEARCH : ''}`;
             try {
-              const r = await fastAnswer(env, { system: sys, contents: toGeminiContents(body.contents), search: true,
-                level: levelFor(body.depth, question, hasMedia, body.skillIds), meter });
+              const r = await fastAnswer(env, {
+                system: sys,
+                contents: toGeminiContents(body.contents),
+                history: toChatHistory(body.contents),
+                messages: body.contents,
+                question,
+                hasMedia,
+                carInfo,
+                search: true,
+                executeSearch: async (q) => await executeGoogleSearchTool(env, q),
+                executeMedia: async (p) => await executeDescribeMediaTool(env, body.contents, p),
+                level: levelFor(body.depth, question, hasMedia, body.skillIds),
+                meter
+              });
               agentOut = { text: cleanReply(r.text), reasoning: (r.thoughts || '').slice(0, 6000) };
             } catch (e) {
               console.error('[chat fast]', e.message);
@@ -4893,7 +4946,7 @@ ${convo}`;
             totalCars, magazine: magCount, shop: shopCount, auditCount,
             aiToday, aiTotal,
             aiLimit: parseInt(env.AI_DAILY_LIMIT || '60', 10),
-            model: env.GEMINI_MODEL || 'gemini-3.5-flash-lite',
+            model: env.OPENROUTER_MODEL || 'openrouter/free',
             aiDaily: aiDaily.slice().reverse(),
             signups: signups.slice().reverse(),
             roles, topUsers, topMakes, recentUsers,
@@ -4928,8 +4981,10 @@ ${convo}`;
           } catch (e) {}
           try { const le = await env.DB.prepare("SELECT value FROM config WHERE key = 'ai_last_error'").first(); lastAiError = le && le.value ? JSON.parse(le.value) : null } catch (e) {}
           const parked = badState();
+          const primaryModel = env.OPENROUTER_MODEL || 'openrouter/free';
+          const fullChain = [primaryModel].concat(chatModels(env));
           return json({ now: Date.now(),
-            chain: chatModels(env).map(m => ({ name: m, parked: parked.find(p => p.key === m) || null, searchParked: parked.find(p => p.key === m + '|search') || null })),
+            chain: fullChain.map(m => ({ name: m, parked: parked.find(p => p.key === m) || null, searchParked: parked.find(p => p.key === m + '|search') || null })),
             fallbacks: fallbackProviders(env).concat(fallbackProviders(env, true)).map(p => ({ name: p.src + ':' + p.model })),
             keys: { gemini: !!env.GEMINI_KEY, groq: !!env.GROQ_API_KEY, cerebras: !!env.CEREBRAS_API_KEY, openrouter: !!env.OPENROUTER_API_KEY, workersAI: !!env.AI },
             parked, stats, events, lastAiError });
@@ -4944,8 +4999,9 @@ ${convo}`;
           const q = url.searchParams.get('q') || 'ราคาน้ำมันเบนซินในไทยวันนี้';
           const out = { keys: {
             gemini: !!env.GEMINI_KEY, openrouter: !!env.OPENROUTER_API_KEY,
+            primaryModel: env.OPENROUTER_MODEL || 'openrouter/free',
             geminiModel: env.GEMINI_MODEL || '(ไม่ได้ตั้ง)', searchModel: env.GEMINI_SEARCH_MODEL || '(ไม่ได้ตั้ง ใช้ gemini-3.5-flash-lite)',
-            chatModels: chatModels(env), fallback: fallbackProviders(env).map(p => p.src + ':' + p.model) } };
+            chatModels: [env.OPENROUTER_MODEL || 'openrouter/free (หลัก)'].concat(chatModels(env)), fallback: fallbackProviders(env).map(p => p.src + ':' + p.model) } };
           try {
             const le = await env.DB.prepare("SELECT value FROM config WHERE key = 'ai_last_error'").first();
             out.lastAiError = le && le.value ? JSON.parse(le.value) : null;
