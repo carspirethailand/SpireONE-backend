@@ -632,7 +632,7 @@ async function tokensToday(env, uid) {
 async function callGemini(env, { contents, system, search, temp, json: wantJson, maxTokens, meter }) {
   const geminiKey = env.GEMINI_KEY;
   if (!geminiKey) throw new Error('AI is not configured');
-  const model = env.GEMINI_MODEL || 'gemini-3.6-flash';
+  const model = env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
   const baseUrl = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
   const url = `${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`;
 
@@ -1708,8 +1708,8 @@ async function executeDescribeMediaTool(env, messages, prompt) {
   if (!geminiKey) {
     throw new Error('GEMINI_KEY environment variable is not configured');
   }
-  const primaryModel = env.GEMINI_MODEL || 'gemini-3.6-flash';
-  const modelsToTry = [primaryModel, 'gemini-3.6-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'];
+  const primaryModel = env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
+  const modelsToTry = [primaryModel, 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.6-flash', 'gemini-3.8-flash'];
   const baseUrl = env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com";
 
   const parts = [];
@@ -4893,7 +4893,7 @@ ${convo}`;
             totalCars, magazine: magCount, shop: shopCount, auditCount,
             aiToday, aiTotal,
             aiLimit: parseInt(env.AI_DAILY_LIMIT || '60', 10),
-            model: env.GEMINI_MODEL || 'gemini-2.5-flash',
+            model: env.GEMINI_MODEL || 'gemini-3.5-flash-lite',
             aiDaily: aiDaily.slice().reverse(),
             signups: signups.slice().reverse(),
             roles, topUsers, topMakes, recentUsers,
@@ -4944,7 +4944,7 @@ ${convo}`;
           const q = url.searchParams.get('q') || 'ราคาน้ำมันเบนซินในไทยวันนี้';
           const out = { keys: {
             gemini: !!env.GEMINI_KEY, openrouter: !!env.OPENROUTER_API_KEY,
-            geminiModel: env.GEMINI_MODEL || '(ไม่ได้ตั้ง)', searchModel: env.GEMINI_SEARCH_MODEL || '(ไม่ได้ตั้ง ใช้ gemini-3.8-flash)',
+            geminiModel: env.GEMINI_MODEL || '(ไม่ได้ตั้ง)', searchModel: env.GEMINI_SEARCH_MODEL || '(ไม่ได้ตั้ง ใช้ gemini-3.5-flash-lite)',
             chatModels: chatModels(env), fallback: fallbackProviders(env).map(p => p.src + ':' + p.model) } };
           try {
             const le = await env.DB.prepare("SELECT value FROM config WHERE key = 'ai_last_error'").first();
@@ -4983,7 +4983,7 @@ ${convo}`;
             schema,
             env: {
               aiConfigured: !!env.GEMINI_KEY,
-              model: env.GEMINI_MODEL || 'gemini-2.5-flash',
+              model: env.GEMINI_MODEL || 'gemini-3.5-flash-lite',
               fallbackModel: env.GEMINI_FALLBACK_MODEL || '',
               liveModel: env.GEMINI_LIVE_MODEL || '',
               aiDailyLimit: parseInt(env.AI_DAILY_LIMIT || '60', 10),

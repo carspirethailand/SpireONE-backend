@@ -3,10 +3,10 @@
    → อ่านรูปแยกอีกหนึ่งครั้ง → ส่งให้โมเดลฟรีที่คิดนานแล้วค่อยตอบ → พลาดก็ถามซ้ำ
    ตอนนี้เหลือการเรียกครั้งเดียว: Gemini ค้นเว็บเอง เห็นรูปเอง คิด แล้วสตรีมคำตอบออกมาทันที
 
-   โมเดลเลือกจาก GEMINI_SEARCH_MODEL (ค่าเริ่มต้น gemini-3.8-flash) แล้วถอยไป GEMINI_MODEL
+   โมเดลเลือกจาก GEMINI_SEARCH_MODEL (ค่าเริ่มต้น gemini-3.5-flash-lite) แล้วถอยไป GEMINI_MODEL
    ถ้าชื่อโมเดลไหนใช้ไม่ได้ (404/400) จะรู้ภายในเสี้ยววินาทีแล้วข้ามไปตัวถัดไปเอง */
 
-const DEFAULT_MODEL = 'gemini-3.8-flash';
+const DEFAULT_MODEL = 'gemini-3.5-flash-lite';
 
 /* โทเคนโดยประมาณของข้อความล่าสุดที่ผู้ใช้ส่ง (ตัวอักษร/3 + รูปละ 300) — ใช้คิดโควตา */
 function userTokens(contents) {
@@ -18,10 +18,21 @@ function userTokens(contents) {
 }
 
 /* โมเดลที่ใช้ตอบ + ค้นเว็บ เรียงตามลำดับที่จะลอง
+   - ตัวหลัก: gemini-3.5-flash-lite, gemini-3.1-flash-lite
+   - ตัวรอง: gemini-3.6-flash, gemini-3.8-flash
    Gemma ใช้เครื่องมือค้นเว็บไม่ได้ จึงไม่เอามาใช้ในงานนี้ แม้จะตั้งไว้ในตัวแปร */
 export function chatModels(env) {
   /* ท้ายรายการเป็นรุ่นที่ Google เปิดให้ใช้มานานและเสถียร — กันกรณีชื่อรุ่นที่ตั้งไว้ใช้ไม่ได้ทั้งหมด แชตจะไม่ล่มทั้งระบบ */
-  const list = [env.GEMINI_CHAT_MODEL, env.GEMINI_SEARCH_MODEL, DEFAULT_MODEL, env.GEMINI_MODEL, 'gemini-2.5-flash']   /* 2.0-flash ถูก Google ยกเลิกแล้ว (404) */
+  const list = [
+    env?.GEMINI_CHAT_MODEL,
+    env?.GEMINI_SEARCH_MODEL || DEFAULT_MODEL,
+    'gemini-3.5-flash-lite',
+    'gemini-3.1-flash-lite',
+    'gemini-3.6-flash',
+    'gemini-3.8-flash',
+    env?.GEMINI_MODEL,
+    'gemini-2.5-flash'
+  ]
     .map(m => String(m || '').trim())
     .filter(m => m && !/^gemma/i.test(m));
   return [...new Set(list)];
