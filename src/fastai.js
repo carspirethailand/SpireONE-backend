@@ -186,7 +186,9 @@ export async function fastAnswer(env, opts) {
   const ladder = want === 'medium' ? ['medium', 'low', null] : want === 'minimal' ? ['minimal', 'low', null] : ['low', null];
   /* งบเวลารวมก่อนได้คำแรก 14 วินาที — เกินนั้นไปทางสำรองเลย ผู้ใช้ไม่ต้องนั่งรอไล่ลองทีละรุ่น */
   /* โควตาทั้งคีย์หมด ("exceeded your current quota") — ทุกรุ่นใช้โควตาก้อนเดียวกัน ไม่ต้องไล่ลองทีละรุ่น */
-  if (bad('gemini|quota')) throw new Error('gemini: key quota exhausted (parked)');
+  /* พักตามคีย์ — เปลี่ยนคีย์ใหม่แล้วลองทันที ไม่ต้องรอ · จดใน trail ให้แผงผู้ดูแลเห็นว่าข้ามเพราะอะไร */
+  const QK = 'gemini|quota|' + String(env.GEMINI_KEY || '').slice(-6);
+  if (bad(QK)) { trail(opts.meter, { model: 'gemini', ok: false, ms: 0, err: 'ข้าม: คีย์นี้เพิ่งติดโควตา (พัก 3 นาที)' }); throw new Error('gemini: key quota exhausted (parked)'); }
   const until = Date.now() + 14000;
   for (const model of chatModels(env)) {
     if (bad(model)) continue;
@@ -205,7 +207,7 @@ export async function fastAnswer(env, opts) {
         trail(opts.meter, { model, level, search, ok: false, ms: Date.now() - t0, err: String(e.message || e).slice(0, 160) });
         last = e;
         if (e.partial) return { text: e.partial, thoughts: '', grounded: false, queries: [], model, cut: true };
-        if (e.quota && /exceeded your current quota|RESOURCE_EXHAUSTED/i.test(e.message || '') && !/grounding/i.test(e.message || '')) { markBad('gemini|quota', 600000); throw e; }
+        if (e.quota && /exceeded your current quota|RESOURCE_EXHAUSTED/i.test(e.message || '') && !/grounding/i.test(e.message || '')) { markBad('gemini|quota|' + String(env.GEMINI_KEY || '').slice(-6), 180000); throw e; }
         if (e.thinking && level) { markBad(model + '|' + level); continue; }     /* ลดระดับการคิด รุ่นเดิม */
         /* ค้นเว็บใช้ไม่ได้ในรุ่นนี้ — ลองรุ่นเดิมแบบไม่ค้น (โควตาค้นเต็มจำไว้แค่ 1 นาที) */
         if (e.tool && search && !(e.quota && !opts.search)) { markBad(model + '|search', e.quota ? 60000 : 600000); search = false; i--; continue; }
@@ -378,7 +380,8 @@ export async function fallbackAnswer(env, system, history, opts) {
   const lastUser = [...clean].reverse().find(m => m.role === 'user');
   const q = lastUser ? (typeof lastUser.content === 'string' ? lastUser.content
     : (lastUser.content || []).filter(x => x.type === 'text').map(x => x.text).join(' ')).trim().slice(0, 200) : '';
-  if (q.length >= 8 && opts.search !== false) {
+  /* DuckDuckGo บล็อกการเรียกจาก Cloudflare (ได้หน้า captcha) — ปิดไว้จนกว่าจะมีตัวค้นที่ใช้ได้ (TAVILY_API_KEY) */
+  if (q.length >= 8 && opts.search !== false && env.WEB_SEARCH_DDG === '1') {
     const t0 = Date.now();
     web = await fetchDuckDuckGoSearch(q);
     trail(opts.meter, { model: 'duckduckgo', ok: !!web, ms: Date.now() - t0, err: web ? '' : 'no results' });
