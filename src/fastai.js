@@ -105,7 +105,7 @@ async function streamOnce(env, model, { system, contents, search, level, onText,
   if (!res.ok || !res.body) {
     clearTimeout(idle);
     const t = await res.text().catch(() => '');
-    const err = new Error(`${model} ${res.status}: ${t.slice(0, 240)}`);
+    const err = new Error(`${model} ${res.status}: ${t.slice(0, 1500)}`);
     err.status = res.status; err.retryable = true;
     /* รุ่นนี้ไม่รับค่าการคิดแบบนี้ — ลองใหม่โดยลดระดับ/ไม่ส่ง แทนที่จะทิ้งทั้งรุ่น */
     err.thinking = res.status === 400 && /thinking/i.test(t);
@@ -191,7 +191,7 @@ export async function fastAnswer(env, opts) {
   if (bad(QK)) { trail(opts.meter, { model: 'gemini', ok: false, ms: 0, err: 'ข้าม: คีย์นี้เพิ่งติดโควตา (พัก 3 นาที)' }); throw new Error('gemini: key quota exhausted (parked)'); }
   const until = Date.now() + 14000;
   for (const model of chatModels(env)) {
-    if (bad(model)) continue;
+    if (bad(model)) { trail(opts.meter, { model, ok: false, ms: 0, err: 'ข้าม: รุ่นนี้เพิ่งล้ม (พักชั่วคราว)' }); continue; }
     let search = !!opts.search && !bad(model + '|search');
     for (let i = 0; i < ladder.length; i++) {
       const level = ladder[i];
@@ -204,7 +204,8 @@ export async function fastAnswer(env, opts) {
         trail(opts.meter, { model, level, search, ok: true, ms: Date.now() - t0, grounded: r.grounded });
         return r;
       } catch (e) {
-        trail(opts.meter, { model, level, search, ok: false, ms: Date.now() - t0, err: String(e.message || e).slice(0, 160) });
+        const em = String(e.message || e), qd = (em.match(/quota[_ ]?metric[^,}]*|metric: [^\n,]*|limit: ?\d+|quotaValue[^,}]*/gi) || []).join(' · ');
+        trail(opts.meter, { model, level, search, ok: false, ms: Date.now() - t0, err: (em.slice(0, 120) + (qd ? ' ‖ ' + qd : '')).slice(0, 300) });
         last = e;
         if (e.partial) return { text: e.partial, thoughts: '', grounded: false, queries: [], model, cut: true };
         /* 429 ตอนค้นเว็บ = มักเป็นโควตาค้นเว็บหมด ไม่ใช่ทั้งคีย์ — ลองแบบไม่ค้นก่อน พักทั้งคีย์เฉพาะเมื่อแบบไม่ค้นก็ 429 ด้วย */
