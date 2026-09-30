@@ -207,6 +207,8 @@ export async function fastAnswer(env, opts) {
         trail(opts.meter, { model, level, search, ok: false, ms: Date.now() - t0, err: String(e.message || e).slice(0, 160) });
         last = e;
         if (e.partial) return { text: e.partial, thoughts: '', grounded: false, queries: [], model, cut: true };
+        /* 429 ตอนค้นเว็บ = มักเป็นโควตาค้นเว็บหมด ไม่ใช่ทั้งคีย์ — ลองแบบไม่ค้นก่อน พักทั้งคีย์เฉพาะเมื่อแบบไม่ค้นก็ 429 ด้วย */
+        if (e.quota && search) { markBad(model + '|search', 600000); search = false; i--; continue; }
         if (e.quota && /exceeded your current quota|RESOURCE_EXHAUSTED/i.test(e.message || '') && !/grounding/i.test(e.message || '')) { markBad('gemini|quota|' + String(env.GEMINI_KEY || '').slice(-6), 180000); throw e; }
         if (e.thinking && level) { markBad(model + '|' + level); continue; }     /* ลดระดับการคิด รุ่นเดิม */
         /* ค้นเว็บใช้ไม่ได้ในรุ่นนี้ — ลองรุ่นเดิมแบบไม่ค้น (โควตาค้นเต็มจำไว้แค่ 1 นาที) */
