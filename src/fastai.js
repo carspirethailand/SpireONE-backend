@@ -516,3 +516,35 @@ export function badState() {
   return out;
 }
 export function unpark(key) { if (key) BAD.delete(key); else BAD.clear() }
+
+/* ค้นเว็บสำรองด้วย DuckDuckGo (หน้า HTML ไม่ต้องใช้คีย์) — ใช้ตอน Gemini ค้นไม่ได้
+   คืนเป็นข้อความสรุป: หัวข้อ + เนื้อหาย่อ + ลิงก์ ไม่เกิน 6 รายการ · ล้มเหลว/ไม่เจอ = '' */
+export async function fetchDuckDuckGoSearch(query, { limit = 6, timeoutMs = 6000 } = {}) {
+  const q = String(query || '').trim();
+  if (!q) return '';
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const res = await fetch('https://html.duckduckgo.com/html/?q=' + encodeURIComponent(q), {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; CendonBot/1.0)', 'Accept-Language': 'th,en;q=0.8' },
+      signal: ac.signal
+    });
+    if (!res.ok) return '';
+    const html = await res.text();
+    const txt = s => String(s || '').replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#x27;|&#39;/g, "'")
+      .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
+    const link = h => { const m = /[?&]uddg=([^&]+)/.exec(h || ''); try { return m ? decodeURIComponent(m[1]) : h } catch (e) { return h } };
+    const out = [];
+    const re = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+    let m;
+    while ((m = re.exec(html)) && out.length < limit) {
+      const title = txt(m[2]), snip = txt(m[3]);
+      if (title && snip) out.push(`- ${title}: ${snip} (${link(m[1])})`);
+    }
+    return out.length ? `ผลค้นเว็บล่าสุดสำหรับ "${q}":\n${out.join('\n')}` : '';
+  } catch (e) {
+    return '';
+  } finally {
+    clearTimeout(timer);
+  }
+}
