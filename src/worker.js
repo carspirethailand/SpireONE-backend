@@ -634,7 +634,7 @@ async function callGemini(env, { contents, system, search, temp, json: wantJson,
   if (!geminiKey) throw new Error('AI is not configured');
   const model = env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
   const baseUrl = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
-  const url = `${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`;
+  const url = `${baseUrl}/v1beta/models/${model}:generateContent`;
 
   const gen = { temperature: typeof temp === 'number' ? Math.min(Math.max(temp, 0), 1) : 0.5 };
   if (maxTokens) gen.maxOutputTokens = maxTokens;
@@ -654,7 +654,7 @@ async function callGemini(env, { contents, system, search, temp, json: wantJson,
 
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey },
     body: JSON.stringify(body),
   });
   if (!res.ok) {
@@ -1751,11 +1751,11 @@ async function executeDescribeMediaTool(env, messages, prompt) {
 
   let lastErr = null;
   for (const mName of [...new Set(modelsToTry)]) {
-    const url = `${baseUrl}/v1beta/models/${mName}:generateContent?key=${geminiKey}`;
+    const url = `${baseUrl}/v1beta/models/${mName}:generateContent`;
     try {
       const res = await fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "x-goog-api-key": geminiKey },
         body: JSON.stringify(body)
       });
 
@@ -1811,9 +1811,9 @@ async function executeGoogleSearchTool(env, query) {
   for (const model of models) {
     for (const toolShape of toolShapes) {
       try {
-        const res = await fetch(`${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`, {
+        const res = await fetch(`${baseUrl}/v1beta/models/${model}:generateContent`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey },
           body: JSON.stringify({
             contents: [{ role: 'user', parts: [{ text: prompt }] }],
             tools: [toolShape],

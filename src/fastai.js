@@ -95,8 +95,8 @@ async function streamOnce(env, model, { system, contents, search, level, onText,
   let idle = setTimeout(() => ac.abort('timeout'), headerMs || 9000);
   let res;
   try {
-    res = await fetch(`${base}/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${env.GEMINI_KEY}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: ac.signal,
+    res = await fetch(`${base}/v1beta/models/${model}:streamGenerateContent?alt=sse`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_KEY }, body: JSON.stringify(body), signal: ac.signal,
     });
   } catch (e) {
     clearTimeout(idle);
