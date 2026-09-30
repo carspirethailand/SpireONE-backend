@@ -373,8 +373,20 @@ export async function fallbackAnswer(env, system, history, opts) {
   let list = media ? fallbackProviders(env, true).concat(fallbackProviders(env)) : fallbackProviders(env);
   /* ทุกเจ้าถูกพักไว้หมด — ดีกว่าตอบว่าไม่มีทางสำรอง ให้ลองทุกเจ้าอีกรอบ (อาจหายแล้ว) */
   if (!list.length) { BAD.forEach((_, k) => { if (k.startsWith('fb|')) BAD.delete(k) }); list = fallbackProviders(env, media).concat(media ? fallbackProviders(env) : []) }
+  /* ตัวสำรองค้นเว็บเองไม่ได้ — ค้น DuckDuckGo ให้ก่อนแล้วแนบผลไปในคำสั่งระบบ (ข้ามคำทักทายสั้น ๆ) */
+  let web = '';
+  const lastUser = [...clean].reverse().find(m => m.role === 'user');
+  const q = lastUser ? (typeof lastUser.content === 'string' ? lastUser.content
+    : (lastUser.content || []).filter(x => x.type === 'text').map(x => x.text).join(' ')).trim().slice(0, 200) : '';
+  if (q.length >= 8 && opts.search !== false) {
+    const t0 = Date.now();
+    web = await fetchDuckDuckGoSearch(q);
+    trail(opts.meter, { model: 'duckduckgo', ok: !!web, ms: Date.now() - t0, err: web ? '' : 'no results' });
+    if (web && opts.onResearch) try { await opts.onResearch(q) } catch (e) {}
+  }
+  const WEB = web ? `\n\n[ผลค้นเว็บจริง ณ ตอนนี้ — ใช้ข้อมูลนี้ตอบ อ้างอิงแหล่ง ห้ามบอกว่าค้นไม่ได้]\n${web}` : '';
   for (const p of list) {
-    let sys = system + NO_TOOLS + FOCUS;
+    let sys = system + (web ? NO_TOOLS.replace(/เรื่องที่ต้องใช้ข้อมูลล่าสุด[^\n]*/, 'ข้อมูลล่าสุดให้ใช้ผลค้นเว็บด้านล่าง') : NO_TOOLS) + WEB + FOCUS;
     for (let attempt = 0; attempt < 2; attempt++) {
       const t0 = Date.now();
       try {
