@@ -1023,7 +1023,7 @@ async function advice(env, me) {
   let summary = null;
   if (env.GEMINI_KEY) {
     try {
-      const model = env.GEMINI_MODEL || 'gemini-3.6-flash';
+      const model = env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
       const r = await fetch(`${env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com'}/v1beta/models/${model}:generateContent?key=${env.GEMINI_KEY}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         /* สรุปจาก AI เป็นของเสริม — ช้าเกิน 8 วินาทีก็ตัดทิ้ง ช่างยังได้คำแนะนำจากระบบครบ */

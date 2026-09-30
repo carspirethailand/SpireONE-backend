@@ -3,10 +3,10 @@
    → อ่านรูปแยกอีกหนึ่งครั้ง → ส่งให้โมเดลฟรีที่คิดนานแล้วค่อยตอบ → พลาดก็ถามซ้ำ
    ตอนนี้เหลือการเรียกครั้งเดียว: Gemini ค้นเว็บเอง เห็นรูปเอง คิด แล้วสตรีมคำตอบออกมาทันที
 
-   โมเดลเลือกจาก GEMINI_SEARCH_MODEL (ค่าเริ่มต้น gemini-3.8-flash) แล้วถอยไป GEMINI_MODEL
+   โมเดลเลือกจาก GEMINI_SEARCH_MODEL (ค่าเริ่มต้น gemini-3.5-flash-lite) แล้วถอยไป GEMINI_MODEL
    ถ้าชื่อโมเดลไหนใช้ไม่ได้ (404/400) จะรู้ภายในเสี้ยววินาทีแล้วข้ามไปตัวถัดไปเอง */
 
-const DEFAULT_MODEL = 'gemini-3.8-flash';
+const DEFAULT_MODEL = 'gemini-3.5-flash-lite';
 
 /* โทเคนโดยประมาณของข้อความล่าสุดที่ผู้ใช้ส่ง (ตัวอักษร/3 + รูปละ 300) — ใช้คิดโควตา */
 function userTokens(contents) {
@@ -18,10 +18,21 @@ function userTokens(contents) {
 }
 
 /* โมเดลที่ใช้ตอบ + ค้นเว็บ เรียงตามลำดับที่จะลอง
+   - ตัวหลัก: gemini-3.5-flash-lite, gemini-3.1-flash-lite
+   - ตัวรอง: gemini-3.6-flash, gemini-3.8-flash
    Gemma ใช้เครื่องมือค้นเว็บไม่ได้ จึงไม่เอามาใช้ในงานนี้ แม้จะตั้งไว้ในตัวแปร */
 export function chatModels(env) {
   /* ท้ายรายการเป็นรุ่นที่ Google เปิดให้ใช้มานานและเสถียร — กันกรณีชื่อรุ่นที่ตั้งไว้ใช้ไม่ได้ทั้งหมด แชตจะไม่ล่มทั้งระบบ */
-  const list = [env.GEMINI_CHAT_MODEL, env.GEMINI_SEARCH_MODEL, DEFAULT_MODEL, env.GEMINI_MODEL, 'gemini-2.5-flash']   /* 2.0-flash ถูก Google ยกเลิกแล้ว (404) */
+  const list = [
+    env?.GEMINI_CHAT_MODEL,
+    env?.GEMINI_SEARCH_MODEL || DEFAULT_MODEL,
+    'gemini-3.5-flash-lite',
+    'gemini-3.1-flash-lite',
+    'gemini-3.6-flash',
+    'gemini-3.8-flash',
+    env?.GEMINI_MODEL,
+    'gemini-2.5-flash'
+  ]
     .map(m => String(m || '').trim())
     .filter(m => m && !/^gemma/i.test(m));
   return [...new Set(list)];
@@ -179,14 +190,299 @@ const BAD = new Map();
 const bad = k => { const v = BAD.get(k); return v && Date.now() < v };
 const markBad = (k, ms = 600000) => BAD.set(k, Date.now() + ms);
 
+/* ══ ตรวจสอบคำถามที่ต้องการข้อมูลสด ══ */
+const FRESH_WORDS = [
+  'ล่าสุด','ใหม่ล่าสุด','รุ่นใหม่','เพิ่งเปิดตัว','เปิดตัว','ปีนี้','ตอนนี้','ปัจจุบัน',
+  'ข่าว','ราคา','กี่บาท','เท่าไหร่','เท่าไร','โปรโมชั่น','ส่วนลด','สเปก','สเป็ค',
+  'latest','newest','new model','just launched','launch','price','how much','news','spec','2025','2026','2027',
+  'ค้นหา','ค้นเว็บ','ค้นข้อมูล','หาข้อมูล','อินเทอร์เน็ต','อินเตอร์เน็ต','กูเกิล','วันนี้','สถานการณ์','น้ำท่วม','อากาศ',
+  'internet','google','search','today','weather',
+];
+export function needsFresh(q) {
+  const t = String(q || '').toLowerCase();
+  if (!t) return false;
+  if (FRESH_WORDS.some(w => t.includes(w))) return true;
+  if (/\b(20[2-9]\d|25[6-9]\d)\b/.test(t)) return true;
+  return false;
+}
+
+/* ── เครื่องมือค้นหาเว็บความเร็วสูงผ่าน DuckDuckGo (ทำงานได้จาก Edge ทุกที่ ไม่ติดโควตา Google) ── */
+export async function fetchDuckDuckGoSearch(query) {
+  try {
+    const qClean = String(query || '')
+      .replace(/^(ช่วย|ให้คุณ|ให้|รบกวน|อยากให้)?\s*(ค้นหา|หาข้อมูล|ค้นเน็ต|เสิร์ช|search)?\s*(ข้อมูล|ให้หน่อย|ตอนนี้เลย|ทีครับ|ทีค่ะ|หน่อย)?/gi, '')
+      .trim() || String(query || '');
+    const q = encodeURIComponent(qClean.slice(0, 150));
+    const url = `https://html.duckduckgo.com/html/?q=${q}`;
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'th-TH,th;q=0.9,en;q=0.8'
+      }
+    });
+    if (!res.ok) return '';
+    const html = await res.text();
+    const blocks = html.split(/<div class="result results_links/);
+    const items = [];
+    for (let i = 1; i < blocks.length && items.length < 6; i++) {
+      const b = blocks[i];
+      if (b.includes('result--ad') || b.includes('badge--ad')) continue;
+      const aM = b.match(/<a class="result__a"[^>]*>([\s\S]*?)<\/a>/i);
+      const snipM = b.match(/<a class="result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/i);
+      const title = aM ? aM[1].replace(/<[^>]+>/g, '').trim() : '';
+      const snippet = snipM ? snipM[1].replace(/<[^>]+>/g, '').replace(/&quot;/g, '"').replace(/&#x27;/g, "'").replace(/&amp;/g, '&').trim() : '';
+      if (snippet) {
+        items.push(`${items.length + 1}. ${title ? `[${title}] ` : ''}${snippet}`);
+      }
+    }
+    return items.join('\n');
+  } catch (e) {
+    console.warn('[ddg search error]', e.message || e);
+    return '';
+  }
+}
+
+/* ── ค้นหาข้อมูลฉุกเฉิน (กรณีไม่มีฟังก์ชันค้นหาภายนอกส่งเข้ามา) ── */
+export async function defaultSearch(env, q) {
+  const geminiKey = env.GEMINI_KEY;
+  const baseUrl = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
+  if (geminiKey && !bad('gemini|quota') && !bad('gemini|region')) {
+    for (const m of chatModels(env)) {
+      if (bad(m)) continue;
+      try {
+        const res = await fetch(`${baseUrl}/v1beta/models/${m}:generateContent?key=${geminiKey}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ role: 'user', parts: [{ text: `ค้นหาข้อเท็จจริงล่าสุดในอินเทอร์เน็ตสั้น ๆ เกี่ยวกับ: ${q}` }] }],
+            tools: [{ google_search: {} }],
+            generationConfig: { temperature: 0.2 }
+          })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const cand = (data.candidates && data.candidates[0]) || {};
+          const txt = (((cand.content && cand.content.parts) || []).map(x => x.text || '').join('').trim());
+          if (txt && !/^ไม่พบข้อมูลยืนยัน/i.test(txt)) return txt;
+        } else if (res.status === 429) {
+          markBad('gemini|quota', 60000);
+        } else if (res.status === 400) {
+          const errTxt = await res.text().catch(() => '');
+          if (/User location is not supported/i.test(errTxt)) markBad('gemini|region', 600000);
+        }
+      } catch (e) {}
+    }
+  }
+  // ค้นด้วย DuckDuckGo เป็นหลักหาก Gemini ติดโควตาหรือบล็อกพื้นที่ — ได้ผลจริง ทันที ไม่ติดโควตา
+  const ddg = await fetchDuckDuckGoSearch(q);
+  if (ddg) return ddg;
+  return '';
+}
+
+/* ══ OpenRouter Tool-Calling Thinking Agent (โมเดลหลักตามคำสั่งผู้ใช้) ══
+   - ใช้ openrouter/free (หรือ env.OPENROUTER_MODEL) เป็นสมองหลักในการคิด
+   - เชื่อมต่อการค้นหาเว็บสด (DuckDuckGo + Google Search Grounding)
+   - สตรีมความคิด (reasoning) และคำตอบสด ๆ แบบเรียลไทม์ */
+async function openrouterAgent(env, opts) {
+  if (!env.OPENROUTER_API_KEY) return null;
+  const model = env.OPENROUTER_MODEL || 'openrouter/free';
+  const baseUrl = env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
+  const url = `${baseUrl}/chat/completions`;
+  const t0 = Date.now();
+
+  const history = opts.history || (opts.messages ? toChatHistory(opts.messages) : (opts.contents ? toChatHistory(opts.contents) : []));
+  const question = opts.question || (history.length ? String(history[history.length - 1].content || '') : '');
+  const isSearchQuery = /ค้นหา|หาข้อมูล|ค้นเน็ต|เสิร์ช|search|เช็คราคา|เช็กราคา|ล่าสุด|ปัจจุบัน|เปิดตัว|ปีนี้|ปีหน้า|202[4-9]|256[7-9]|โปรโมชั่น|แคมเปญ|ดอกเบี้ย|ผ่อน|ตารางผ่อน|มีขายไหม|เข้าไทย|มาไทย|ขายยัง|วางขาย|รุ่นใหม่|facelift|all new|all-new/i.test(question);
+  const fresh = (opts.search !== false) && (needsFresh(question) || (opts.carInfo && needsFresh(question)) || isSearchQuery);
+
+  const searchFn = opts.executeSearch || (q => defaultSearch(env, q));
+  let observation = '';
+  let searchTopic = '';
+
+  // 1. Pre-search Grounding: ถ้าคำถามต้องการข้อมูลสด ค้นหาเว็บล่วงหน้าทันที (< 1 วินาที)
+  // เพื่อให้โมเดลตอบรอบเดียวจบแบบ Single-turn Streaming เร็ว ไม่ติด timeout
+  if (fresh) {
+    const carPrefix = (opts.carInfo && (opts.carInfo.make || opts.carInfo.model)) ? `${opts.carInfo.make || ''} ${opts.carInfo.model || ''} ` : '';
+    const qClean = question.replace(/^(ช่วย|ให้คุณ|ให้|รบกวน|อยากให้)?\s*(ค้นหา|หาข้อมูล|เสิร์ช|search)?\s*(ข้อมูล|ให้หน่อย|ตอนนี้เลย|ทีครับ|ทีค่ะ|หน่อย)?/gi, '').trim() || question;
+    searchTopic = `${carPrefix}${qClean}`.trim();
+    if (opts.onSearch) await opts.onSearch(searchTopic);
+    try {
+      observation = await searchFn(searchTopic);
+    } catch (e) {
+      console.warn('[openrouter pre-search failed]', e.message || e);
+    }
+  } else if (opts.hasMedia && opts.executeMedia) {
+    try {
+      observation = await opts.executeMedia("ดูและอธิบายรายละเอียดภาพหรือสื่อที่แนบมา");
+    } catch (e) {}
+  }
+
+  // 2. ป้อนข้อมูลที่ค้นพบเข้าไปใน System Prompt
+  let searchPrompt = '';
+  if (observation) {
+    searchPrompt = `\n\n[ข้อมูลล่าสุดที่ค้นพบจากอินเทอร์เน็ตแบบเรียลไทม์]:\nหัวข้อค้นหา: ${searchTopic || question}\n${observation}\n\nคำสั่งสำคัญ:
+- นำข้อเท็จจริงล่าสุดข้างต้นมาตอบคำถามของผู้ใช้ให้ครบถ้วน ชัดเจน ตรงประเด็น และเป็นมิตร
+- อ้างอิงข้อมูลจริงจากผลการค้นหา เช่น ชื่อรุ่น สเปก ราคา ปีเปิดตัว
+- ห้ามตอบว่าไม่มีข้อมูลล่าสุดหรือไม่มีเครื่องมือค้นหา เพราะระบบได้ค้นหาข้อมูลล่าสุดจากอินเทอร์เน็ตมาให้คุณเรียบร้อยแล้ว
+- ตอบเนื้อหาออกมาตรง ๆ ไม่ต้องเกริ่นว่า "จากข้อมูลการค้นหา"`;
+  } else {
+    searchPrompt = `\n\n[เครื่องมือค้นหา]:
+ถ้าจำเป็นต้องค้นหาข้อมูลเพิ่มเติม สามารถเรียกใช้ได้โดยพิมพ์:
+Action: google_search("คำค้นหา")`;
+  }
+
+  const sys = `${opts.system || ''}${searchPrompt}`;
+  let messages = [
+    { role: 'system', content: sys },
+    ...history
+  ];
+
+  let thoughts = '';
+  let responseText = '';
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort('timeout'), 45000);
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${env.OPENROUTER_API_KEY}`,
+        'HTTP-Referer': 'https://carspirethailand.com',
+        'X-Title': 'Cendon',
+      },
+      body: JSON.stringify({
+        model,
+        messages,
+        temperature: 0.3,
+        stream: true
+      }),
+      signal: ac.signal
+    });
+
+    if (!res.ok) {
+      const errTxt = await res.text().catch(() => '');
+      throw new Error(`OpenRouter ${res.status}: ${errTxt.slice(0, 150)}`);
+    }
+
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop() || '';
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t.startsWith('data:')) continue;
+        const payload = t.slice(5).trim();
+        if (payload === '[DONE]') continue;
+        let d;
+        try { d = JSON.parse(payload); } catch { continue; }
+        const delta = (d.choices && d.choices[0] && d.choices[0].delta) || {};
+        const r = delta.reasoning || delta.reasoning_content;
+        if (r) {
+          thoughts += r;
+          if (opts.onThought) await opts.onThought(r);
+        }
+        if (delta.content) {
+          responseText += delta.content;
+          if (opts.onText) await opts.onText(delta.content);
+        }
+      }
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+
+  // 3. Dynamic Tool Calling Fallback (กรณีรอบแรกไม่ได้ pre-search แต่โมเดลเขียน Action ออกมา)
+  const combined = `${responseText}\n${thoughts}`;
+  let actionMatch = combined.match(/(?:Action|Tool):\s*(\w+)\s*[:\(]\s*(?:query\s*=\s*)?(["'`\u201c\u2018])([\s\S]*?)\2\s*\)?/i);
+  if (!actionMatch) {
+    const loose = combined.match(/(?:Action|Tool):\s*(\w+)\s*\(([^)]+)\)/i);
+    if (loose) {
+      actionMatch = [loose[0], loose[1], '"', loose[2].replace(/^["'`\u201c\u2018]|["'`\u201d\u2019]$/g, '').trim()];
+    }
+  }
+
+  if (actionMatch && !observation) {
+    const tName = actionMatch[1].toLowerCase();
+    const tInput = actionMatch[3];
+    if (tName === 'google_search' || tName === 'search' || tName === 'web_search') {
+      if (opts.onSearch) await opts.onSearch(tInput);
+      const postObs = await searchFn(tInput);
+      if (postObs) {
+        observation = postObs;
+        searchTopic = tInput;
+        try {
+          const step2Res = await fetch(url, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${env.OPENROUTER_API_KEY}`,
+              'HTTP-Referer': 'https://carspirethailand.com',
+              'X-Title': 'Cendon',
+            },
+            body: JSON.stringify({
+              model,
+              messages: [
+                ...messages,
+                { role: 'assistant', content: responseText },
+                { role: 'user', content: `[ผลการค้นหาเว็บ]:\n${postObs}\n\nคำสั่ง: นำผลการค้นหาข้างต้นมาสรุปตอบผู้ใช้ให้ครบถ้วน ชัดเจน เป็นมิตร` }
+              ],
+              temperature: 0.3
+            })
+          });
+          if (step2Res.ok) {
+            const s2Data = await step2Res.json();
+            const s2Text = (s2Data.choices && s2Data.choices[0] && s2Data.choices[0].message && s2Data.choices[0].message.content) || '';
+            if (s2Text) {
+              responseText = s2Text;
+            }
+          }
+        } catch (e) {}
+      }
+    }
+  }
+
+  let clean = stripToolCalls(responseText).trim();
+  const faMatch = clean.match(/Final Answer:\s*([\s\S]+)$/i);
+  if (faMatch) clean = faMatch[1].trim();
+
+  trail(opts.meter, { model, level: null, search: !!observation, ok: true, ms: Date.now() - t0, grounded: !!observation });
+  return {
+    text: clean,
+    thoughts,
+    grounded: !!observation,
+    queries: searchTopic ? [searchTopic] : [],
+    model
+  };
+}
+
 export async function fastAnswer(env, opts) {
+  // 1. โมเดลหลัก: OpenRouter Tool-Calling Thinking Agent ตามคำสั่งผู้ใช้
+  if (env.OPENROUTER_API_KEY && !bad('or:primary')) {
+    try {
+      const orResult = await openrouterAgent(env, opts);
+      if (orResult && orResult.text && orResult.text.trim()) {
+        return orResult;
+      }
+    } catch (e) {
+      console.warn('[fastAnswer openrouter primary failed]', e.message || e);
+      if (/429|rate/i.test(e.message || '')) markBad('or:primary', 15000);
+    }
+  }
+
+  // 2. โมเดลรอง: Gemini พร้อม Search Grounding
   if (!env.GEMINI_KEY) throw new Error('AI is not configured');
   let last = null;
   const want = opts.level || 'low';
   const ladder = want === 'medium' ? ['medium', 'low', null] : want === 'minimal' ? ['minimal', 'low', null] : ['low', null];
   /* งบเวลารวมก่อนได้คำแรก 14 วินาที — เกินนั้นไปทางสำรองเลย ผู้ใช้ไม่ต้องนั่งรอไล่ลองทีละรุ่น */
-  /* โควตาทั้งคีย์หมด ("exceeded your current quota") — ทุกรุ่นใช้โควตาก้อนเดียวกัน ไม่ต้องไล่ลองทีละรุ่น */
-  if (bad('gemini|quota')) throw new Error('gemini: key quota exhausted (parked)');
   const until = Date.now() + 14000;
   for (const model of chatModels(env)) {
     if (bad(model)) continue;
@@ -205,13 +501,12 @@ export async function fastAnswer(env, opts) {
         trail(opts.meter, { model, level, search, ok: false, ms: Date.now() - t0, err: String(e.message || e).slice(0, 160) });
         last = e;
         if (e.partial) return { text: e.partial, thoughts: '', grounded: false, queries: [], model, cut: true };
-        if (e.quota && /exceeded your current quota|RESOURCE_EXHAUSTED/i.test(e.message || '') && !/grounding/i.test(e.message || '')) { markBad('gemini|quota', 600000); throw e; }
         if (e.thinking && level) { markBad(model + '|' + level); continue; }     /* ลดระดับการคิด รุ่นเดิม */
-        /* ค้นเว็บใช้ไม่ได้ในรุ่นนี้ — ลองรุ่นเดิมแบบไม่ค้น (โควตาค้นเต็มจำไว้แค่ 1 นาที) */
-        if (e.tool && search && !(e.quota && !opts.search)) { markBad(model + '|search', e.quota ? 60000 : 600000); search = false; i--; continue; }
+        /* ค้นเว็บใช้ไม่ได้ในรุ่นนี้ หรือโควตาค้นเว็บเต็ม — ลองรุ่นเดิมแบบไม่ค้น */
+        if (e.tool && search) { markBad(model + '|search', e.quota ? 60000 : 600000); search = false; i--; continue; }
         if (e.dead) markBad(model);
-        else if (e.quota || e.busy) markBad(model, 60000);                     /* ล่ม/เต็มชั่วคราว ข้ามรุ่นนี้ 1 นาที */
-        break;                                                                 /* ข้ามไปรุ่นถัดไป */
+        else if (e.quota || e.busy) markBad(model, 60000);                     /* ล่ม/เต็มชั่วคราว ข้ามรุ่นนี้ 1 นาที แล้วลองรุ่นถัดไป */
+        break;                                                                 /* ข้ามไปลองรุ่นถัดไปใน chatModels */
       }
     }
   }
@@ -326,8 +621,8 @@ export function fallbackProviders(env, media) {
   /* Groq ก่อน (ฟรี เร็ว) — ถ้าชื่อรุ่นหลักใช้ไม่ได้กับคีย์นี้ มีรุ่นสำรอง (ตัวเดียวกับที่ใช้ดูรูป) */
   if (env.GROQ_API_KEY) {
     const gu = `${env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1'}/chat/completions`;
-    L.push({ src: 'groq', url: gu, key: env.GROQ_API_KEY, model: env.GROQ_MODEL || 'openai/gpt-oss-120b' });
-    L.push({ src: 'groq-alt', url: gu, key: env.GROQ_API_KEY, model: 'meta-llama/llama-4-scout-17b-16e-instruct' });
+    L.push({ src: 'groq', url: gu, key: env.GROQ_API_KEY, model: env.GROQ_MODEL || 'llama-3.1-8b-instant' });
+    L.push({ src: 'groq-alt', url: gu, key: env.GROQ_API_KEY, model: 'llama-3.1-8b-instant' });
   }
   if (env.CEREBRAS_API_KEY) L.push({ src: 'cerebras', url: `${env.CEREBRAS_BASE_URL || 'https://api.cerebras.ai/v1'}/chat/completions`,
     key: env.CEREBRAS_API_KEY, model: env.CEREBRAS_MODEL || 'gpt-oss-120b', extra: { reasoning_effort: 'low' } });
@@ -338,11 +633,15 @@ export function fallbackProviders(env, media) {
   return L.filter(p => !bad('fb|' + p.src));
 }
 
-/* คำสั่งเสริมของทางสำรอง: โมเดลพวกนี้ค้นเว็บไม่ได้ ต้องบอกตรง ๆ ไม่งั้นมันพยายามเรียกเครื่องมือที่ไม่มีอยู่ */
+/* คำสั่งเสริมของทางสำรอง: ป้องกันไม่ให้โมเดลพ่นคำสั่งเรียกเครื่องมือดิบออกมา */
 const NO_TOOLS = `
 
+<<<<<<< HEAD
 [สำคัญ] รอบนี้ไม่มีเครื่องมือใด ๆ ให้เรียกใช้ ห้ามเขียนคำสั่งเรียกฟังก์ชัน ห้ามเขียน google(...) / Action: google_search(...) หรือ <|tool_call|>
 ตอบเป็นภาษาคนออกมาเลย จากความรู้ที่มี เรื่องที่ต้องใช้ข้อมูลล่าสุดให้บอกตรง ๆ ว่ายังยืนยันข้อมูลล่าสุดไม่ได้ แล้วแนะนำแหล่งที่ตรวจเองได้`;
+=======
+[สำคัญ] ตอบเป็นข้อความภาษาคนธรรมดา ห้ามเขียนคำสั่งเรียกฟังก์ชัน ห้ามเขียน google(...) หรือ <|tool_call|>`;
+>>>>>>> 03497a92d6fb61f0356e1e403669b28e71ec0eb7
 
 /* คำตอบขยะที่ต้องทิ้งแล้วไปรุ่นถัดไป: ผลตรวจความปลอดภัย หรือข้อความสั้นกุดไม่มีเนื้อ */
 const JUNK_RE = /^\s*(user|response|prompt)\s*safety\s*:|^\s*(safe|unsafe)\s*(\n|$)|^\s*S\d+\s*$/im;
@@ -365,16 +664,31 @@ export function toChatHistory(msgs) {
 const flat = h => h.map(m => ({ role: m.role, content: Array.isArray(m.content) ? m.content.map(c => c.text || ' [ผู้ใช้แนบรูปมา]').join('') : m.content }));
 
 export async function fallbackAnswer(env, system, history, opts) {
+  opts = opts || {};
   let last = null;
   const media = history.some(m => m.media);
   const clean = history.map(({ media, ...m }) => m);
   /* ย้ำให้ตอบคำถามล่าสุดตรง ๆ — รุ่นสำรองชอบหยิบข้อมูลรถในคำสั่งระบบมาตอบแทนสิ่งที่ถูกถาม */
   const FOCUS = '\n\n[สำคัญที่สุด] ตอบ "ข้อความล่าสุดของผู้ใช้" ให้ตรงประเด็น ข้อมูลรถของผู้ใช้ใช้ประกอบเท่านั้น ห้ามตอบแค่ข้อมูลรถถ้าเขาไม่ได้ถาม';
+  
+  // เสริมข้อมูลค้นหาเว็บสดให้ทางสำรองด้วย หากคำถามเป็นเรื่องที่ต้องใช้ข้อมูลล่าสุด
+  let extraWeb = '';
+  const lastUser = [...clean].reverse().find(m => m.role === 'user');
+  const userText = lastUser ? (Array.isArray(lastUser.content) ? lastUser.content.map(c => c.text || '').join('') : String(lastUser.content)) : '';
+  if (userText && (needsFresh(userText) || /ค้นหา|หาข้อมูล|ล่าสุด|202[4-9]|256[7-9]/i.test(userText))) {
+    try {
+      const ddg = await fetchDuckDuckGoSearch(userText);
+      if (ddg) {
+        extraWeb = `\n\n[ข้อมูลล่าสุดที่ค้นพบจากอินเทอร์เน็ต]:\n${ddg}\nให้นำข้อเท็จจริงนี้มาตอบคำถามผู้ใช้ ห้ามบอกว่าไม่มีข้อมูลหรือไม่มีการเข้าถึงอินเทอร์เน็ต`;
+      }
+    } catch (e) {}
+  }
+
   let list = media ? fallbackProviders(env, true).concat(fallbackProviders(env)) : fallbackProviders(env);
   /* ทุกเจ้าถูกพักไว้หมด — ดีกว่าตอบว่าไม่มีทางสำรอง ให้ลองทุกเจ้าอีกรอบ (อาจหายแล้ว) */
   if (!list.length) { BAD.forEach((_, k) => { if (k.startsWith('fb|')) BAD.delete(k) }); list = fallbackProviders(env, media).concat(media ? fallbackProviders(env) : []) }
   for (const p of list) {
-    let sys = system + NO_TOOLS + FOCUS;
+    let sys = system + extraWeb + NO_TOOLS + FOCUS;
     for (let attempt = 0; attempt < 2; attempt++) {
       const t0 = Date.now();
       try {

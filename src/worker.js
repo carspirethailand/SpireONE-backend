@@ -1,7 +1,7 @@
 import { verifyFirebaseToken } from './auth.js';
 import { handleTech } from './techs.js';
 import { handleVec, kbScores, refreshKb } from './vectors.js';
-import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels, toChatHistory, levelFor, depthNote, featuresBlock, badState, unpark } from './fastai.js';
+import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels, toChatHistory, levelFor, depthNote, featuresBlock, badState, unpark, fetchDuckDuckGoSearch } from './fastai.js';
 
 /*
  * SpireONE backend — security-hardened.
@@ -632,7 +632,7 @@ async function tokensToday(env, uid) {
 async function callGemini(env, { contents, system, search, temp, json: wantJson, maxTokens, meter }) {
   const geminiKey = env.GEMINI_KEY;
   if (!geminiKey) throw new Error('AI is not configured');
-  const model = env.GEMINI_MODEL || 'gemini-3.6-flash';
+  const model = env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
   const baseUrl = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
   const url = `${baseUrl}/v1beta/models/${model}:generateContent?key=${geminiKey}`;
 
@@ -1708,8 +1708,8 @@ async function executeDescribeMediaTool(env, messages, prompt) {
   if (!geminiKey) {
     throw new Error('GEMINI_KEY environment variable is not configured');
   }
-  const primaryModel = env.GEMINI_MODEL || 'gemini-3.6-flash';
-  const modelsToTry = [primaryModel, 'gemini-3.6-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'];
+  const primaryModel = env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
+  const modelsToTry = [primaryModel, 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.6-flash', 'gemini-3.8-flash'];
   const baseUrl = env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com";
 
   const parts = [];
@@ -1839,6 +1839,14 @@ async function executeGoogleSearchTool(env, query) {
       }
     }
   }
+
+  // ค้นด้วย DuckDuckGo เป็นหลักหาก Gemini ติดโควตาหรือบล็อกพื้นที่ — รวดเร็ว ได้ผลจริง 100%
+  const ddg = await fetchDuckDuckGoSearch(query);
+  if (ddg) {
+    console.log('[search] สำเร็จด้วย DuckDuckGo search');
+    return ddg;
+  }
+
   console.warn('[search] ค้นไม่สำเร็จทุกโมเดล');
   return '';
 }
@@ -4292,7 +4300,16 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
               let firstText = true;
               try {
                 const r = await fastAnswer(env, {
-                  system: sys, contents: toGeminiContents(msgs), search: true,
+                  system: sys,
+                  contents: toGeminiContents(msgs),
+                  history: toChatHistory(msgs),
+                  messages: msgs,
+                  question,
+                  hasMedia,
+                  carInfo,
+                  search: true,
+                  executeSearch: async (q) => await executeGoogleSearchTool(env, q),
+                  executeMedia: async (p) => await executeDescribeMediaTool(env, msgs, p),
                   level: levelFor(body.depth, question, hasMedia, body.skillIds), meter,
                   onThought: d => send({ type: 'reasoning', delta: d }),
                   onSearch: async q => { await send({ type: 'research', q: String(q).slice(0, 120) }); await send({ type: 'status', key: 'search', text: 'กำลังค้น: ' + String(q).slice(0, 60) }) },
@@ -4473,8 +4490,20 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
 ${STREAM_TALK}${featuresBlock()}${smartBlock()}${stylePrompt(activeStyle, activeCustomStyle)}${depthNote(body.depth)}
 ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext}` : ''}${userBlock}${kbBlock}${skillPrompt || ''}${fresh ? FORCE_SEARCH : ''}`;
             try {
-              const r = await fastAnswer(env, { system: sys, contents: toGeminiContents(body.contents), search: true,
-                level: levelFor(body.depth, question, hasMedia, body.skillIds), meter });
+              const r = await fastAnswer(env, {
+                system: sys,
+                contents: toGeminiContents(body.contents),
+                history: toChatHistory(body.contents),
+                messages: body.contents,
+                question,
+                hasMedia,
+                carInfo,
+                search: true,
+                executeSearch: async (q) => await executeGoogleSearchTool(env, q),
+                executeMedia: async (p) => await executeDescribeMediaTool(env, body.contents, p),
+                level: levelFor(body.depth, question, hasMedia, body.skillIds),
+                meter
+              });
               agentOut = { text: cleanReply(r.text), reasoning: (r.thoughts || '').slice(0, 6000) };
             } catch (e) {
               console.error('[chat fast]', e.message);
@@ -4893,7 +4922,7 @@ ${convo}`;
             totalCars, magazine: magCount, shop: shopCount, auditCount,
             aiToday, aiTotal,
             aiLimit: parseInt(env.AI_DAILY_LIMIT || '60', 10),
-            model: env.GEMINI_MODEL || 'gemini-2.5-flash',
+            model: env.OPENROUTER_MODEL || 'openrouter/free',
             aiDaily: aiDaily.slice().reverse(),
             signups: signups.slice().reverse(),
             roles, topUsers, topMakes, recentUsers,
@@ -4928,8 +4957,10 @@ ${convo}`;
           } catch (e) {}
           try { const le = await env.DB.prepare("SELECT value FROM config WHERE key = 'ai_last_error'").first(); lastAiError = le && le.value ? JSON.parse(le.value) : null } catch (e) {}
           const parked = badState();
+          const primaryModel = env.OPENROUTER_MODEL || 'openrouter/free';
+          const fullChain = [primaryModel].concat(chatModels(env));
           return json({ now: Date.now(),
-            chain: chatModels(env).map(m => ({ name: m, parked: parked.find(p => p.key === m) || null, searchParked: parked.find(p => p.key === m + '|search') || null })),
+            chain: fullChain.map(m => ({ name: m, parked: parked.find(p => p.key === m) || null, searchParked: parked.find(p => p.key === m + '|search') || null })),
             fallbacks: fallbackProviders(env).concat(fallbackProviders(env, true)).map(p => ({ name: p.src + ':' + p.model })),
             keys: { gemini: !!env.GEMINI_KEY, groq: !!env.GROQ_API_KEY, cerebras: !!env.CEREBRAS_API_KEY, openrouter: !!env.OPENROUTER_API_KEY, workersAI: !!env.AI },
             parked, stats, events, lastAiError });
@@ -4944,8 +4975,9 @@ ${convo}`;
           const q = url.searchParams.get('q') || 'ราคาน้ำมันเบนซินในไทยวันนี้';
           const out = { keys: {
             gemini: !!env.GEMINI_KEY, openrouter: !!env.OPENROUTER_API_KEY,
-            geminiModel: env.GEMINI_MODEL || '(ไม่ได้ตั้ง)', searchModel: env.GEMINI_SEARCH_MODEL || '(ไม่ได้ตั้ง ใช้ gemini-3.8-flash)',
-            chatModels: chatModels(env), fallback: fallbackProviders(env).map(p => p.src + ':' + p.model) } };
+            primaryModel: env.OPENROUTER_MODEL || 'openrouter/free',
+            geminiModel: env.GEMINI_MODEL || '(ไม่ได้ตั้ง)', searchModel: env.GEMINI_SEARCH_MODEL || '(ไม่ได้ตั้ง ใช้ gemini-3.5-flash-lite)',
+            chatModels: [env.OPENROUTER_MODEL || 'openrouter/free (หลัก)'].concat(chatModels(env)), fallback: fallbackProviders(env).map(p => p.src + ':' + p.model) } };
           try {
             const le = await env.DB.prepare("SELECT value FROM config WHERE key = 'ai_last_error'").first();
             out.lastAiError = le && le.value ? JSON.parse(le.value) : null;
@@ -4983,7 +5015,7 @@ ${convo}`;
             schema,
             env: {
               aiConfigured: !!env.GEMINI_KEY,
-              model: env.GEMINI_MODEL || 'gemini-2.5-flash',
+              model: env.GEMINI_MODEL || 'gemini-3.5-flash-lite',
               fallbackModel: env.GEMINI_FALLBACK_MODEL || '',
               liveModel: env.GEMINI_LIVE_MODEL || '',
               aiDailyLimit: parseInt(env.AI_DAILY_LIMIT || '60', 10),
