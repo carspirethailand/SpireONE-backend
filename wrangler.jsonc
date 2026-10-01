@@ -37,8 +37,10 @@
     "OPENROUTER_BASE_URL": "https://openrouter.ai/api/v1",
     "CF_AI_FALLBACK_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
   },
+  // smart placement เคยพา worker ไปรันในพื้นที่ที่ Gemini ไม่รองรับ (400 "User location is not supported")
+  // ล็อกไว้ที่สหรัฐฯ ซึ่ง Gemini/Google/Bing ใช้ได้แน่นอน
   "placement": {
-    "mode": "smart"
+    "region": "gcp:us-east4"
   },
   "triggers": {
     "crons": [
