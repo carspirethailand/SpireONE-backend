@@ -4604,14 +4604,13 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
             uses: 1,
             expireTime: new Date(now + 30 * 60 * 1000).toISOString(),
             newSessionExpireTime: new Date(now + 2 * 60 * 1000).toISOString(),
-            liveConnectConstraints: {
+            /* REST ใช้ชื่อ bidiGenerateContentSetup (liveConnectConstraints เป็นชื่อฝั่ง SDK — ส่งไปจะได้ 400 Unknown name) */
+            bidiGenerateContentSetup: {
               model: 'models/' + liveModel,
-              config: {
-                responseModalities: ['AUDIO'],
-                systemInstruction: { parts: [{ text: String(b.system || '').slice(0, 6000) }] },
-                inputAudioTranscription: {},
-                outputAudioTranscription: {},
-              },
+              generationConfig: { responseModalities: ['AUDIO'] },
+              systemInstruction: { parts: [{ text: String(b.system || '').slice(0, 6000) }] },
+              inputAudioTranscription: {},
+              outputAudioTranscription: {},
             },
           });
 
@@ -4628,7 +4627,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
             }
             lastErr = `${liveModel} ${res.status}: ${(await res.text()).slice(0, 200)}`;
             /* รุ่นนี้ใช้ไม่ได้ (ไม่มี/ไม่มีสิทธิ์) → ลองรุ่นถัดไป · คีย์ผิดหรือโควตาหมด → ลองต่อก็ไม่ช่วย */
-            if (![400, 404].includes(res.status)) break;
+            if (res.status !== 404 && !(res.status === 400 && /model/i.test(lastErr) && !/Unknown name|Invalid JSON/i.test(lastErr))) break;
           }
           noteAiError(env, new Error('live: ' + lastErr));
           return deny(`Live token error ${lastErr}`, 502);
