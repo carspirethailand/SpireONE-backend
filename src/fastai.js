@@ -95,8 +95,8 @@ async function streamOnce(env, model, { system, contents, search, level, onText,
   let idle = setTimeout(() => ac.abort('timeout'), headerMs || 9000);
   let res;
   try {
-    res = await fetch(`${base}/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${env.GEMINI_KEY}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: ac.signal,
+    res = await fetch(`${base}/v1beta/models/${model}:streamGenerateContent?alt=sse`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_KEY }, body: JSON.stringify(body), signal: ac.signal,
     });
   } catch (e) {
     clearTimeout(idle);
@@ -105,7 +105,7 @@ async function streamOnce(env, model, { system, contents, search, level, onText,
   if (!res.ok || !res.body) {
     clearTimeout(idle);
     const t = await res.text().catch(() => '');
-    const err = new Error(`${model} ${res.status}: ${t.slice(0, 240)}`);
+    const err = new Error(`${model} ${res.status}: ${t.slice(0, 1500)}`);
     err.status = res.status; err.retryable = true;
     /* รุ่นนี้ไม่รับค่าการคิดแบบนี้ — ลองใหม่โดยลดระดับ/ไม่ส่ง แทนที่จะทิ้งทั้งรุ่น */
     err.thinking = res.status === 400 && /thinking/i.test(t);
@@ -186,10 +186,12 @@ export async function fastAnswer(env, opts) {
   const ladder = want === 'medium' ? ['medium', 'low', null] : want === 'minimal' ? ['minimal', 'low', null] : ['low', null];
   /* งบเวลารวมก่อนได้คำแรก 14 วินาที — เกินนั้นไปทางสำรองเลย ผู้ใช้ไม่ต้องนั่งรอไล่ลองทีละรุ่น */
   /* โควตาทั้งคีย์หมด ("exceeded your current quota") — ทุกรุ่นใช้โควตาก้อนเดียวกัน ไม่ต้องไล่ลองทีละรุ่น */
-  if (bad('gemini|quota')) throw new Error('gemini: key quota exhausted (parked)');
+  /* พักตามคีย์ — เปลี่ยนคีย์ใหม่แล้วลองทันที ไม่ต้องรอ · จดใน trail ให้แผงผู้ดูแลเห็นว่าข้ามเพราะอะไร */
+  const QK = 'gemini|quota|' + String(env.GEMINI_KEY || '').slice(-6);
+  if (bad(QK)) { trail(opts.meter, { model: 'gemini', ok: false, ms: 0, err: 'ข้าม: คีย์นี้เพิ่งติดโควตา (พัก 3 นาที)' }); throw new Error('gemini: key quota exhausted (parked)'); }
   const until = Date.now() + 14000;
   for (const model of chatModels(env)) {
-    if (bad(model)) continue;
+    if (bad(model)) { trail(opts.meter, { model, ok: false, ms: 0, err: 'ข้าม: รุ่นนี้เพิ่งล้ม (พักชั่วคราว)' }); continue; }
     let search = !!opts.search && !bad(model + '|search');
     for (let i = 0; i < ladder.length; i++) {
       const level = ladder[i];
@@ -202,10 +204,13 @@ export async function fastAnswer(env, opts) {
         trail(opts.meter, { model, level, search, ok: true, ms: Date.now() - t0, grounded: r.grounded });
         return r;
       } catch (e) {
-        trail(opts.meter, { model, level, search, ok: false, ms: Date.now() - t0, err: String(e.message || e).slice(0, 160) });
+        const em = String(e.message || e), qd = (em.match(/quota[_ ]?metric[^,}]*|metric: [^\n,]*|limit: ?\d+|quotaValue[^,}]*/gi) || []).join(' · ');
+        trail(opts.meter, { model, level, search, ok: false, ms: Date.now() - t0, err: (em.slice(0, 120) + (qd ? ' ‖ ' + qd : '')).slice(0, 300) });
         last = e;
         if (e.partial) return { text: e.partial, thoughts: '', grounded: false, queries: [], model, cut: true };
-        if (e.quota && /exceeded your current quota|RESOURCE_EXHAUSTED/i.test(e.message || '') && !/grounding/i.test(e.message || '')) { markBad('gemini|quota', 600000); throw e; }
+        /* 429 ตอนค้นเว็บ = มักเป็นโควตาค้นเว็บหมด ไม่ใช่ทั้งคีย์ — ลองแบบไม่ค้นก่อน พักทั้งคีย์เฉพาะเมื่อแบบไม่ค้นก็ 429 ด้วย */
+        if (e.quota && search) { markBad(model + '|search', 600000); search = false; i--; continue; }
+        if (e.quota && /exceeded your current quota|RESOURCE_EXHAUSTED/i.test(e.message || '') && !/grounding/i.test(e.message || '')) { markBad('gemini|quota|' + String(env.GEMINI_KEY || '').slice(-6), 180000); throw e; }
         if (e.thinking && level) { markBad(model + '|' + level); continue; }     /* ลดระดับการคิด รุ่นเดิม */
         /* ค้นเว็บใช้ไม่ได้ในรุ่นนี้ — ลองรุ่นเดิมแบบไม่ค้น (โควตาค้นเต็มจำไว้แค่ 1 นาที) */
         if (e.tool && search && !(e.quota && !opts.search)) { markBad(model + '|search', e.quota ? 60000 : 600000); search = false; i--; continue; }
@@ -373,8 +378,21 @@ export async function fallbackAnswer(env, system, history, opts) {
   let list = media ? fallbackProviders(env, true).concat(fallbackProviders(env)) : fallbackProviders(env);
   /* ทุกเจ้าถูกพักไว้หมด — ดีกว่าตอบว่าไม่มีทางสำรอง ให้ลองทุกเจ้าอีกรอบ (อาจหายแล้ว) */
   if (!list.length) { BAD.forEach((_, k) => { if (k.startsWith('fb|')) BAD.delete(k) }); list = fallbackProviders(env, media).concat(media ? fallbackProviders(env) : []) }
+  /* ตัวสำรองค้นเว็บเองไม่ได้ — ค้น DuckDuckGo ให้ก่อนแล้วแนบผลไปในคำสั่งระบบ (ข้ามคำทักทายสั้น ๆ) */
+  let web = '';
+  const lastUser = [...clean].reverse().find(m => m.role === 'user');
+  const q = lastUser ? (typeof lastUser.content === 'string' ? lastUser.content
+    : (lastUser.content || []).filter(x => x.type === 'text').map(x => x.text).join(' ')).trim().slice(0, 200) : '';
+  /* DuckDuckGo บล็อกการเรียกจาก Cloudflare (ได้หน้า captcha) — ปิดไว้จนกว่าจะมีตัวค้นที่ใช้ได้ (TAVILY_API_KEY) */
+  if (q.length >= 8 && opts.search !== false && env.WEB_SEARCH_DDG === '1') {
+    const t0 = Date.now();
+    web = await fetchDuckDuckGoSearch(q);
+    trail(opts.meter, { model: 'duckduckgo', ok: !!web, ms: Date.now() - t0, err: web ? '' : 'no results' });
+    if (web && opts.onResearch) try { await opts.onResearch(q) } catch (e) {}
+  }
+  const WEB = web ? `\n\n[ผลค้นเว็บจริง ณ ตอนนี้ — ใช้ข้อมูลนี้ตอบ อ้างอิงแหล่ง ห้ามบอกว่าค้นไม่ได้]\n${web}` : '';
   for (const p of list) {
-    let sys = system + NO_TOOLS + FOCUS;
+    let sys = system + (web ? NO_TOOLS.replace(/เรื่องที่ต้องใช้ข้อมูลล่าสุด[^\n]*/, 'ข้อมูลล่าสุดให้ใช้ผลค้นเว็บด้านล่าง') : NO_TOOLS) + WEB + FOCUS;
     for (let attempt = 0; attempt < 2; attempt++) {
       const t0 = Date.now();
       try {
@@ -516,3 +534,35 @@ export function badState() {
   return out;
 }
 export function unpark(key) { if (key) BAD.delete(key); else BAD.clear() }
+
+/* ค้นเว็บสำรองด้วย DuckDuckGo (หน้า HTML ไม่ต้องใช้คีย์) — ใช้ตอน Gemini ค้นไม่ได้
+   คืนเป็นข้อความสรุป: หัวข้อ + เนื้อหาย่อ + ลิงก์ ไม่เกิน 6 รายการ · ล้มเหลว/ไม่เจอ = '' */
+export async function fetchDuckDuckGoSearch(query, { limit = 6, timeoutMs = 6000 } = {}) {
+  const q = String(query || '').trim();
+  if (!q) return '';
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const res = await fetch('https://html.duckduckgo.com/html/?q=' + encodeURIComponent(q), {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; CendonBot/1.0)', 'Accept-Language': 'th,en;q=0.8' },
+      signal: ac.signal
+    });
+    if (!res.ok) return '';
+    const html = await res.text();
+    const txt = s => String(s || '').replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#x27;|&#39;/g, "'")
+      .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
+    const link = h => { const m = /[?&]uddg=([^&]+)/.exec(h || ''); try { return m ? decodeURIComponent(m[1]) : h } catch (e) { return h } };
+    const out = [];
+    const re = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+    let m;
+    while ((m = re.exec(html)) && out.length < limit) {
+      const title = txt(m[2]), snip = txt(m[3]);
+      if (title && snip) out.push(`- ${title}: ${snip} (${link(m[1])})`);
+    }
+    return out.length ? `ผลค้นเว็บล่าสุดสำหรับ "${q}":\n${out.join('\n')}` : '';
+  } catch (e) {
+    return '';
+  } finally {
+    clearTimeout(timer);
+  }
+}
