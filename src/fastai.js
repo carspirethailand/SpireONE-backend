@@ -187,6 +187,7 @@ export async function geminiScope(env) {
   return 'gemini|' + [...new Uint8Array(digest)].slice(0, 12).map(x => x.toString(16).padStart(2, '0')).join('');
 }
 
+const lastQ = contents => { const u = [...(contents || [])].reverse().find(c => c.role === 'user'); return u ? (u.parts || []).map(p => p.text || '').join(' ').trim().slice(0, 200) : '' };
 export async function fastAnswer(env, opts) {
   if (!env.GEMINI_KEY) throw new Error('AI is not configured');
   let last = null;
@@ -200,6 +201,9 @@ export async function fastAnswer(env, opts) {
     const scoped = key => scope + '|' + key;
     if (bad(scoped(model))) { trail(opts.meter, { model, ok: false, ms: 0, err: 'ข้าม: รุ่นนี้เพิ่งล้ม (พักชั่วคราว)' }); continue; }
     let search = !!opts.search && !bad(scoped(model + '|search'));
+    if (opts.search && !search && !opts._web) { const t1 = Date.now(); opts._web = await webSearch(env, lastQ(opts.contents));
+      trail(opts.meter, { model: 'ค้นเว็บ:' + (opts._web.src || 'ไม่พบ'), ok: !!opts._web.text, ms: Date.now() - t1, err: opts._web.text ? '' : 'no results' });
+      if (opts._web.text) opts = { ...opts, system: (opts.system || '') + webBlock(opts._web) }; }
     for (let i = 0; i < ladder.length; i++) {
       const level = ladder[i];
       if (level && bad(scoped(model + '|' + level))) continue;
@@ -216,8 +220,14 @@ export async function fastAnswer(env, opts) {
         last = e;
         if (e.partial) return { text: e.partial, thoughts: '', grounded: false, queries: [], model, cut: true };
         /* Try without grounding once, then the next model; never assume all
-           models or a newly configured project share this failure. */
-        if (e.quota && search) { markBad(scoped(model + '|search'), 60000); search = false; i--; continue; }
+           models or a newly configured project share this failure.
+           Free Tier ใช้ Google Search ผ่าน API ไม่ได้ — ค้นเองแล้วแนบผลให้รุ่นเดิมตอบ */
+        if (e.quota && search) {
+          markBad(scoped(model + '|search'), 60000); search = false; i--;
+          if (!opts._web) { const t1 = Date.now(); opts._web = await webSearch(env, lastQ(opts.contents));
+            trail(opts.meter, { model: 'ค้นเว็บ:' + (opts._web.src || 'ไม่พบ'), ok: !!opts._web.text, ms: Date.now() - t1, err: opts._web.text ? '' : 'no results' });
+            if (opts._web.text) { opts = { ...opts, system: (opts.system || '') + webBlock(opts._web) }; try { opts.onSearch && opts.onSearch([lastQ(opts.contents)]) } catch (_) {} } }
+          continue; }
         if (e.thinking && level) { markBad(scoped(model + '|' + level)); continue; }
         /* ค้นเว็บใช้ไม่ได้ในรุ่นนี้ — ลองรุ่นเดิมแบบไม่ค้น (โควตาค้นเต็มจำไว้แค่ 1 นาที) */
         if (e.tool && search && !(e.quota && !opts.search)) { markBad(scoped(model + '|search'), e.quota ? 60000 : 600000); search = false; i--; continue; }
@@ -391,10 +401,11 @@ export async function fallbackAnswer(env, system, history, opts) {
   const q = lastUser ? (typeof lastUser.content === 'string' ? lastUser.content
     : (lastUser.content || []).filter(x => x.type === 'text').map(x => x.text).join(' ')).trim().slice(0, 200) : '';
   /* DuckDuckGo บล็อกการเรียกจาก Cloudflare (ได้หน้า captcha) — ปิดไว้จนกว่าจะมีตัวค้นที่ใช้ได้ (TAVILY_API_KEY) */
-  if (q.length >= 8 && opts.search !== false && env.WEB_SEARCH_DDG === '1') {
+  const needWeb = opts.search === true || /ค้น|ข่าว|ล่าสุด|ตอนนี้|วันนี้|ปีนี้|ราคา|เปิดตัว|รุ่นใหม่|อัปเดต|internet|อินเทอร์เน็ต|research|search|latest|news|price|launch|20[2-3]\d|25[6-9]\d/i.test(q);
+  if (q.length >= 6 && opts.search !== false && needWeb) {
     const t0 = Date.now();
-    web = await fetchDuckDuckGoSearch(q);
-    trail(opts.meter, { model: 'duckduckgo', ok: !!web, ms: Date.now() - t0, err: web ? '' : 'no results' });
+    const w = await webSearch(env, q); web = w.text;
+    trail(opts.meter, { model: 'ค้นเว็บ:' + (w.src || 'ไม่พบ'), ok: !!web, ms: Date.now() - t0, err: web ? '' : 'no results' });
     if (web && opts.onResearch) try { await opts.onResearch(q) } catch (e) {}
   }
   const WEB = web ? `\n\n[ผลค้นเว็บจริง ณ ตอนนี้ — ใช้ข้อมูลนี้ตอบ อ้างอิงแหล่ง ห้ามบอกว่าค้นไม่ได้]\n${web}` : '';
@@ -576,3 +587,55 @@ export async function fetchDuckDuckGoSearch(query, { limit = 6, timeoutMs = 6000
     clearTimeout(timer);
   }
 }
+
+
+/* ══ ค้นเว็บแยกจาก Gemini ══
+   Gemini Free Tier ใช้ Google Search ผ่าน API ไม่ได้ (429 ตั้งแต่ครั้งแรก) จึงค้นเองแล้วส่งผลให้โมเดลตอบ
+   ลำดับ: Tavily (ถ้ามี TAVILY_API_KEY) → Brave (BRAVE_API_KEY) → Google News RSS + Wikipedia (ฟรี ไม่ต้องมีคีย์) */
+const WEB_CACHE = new Map();
+const unent = s => String(s || '').replace(/<!\[CDATA\[|\]\]>/g, '').replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&').replace(/&quot;/g, '"')
+  .replace(/&#39;|&#x27;|&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
+async function getT(url, init = {}, ms = 5000) {
+  const ac = new AbortController(); const t = setTimeout(() => ac.abort(), ms);
+  try { return await fetch(url, { ...init, signal: ac.signal }) } finally { clearTimeout(t) }
+}
+export async function webSearch(env, query, { max = 6 } = {}) {
+  const q = String(query || '').trim().slice(0, 200);
+  if (!q) return { text: '', src: '' };
+  const hit = WEB_CACHE.get(q); if (hit && hit.exp > Date.now()) return hit.v;
+  const keep = v => { WEB_CACHE.set(q, { v, exp: Date.now() + 600000 }); if (WEB_CACHE.size > 200) WEB_CACHE.delete(WEB_CACHE.keys().next().value); return v };
+  const fmt = rows => rows.slice(0, max).map(r => `- ${r.title}${r.date ? ' (' + r.date + ')' : ''}: ${r.snip} [${r.url}]`).join('\n');
+  try {
+    if (env.TAVILY_API_KEY) {
+      const r = await getT('https://api.tavily.com/search', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + env.TAVILY_API_KEY },
+        body: JSON.stringify({ query: q, max_results: max, include_answer: true, search_depth: 'basic' }) }, 8000);
+      if (r.ok) { const d = await r.json(); const rows = (d.results || []).map(x => ({ title: x.title, snip: String(x.content || '').slice(0, 300), url: x.url }));
+        if (rows.length) return keep({ text: (d.answer ? 'สรุป: ' + d.answer + '\n' : '') + fmt(rows), src: 'tavily' }); }
+    }
+  } catch (e) {}
+  try {
+    if (env.BRAVE_API_KEY) {
+      const r = await getT('https://api.search.brave.com/res/v1/web/search?count=' + max + '&q=' + encodeURIComponent(q), { headers: { Accept: 'application/json', 'X-Subscription-Token': env.BRAVE_API_KEY } });
+      if (r.ok) { const d = await r.json(); const rows = ((d.web && d.web.results) || []).map(x => ({ title: unent(x.title), snip: unent(x.description), url: x.url, date: x.age }));
+        if (rows.length) return keep({ text: fmt(rows), src: 'brave' }); }
+    }
+  } catch (e) {}
+  /* ฟรีไม่ต้องมีคีย์: ข่าวล่าสุดจาก Google News (มีวันที่) + บทความ Wikipedia */
+  const rows = [];
+  const th = /[฀-๿]/.test(q);
+  try {
+    const r = await getT('https://news.google.com/rss/search?q=' + encodeURIComponent(q) + (th ? '&hl=th&gl=TH&ceid=TH:th' : '&hl=en-US&gl=US&ceid=US:en'), { headers: { 'User-Agent': 'Mozilla/5.0 CendonBot' } });
+    if (r.ok) { const x = await r.text();
+      for (const m of x.matchAll(/<item>([\s\S]*?)<\/item>/g)) {
+        const it = m[1], g = t => (it.match(new RegExp('<' + t + '[^>]*>([\\s\\S]*?)</' + t + '>')) || [])[1];
+        const date = g('pubDate'); rows.push({ title: unent(g('title')), snip: unent(g('description')).slice(0, 220), url: unent(g('link')), date: date ? new Date(date).toISOString().slice(0, 10) : '' });
+        if (rows.length >= max) break; } }
+  } catch (e) {}
+  try {
+    const lang = th ? 'th' : 'en';
+    const r = await getT(`https://${lang}.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit=2&srsearch=` + encodeURIComponent(q), { headers: { 'User-Agent': 'CendonBot/1.0' } });
+    if (r.ok) { const d = await r.json(); for (const x of ((d.query && d.query.search) || [])) rows.push({ title: 'Wikipedia: ' + x.title, snip: unent(x.snippet), url: `https://${lang}.wikipedia.org/wiki/` + encodeURIComponent(x.title.replace(/ /g, '_')) }) }
+  } catch (e) {}
+  return keep(rows.length ? { text: fmt(rows.slice(0, max + 2)), src: 'news+wiki' } : { text: '', src: '' });
+}
+export const webBlock = w => w && w.text ? `\n\n[ผลค้นเว็บจริง ณ ตอนนี้ (${w.src}) — ใช้ข้อมูลนี้ตอบเป็นหลัก ระบุแหล่ง/วันที่ ถ้าข้อมูลขัดกันให้บอก ห้ามบอกว่าค้นไม่ได้]\n${w.text}` : '';
