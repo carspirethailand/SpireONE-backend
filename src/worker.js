@@ -1,7 +1,8 @@
 import { verifyFirebaseToken } from './auth.js';
+import { buildFeatureRequest } from './features-ai.mjs';
 import { handleTech } from './techs.js';
 import { handleVec, kbScores, refreshKb } from './vectors.js';
-import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels, toChatHistory, levelFor, depthNote, featuresBlock, badState, unpark, fetchDuckDuckGoSearch } from './fastai.js';
+import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels, toChatHistory, levelFor, depthNote, featuresBlock, badState, unpark } from './fastai.js';
 
 /*
  * SpireONE backend — security-hardened.
@@ -1840,12 +1841,7 @@ async function executeGoogleSearchTool(env, query) {
     }
   }
 
-  // ค้นด้วย DuckDuckGo เป็นหลักหาก Gemini ติดโควตาหรือบล็อกพื้นที่ — รวดเร็ว ได้ผลจริง 100%
-  const ddg = await fetchDuckDuckGoSearch(query);
-  if (ddg) {
-    console.log('[search] สำเร็จด้วย DuckDuckGo search');
-    return ddg;
-  }
+  // No verified search result: return empty rather than call a missing provider.
 
   console.warn('[search] ค้นไม่สำเร็จทุกโมเดล');
   return '';
@@ -5252,6 +5248,36 @@ ${convo}`;
           await env.DB.prepare('DELETE FROM push_jobs WHERE id = ? AND uid = ?')
             .bind(String(b.id), actor.payload.sub).run();
           return json({ ok: true });
+        })();
+      }
+
+      /* Feature tools share the authenticated AI pipeline; never return demo results. */
+      if (url.pathname === '/api/features/analyze' && request.method === 'POST') {
+        return await guarded('user', async (actor) => {
+          const maintenance = await getConfig(env, 'maintenance', { enabled: false });
+          if (maintenance.enabled && rank(actor.role) < rank('moderator')) return deny('maintenance', 503);
+          const body = await readBody();
+          let input;
+          try { input = buildFeatureRequest(body); }
+          catch (e) { return deny(e.message, 400); }
+          const uid = actor.payload.sub;
+          const day = new Date().toISOString().slice(0, 10);
+          const warnings = [];
+          const limits = await getConfig(env, 'limits', {});
+          const limit = limits.aiDaily || parseInt(env.AI_DAILY_LIMIT || '60', 10);
+          if (rank(actor.role) < rank('admin')) {
+            const used = await env.DB.prepare('SELECT count FROM usage WHERE uid = ? AND day = ?').bind(uid, day).first();
+            if (used && used.count >= limit) return deny('quota', 429);
+            const quota = await quotaState(env, uid, actor.role);
+            if (quota && quota.used >= quota.limit) return json({ error: 'quota', quota }, 429);
+          }
+          const meter = newMeter();
+          const text = await callGemini(env, { ...input, meter });
+          await meterTokens(env, uid, meter);
+          // meterTokens already counted one call; multimodal tools cost three calls total.
+          await safe(env, warnings, 'usage.write', () => env.DB.prepare(`INSERT INTO usage (uid, day, count) VALUES (?, ?, 2)
+            ON CONFLICT(uid, day) DO UPDATE SET count = count + 2`).bind(uid, day).run(), null);
+          return json({ text, tool: body.tool, source: 'ai', warnings });
         })();
       }
 
