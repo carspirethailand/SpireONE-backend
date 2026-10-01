@@ -4610,7 +4610,12 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
             /* REST ใช้ชื่อ bidiGenerateContentSetup (liveConnectConstraints เป็นชื่อฝั่ง SDK — ส่งไปจะได้ 400 Unknown name) */
             bidiGenerateContentSetup: {
               model: 'models/' + liveModel,
-              generationConfig: { responseModalities: ['AUDIO'] },
+              /* ความหน่วง: ปิดการคิดยาวของรุ่น 2.5 (คิดก่อนพูดทำให้เงียบไป 1-3 วิ) */
+              generationConfig: { responseModalities: ['AUDIO'], ...(/2\.5/.test(liveModel) ? { thinkingConfig: { thinkingBudget: 0 } } : {}) },
+              /* จับจังหวะพูดไวขึ้น: รู้ว่าเริ่มพูดเร็ว และเงียบแค่ 0.35 วิ ก็ถือว่าพูดจบ ส่งให้ AI ตอบทันที */
+              realtimeInputConfig: { automaticActivityDetection: {
+                startOfSpeechSensitivity: 'START_SENSITIVITY_HIGH', endOfSpeechSensitivity: 'END_SENSITIVITY_HIGH',
+                prefixPaddingMs: 40, silenceDurationMs: 350 } },
               systemInstruction: { parts: [{ text: String(b.system || '').slice(0, 6000) }] },
               inputAudioTranscription: {},
               outputAudioTranscription: {},
