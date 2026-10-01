@@ -1660,6 +1660,29 @@ async function logAiEvent(env, ev) {
 /* จดสาเหตุล่าสุดที่ Gemini ใช้ไม่ได้ — ให้เจ้าของเห็นในหน้าตรวจระบบ จะได้รู้ว่าติดคีย์ โควตา หรือชื่อรุ่น
    จดไม่เกินนาทีละครั้ง ไม่ให้เขียนฐานข้อมูลทุกข้อความ */
 let aiErrAt = 0;
+/* รุ่นที่คุยสดได้ (เสียง + กล้อง) — ถาม Google ครั้งเดียวแล้วจำไว้ 6 ชั่วโมง
+   เรียง: GEMINI_LIVE_MODEL ที่ตั้งไว้ → native-audio เวอร์ชันใหม่สุด → รุ่นอื่นที่ Live ได้ → ชื่อสำรองที่รู้จัก */
+let LIVE_CACHE = null;
+async function liveModels(env, baseUrl, key) {
+  const fixed = env.GEMINI_LIVE_MODEL ? [env.GEMINI_LIVE_MODEL] : [];
+  const fallback = ['gemini-2.5-flash-native-audio-preview-09-2025', 'gemini-live-2.5-flash-preview', 'gemini-2.0-flash-live-001'];
+  if (!LIVE_CACHE || Date.now() - LIVE_CACHE.at > 6 * 3600000) {
+    let found = [];
+    try {
+      const r = await fetch(`${baseUrl}/v1beta/models?pageSize=1000`, { headers: { 'x-goog-api-key': key } });
+      if (r.ok) {
+        const d = await r.json();
+        found = (d.models || []).filter(m => (m.supportedGenerationMethods || []).includes('bidiGenerateContent'))
+          .map(m => String(m.name || '').replace(/^models\//, ''));
+      }
+    } catch (e) { /* ใช้ชื่อสำรอง */ }
+    const ver = n => { const m = n.match(/(\d+)\.(\d+)/); return m ? +m[1] * 100 + +m[2] : 0 };
+    found.sort((a, b) => (/native-audio/.test(b) - /native-audio/.test(a)) || (ver(b) - ver(a)) || (/preview/.test(a) - /preview/.test(b)));
+    LIVE_CACHE = { at: Date.now(), list: found };
+  }
+  return [...new Set([...fixed, ...LIVE_CACHE.list, ...fallback])].slice(0, 5);
+}
+
 function noteAiError(env, e) {
   if (Date.now() - aiErrAt < 60000) return;
   aiErrAt = Date.now();
@@ -4571,11 +4594,13 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
           const geminiKey = env.GEMINI_KEY;
           if (!geminiKey) return deny('AI is not configured', 500);
           const b = (await readBody()) || {};
-          const liveModel = env.GEMINI_LIVE_MODEL || 'gemini-live-2.5-flash-native-audio';
           const baseUrl = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
+          /* ชื่อรุ่น Live เปลี่ยนบ่อยและไม่ตรงกับชื่อฝั่ง Vertex — ถาม Google ว่ารุ่นไหนคุยสดได้ แล้วเลือกเอง
+             ตั้ง GEMINI_LIVE_MODEL ไว้ = ลองตัวนั้นก่อน */
+          const candidates = await liveModels(env, baseUrl, geminiKey);
           const now = Date.now();
 
-          const tokenReq = {
+          const mk = liveModel => ({
             uses: 1,
             expireTime: new Date(now + 30 * 60 * 1000).toISOString(),
             newSessionExpireTime: new Date(now + 2 * 60 * 1000).toISOString(),
@@ -4590,17 +4615,23 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
             },
           };
 
-          const res = await fetch(`${baseUrl}/v1alpha/auth_tokens`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey },
-            body: JSON.stringify(tokenReq),
-          });
-          if (!res.ok) {
-            const t = await res.text();
-            return deny(`Live token error ${res.status}: ${t.slice(0, 200)}`, 502);
+          let lastErr = '';
+          for (const liveModel of candidates) {
+            const res = await fetch(`${baseUrl}/v1alpha/auth_tokens`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey },
+              body: JSON.stringify(mk(liveModel)),
+            });
+            if (res.ok) {
+              const tok = await res.json();
+              return json({ token: tok.name, model: liveModel });
+            }
+            lastErr = `${liveModel} ${res.status}: ${(await res.text()).slice(0, 200)}`;
+            /* รุ่นนี้ใช้ไม่ได้ (ไม่มี/ไม่มีสิทธิ์) → ลองรุ่นถัดไป · คีย์ผิดหรือโควตาหมด → ลองต่อก็ไม่ช่วย */
+            if (![400, 404].includes(res.status)) break;
           }
-          const tok = await res.json();
-          return json({ token: tok.name, model: liveModel });
+          noteAiError(env, new Error('live: ' + lastErr));
+          return deny(`Live token error ${lastErr}`, 502);
         })();
       }
 
