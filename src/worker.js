@@ -1680,7 +1680,7 @@ async function liveModels(env, baseUrl, key) {
     found.sort((a, b) => (/native-audio/.test(b) - /native-audio/.test(a)) || (ver(b) - ver(a)) || (/preview/.test(a) - /preview/.test(b)));
     LIVE_CACHE = { at: Date.now(), list: found };
   }
-  return [...new Set([...fixed, ...LIVE_CACHE.list, ...fallback])].slice(0, 5);
+  return [...new Set([...fixed, ...LIVE_CACHE.list, ...fallback])].slice(0, 8);
 }
 
 function noteAiError(env, e) {
@@ -4597,7 +4597,10 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
           const baseUrl = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
           /* ชื่อรุ่น Live เปลี่ยนบ่อยและไม่ตรงกับชื่อฝั่ง Vertex — ถาม Google ว่ารุ่นไหนคุยสดได้ แล้วเลือกเอง
              ตั้ง GEMINI_LIVE_MODEL ไว้ = ลองตัวนั้นก่อน */
-          const candidates = await liveModels(env, baseUrl, geminiKey);
+          /* skip = รุ่นที่เบราว์เซอร์ลองแล้วสายหลุด (1011 ฯลฯ) → ข้ามไปรุ่นถัดไป */
+          const skip = new Set((Array.isArray(b.skip) ? b.skip : []).map(String));
+          let candidates = (await liveModels(env, baseUrl, geminiKey)).filter(m => !skip.has(m));
+          if (!candidates.length) return deny('Live token error: no working live model', 502);
           const now = Date.now();
 
           const mk = liveModel => ({
