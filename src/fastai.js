@@ -225,7 +225,7 @@ export async function fastAnswer(env, opts) {
        ปิดไว้ก่อน ใช้ตัวค้นเว็บของเราแทน · เปิด billing แล้วตั้ง GEMINI_GROUNDING=1 */
     let search = !!opts.search && env.GEMINI_GROUNDING === '1' && !bad(scoped(model + '|search'));
     if (opts.search && !search && !opts._web) { const t1 = Date.now(); opts._web = await webSearch(env, lastQ(opts.contents));
-      trail(opts.meter, { model: 'ค้นเว็บ:' + (opts._web.src || 'ไม่พบ'), ok: !!opts._web.text, ms: Date.now() - t1, err: opts._web.text ? '' : 'no results' });
+      trail(opts.meter, { model: 'ค้นเว็บ:' + (opts._web.src || 'ไม่พบ'), ok: !!opts._web.text, ms: Date.now() - t1, err: opts._web.stat || (opts._web.text ? '' : 'no results') });
       if (opts._web.text) opts = { ...opts, system: (opts.system || '') + webBlock(opts._web) }; }
     for (let i = 0; i < ladder.length; i++) {
       const level = ladder[i];
@@ -248,7 +248,7 @@ export async function fastAnswer(env, opts) {
         if (e.quota && search) {
           markBad(scoped(model + '|search'), 60000); search = false; i--;
           if (!opts._web) { const t1 = Date.now(); opts._web = await webSearch(env, lastQ(opts.contents));
-            trail(opts.meter, { model: 'ค้นเว็บ:' + (opts._web.src || 'ไม่พบ'), ok: !!opts._web.text, ms: Date.now() - t1, err: opts._web.text ? '' : 'no results' });
+            trail(opts.meter, { model: 'ค้นเว็บ:' + (opts._web.src || 'ไม่พบ'), ok: !!opts._web.text, ms: Date.now() - t1, err: opts._web.stat || (opts._web.text ? '' : 'no results') });
             if (opts._web.text) { opts = { ...opts, system: (opts.system || '') + webBlock(opts._web) }; try { opts.onSearch && opts.onSearch([lastQ(opts.contents)]) } catch (_) {} } }
           continue; }
         if (e.thinking && level) { markBad(scoped(model + '|' + level)); continue; }
@@ -429,7 +429,7 @@ export async function fallbackAnswer(env, system, history, opts) {
   if (q.length >= 6 && opts.search !== false && needWeb) {
     const t0 = Date.now();
     const w = await webSearch(env, q); web = w.text;
-    trail(opts.meter, { model: 'ค้นเว็บ:' + (w.src || 'ไม่พบ'), ok: !!web, ms: Date.now() - t0, err: web ? '' : 'no results' });
+    trail(opts.meter, { model: 'ค้นเว็บ:' + (w.src || 'ไม่พบ'), ok: !!web, ms: Date.now() - t0, err: w.stat || (web ? '' : 'no results') });
     if (web && opts.onResearch) try { await opts.onResearch(q) } catch (e) {}
   }
   const WEB = web ? `\n\n[ผลค้นเว็บจริง ณ ตอนนี้ — ใช้ข้อมูลนี้ตอบ อ้างอิงแหล่ง ห้ามบอกว่าค้นไม่ได้]\n${web}` : '';
@@ -628,7 +628,7 @@ export async function webSearch(env, query, { max = 6 } = {}) {
   if (!q) return { text: '', src: '' };
   const hit = WEB_CACHE.get(q); if (hit && hit.exp > Date.now()) return hit.v;
   const keep = v => { WEB_CACHE.set(q, { v, exp: Date.now() + 600000 }); if (WEB_CACHE.size > 200) WEB_CACHE.delete(WEB_CACHE.keys().next().value); return v };
-  const fmt = rows => rows.slice(0, max).map(r => `- ${r.title}${r.date ? ' (' + r.date + ')' : ''}: ${r.snip} [${r.url}]`).join('\n');
+  const fmt = rows => rows.slice(0, max + 4).map(r => `- ${r.title}${r.date ? ' (' + r.date + ')' : ''}: ${r.snip} [${r.url}]`).join('\n');
   try {
     if (env.TAVILY_API_KEY) {
       const r = await getT('https://api.tavily.com/search', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + env.TAVILY_API_KEY },
@@ -644,31 +644,46 @@ export async function webSearch(env, query, { max = 6 } = {}) {
         if (rows.length) return keep({ text: fmt(rows), src: 'brave' }); }
     }
   } catch (e) {}
-  /* ฟรีไม่ต้องมีคีย์: ข่าวล่าสุดจาก Google News (มีวันที่) + บทความ Wikipedia */
-  const rows = [];
+  /* ฟรีไม่ต้องมีคีย์ — ยิงหลายแหล่งพร้อมกัน แหล่งไหนช้า/ถูกบล็อกก็ไม่ลากทั้งหมด (แต่ละแหล่งรอไม่เกิน 4 วิ)
+     Google News (ไทย+อังกฤษ) · Bing News · Bing เว็บทั่วไป · Wikipedia (ไทย+อังกฤษ) */
   const th = /[฀-๿]/.test(q);
-  const news = async (hl, gl, ceid) => {
+  const UA = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36', 'Accept-Language': 'th,en;q=0.8' };
+  const rss = async (url, tag) => {
     try {
-      const r = await getT('https://news.google.com/rss/search?q=' + encodeURIComponent(q) + `&hl=${hl}&gl=${gl}&ceid=${ceid}`, { headers: { 'User-Agent': 'Mozilla/5.0 CendonBot' } });
-      if (!r.ok) return [];
+      const r = await getT(url, { headers: UA }, 4000);
+      if (!r.ok) return { tag, rows: [], err: String(r.status) };
       const x = await r.text(), out = [];
       for (const m of x.matchAll(/<item>([\s\S]*?)<\/item>/g)) {
         const it = m[1], g = t => (it.match(new RegExp('<' + t + '[^>]*>([\\s\\S]*?)</' + t + '>')) || [])[1];
         const d = g('pubDate'), ts = d ? Date.parse(d) : 0;
-        out.push({ title: unent(g('title')), snip: unent(g('description')).slice(0, 220), url: unent(g('link')), date: ts ? new Date(ts).toISOString().slice(0, 10) : '', ts });
-        if (out.length >= 12) break; }
-      return out;
-    } catch (e) { return [] }
+        const title = unent(g('title')); if (!title) continue;
+        out.push({ title, snip: unent(g('description')).slice(0, 240), url: unent(g('link')), date: ts ? new Date(ts).toISOString().slice(0, 10) : '', ts, tag });
+        if (out.length >= 10) break; }
+      return { tag, rows: out, err: out.length ? '' : 'empty' };
+    } catch (e) { return { tag, rows: [], err: e.name === 'AbortError' ? 'timeout' : 'fail' } }
   };
-  /* ค้นทั้งข่าวไทยและข่าวต่างประเทศพร้อมกัน — ข่าวรถรุ่นใหม่มักออกภาษาอังกฤษก่อน · เรียงข่าวใหม่สุดก่อน ตัดหัวข้อซ้ำ */
-  const [nt, ne] = await Promise.all([news('th', 'TH', 'TH:th'), news('en-US', 'US', 'US:en')]);
-  const seen = new Set();
-  for (const x of nt.concat(ne).sort((a, b) => b.ts - a.ts)) { const k = x.title.toLowerCase().slice(0, 60); if (seen.has(k)) continue; seen.add(k); rows.push(x); if (rows.length >= max) break; }
-  try {
-    const lang = th ? 'th' : 'en';
-    const r = await getT(`https://${lang}.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit=2&srsearch=` + encodeURIComponent(q), { headers: { 'User-Agent': 'CendonBot/1.0' } });
-    if (r.ok) { const d = await r.json(); for (const x of ((d.query && d.query.search) || [])) rows.push({ title: 'Wikipedia: ' + x.title, snip: unent(x.snippet), url: `https://${lang}.wikipedia.org/wiki/` + encodeURIComponent(x.title.replace(/ /g, '_')) }) }
-  } catch (e) {}
-  return keep(rows.length ? { text: fmt(rows.slice(0, max + 2)), src: 'news+wiki' } : { text: '', src: '' });
+  const wiki = async lang => {
+    try {
+      const r = await getT(`https://${lang}.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit=2&srsearch=` + encodeURIComponent(q.replace(/(^|\s)-\S+/g, '')), { headers: { 'User-Agent': 'CendonBot/1.0' } }, 4000);
+      if (!r.ok) return { tag: 'wiki-' + lang, rows: [], err: String(r.status) };
+      const d = await r.json();
+      const rows = ((d.query && d.query.search) || []).map(x => ({ title: 'Wikipedia: ' + x.title, snip: unent(x.snippet), url: `https://${lang}.wikipedia.org/wiki/` + encodeURIComponent(x.title.replace(/ /g, '_')), ts: 0, tag: 'wiki-' + lang }));
+      return { tag: 'wiki-' + lang, rows, err: rows.length ? '' : 'empty' };
+    } catch (e) { return { tag: 'wiki-' + lang, rows: [], err: 'fail' } }
+  };
+  const qe = encodeURIComponent(q);
+  const got = await Promise.all([
+    rss(`https://news.google.com/rss/search?q=${qe}&hl=th&gl=TH&ceid=TH:th`, 'gnews-th'),
+    rss(`https://news.google.com/rss/search?q=${qe}&hl=en-US&gl=US&ceid=US:en`, 'gnews-en'),
+    rss(`https://www.bing.com/news/search?q=${qe}&format=rss&setlang=${th ? 'th' : 'en'}`, 'bing-news'),
+    rss(`https://www.bing.com/search?q=${qe}&format=rss&setlang=${th ? 'th' : 'en'}`, 'bing-web'),
+    wiki('en'), th ? wiki('th') : Promise.resolve({ tag: 'wiki-th', rows: [], err: 'skip' }),
+  ]);
+  /* รวม: ข่าวใหม่สุดก่อน · ผลเว็บทั่วไปแทรกเข้ามา · ตัดหัวข้อซ้ำ · เก็บสถิติแต่ละแหล่งไว้ให้แผงผู้ดูแล */
+  const seen = new Set(), rows = [];
+  const pool = got.flatMap(g => g.rows).sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  for (const x of pool) { const k = x.title.toLowerCase().replace(/\W+/g, '').slice(0, 50); if (!k || seen.has(k)) continue; seen.add(k); rows.push(x); if (rows.length >= max + 4) break; }
+  const stat = got.map(g => g.tag + ':' + (g.rows.length || g.err)).join(' ');
+  return keep(rows.length ? { text: fmt(rows), src: 'multi', stat } : { text: '', src: '', stat });
 }
 export const webBlock = w => w && w.text ? `\n\n[ผลค้นเว็บจริง ณ ตอนนี้ (${w.src}) เรียงข่าวใหม่สุดก่อน — ข้อมูลนี้ใหม่กว่าความรู้ของคุณ ให้เชื่อข่าวเหล่านี้เป็นหลัก แม้ขัดกับที่คุณเคยรู้ (เช่น รุ่นที่คุณคิดว่ายังไม่เปิดตัว) ระบุแหล่ง/วันที่ ห้ามตอบว่ายังไม่มีข้อมูลยืนยันถ้าในผลค้นมีข่าวเรื่องนั้น]\n${w.text}` : '';
