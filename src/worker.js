@@ -4306,7 +4306,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                   search: true,
                   executeSearch: async (q) => await executeGoogleSearchTool(env, q),
                   executeMedia: async (p) => await executeDescribeMediaTool(env, msgs, p),
-                  level: levelFor(body.depth, question, hasMedia, body.skillIds), meter,
+                  depth: body.depth, level: levelFor(body.depth, question, hasMedia, body.skillIds), meter,
                   onThought: d => send({ type: 'reasoning', delta: d }),
                   onSearch: async q => { await send({ type: 'research', q: String(q).slice(0, 120) }); await send({ type: 'status', key: 'search', text: 'กำลังค้น: ' + String(q).slice(0, 60) }) },
                   onText: async d => {
@@ -4321,7 +4321,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                 console.error('[stream fast]', e.message);
                 noteAiError(env, e);
                 /* ทางสำรองพังด้วย — แนบสาเหตุของ Gemini ไปด้วย ผู้ดูแลจะเห็นต้นเหตุจริง ไม่ใช่แค่ของทางสำรอง */
-                const r = await fallbackAnswer(env, sys, historyOf(msgs), {
+                const r = await fallbackAnswer(env, sys, historyOf(msgs), { depth: body.depth,
                   geminiError: e, meter, onThought: d => send({ type: 'reasoning', delta: d }),
                   onText: async d => {
                     if (firstText) { firstText = false; await send({ type: 'status', key: 'write', text: 'กำลังเขียนคำตอบ' }); }
@@ -4497,14 +4497,14 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                 search: true,
                 executeSearch: async (q) => await executeGoogleSearchTool(env, q),
                 executeMedia: async (p) => await executeDescribeMediaTool(env, body.contents, p),
-                level: levelFor(body.depth, question, hasMedia, body.skillIds),
+                depth: body.depth, level: levelFor(body.depth, question, hasMedia, body.skillIds),
                 meter
               });
               agentOut = { text: cleanReply(r.text), reasoning: (r.thoughts || '').slice(0, 6000) };
             } catch (e) {
               console.error('[chat fast]', e.message);
               noteAiError(env, e);
-              const r = await fallbackAnswer(env, sys, historyOf(body.contents), { meter });
+              const r = await fallbackAnswer(env, sys, historyOf(body.contents), { meter, depth: body.depth });
               agentOut = { text: cleanReply(r.text), reasoning: (r.thoughts || '').slice(0, 6000) };
             }
             const text = (agentOut && agentOut.text) || '';

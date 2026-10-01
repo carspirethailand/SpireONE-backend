@@ -224,7 +224,7 @@ export async function fastAnswer(env, opts) {
     /* Google Search ของ Gemini ใช้ได้เฉพาะโปรเจกต์ที่เปิด billing — Free Tier ได้ 429 ทุกครั้ง เสียโควตาและเวลาเปล่า
        ปิดไว้ก่อน ใช้ตัวค้นเว็บของเราแทน · เปิด billing แล้วตั้ง GEMINI_GROUNDING=1 */
     let search = !!opts.search && env.GEMINI_GROUNDING === '1' && !bad(scoped(model + '|search'));
-    if (opts.search && !search && !opts._web) { const t1 = Date.now(); opts._web = await webSearch(env, lastQ(opts.contents));
+    if (opts.search && !search && !opts._web) { const t1 = Date.now(); opts._web = await webSearch(env, lastQ(opts.contents), { depth: opts.depth == null ? 1 : +opts.depth });
       trail(opts.meter, { model: 'ค้นเว็บ:' + (opts._web.src || 'ไม่พบ'), ok: !!opts._web.text, ms: Date.now() - t1, err: opts._web.stat || (opts._web.text ? '' : 'no results') });
       if (opts._web.text) opts = { ...opts, system: (opts.system || '') + webBlock(opts._web) }; }
     for (let i = 0; i < ladder.length; i++) {
@@ -247,7 +247,7 @@ export async function fastAnswer(env, opts) {
            Free Tier ใช้ Google Search ผ่าน API ไม่ได้ — ค้นเองแล้วแนบผลให้รุ่นเดิมตอบ */
         if (e.quota && search) {
           markBad(scoped(model + '|search'), 60000); search = false; i--;
-          if (!opts._web) { const t1 = Date.now(); opts._web = await webSearch(env, lastQ(opts.contents));
+          if (!opts._web) { const t1 = Date.now(); opts._web = await webSearch(env, lastQ(opts.contents), { depth: opts.depth == null ? 1 : +opts.depth });
             trail(opts.meter, { model: 'ค้นเว็บ:' + (opts._web.src || 'ไม่พบ'), ok: !!opts._web.text, ms: Date.now() - t1, err: opts._web.stat || (opts._web.text ? '' : 'no results') });
             if (opts._web.text) { opts = { ...opts, system: (opts.system || '') + webBlock(opts._web) }; try { opts.onSearch && opts.onSearch([lastQ(opts.contents)]) } catch (_) {} } }
           continue; }
@@ -428,7 +428,7 @@ export async function fallbackAnswer(env, system, history, opts) {
   const needWeb = opts.search === true || /ค้น|ข่าว|ล่าสุด|ตอนนี้|วันนี้|ปีนี้|ราคา|เปิดตัว|รุ่นใหม่|อัปเดต|internet|อินเทอร์เน็ต|research|search|latest|news|price|launch|20[2-3]\d|25[6-9]\d/i.test(q);
   if (q.length >= 6 && opts.search !== false && needWeb) {
     const t0 = Date.now();
-    const w = await webSearch(env, q); web = w.text;
+    const w = await webSearch(env, q, { depth: opts.depth == null ? 1 : +opts.depth }); web = w.text;
     trail(opts.meter, { model: 'ค้นเว็บ:' + (w.src || 'ไม่พบ'), ok: !!web, ms: Date.now() - t0, err: w.stat || (web ? '' : 'no results') });
     if (web && opts.onResearch) try { await opts.onResearch(q) } catch (e) {}
   }
@@ -623,11 +623,12 @@ async function getT(url, init = {}, ms = 5000) {
   const ac = new AbortController(); const t = setTimeout(() => ac.abort(), ms);
   try { return await fetch(url, { ...init, signal: ac.signal }) } finally { clearTimeout(t) }
 }
-export async function webSearch(env, query, { max = 6 } = {}) {
+export async function webSearch(env, query, { max = 6, depth = 1 } = {}) {
   const q = String(query || '').trim().slice(0, 200);
   if (!q) return { text: '', src: '' };
-  const hit = WEB_CACHE.get(q); if (hit && hit.exp > Date.now()) return hit.v;
-  const keep = v => { WEB_CACHE.set(q, { v, exp: Date.now() + 600000 }); if (WEB_CACHE.size > 200) WEB_CACHE.delete(WEB_CACHE.keys().next().value); return v };
+  const ck = q + '|' + depth;
+  const hit = WEB_CACHE.get(ck); if (hit && hit.exp > Date.now()) return hit.v;
+  const keep = v => { WEB_CACHE.set(ck, { v, exp: Date.now() + 600000 }); if (WEB_CACHE.size > 200) WEB_CACHE.delete(WEB_CACHE.keys().next().value); return v };
   const fmt = rows => rows.slice(0, max + 4).map(r => `- ${r.title}${r.date ? ' (' + r.date + ')' : ''}: ${r.snip} [${r.url}]`).join('\n');
   try {
     if (env.TAVILY_API_KEY) {
@@ -683,7 +684,54 @@ export async function webSearch(env, query, { max = 6 } = {}) {
   const seen = new Set(), rows = [];
   const pool = got.flatMap(g => g.rows).sort((a, b) => (b.ts || 0) - (a.ts || 0));
   for (const x of pool) { const k = x.title.toLowerCase().replace(/\W+/g, '').slice(0, 50); if (!k || seen.has(k)) continue; seen.add(k); rows.push(x); if (rows.length >= max + 4) break; }
-  const stat = got.map(g => g.tag + ':' + (g.rows.length || g.err)).join(' ');
-  return keep(rows.length ? { text: fmt(rows), src: 'multi', stat } : { text: '', src: '', stat });
+  let stat = got.map(g => g.tag + ':' + (g.rows.length || g.err)).join(' ');
+  /* อ่านเนื้อหาจริงตามโหมด: Sprint ไม่อ่าน · Grand Tour 2 เว็บ (3 วิ) · Atelier 4 เว็บ (6 วิ) — เลือกเว็บน่าเชื่อถือก่อน */
+  const READ = depth >= 2 ? { n: 4, ms: 6000 } : depth == 1 ? { n: 2, ms: 3000 } : null;
+  let pages = '';
+  if (READ && rows.length) {
+    const rd = await readPages(rows, q, READ.n, READ.ms);
+    pages = rd.text; stat += ' · อ่าน ' + rd.ok + '/' + rd.tried + ' เว็บ';
+  }
+  return keep(rows.length ? { text: fmt(rows) + (pages ? '\n\nเนื้อหาจากหน้าเว็บที่เปิดอ่าน:\n' + pages : ''), src: 'multi', stat } : { text: '', src: '', stat });
 }
 export const webBlock = w => w && w.text ? `\n\n[ผลค้นเว็บจริง ณ ตอนนี้ (${w.src}) เรียงข่าวใหม่สุดก่อน — ข้อมูลนี้ใหม่กว่าความรู้ของคุณ ให้เชื่อข่าวเหล่านี้เป็นหลัก แม้ขัดกับที่คุณเคยรู้ (เช่น รุ่นที่คุณคิดว่ายังไม่เปิดตัว) ระบุแหล่ง/วันที่ ห้ามตอบว่ายังไม่มีข้อมูลยืนยันถ้าในผลค้นมีข่าวเรื่องนั้น]\n${w.text}` : '';
+
+
+/* ══ เปิดอ่านหน้าเว็บจริง ══ */
+const TRUST = [
+  /* ผู้ผลิตรถ */ /(^|\.)(mitsubishi-motors|toyota|honda|isuzu|nissan|mazda|ford|bmw|mercedes-benz|hyundai|kia|suzuki|mg|byd|gwm|subaru|lexus|volvo|porsche|tesla)\.(com|co\.th|co\.jp|net)$/i,
+  /* สื่อรถไทย */ /(^|\.)(headlightmag\.com|autospinn\.com|grandprix\.co\.th|carvariety\.com|autodeft\.com|checkraka\.com|one2car\.com|motortrivia\.com|autostation\.com|car250\.com|tnews\.co\.th)$/i,
+  /* สื่อรถต่างประเทศ */ /(^|\.)(carscoops\.com|motor1\.com|autocar\.co\.uk|caranddriver\.com|topgear\.com|carexpert\.com\.au|drive\.com\.au|paultan\.org|carsguide\.com\.au|autoblog\.com|motortrend\.com|whichcar\.com\.au|edmunds\.com)$/i,
+  /* ข่าวทั่วไป/ทางการ */ /(^|\.)(thairath\.co\.th|bangkokpost\.com|nationthailand\.com|matichon\.co\.th|prachachat\.net|thaipbs\.or\.th|reuters\.com|bbc\.com|apnews\.com|tmd\.go\.th|go\.th)$/i,
+];
+const hostOf = u => { try { return new URL(u).hostname.replace(/^www\./, '') } catch (e) { return '' } };
+/* ลิงก์ Bing News เป็นลิงก์ผ่าน (apiclick ...&url=) — ดึง url จริงออกมา · ลิงก์ Google News เปิดตรงไม่ได้ ข้าม */
+function realUrl(u) {
+  try { const x = new URL(u); if (/bing\.com$/.test(x.hostname) && x.searchParams.get('url')) return x.searchParams.get('url');
+    if (/news\.google\.com$/.test(x.hostname)) return ''; return u } catch (e) { return '' }
+}
+function pageText(html, q) {
+  let t = String(html || '').replace(/<(script|style|noscript|svg|nav|footer|header|aside|form)[\s\S]*?<\/\1>/gi, ' ');
+  const art = t.match(/<article[\s\S]*?<\/article>/i); if (art) t = art[0];
+  t = unent(t);
+  /* เลือกช่วงที่มีคำค้นหนาแน่นที่สุด ไม่ใช่แค่ต้นหน้า (ซึ่งมักเป็นเมนู) */
+  const words = String(q).toLowerCase().split(/\s+/).filter(w => w.length > 2 && !w.startsWith('-'));
+  if (t.length <= 1600 || !words.length) return t.slice(0, 1600);
+  let best = 0, bestAt = 0;
+  for (let i = 0; i < t.length - 1600; i += 400) { const seg = t.slice(i, i + 1600).toLowerCase(); const sc = words.reduce((n, w) => n + seg.split(w).length - 1, 0); if (sc > best) { best = sc; bestAt = i } }
+  return t.slice(bestAt, bestAt + 1600);
+}
+export async function readPages(rows, q, n, budgetMs) {
+  const score = u => { const h = hostOf(u); const i = TRUST.findIndex(re => re.test(h)); return i < 0 ? 9 : i };
+  const cand = rows.map(r => ({ ...r, real: realUrl(r.url) })).filter(r => r.real && !/wikipedia\.org/.test(r.real))
+    .sort((a, b) => score(a.real) - score(b.real)).slice(0, n);
+  const UA = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36', 'Accept-Language': 'th,en;q=0.8', Accept: 'text/html' };
+  const res = await Promise.all(cand.map(async r => {
+    try { const x = await getT(r.real, { headers: UA, redirect: 'follow' }, budgetMs);
+      if (!x.ok || !/html/i.test(x.headers.get('content-type') || '')) return '';
+      const body = (await x.text()).slice(0, 400000), txt = pageText(body, q);
+      return txt.length > 200 ? `【${r.title}】 (${hostOf(r.real)}${r.date ? ', ' + r.date : ''})\n${txt}` : '';
+    } catch (e) { return '' } }));
+  const ok = res.filter(Boolean);
+  return { text: ok.join('\n\n'), ok: ok.length, tried: cand.length };
+}
