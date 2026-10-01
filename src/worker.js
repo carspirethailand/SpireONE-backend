@@ -4613,7 +4613,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                 outputAudioTranscription: {},
               },
             },
-          };
+          });
 
           let lastErr = '';
           for (const liveModel of candidates) {
