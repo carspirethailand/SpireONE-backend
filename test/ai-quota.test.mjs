@@ -1,7 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {fastAnswer,unpark,badState,geminiScope} from '../src/fastai.js';
-const env=key=>({GEMINI_KEY:key,GEMINI_CHAT_MODEL:'gemini-3.8-flash',GEMINI_SEARCH_MODEL:'gemini-3.8-flash',GEMINI_MODEL:'gemini-3.8-flash'});
+const env=key=>({GEMINI_KEY:key,GEMINI_CHAT_MODEL:'gemini-3.8-flash',GEMINI_SEARCH_MODEL:'gemini-3.8-flash',GEMINI_MODEL:'gemini-3.8-flash',GEMINI_GROUNDING:'1'});
 const opts={contents:[{role:'user',parts:[{text:'Test-only question'}]}],level:'low',search:true};
 const success=grounded=>new Response('data: '+JSON.stringify({candidates:[{content:{parts:[{text:'Fixture transport result'}]},...(grounded?{groundingMetadata:{webSearchQueries:['Test-only query']}}:{})}]})+'\n\n',{headers:{'Content-Type':'text/event-stream'}});
 const limited=()=>new Response(JSON.stringify({error:{status:'RESOURCE_EXHAUSTED',message:'Test-only quota violation'}}),{status:429});

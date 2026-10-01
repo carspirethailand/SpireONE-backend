@@ -200,7 +200,9 @@ export async function fastAnswer(env, opts) {
   for (const model of chatModels(env)) {
     const scoped = key => scope + '|' + key;
     if (bad(scoped(model))) { trail(opts.meter, { model, ok: false, ms: 0, err: 'ข้าม: รุ่นนี้เพิ่งล้ม (พักชั่วคราว)' }); continue; }
-    let search = !!opts.search && !bad(scoped(model + '|search'));
+    /* Google Search ของ Gemini ใช้ได้เฉพาะโปรเจกต์ที่เปิด billing — Free Tier ได้ 429 ทุกครั้ง เสียโควตาและเวลาเปล่า
+       ปิดไว้ก่อน ใช้ตัวค้นเว็บของเราแทน · เปิด billing แล้วตั้ง GEMINI_GROUNDING=1 */
+    let search = !!opts.search && env.GEMINI_GROUNDING === '1' && !bad(scoped(model + '|search'));
     if (opts.search && !search && !opts._web) { const t1 = Date.now(); opts._web = await webSearch(env, lastQ(opts.contents));
       trail(opts.meter, { model: 'ค้นเว็บ:' + (opts._web.src || 'ไม่พบ'), ok: !!opts._web.text, ms: Date.now() - t1, err: opts._web.text ? '' : 'no results' });
       if (opts._web.text) opts = { ...opts, system: (opts.system || '') + webBlock(opts._web) }; }
@@ -345,14 +347,15 @@ export function fallbackProviders(env, media) {
       headers: { 'HTTP-Referer': 'https://carspirethailand.com', 'X-Title': 'Cendon' } });
     return L.filter(p => !bad('fb|' + p.src));
   }
-  /* Groq ก่อน (ฟรี เร็ว) — ถ้าชื่อรุ่นหลักใช้ไม่ได้กับคีย์นี้ มีรุ่นสำรอง (ตัวเดียวกับที่ใช้ดูรูป) */
+  /* Cerebras ก่อน (เจ้าของเลือกเป็นตัวสำรองหลัก เสถียร เร็ว) → Groq → Workers AI → OpenRouter */
+  if (env.CEREBRAS_API_KEY) L.push({ src: 'cerebras', url: `${env.CEREBRAS_BASE_URL || 'https://api.cerebras.ai/v1'}/chat/completions`,
+    key: env.CEREBRAS_API_KEY, model: env.CEREBRAS_MODEL || 'gpt-oss-120b', extra: { reasoning_effort: 'low' } });
+  /* Groq (ฟรี เร็ว) — ถ้าชื่อรุ่นหลักใช้ไม่ได้กับคีย์นี้ มีรุ่นสำรอง (ตัวเดียวกับที่ใช้ดูรูป) */
   if (env.GROQ_API_KEY) {
     const gu = `${env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1'}/chat/completions`;
     L.push({ src: 'groq', url: gu, key: env.GROQ_API_KEY, model: env.GROQ_MODEL || 'openai/gpt-oss-120b' });
     L.push({ src: 'groq-alt', url: gu, key: env.GROQ_API_KEY, model: 'meta-llama/llama-4-scout-17b-16e-instruct' });
   }
-  if (env.CEREBRAS_API_KEY) L.push({ src: 'cerebras', url: `${env.CEREBRAS_BASE_URL || 'https://api.cerebras.ai/v1'}/chat/completions`,
-    key: env.CEREBRAS_API_KEY, model: env.CEREBRAS_MODEL || 'gpt-oss-120b', extra: { reasoning_effort: 'low' } });
   if (env.AI) L.push({ src: 'workers-ai', ai: true, model: env.CF_AI_FALLBACK_MODEL || '@cf/meta/llama-3.3-70b-instruct-fp8-fast' });
   if (env.OPENROUTER_API_KEY) L.push({ src: 'openrouter', url: `${env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1'}/chat/completions`,
     key: env.OPENROUTER_API_KEY, model: env.OPENROUTER_MODEL || 'openrouter/free',   /* รุ่นฟรีเฉพาะชื่อถูกถอดบ่อย ใช้ตัวเลือกฟรีอัตโนมัติ แล้วกรองคำตอบขยะด้วย isJunk */
