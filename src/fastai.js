@@ -234,7 +234,7 @@ export async function fastAnswer(env, opts) {
       if (left < 1500) throw last || new Error('gemini: time budget used');
       const t0 = Date.now();
       try {
-        const r = await streamOnce(env, model, { ...opts, level, search, headerMs: Math.min(9000, left) });
+        const r = await streamOnce(env, model, { ...opts, level, search, headerMs: Math.min(search ? 16000 : 9000, left) });
         trail(opts.meter, { model, level, search, ok: true, ms: Date.now() - t0, grounded: r.grounded });
         return r;
       } catch (e) {
@@ -375,7 +375,7 @@ export function fallbackProviders(env, media) {
   if (env.GROQ_API_KEY) {
     const gu = `${env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1'}/chat/completions`;
     L.push({ src: 'groq', url: gu, key: env.GROQ_API_KEY, model: env.GROQ_MODEL || 'openai/gpt-oss-120b' });
-    L.push({ src: 'groq-alt', url: gu, key: env.GROQ_API_KEY, model: 'meta-llama/llama-4-scout-17b-16e-instruct' });
+    L.push({ src: 'groq-alt', url: gu, key: env.GROQ_API_KEY, model: env.GROQ_ALT_MODEL || 'llama-3.3-70b-versatile' });
   }
   if (env.AI) L.push({ src: 'workers-ai', ai: true, model: env.CF_AI_FALLBACK_MODEL || '@cf/meta/llama-3.3-70b-instruct-fp8-fast' });
   if (env.OPENROUTER_API_KEY) L.push({ src: 'openrouter', url: `${env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1'}/chat/completions`,
@@ -433,12 +433,21 @@ export async function fallbackAnswer(env, system, history, opts) {
     if (web && opts.onResearch) try { await opts.onResearch(q) } catch (e) {}
   }
   const WEB = web ? `\n\n[ผลค้นเว็บจริง ณ ตอนนี้ — ใช้ข้อมูลนี้ตอบ อ้างอิงแหล่ง ห้ามบอกว่าค้นไม่ได้]\n${web}` : '';
+  /* รุ่นสำรองมักมองข้ามข้อมูลยาวในคำสั่งระบบ แล้วตอบว่า "ไม่มีข้อมูล" — แปะผลค้นไว้ในข้อความล่าสุดของผู้ใช้ด้วย ให้อยู่ใกล้คำถามที่สุด */
+  const withWeb = msgs => {
+    if (!web) return msgs;
+    const i = msgs.map(m => m.role).lastIndexOf('user');
+    if (i < 0 || typeof msgs[i].content !== 'string') return msgs;
+    const out = msgs.slice();
+    out[i] = { ...out[i], content: `ข้อมูลที่ค้นจากเว็บมาให้แล้ว (ใช้ตอบได้เลย):\n${web.slice(0, 9000)}\n\n---\nคำถามของฉัน: ${out[i].content}\n\n(สรุปจากข้อมูลข้างบนเท่าที่มี บอกแหล่งที่มา ถ้าข้อมูลมีแค่บางส่วนให้ตอบส่วนที่มีพร้อมบอกว่าส่วนไหนยังไม่ยืนยัน ห้ามตอบว่าไม่มีข้อมูลถ้าข้างบนมีเนื้อหาเกี่ยวข้อง)` };
+    return out;
+  };
   for (const p of list) {
     let sys = system + (web ? NO_TOOLS.replace(/เรื่องที่ต้องใช้ข้อมูลล่าสุด[^\n]*/, 'ข้อมูลล่าสุดให้ใช้ผลค้นเว็บด้านล่าง') : NO_TOOLS) + WEB + FOCUS;
     for (let attempt = 0; attempt < 2; attempt++) {
       const t0 = Date.now();
       try {
-        const r = await streamProvider(env, p, [{ role: 'system', content: sys }, ...(p.vision ? clean : flat(clean))], opts);
+        const r = await streamProvider(env, p, [{ role: 'system', content: sys }, ...(p.vision ? clean : withWeb(flat(clean)))], opts);
         trail(opts.meter, { model: p.src + ':' + p.model, ok: !!r.text.trim() && !isJunk(r.text), ms: Date.now() - t0, err: isJunk(r.text) ? 'junk answer' : (r.text.trim() ? '' : 'empty') });
         if (isJunk(r.text)) break;
         if (r.text.trim()) return { ...r, src: p.src };
