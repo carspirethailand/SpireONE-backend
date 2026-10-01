@@ -2,7 +2,7 @@ import { verifyFirebaseToken } from './auth.js';
 import { buildFeatureRequest } from './features-ai.mjs';
 import { handleTech } from './techs.js';
 import { handleVec, kbScores, refreshKb } from './vectors.js';
-import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels, toChatHistory, levelFor, depthNote, featuresBlock, badState, unpark } from './fastai.js';
+import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels, toChatHistory, levelFor, depthNote, featuresBlock, badState, geminiScope, unpark } from './fastai.js';
 
 /*
  * SpireONE backend — security-hardened.
@@ -4952,11 +4952,11 @@ ${convo}`;
               avgMs: h.length ? Math.round(h.reduce((a, e) => a + (e.ms || 0), 0) / h.length) : 0 };
           } catch (e) {}
           try { const le = await env.DB.prepare("SELECT value FROM config WHERE key = 'ai_last_error'").first(); lastAiError = le && le.value ? JSON.parse(le.value) : null } catch (e) {}
-          const parked = badState();
+          const parked = badState(await geminiScope(env));
           const primaryModel = env.OPENROUTER_MODEL || 'openrouter/free';
           const fullChain = [primaryModel].concat(chatModels(env));
           return json({ now: Date.now(),
-            chain: fullChain.map(m => ({ name: m, parked: parked.find(p => p.key === m) || null, searchParked: parked.find(p => p.key === m + '|search') || null })),
+            chain: fullChain.map(m => ({ name: m, parked: parked.find(p => p.model === m) || null, searchParked: parked.find(p => p.model === m + '|search') || null })),
             fallbacks: fallbackProviders(env).concat(fallbackProviders(env, true)).map(p => ({ name: p.src + ':' + p.model })),
             keys: { gemini: !!env.GEMINI_KEY, groq: !!env.GROQ_API_KEY, cerebras: !!env.CEREBRAS_API_KEY, openrouter: !!env.OPENROUTER_API_KEY, workersAI: !!env.AI },
             parked, stats, events, lastAiError });
@@ -5012,6 +5012,7 @@ ${convo}`;
             env: {
               aiConfigured: !!env.GEMINI_KEY,
               model: env.GEMINI_MODEL || 'gemini-3.5-flash-lite',
+              searchModel: env.GEMINI_SEARCH_MODEL || '',
               fallbackModel: env.GEMINI_FALLBACK_MODEL || '',
               liveModel: env.GEMINI_LIVE_MODEL || '',
               aiDailyLimit: parseInt(env.AI_DAILY_LIMIT || '60', 10),

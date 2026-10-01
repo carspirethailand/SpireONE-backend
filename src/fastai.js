@@ -179,23 +179,30 @@ const BAD = new Map();
 const bad = k => { const v = BAD.get(k); return v && Date.now() < v };
 const markBad = (k, ms = 600000) => BAD.set(k, Date.now() + ms);
 
+/* Never carry per-project/model throttles across a credential change. The hash,
+   not the secret or its suffix, is safe to display in admin diagnostics. */
+export async function geminiScope(env) {
+  const bytes = new TextEncoder().encode(String(env.GEMINI_BASE_URL || '') + '\n' + env.GEMINI_KEY);
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return 'gemini|' + [...new Uint8Array(digest)].slice(0, 12).map(x => x.toString(16).padStart(2, '0')).join('');
+}
+
 export async function fastAnswer(env, opts) {
   if (!env.GEMINI_KEY) throw new Error('AI is not configured');
   let last = null;
   const want = opts.level || 'low';
   const ladder = want === 'medium' ? ['medium', 'low', null] : want === 'minimal' ? ['minimal', 'low', null] : ['low', null];
   /* งบเวลารวมก่อนได้คำแรก 14 วินาที — เกินนั้นไปทางสำรองเลย ผู้ใช้ไม่ต้องนั่งรอไล่ลองทีละรุ่น */
-  /* โควตาทั้งคีย์หมด ("exceeded your current quota") — ทุกรุ่นใช้โควตาก้อนเดียวกัน ไม่ต้องไล่ลองทีละรุ่น */
-  /* พักตามคีย์ — เปลี่ยนคีย์ใหม่แล้วลองทันที ไม่ต้องรอ · จดใน trail ให้แผงผู้ดูแลเห็นว่าข้ามเพราะอะไร */
-  const QK = 'gemini|quota|' + String(env.GEMINI_KEY || '').slice(-6);
-  if (bad(QK)) { trail(opts.meter, { model: 'gemini', ok: false, ms: 0, err: 'ข้าม: คีย์นี้เพิ่งติดโควตา (พัก 3 นาที)' }); throw new Error('gemini: key quota exhausted (parked)'); }
+  /* A 429 may be RPM/TPM or model-specific, not exhaustion of every model. */
+  const scope = await geminiScope(env);
   const until = Date.now() + 14000;
   for (const model of chatModels(env)) {
-    if (bad(model)) { trail(opts.meter, { model, ok: false, ms: 0, err: 'ข้าม: รุ่นนี้เพิ่งล้ม (พักชั่วคราว)' }); continue; }
-    let search = !!opts.search && !bad(model + '|search');
+    const scoped = key => scope + '|' + key;
+    if (bad(scoped(model))) { trail(opts.meter, { model, ok: false, ms: 0, err: 'ข้าม: รุ่นนี้เพิ่งล้ม (พักชั่วคราว)' }); continue; }
+    let search = !!opts.search && !bad(scoped(model + '|search'));
     for (let i = 0; i < ladder.length; i++) {
       const level = ladder[i];
-      if (level && bad(model + '|' + level)) continue;
+      if (level && bad(scoped(model + '|' + level))) continue;
       const left = until - Date.now();
       if (left < 1500) throw last || new Error('gemini: time budget used');
       const t0 = Date.now();
@@ -208,14 +215,14 @@ export async function fastAnswer(env, opts) {
         trail(opts.meter, { model, level, search, ok: false, ms: Date.now() - t0, err: (em.slice(0, 120) + (qd ? ' ‖ ' + qd : '')).slice(0, 300) });
         last = e;
         if (e.partial) return { text: e.partial, thoughts: '', grounded: false, queries: [], model, cut: true };
-        /* 429 ตอนค้นเว็บ = มักเป็นโควตาค้นเว็บหมด ไม่ใช่ทั้งคีย์ — ลองแบบไม่ค้นก่อน พักทั้งคีย์เฉพาะเมื่อแบบไม่ค้นก็ 429 ด้วย */
-        if (e.quota && search) { markBad(model + '|search', 600000); search = false; i--; continue; }
-        if (e.quota && /exceeded your current quota|RESOURCE_EXHAUSTED/i.test(e.message || '') && !/grounding/i.test(e.message || '')) { markBad('gemini|quota|' + String(env.GEMINI_KEY || '').slice(-6), 180000); throw e; }
-        if (e.thinking && level) { markBad(model + '|' + level); continue; }     /* ลดระดับการคิด รุ่นเดิม */
+        /* Try without grounding once, then the next model; never assume all
+           models or a newly configured project share this failure. */
+        if (e.quota && search) { markBad(scoped(model + '|search'), 60000); search = false; i--; continue; }
+        if (e.thinking && level) { markBad(scoped(model + '|' + level)); continue; }
         /* ค้นเว็บใช้ไม่ได้ในรุ่นนี้ — ลองรุ่นเดิมแบบไม่ค้น (โควตาค้นเต็มจำไว้แค่ 1 นาที) */
-        if (e.tool && search && !(e.quota && !opts.search)) { markBad(model + '|search', e.quota ? 60000 : 600000); search = false; i--; continue; }
-        if (e.dead) markBad(model);
-        else if (e.quota || e.busy) markBad(model, 60000);                     /* ล่ม/เต็มชั่วคราว ข้ามรุ่นนี้ 1 นาที */
+        if (e.tool && search && !(e.quota && !opts.search)) { markBad(scoped(model + '|search'), e.quota ? 60000 : 600000); search = false; i--; continue; }
+        if (e.dead) markBad(scoped(model));
+        else if (e.quota || e.busy) markBad(scoped(model), 60000);
         break;                                                                 /* ข้ามไปรุ่นถัดไป */
       }
     }
@@ -528,9 +535,12 @@ export function featuresBlock() {
 /* ══ ข้อมูลสดสำหรับแผงผู้ดูแล ══ */
 function trail(meter, step) { if (meter) (meter.trail = meter.trail || []).push({ at: Date.now(), ...step }) }
 /* รุ่น/ผู้ให้บริการที่ถูกพักไว้ตอนนี้ และจะกลับมาเมื่อไร */
-export function badState() {
+export function badState(scope) {
   const now = Date.now(), out = [];
-  BAD.forEach((until, k) => { if (until > now) out.push({ key: k, backInSec: Math.round((until - now) / 1000) }) });
+  BAD.forEach((until, k) => {
+    if(scope&&k.startsWith('gemini|')&&!k.startsWith(scope+'|'))return;
+    if (until > now) out.push({ key: k, model: k.startsWith('gemini|') ? k.split('|').slice(2).join('|') : k, backInSec: Math.round((until - now) / 1000) });
+  });
   return out;
 }
 export function unpark(key) { if (key) BAD.delete(key); else BAD.clear() }
