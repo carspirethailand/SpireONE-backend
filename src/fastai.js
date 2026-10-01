@@ -187,7 +187,28 @@ export async function geminiScope(env) {
   return 'gemini|' + [...new Uint8Array(digest)].slice(0, 12).map(x => x.toString(16).padStart(2, '0')).join('');
 }
 
-const lastQ = contents => { const u = [...(contents || [])].reverse().find(c => c.role === 'user'); return u ? (u.parts || []).map(p => p.text || '').join(' ').trim().slice(0, 200) : '' };
+/* คำค้นจากบริบท: ข้อความล่าสุด + ข้อความก่อนหน้าของผู้ใช้ (ไว้เข้าใจ "ไม่ครับ ผมขอข้อมูล pajero" ที่ต่อจากเรื่องเดิม) */
+const lastQ = contents => searchQuery([...(contents || [])].filter(c => c.role === 'user').map(u => (u.parts || []).map(p => p.text || '').join(' ')));
+export function searchQuery(userTexts) {
+  const FILL = /^(please|search|research|me|the|info|about|find|for|of|a|an|and|or|to)$/i;
+  const TH_FILL = /ไม่ครับ|ไม่ค่ะ|ครับ|ค่ะ|นะคะ|นะ|ช่วยค้นหา|ค้นหา|ช่วย|หน่อย|ผมขอ|ฉันขอ|ขอดู|ขอ|ข้อมูลทั้งหมด|ข้อมูล|ทั้งหมด|อยากรู้|เกี่ยวกับ|บอกหน่อย/g;
+  const neg = new Set(), pos = [];
+  const add = (w, n) => { w = w.toLowerCase(); if (!w || FILL.test(w)) return; if (n) neg.add(w); else if (!pos.includes(w)) pos.push(w) };
+  const take = t => {
+    /* "not pajero sport" / "ไม่ใช่ pajero sport" → คำในวลีนี้เป็นคำที่ไม่ต้องการ (เว้นคำที่เป็นคำหลักอยู่แล้ว) */
+    const parts = String(t || '').replace(TH_FILL, ' ').split(/(?:\bnot\b|ไม่ใช่)/i);
+    parts.forEach((ph, i) => { const seg = i === 0 ? ph : ph.split(/[,.;!?]/)[0], rest = i === 0 ? '' : ph.slice(seg.length);
+      seg.replace(/[?!.,"'()]/g, ' ').split(/\s+/).forEach(w => add(w, i > 0));
+      rest.replace(/[?!.,"'()]/g, ' ').split(/\s+/).forEach(w => add(w, false)); });
+  };
+  const list = (userTexts || []).filter(Boolean);
+  if (!list.length) return '';
+  take(list[list.length - 1]);
+  /* ข้อความล่าสุดสั้น/คลุมเครือ ("ไม่ครับ ผมขอข้อมูล pajero") → เติมคำสำคัญจากข้อความก่อนหน้า */
+  for (let i = list.length - 2; i >= 0 && pos.length < 5; i--) take(list[i]);
+  const minus = [...neg].filter(w => !pos.includes(w)).map(w => '-' + w);
+  return pos.concat(minus).join(' ').slice(0, 160);
+}
 export async function fastAnswer(env, opts) {
   if (!env.GEMINI_KEY) throw new Error('AI is not configured');
   let last = null;
@@ -401,8 +422,8 @@ export async function fallbackAnswer(env, system, history, opts) {
   /* ตัวสำรองค้นเว็บเองไม่ได้ — ค้น DuckDuckGo ให้ก่อนแล้วแนบผลไปในคำสั่งระบบ (ข้ามคำทักทายสั้น ๆ) */
   let web = '';
   const lastUser = [...clean].reverse().find(m => m.role === 'user');
-  const q = lastUser ? (typeof lastUser.content === 'string' ? lastUser.content
-    : (lastUser.content || []).filter(x => x.type === 'text').map(x => x.text).join(' ')).trim().slice(0, 200) : '';
+  const txt = m => typeof m.content === 'string' ? m.content : (m.content || []).filter(x => x.type === 'text').map(x => x.text).join(' ');
+  const q = searchQuery(clean.filter(m => m.role === 'user').map(txt));
   /* DuckDuckGo บล็อกการเรียกจาก Cloudflare (ได้หน้า captcha) — ปิดไว้จนกว่าจะมีตัวค้นที่ใช้ได้ (TAVILY_API_KEY) */
   const needWeb = opts.search === true || /ค้น|ข่าว|ล่าสุด|ตอนนี้|วันนี้|ปีนี้|ราคา|เปิดตัว|รุ่นใหม่|อัปเดต|internet|อินเทอร์เน็ต|research|search|latest|news|price|launch|20[2-3]\d|25[6-9]\d/i.test(q);
   if (q.length >= 6 && opts.search !== false && needWeb) {
@@ -626,14 +647,23 @@ export async function webSearch(env, query, { max = 6 } = {}) {
   /* ฟรีไม่ต้องมีคีย์: ข่าวล่าสุดจาก Google News (มีวันที่) + บทความ Wikipedia */
   const rows = [];
   const th = /[฀-๿]/.test(q);
-  try {
-    const r = await getT('https://news.google.com/rss/search?q=' + encodeURIComponent(q) + (th ? '&hl=th&gl=TH&ceid=TH:th' : '&hl=en-US&gl=US&ceid=US:en'), { headers: { 'User-Agent': 'Mozilla/5.0 CendonBot' } });
-    if (r.ok) { const x = await r.text();
+  const news = async (hl, gl, ceid) => {
+    try {
+      const r = await getT('https://news.google.com/rss/search?q=' + encodeURIComponent(q) + `&hl=${hl}&gl=${gl}&ceid=${ceid}`, { headers: { 'User-Agent': 'Mozilla/5.0 CendonBot' } });
+      if (!r.ok) return [];
+      const x = await r.text(), out = [];
       for (const m of x.matchAll(/<item>([\s\S]*?)<\/item>/g)) {
         const it = m[1], g = t => (it.match(new RegExp('<' + t + '[^>]*>([\\s\\S]*?)</' + t + '>')) || [])[1];
-        const date = g('pubDate'); rows.push({ title: unent(g('title')), snip: unent(g('description')).slice(0, 220), url: unent(g('link')), date: date ? new Date(date).toISOString().slice(0, 10) : '' });
-        if (rows.length >= max) break; } }
-  } catch (e) {}
+        const d = g('pubDate'), ts = d ? Date.parse(d) : 0;
+        out.push({ title: unent(g('title')), snip: unent(g('description')).slice(0, 220), url: unent(g('link')), date: ts ? new Date(ts).toISOString().slice(0, 10) : '', ts });
+        if (out.length >= 12) break; }
+      return out;
+    } catch (e) { return [] }
+  };
+  /* ค้นทั้งข่าวไทยและข่าวต่างประเทศพร้อมกัน — ข่าวรถรุ่นใหม่มักออกภาษาอังกฤษก่อน · เรียงข่าวใหม่สุดก่อน ตัดหัวข้อซ้ำ */
+  const [nt, ne] = await Promise.all([news('th', 'TH', 'TH:th'), news('en-US', 'US', 'US:en')]);
+  const seen = new Set();
+  for (const x of nt.concat(ne).sort((a, b) => b.ts - a.ts)) { const k = x.title.toLowerCase().slice(0, 60); if (seen.has(k)) continue; seen.add(k); rows.push(x); if (rows.length >= max) break; }
   try {
     const lang = th ? 'th' : 'en';
     const r = await getT(`https://${lang}.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit=2&srsearch=` + encodeURIComponent(q), { headers: { 'User-Agent': 'CendonBot/1.0' } });
@@ -641,4 +671,4 @@ export async function webSearch(env, query, { max = 6 } = {}) {
   } catch (e) {}
   return keep(rows.length ? { text: fmt(rows.slice(0, max + 2)), src: 'news+wiki' } : { text: '', src: '' });
 }
-export const webBlock = w => w && w.text ? `\n\n[ผลค้นเว็บจริง ณ ตอนนี้ (${w.src}) — ใช้ข้อมูลนี้ตอบเป็นหลัก ระบุแหล่ง/วันที่ ถ้าข้อมูลขัดกันให้บอก ห้ามบอกว่าค้นไม่ได้]\n${w.text}` : '';
+export const webBlock = w => w && w.text ? `\n\n[ผลค้นเว็บจริง ณ ตอนนี้ (${w.src}) เรียงข่าวใหม่สุดก่อน — ข้อมูลนี้ใหม่กว่าความรู้ของคุณ ให้เชื่อข่าวเหล่านี้เป็นหลัก แม้ขัดกับที่คุณเคยรู้ (เช่น รุ่นที่คุณคิดว่ายังไม่เปิดตัว) ระบุแหล่ง/วันที่ ห้ามตอบว่ายังไม่มีข้อมูลยืนยันถ้าในผลค้นมีข่าวเรื่องนั้น]\n${w.text}` : '';
