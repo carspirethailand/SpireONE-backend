@@ -216,8 +216,7 @@ export function searchQuery(userTexts) {
 }
 /* ══ สถาปัตยกรรม ReAct (Reason + Act Loop Engine) ══
    - สมองหลัก: openrouter/free (ผ่าน OpenRouter API)
-   - ตัวสำรอง 1: gpt-oss-120b (ผ่าน Cerebras)
-   - ตัวสำรอง 2: gpt-oss-20b / llama-3.1-8b-instant (ผ่าน Groq) */
+   - ตัวสำรอง ReAct: gpt-oss-120b, gpt-oss-20b ผ่าน Groq เท่านั้น */
 export function reactProviders(env) {
   const L = [];
   // 1. ตัวหลัก: OpenRouter (openrouter/free)
@@ -228,21 +227,10 @@ export function reactProviders(env) {
       key: env.OPENROUTER_API_KEY,
       model: env.OPENROUTER_MODEL || 'openrouter/free',
       headers: { 'HTTP-Referer': 'https://carspirethailand.com', 'X-Title': 'Cendon' },
-      timeoutMs: 45000
-    });
-  }
-  // 2. ตัวสำรอง 1: Cerebras (gpt-oss-120b)
-  if (env.CEREBRAS_API_KEY && !bad('react|cerebras')) {
-    L.push({
-      src: 'cerebras',
-      url: `${env.CEREBRAS_BASE_URL || 'https://api.cerebras.ai/v1'}/chat/completions`,
-      key: env.CEREBRAS_API_KEY,
-      model: env.CEREBRAS_MODEL || 'gpt-oss-120b',
-      extra: { reasoning_effort: 'low' },
       timeoutMs: 25000
     });
   }
-  // 3. ตัวสำรอง 2: Groq (openai/gpt-oss-120b หรือ llama-3.1-8b-instant)
+  // 2. ตัวสำรอง ReAct: Groq เท่านั้น (openai/gpt-oss-120b, openai/gpt-oss-20b, llama-3.1-8b-instant)
   if (env.GROQ_API_KEY && !bad('react|groq')) {
     const gu = `${env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1'}/chat/completions`;
     L.push({
@@ -250,7 +238,8 @@ export function reactProviders(env) {
       url: gu,
       key: env.GROQ_API_KEY,
       model: env.GROQ_MODEL || 'openai/gpt-oss-120b',
-      altModel: 'llama-3.1-8b-instant',
+      altModel: 'openai/gpt-oss-20b',
+      emergencyModel: 'llama-3.1-8b-instant',
       timeoutMs: 20000
     });
   }
@@ -336,19 +325,34 @@ export async function reactAgent(env, opts) {
             signal: ac.signal
           });
 
-          // Groq fallback if model 404 (e.g. model name not enabled on Groq)
-          if (!res.ok && p.src === 'groq' && p.altModel && res.status === 404) {
-            bodyPayload.model = p.altModel;
-            res = await fetch(p.url, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${p.key}`,
-                ...(p.headers || {})
-              },
-              body: JSON.stringify(bodyPayload),
-              signal: ac.signal
-            });
+          // Groq fallback if model 404/429/413 (e.g. gpt-oss-120b -> gpt-oss-20b -> llama-3.1-8b-instant)
+          if (!res.ok && p.src === 'groq') {
+            if (p.altModel && (res.status === 404 || res.status === 429 || res.status === 413)) {
+              bodyPayload.model = p.altModel;
+              res = await fetch(p.url, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${p.key}`,
+                  ...(p.headers || {})
+                },
+                body: JSON.stringify(bodyPayload),
+                signal: ac.signal
+              });
+            }
+            if (!res.ok && p.emergencyModel && (res.status === 404 || res.status === 429 || res.status === 413)) {
+              bodyPayload.model = p.emergencyModel;
+              res = await fetch(p.url, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${p.key}`,
+                  ...(p.headers || {})
+                },
+                body: JSON.stringify(bodyPayload),
+                signal: ac.signal
+              });
+            }
           }
 
           if (!res.ok) {
@@ -492,11 +496,12 @@ export async function fastAnswer(env, opts) {
     console.warn('[fastAnswer reactAgent error]', e.message || e);
   }
 
-  // 2. ถ้า ReAct ล้มเหลวทั้งหมด ถอยไปที่ Gemini Models Ladder
+  // 2. ถ้า ReAct ล้มเหลว ถอยไปที่ Gemini (3.1 flash lite -> 3.5 flash lite เท่านั้น)
   if (env.GEMINI_KEY && !bad('gemini|quota') && !bad('gemini|region')) {
     const scope = await geminiScope(env);
     const ladder = ['low', null];
-    for (const model of chatModels(env)) {
+    const models = ['gemini-3.1-flash-lite', 'gemini-3.5-flash-lite'];
+    for (const model of models) {
       const scoped = key => scope + '|' + key;
       if (bad(scoped(model))) continue;
       for (const level of ladder) {
@@ -512,9 +517,7 @@ export async function fastAnswer(env, opts) {
     }
   }
 
-  // 3. ทางสำรองฉุกเฉิน
-  const history = opts.history || (opts.messages ? toChatHistory(opts.messages) : (opts.contents ? toChatHistory(opts.contents) : []));
-  return await fallbackAnswer(env, opts.system || '', history, opts);
+  throw new Error('All configured models failed: ReAct (OpenRouter, Groq) and Gemini (3.1-flash-lite, 3.5-flash-lite)');
 }
 
 /* ══ ทางสำรองเมื่อ Gemini ใช้ไม่ได้ ══
@@ -622,18 +625,14 @@ export function fallbackProviders(env, media) {
       headers: { 'HTTP-Referer': 'https://carspirethailand.com', 'X-Title': 'Cendon' } });
     return L.filter(p => !bad('fb|' + p.src));
   }
-  /* Cerebras ก่อน (เจ้าของเลือกเป็นตัวสำรองหลัก เสถียร เร็ว) → Groq → Workers AI → OpenRouter */
-  if (env.CEREBRAS_API_KEY) L.push({ src: 'cerebras', url: `${env.CEREBRAS_BASE_URL || 'https://api.cerebras.ai/v1'}/chat/completions`,
-    key: env.CEREBRAS_API_KEY, model: env.CEREBRAS_MODEL || 'gpt-oss-120b', extra: { reasoning_effort: 'low' } });
-  /* Groq (ฟรี เร็ว) — ถ้าชื่อรุ่นหลักใช้ไม่ได้กับคีย์นี้ มีรุ่นสำรอง (ตัวเดียวกับที่ใช้ดูรูป) */
+  /* สำรองเฉพาะ Groq และ OpenRouter */
   if (env.GROQ_API_KEY) {
     const gu = `${env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1'}/chat/completions`;
     L.push({ src: 'groq', url: gu, key: env.GROQ_API_KEY, model: env.GROQ_MODEL || 'openai/gpt-oss-120b' });
-    L.push({ src: 'groq-alt', url: gu, key: env.GROQ_API_KEY, model: env.GROQ_ALT_MODEL || 'llama-3.3-70b-versatile' });
+    L.push({ src: 'groq-alt', url: gu, key: env.GROQ_API_KEY, model: env.GROQ_ALT_MODEL || 'llama-3.1-8b-instant' });
   }
-  if (env.AI) L.push({ src: 'workers-ai', ai: true, model: env.CF_AI_FALLBACK_MODEL || '@cf/meta/llama-3.3-70b-instruct-fp8-fast' });
   if (env.OPENROUTER_API_KEY) L.push({ src: 'openrouter', url: `${env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1'}/chat/completions`,
-    key: env.OPENROUTER_API_KEY, model: env.OPENROUTER_MODEL || 'openrouter/free',   /* รุ่นฟรีเฉพาะชื่อถูกถอดบ่อย ใช้ตัวเลือกฟรีอัตโนมัติ แล้วกรองคำตอบขยะด้วย isJunk */
+    key: env.OPENROUTER_API_KEY, model: env.OPENROUTER_MODEL || 'openrouter/free',
     headers: { 'HTTP-Referer': 'https://carspirethailand.com', 'X-Title': 'Cendon' } });
   return L.filter(p => !bad('fb|' + p.src));
 }

@@ -4292,18 +4292,15 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                 });
                 text = r.text;
               } catch (e) {
-                /* Gemini ใช้ไม่ได้ทั้งหมด (คีย์/โควตา/ชื่อรุ่น) — ไปทางสำรองที่เร็วที่สุดที่มี ผู้ใช้ยังได้คำตอบ
-                   และจดสาเหตุไว้ให้เจ้าของดูในหน้าตรวจระบบ (ผู้ใช้ไม่เห็น) */
                 console.error('[stream fast]', e.message);
                 noteAiError(env, e);
-                /* ทางสำรองพังด้วย — แนบสาเหตุของ Gemini ไปด้วย ผู้ดูแลจะเห็นต้นเหตุจริง ไม่ใช่แค่ของทางสำรอง */
-                const r = await fallbackAnswer(env, sys, historyOf(msgs), { depth: body.depth,
-                  geminiError: e, meter, onThought: d => send({ type: 'reasoning', delta: d }),
-                  onText: async d => {
-                    if (firstText) { firstText = false; await send({ type: 'status', key: 'write', text: 'กำลังเขียนคำตอบ' }); }
-                    await send({ type: 'text', delta: d });
-                  } });
-                text = r.text || '';
+                const errMsg = 'ขออภัยครับ ขณะนี้ระบบประมวลผล AI กำลังมีผู้ใช้งานหนาแน่น กรุณาลองใหม่อีกครั้งในอีกสักครู่ครับ';
+                if (firstText) {
+                  firstText = false;
+                  await send({ type: 'status', key: 'write', text: 'ระบบ AI ขัดข้องชั่วคราว' });
+                }
+                await send({ type: 'text', delta: errMsg });
+                text = errMsg;
               }
 
               /* ── ปิดสตรีมให้เร็วที่สุด แล้วค่อยเก็บบัญชี ── */
@@ -4481,8 +4478,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
             } catch (e) {
               console.error('[chat fast]', e.message);
               noteAiError(env, e);
-              const r = await fallbackAnswer(env, sys, historyOf(body.contents), { meter, depth: body.depth });
-              agentOut = { text: cleanReply(r.text), reasoning: (r.thoughts || '').slice(0, 6000) };
+              agentOut = { text: 'ขออภัยครับ ขณะนี้ระบบประมวลผล AI กำลังมีผู้ใช้งานหนาแน่น กรุณาลองใหม่อีกครั้งในอีกสักครู่ครับ', reasoning: '' };
             }
             const text = (agentOut && agentOut.text) || '';
             const reasoning = (agentOut && agentOut.reasoning) || '';
