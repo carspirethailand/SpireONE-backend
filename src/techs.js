@@ -244,7 +244,11 @@ function publicTech(r) {
     reply: null, verified: !!r.verified, test: !!r.test,
     photos: r.photos || [], online: !!r.online, hours: d.hours || '',
     /* รูปปกหน้าร้าน (แบนเนอร์) — ต้องเป็นรูปของร้านนี้ที่ยังอยู่ ไม่งั้นใช้รูปแรกแทน */
-    cover: d.cover && (r.photos || []).includes(d.cover) ? d.cover : ((r.photos || [])[0] || null),
+    cover: d.cover && (r.photos || []).includes(d.cover) ? d.cover : ((r.photos || []).find(x => x !== d.avatar) || null),
+    /* รูปโปรไฟล์แยกจากรูปผลงาน — ไม่มีก็ใช้ตัวอักษรย่อ (ไม่เอารูปผลงานมาแทนแล้ว) */
+    avatar: d.avatar && (r.photos || []).includes(d.avatar) ? d.avatar : null,
+    /* เบอร์โทรโชว์เฉพาะช่างที่เปิดให้ลูกค้าโทรตรง */
+    phone: d.showPhone ? String(d.phone || r.phone || '') : '', showPhone: !!d.showPhone,
   };
 }
 /* D1 รับตัวแปรได้ไม่เกิน 100 ตัวต่อคำสั่ง — พอช่าง/งานเกินร้อย รายชื่อจะพังทั้งหน้า
@@ -377,9 +381,10 @@ async function apply(env, me, b) {
         VALUES (?,?,?,'approved',1,NULL,1,?,?)
         ON CONFLICT(uid) DO UPDATE SET data=excluded.data,status='approved',test=1,revision=revision+1,updated_at=excluded.updated_at`)
         .bind(me.uid, me.email, JSON.stringify(d), t, t),
+      /* ร้านเดิมที่แก้ไว้แล้วต้องไม่ถูกค่าเริ่มต้นเขียนทับ (บั๊ก "บันทึกแล้วกลับเป็นค่าเดิม") */
       env.DB.prepare(`INSERT INTO tech_profiles (id,uid,phone,data,verified,test,suspended,created_at,updated_at)
         VALUES (?,?,?,?,0,1,0,?,?)
-        ON CONFLICT(uid) DO UPDATE SET data=excluded.data,phone=excluded.phone,test=1,suspended=0,updated_at=excluded.updated_at`)
+        ON CONFLICT(uid) DO UPDATE SET data=CASE WHEN tech_profiles.data IS NULL OR tech_profiles.data='' OR tech_profiles.data='{}' THEN excluded.data ELSE tech_profiles.data END,test=1,suspended=0,updated_at=excluded.updated_at`)
         .bind(id, me.uid, d.phone, JSON.stringify(d), t, t),
     ]);
     return { ok: true, id };
@@ -513,7 +518,7 @@ async function review(env, me, b) {
       lat: d.lat, lng: d.lng, cert: !!d.hasCert };
     stmts.push(env.DB.prepare(`INSERT INTO tech_profiles (id,uid,phone,data,verified,test,suspended,created_at,updated_at)
       VALUES (?,?,?,?,1,0,0,?,?)
-      ON CONFLICT(uid) DO UPDATE SET data=excluded.data,phone=excluded.phone,verified=1,test=0,suspended=0,updated_at=excluded.updated_at`)
+      ON CONFLICT(uid) DO UPDATE SET data=CASE WHEN tech_profiles.data IS NULL OR tech_profiles.data='' OR tech_profiles.data='{}' THEN excluded.data ELSE tech_profiles.data END,phone=excluded.phone,verified=1,test=0,suspended=0,updated_at=excluded.updated_at`)
       .bind(id, a.uid, d.phone, JSON.stringify(profile), t, t));
   }
   await env.DB.batch(stmts);
@@ -985,6 +990,15 @@ async function editShop(env, me, b) {
     const id = Number(b.cover) || 0;
     if (id && !(await env.DB.prepare("SELECT 1 FROM tech_docs WHERE id = ? AND uid = ? AND kind IN ('shop','work')").bind(id, me.uid).first())) fail(400, 'ไม่พบรูปนี้ในร้าน');
     d.cover = id || null;
+  }
+  if (b.phone != null) d.phone = String(b.phone).replace(/[^0-9+]/g, '').slice(0, 15);
+  if (b.showPhone != null) d.showPhone = !!b.showPhone;
+  if (b.addAvatar) {
+    const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(b.addAvatar.data || ''));
+    if (!m || m[2].length > 600000) fail(400, 'ไฟล์ต้องเป็นรูปภาพ');
+    const r = await env.DB.prepare('INSERT INTO tech_docs (uid, kind, mime, data, created_at) VALUES (?,?,?,?,?)').bind(me.uid, 'shop', m[1], m[2], now()).run();
+    if (d.avatar) await env.DB.prepare("DELETE FROM tech_docs WHERE id = ? AND uid = ? AND kind = 'shop'").bind(d.avatar, me.uid).run();
+    d.avatar = r.meta && r.meta.last_row_id || null;
   }
   if (b.addCover) {
     const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(b.addCover.data || ''));
