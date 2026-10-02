@@ -243,6 +243,8 @@ function publicTech(r) {
     reviewCount: r.review_count, jobs: r.jobs,
     reply: null, verified: !!r.verified, test: !!r.test,
     photos: r.photos || [], online: !!r.online, hours: d.hours || '',
+    /* รูปปกหน้าร้าน (แบนเนอร์) — ต้องเป็นรูปของร้านนี้ที่ยังอยู่ ไม่งั้นใช้รูปแรกแทน */
+    cover: d.cover && (r.photos || []).includes(d.cover) ? d.cover : ((r.photos || [])[0] || null),
   };
 }
 /* D1 รับตัวแปรได้ไม่เกิน 100 ตัวต่อคำสั่ง — พอช่าง/งานเกินร้อย รายชื่อจะพังทั้งหน้า
@@ -978,6 +980,20 @@ async function editShop(env, me, b) {
   if (b.mobile != null) d.mobile = !!b.mobile;
   if (b.urgent != null) d.urgent = !!b.urgent;
   if (b.lat != null || b.lng != null) Object.assign(d, coord(b));
+  /* ตั้งรูปที่มีอยู่เป็นปก หรืออัปโหลดรูปปกใหม่ (นับรวมโควตา 12 รูป) */
+  if (b.cover != null) {
+    const id = Number(b.cover) || 0;
+    if (id && !(await env.DB.prepare("SELECT 1 FROM tech_docs WHERE id = ? AND uid = ? AND kind IN ('shop','work')").bind(id, me.uid).first())) fail(400, 'ไม่พบรูปนี้ในร้าน');
+    d.cover = id || null;
+  }
+  if (b.addCover) {
+    const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(b.addCover.data || ''));
+    if (!m || m[2].length > 1400000) fail(400, 'ไฟล์ต้องเป็นรูปภาพ');
+    const have = await env.DB.prepare("SELECT COUNT(*) AS n FROM tech_docs WHERE uid = ? AND kind IN ('shop','work')").bind(me.uid).first();
+    if (have.n >= 12) fail(400, 'รูปร้านและผลงานรวมกันได้ไม่เกิน 12 รูป ลบรูปเก่าก่อน');
+    const r = await env.DB.prepare('INSERT INTO tech_docs (uid, kind, mime, data, created_at) VALUES (?,?,?,?,?)').bind(me.uid, 'shop', m[1], m[2], now()).run();
+    d.cover = r.meta && r.meta.last_row_id || null;
+  }
   const stmts = [env.DB.prepare('UPDATE tech_profiles SET data = ?, updated_at = ? WHERE id = ?').bind(JSON.stringify(d), now(), t.id)];
   /* รูปใหม่ต่อท้าย รูปที่ลบคือรหัสรูปของร้านนี้เท่านั้น — ลบรูปร้านอื่นผ่านทางนี้ไม่ได้ */
   if (Array.isArray(b.removePhotos)) b.removePhotos.slice(0, 20).forEach(id =>
