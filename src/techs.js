@@ -1022,7 +1022,7 @@ async function editShop(env, me, b) {
     const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(b.addCover.data || ''));
     if (!m || m[2].length > 1400000) fail(400, 'ไฟล์ต้องเป็นรูปภาพ');
     const have = await env.DB.prepare("SELECT COUNT(*) AS n FROM tech_docs WHERE uid = ? AND kind IN ('shop','work')").bind(me.uid).first();
-    if (have.n >= 12) fail(400, 'รูปร้านและผลงานรวมกันได้ไม่เกิน 12 รูป ลบรูปเก่าก่อน');
+    if (have.n >= 1000) fail(400, 'รูปร้านเยอะเกินไป');
     const r = await env.DB.prepare('INSERT INTO tech_docs (uid, kind, mime, data, created_at) VALUES (?,?,?,?,?)').bind(me.uid, 'shop', m[1], m[2], now()).run();
     d.cover = r.meta && r.meta.last_row_id || null;
   }
@@ -1032,7 +1032,7 @@ async function editShop(env, me, b) {
     stmts.push(env.DB.prepare("DELETE FROM tech_docs WHERE id = ? AND uid = ? AND kind IN ('shop','work')").bind(Number(id), me.uid)));
   if (Array.isArray(b.addPhotos)) {
     const have = await env.DB.prepare("SELECT COUNT(*) AS n FROM tech_docs WHERE uid = ? AND kind IN ('shop','work')").bind(me.uid).first();
-    if (have.n + b.addPhotos.length > 12) fail(400, 'รูปร้านและผลงานรวมกันได้ไม่เกิน 12 รูป');
+    if (have.n + b.addPhotos.length > 1000) fail(400, 'รูปร้านเยอะเกินไป');
     b.addPhotos.forEach(x => {
       const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(x && x.data || ''));
       if (!m || m[2].length > 1400000) fail(400, 'ไฟล์ต้องเป็นรูปภาพ');
@@ -1075,8 +1075,9 @@ async function saveGig(env, me, b) {
   const cats = JSON.stringify((Array.isArray(b.cats) ? b.cats : []).map(String).slice(0, 6));
   const brands = JSON.stringify((Array.isArray(b.brands) ? b.brands : []).map(x => String(x).slice(0, 30)).slice(0, 10));
   let photos = (Array.isArray(b.keep) ? b.keep.map(Number).filter(Boolean) : []);
-  const add = Array.isArray(b.addPhotos) ? b.addPhotos.slice(0, 8) : [];
-  if (photos.length + add.length > 8) fail(400, 'โพสต์หนึ่งใส่รูปได้ไม่เกิน 8 รูป');
+  /* รูปไม่จำกัดต่อโพสต์ — แอปส่งมาเป็นชุดละไม่กี่รูป (คำขอเดียวไม่ใหญ่เกิน) เพดานกันพังไว้ 300 */
+  const add = Array.isArray(b.addPhotos) ? b.addPhotos.slice(0, 6) : [];
+  if (photos.length + add.length > 300) fail(400, 'รูปในโพสต์เดียวเยอะเกินไป');
   if (kind === 'work' && photos.length + add.length < 1) fail(400, 'โพสต์ผลงานต้องมีรูปอย่างน้อย 1 รูป');
   for (const x of add) {
     const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(x && x.data || ''));
@@ -1093,7 +1094,7 @@ async function saveGig(env, me, b) {
     return { ok: true, id: +b.id };
   }
   const c = await env.DB.prepare('SELECT COUNT(*) AS n FROM tech_gigs WHERE uid = ? AND active = 1').bind(me.uid).first();
-  if (c.n >= 30) fail(400, 'โพสต์ได้สูงสุด 30 โพสต์ ลบโพสต์เก่าก่อน');
+  if (c.n >= 2000) fail(400, 'โพสต์เยอะเกินไป ลบโพสต์เก่าก่อน');
   const r = await env.DB.prepare('INSERT INTO tech_gigs (uid,tech_id,kind,title,body,price,cats,brands,photos,active,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,1,?,?)')
     .bind(me.uid, t.id, kind, title, body, price, cats, brands, photos, now(), now()).run();
   return { ok: true, id: r.meta && r.meta.last_row_id };
