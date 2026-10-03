@@ -1099,7 +1099,10 @@ async function saveGig(env, me, b) {
   if (title.length < 3) fail(400, 'ใส่หัวข้อโพสต์อย่างน้อย 3 ตัวอักษร');
   const body = String(b.body || '').trim().slice(0, 2000);
   const price = num(b.price, 'ราคา', 1, 1000000);
-  const cats = JSON.stringify((Array.isArray(b.cats) ? b.cats : []).map(String).slice(0, 6));
+  /* ทุกบริการต้องอยู่ในหมวด — หน้าแรกแบ่งบริการตามหมวด ลูกค้าหาเจอจากหมวดนั้น */
+  const catList = (Array.isArray(b.cats) ? b.cats : []).map(x => String(x).slice(0, 24)).filter(Boolean).slice(0, 6);
+  if (!catList.length) fail(400, 'เลือกหมวดหมู่บริการก่อน');
+  const cats = JSON.stringify(catList);
   const brands = JSON.stringify((Array.isArray(b.brands) ? b.brands : []).map(x => String(x).slice(0, 30)).slice(0, 10));
   let photos = (Array.isArray(b.keep) ? b.keep.map(Number).filter(Boolean) : []);
   /* รูปไม่จำกัดต่อโพสต์ — แอปส่งมาเป็นชุดละไม่กี่รูป (คำขอเดียวไม่ใหญ่เกิน) เพดานกันพังไว้ 300 */
