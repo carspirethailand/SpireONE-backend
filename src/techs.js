@@ -327,7 +327,9 @@ async function meInfo(env, me) {
   return {
     uid: me.uid, email: me.email, admin: me.admin, staff: me.staff, version: API_VERSION,
     application: appOut(a),
-    technician: t ? { ...publicTech((await withPhotos(env, [t]))[0]), suspended: !!t.suspended } : null,
+    technician: t ? { ...publicTech((await withPhotos(env, [t]))[0]), suspended: !!t.suspended,
+      /* ค่าตั้งของร้านที่เห็นเฉพาะเจ้าของ (Studio → ตั้งค่า) */
+      ...(() => { const d = parse(t.data) || {}; return { autoReply: d.autoReply || null, minPrice: d.minPrice || 0, vacationRaw: d.vacation || null }; })() } : null,
     attention,
   };
 }
