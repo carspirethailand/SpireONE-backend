@@ -129,6 +129,8 @@ const TECH_ALTER = [
     title TEXT NOT NULL, body TEXT, price INTEGER, cats TEXT, brands TEXT, photos TEXT, active INTEGER NOT NULL DEFAULT 1,
     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
   `CREATE INDEX IF NOT EXISTS tech_gigs_active ON tech_gigs(active, created_at)`,
+  /* ยอดเข้าชมรายวันของร้าน (Studio → สถิติ): kind = shop | gig | call | book */
+  `CREATE TABLE IF NOT EXISTS tech_views (tech_id TEXT NOT NULL, day INTEGER NOT NULL, kind TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tech_id, day, kind))`,
 ];
 let techReady = false;
 async function ensureTech(env) {
@@ -234,6 +236,12 @@ async function sha(s) {
 }
 
 /* ── ช่าง ── */
+const THEMES = ['orange', 'blue', 'green', 'violet', 'rose', 'slate', 'amber', 'teal'];
+function vacationOf(d) {
+  const v = d.vacation;
+  if (!v || !v.on || (v.until && v.until < Date.now())) return null;
+  return { until: v.until || null, note: v.note || '' };
+}
 function publicTech(r) {
   const d = parse(r.data) || {};
   return {
@@ -255,6 +263,8 @@ function publicTech(r) {
     /* เบอร์โทรโชว์เฉพาะช่างที่เปิดให้ลูกค้าโทรตรง */
     phone: d.showPhone ? String(d.phone || r.phone || '') : '', showPhone: !!d.showPhone,
     subs: d.subs || [], week: d.week || null, brands2: d.brands2 || [], line: d.line || '', facebook: d.facebook || '', address: d.address || '',
+    /* โหมดพักร้อน: แสดงบนหน้าร้าน และงดรับคำขอใหม่จนกว่าจะถึงวันที่ตั้ง */
+    vacation: vacationOf(d), greet: d.greet || '', theme: d.theme || '',
   };
 }
 /* D1 รับตัวแปรได้ไม่เกิน 100 ตัวต่อคำสั่ง — พอช่าง/งานเกินร้อย รายชื่อจะพังทั้งหน้า
@@ -666,6 +676,8 @@ async function createJob(env, me, b) {
   if (!t.test && !t.verified) fail(404, 'ช่างยังไม่ผ่านการตรวจ');
   if (t.uid === me.uid) fail(400, 'ขอราคาจากร้านตัวเองไม่ได้');
   const d = parse(t.data) || {};
+  const vac = vacationOf(d);
+  if (vac) fail(409, 'ร้านนี้ปิดชั่วคราว' + (vac.note ? ' — ' + vac.note : '') + ' ลองร้านอื่นก่อนนะ');
   const mode = b.mode === 'mobile' && d.mobile ? 'mobile' : 'shop';
 
   if (!t.test) {
@@ -694,7 +706,21 @@ async function createJob(env, me, b) {
     JSON.stringify([{ status: 'requested', at: ts, by: 'customer' }]), ts, ts, group, noteIn(b)).run();
   /* ขอหลายร้านพร้อมกัน เก็บรูปชุดเดียวผูกกับชุดคำขอ ไม่ต้องเก็บซ้ำทุกร้าน */
   await saveMedia(env, group || id, me.uid, photos);
+  /* ตอบกลับอัตโนมัติของร้าน — ลูกค้ารู้ทันทีว่าร้านได้รับเรื่องแล้ว */
+  if (d.autoReply && d.autoReply.on && d.autoReply.text) {
+    await env.DB.prepare('INSERT INTO tech_messages (job_id, uid, role, text, at) VALUES (?,?,?,?,?)')
+      .bind(id, t.uid, 'technician', d.autoReply.text, ts + 1).run();
+  }
+  await bumpView(env, t.id, 'book');
   return { id };
+}
+
+const DAY = 86400000;
+async function bumpView(env, techId, kind) {
+  try {
+    await env.DB.prepare('INSERT INTO tech_views (tech_id, day, kind, n) VALUES (?,?,?,1) ON CONFLICT(tech_id, day, kind) DO UPDATE SET n = n + 1')
+      .bind(techId, Math.floor(now() / DAY), kind).run();
+  } catch (e) { /* สถิติพลาดไม่ควรทำให้งานหลักพัง */ }
 }
 
 async function getJob(env, me, id) {
@@ -1026,6 +1052,15 @@ async function editShop(env, me, b) {
   if (b.line != null) d.line = String(b.line).trim().slice(0, 60);
   if (b.facebook != null) d.facebook = String(b.facebook).trim().slice(0, 200);
   if (b.address != null) d.address = String(b.address).trim().slice(0, 300);
+  /* Studio → ตั้งค่า */
+  if (b.vacation != null) {
+    const v = b.vacation || {};
+    d.vacation = { on: !!v.on, until: Number(v.until) > 0 ? Number(v.until) : null, note: String(v.note || '').trim().slice(0, 200) };
+  }
+  if (b.autoReply != null) { const a = b.autoReply || {}; d.autoReply = { on: !!a.on, text: String(a.text || '').trim().slice(0, 500) }; }
+  if (b.greet != null) d.greet = String(b.greet).trim().slice(0, 200);
+  if (b.minPrice != null) d.minPrice = num(b.minPrice, 'ราคางานต่ำสุด', 0, 1000000);
+  if (b.theme != null) d.theme = THEMES.includes(b.theme) ? b.theme : '';
   /* เวลาทำการรายวัน: 7 ช่อง [จ..อา] แต่ละช่อง {on, open:"08:00", close:"18:00"} */
   if (b.week != null) {
     const w = Array.isArray(b.week) ? b.week.slice(0, 7) : [];
@@ -1176,11 +1211,44 @@ async function stats(env, me) {
   }
   reviews.sort((a, b) => b.at - a.at);
   const pt = publicTech(t);
+  /* ── Studio → สถิติ: 30 วัน, เดือนนี้เทียบเดือนก่อน, funnel ── */
+  const d30 = Array.from({ length: 30 }, (_, i) => ({ d: today - (29 - i) * day, earn: 0, jobs: 0, shop: 0, gig: 0, call: 0, book: 0 }));
+  const slot30 = at => d30.find(x => at >= x.d && at < x.d + day);
+  const prevMonth = new Date(start.getFullYear(), start.getMonth() - 1, 1).getTime();
+  const M = { earn: 0, done: 0, req: 0, views: 0, reviews: 0, rsum: 0 }, P = { earn: 0, done: 0, req: 0, views: 0, reviews: 0, rsum: 0 };
+  let completed = 0;
+  for (const j of results) {
+    const q = parse(j.quote), h = parse(j.history) || [];
+    if (j.created_at >= month) M.req++; else if (j.created_at >= prevMonth) P.req++;
+    const s0 = slot30(j.created_at); if (s0) s0.jobs++;
+    if (j.status === 'completed') {
+      completed++;
+      const at = (h.find(x => x.status === 'completed') || {}).at || j.updated_at;
+      const tot = q ? q.total : 0;
+      const s1 = slot30(at); if (s1) s1.earn += tot;
+      if (at >= month) { M.earn += tot; M.done++; } else if (at >= prevMonth) { P.earn += tot; P.done++; }
+    }
+    const rv = parse(j.review);
+    if (rv) { if (rv.at >= month) { M.reviews++; M.rsum += rv.rating; } else if (rv.at >= prevMonth) { P.reviews++; P.rsum += rv.rating; } }
+  }
+  const { results: vs } = await env.DB.prepare('SELECT day, kind, n FROM tech_views WHERE tech_id = ? AND day >= ?')
+    .bind(t.id, Math.floor(prevMonth / DAY)).all();
+  const views = { shop: 0, gig: 0, call: 0, book: 0 };
+  for (const v of vs) {
+    const at = v.day * DAY;
+    const s2 = d30.find(x => at + DAY / 2 >= x.d && at + DAY / 2 < x.d + day) || slot30(at);
+    if (s2 && s2[v.kind] != null) s2[v.kind] += v.n;
+    if (at >= month - DAY) { if (v.kind === 'shop' || v.kind === 'gig') M.views += v.n; if (views[v.kind] != null) views[v.kind] += v.n; }
+    else if (v.kind === 'shop' || v.kind === 'gig') P.views += v.n;
+  }
+  const fin = o => ({ earn: o.earn, done: o.done, requests: o.req, views: o.views, reviews: o.reviews, rating: o.reviews ? Math.round(o.rsum / o.reviews * 10) / 10 : null });
   return {
     online: !!t.online, earnToday, earnMonth, done, requested, quoted, won,
     winRate: quoted ? Math.round(won / quoted * 100) : 0,
     replyMin: respN ? Math.round(respSum / respN / 60000) : null,
     rating: pt.rating, reviewCount: pt.reviewCount, daily, reviews: reviews.slice(0, 5),
+    days30: d30, month: fin(M), prev: fin(P), viewsMonth: views,
+    funnel: { requested, quoted, won, completed },
   };
 }
 
@@ -1246,6 +1314,14 @@ async function route(request, env) {
     let me = null;
     try { me = await who(request, env, false); } catch (e) {}
     return listGigs(env, me, url);
+  }
+  /* นับยอดเข้าชม (ไม่ต้องล็อกอิน) — นับเฉพาะร้านที่มีอยู่จริง */
+  if (p === '/api/tech/view' && m === 'POST') {
+    const b = await body();
+    const kind = ['shop', 'gig', 'call'].includes(b.kind) ? b.kind : null;
+    const t = kind && await techById(env, String(b.id || ''));
+    if (t && !t.suspended) await bumpView(env, t.id, kind);
+    return { ok: true };
   }
   if (p === '/api/tech/reviews' && m === 'GET') {
     let me = null;
