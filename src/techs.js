@@ -476,7 +476,7 @@ async function appDocs(env, me, uid) {
 async function image(env, request, id) {
   const d = await env.DB.prepare(
     `SELECT d.mime, d.data, p.verified, p.test FROM tech_docs d JOIN tech_profiles p ON p.uid = d.uid
-     WHERE d.id = ? AND d.kind IN ('shop','work','gig') AND p.suspended = 0`).bind(id).first();
+     WHERE d.id = ? AND d.kind IN ('shop','work','gig','review') AND p.suspended = 0`).bind(id).first();
   /* ร้านทีมงาน (test) ยังไม่ผ่านการตรวจแต่ทีมงานเห็นในรายชื่อ — ถ้าไม่ให้รูปผ่าน ทีมงานเห็นรูปแตก
      แท็ก <img> ส่งโทเคนไม่ได้ จึงเปิดเฉพาะรูปอู่/ผลงาน (ไม่ใช่บัตร) และรหัสรูปมีแค่ในรายชื่อที่ทีมงานเห็น */
   if (!d || !(d.verified || d.test)) return new Response('Not found', { status: 404 });
@@ -756,6 +756,7 @@ async function updateJob(env, me, id, b) {
   const by = isTech && !isCustomer ? 'technician' : isCustomer && !isTech ? 'customer'
     : who_ === 'tech' ? 'technician' : who_ === 'admin' ? 'admin' : 'customer';
   const extra = [];
+  let reviewPics = [];
 
   if (action === 'quote') {
     const labor = num(b.labor, 'ค่าแรง', 0, 1000000), parts = num(b.parts, 'อะไหล่', 0, 1000000),
@@ -780,7 +781,23 @@ async function updateJob(env, me, id, b) {
   if (action === 'review') {
     if (j.review) fail(409, 'ให้คะแนนงานนี้ไปแล้ว');
     const rating = Math.round(num(b.rating, 'คะแนน', 1, 5));
-    set.review = JSON.stringify({ rating, text: str(b.note, 'รีวิว', 5, 2000), at: ts });
+    const text = str(b.note, 'รีวิว', 5, 2000);
+    /* รูปจากลูกค้า (สูงสุด 4) — เก็บเป็นของร้านนั้น (uid ช่าง) เพื่อให้ /api/tech/img เปิดได้เฉพาะร้านที่ผ่านการตรวจ */
+    const add = Array.isArray(b.photos) ? b.photos.slice(0, 4) : [];
+    const pics = add.map(x => {
+      const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(x && x.data || x || ''));
+      if (!m || m[2].length > 1400000) fail(400, 'ไฟล์ต้องเป็นรูปภาพ');
+      return m;
+    });
+    const ids = [];
+    if (pics.length && t) {
+      for (const m of pics) {
+        const r = await env.DB.prepare('INSERT INTO tech_docs (uid, kind, mime, data, created_at) VALUES (?,?,?,?,?)').bind(t.uid, 'review', m[1], m[2], ts).run();
+        if (r.meta && r.meta.last_row_id) ids.push(r.meta.last_row_id);
+      }
+    }
+    reviewPics = ids;
+    set.review = JSON.stringify({ rating, text, photos: ids, at: ts });
     /* งานทดสอบไม่นับคะแนน — ไม่งั้นผู้ดูแลปั้นคะแนนให้ช่างทดสอบได้ */
     if (t && !j.test) extra.push(env.DB.prepare(
       'UPDATE tech_profiles SET rating_sum = rating_sum + ?, review_count = review_count + 1 WHERE id = ?').bind(rating, t.id));
@@ -796,7 +813,11 @@ async function updateJob(env, me, id, b) {
   const r = await env.DB.prepare(
     `UPDATE tech_jobs SET ${cols.map(c => c + ' = ?').join(', ')}, revision = revision + 1 WHERE id = ? AND revision = ?`)
     .bind(...cols.map(c => set[c]), j.id, j.revision).run();
-  if (!r.meta.changes) fail(409, 'ใบงานเพิ่งถูกอัปเดต กรุณารีเฟรชแล้วลองอีกครั้ง');
+  if (!r.meta.changes) {
+    /* บันทึกรีวิวไม่ติด — ลบรูปที่เพิ่งใส่ไป ไม่ให้ค้างในฐานข้อมูล */
+    if (reviewPics.length) await env.DB.batch(reviewPics.map(id => env.DB.prepare("DELETE FROM tech_docs WHERE id = ? AND kind = 'review'").bind(id)));
+    fail(409, 'ใบงานเพิ่งถูกอัปเดต กรุณารีเฟรชแล้วลองอีกครั้ง');
+  }
   if (action === 'accept' && j.group_id) {
     extra.push(env.DB.prepare("UPDATE tech_posts SET status = 'matched', updated_at = ? WHERE id = ?").bind(ts, j.group_id));
     /* ลูกค้าเลือกร้านนี้แล้ว — ร้านอื่นในชุดเดียวกันที่ยังไม่ได้นัด ปิดให้เลย
@@ -1044,7 +1065,10 @@ async function editShop(env, me, b) {
   return { ok: true };
 }
 
-/* ═══ โพสต์ของช่าง (แพ็กเกจบริการ / ผลงาน) ═══ */
+/* ═══ โพสต์บริการของช่าง ═══
+   ร้านละไม่เกิน 2 รายการ — ให้หน้าแรกเป็นที่หาช่าง ไม่ใช่ฟีดโซเชียล
+   (โพสต์ "ผลงาน" แบบเก่าเลิกใช้แล้ว ความน่าเชื่อถือมาจากรีวิวลูกค้าแทน) */
+const GIG_MAX = 2;
 function gigOut(g, t) {
   return { id: g.id, kind: g.kind, title: g.title, body: g.body || '', price: g.price || 0, cats: parse(g.cats) || [],
     brands: parse(g.brands) || [], photos: parse(g.photos) || [], createdAt: g.created_at, tech: t ? publicTech(t) : null };
@@ -1054,9 +1078,12 @@ async function listGigs(env, me, url) {
   let rows;
   if (mine) {
     if (!me) fail(401, 'ต้องเข้าสู่ระบบ');
-    rows = (await env.DB.prepare('SELECT * FROM tech_gigs WHERE uid = ? AND active = 1 ORDER BY created_at DESC LIMIT 100').bind(me.uid).all()).results;
+    rows = (await env.DB.prepare("SELECT * FROM tech_gigs WHERE uid = ? AND active = 1 AND kind = 'package' ORDER BY created_at DESC LIMIT 100").bind(me.uid).all()).results;
   } else {
-    rows = (await env.DB.prepare('SELECT * FROM tech_gigs WHERE active = 1 ORDER BY created_at DESC LIMIT 300').all()).results;
+    rows = (await env.DB.prepare("SELECT * FROM tech_gigs WHERE active = 1 AND kind = 'package' ORDER BY created_at DESC LIMIT 600").all()).results;
+    /* ร้านที่โพสต์ไว้ก่อนมีเพดาน — ลูกค้าเห็นแค่ 2 รายการล่าสุดของแต่ละร้าน */
+    const per = {};
+    rows = rows.filter(r => (per[r.tech_id] = (per[r.tech_id] || 0) + 1) <= GIG_MAX).slice(0, 300);
   }
   if (!rows.length) return { gigs: [] };
   const ids = [...new Set(rows.map(r => r.tech_id))];
@@ -1067,18 +1094,21 @@ async function listGigs(env, me, url) {
 }
 async function saveGig(env, me, b) {
   const t = await myShop(env, me);
-  const kind = b.kind === 'work' ? 'work' : 'package';
+  const kind = 'package';
   const title = String(b.title || '').trim().slice(0, 100);
   if (title.length < 3) fail(400, 'ใส่หัวข้อโพสต์อย่างน้อย 3 ตัวอักษร');
   const body = String(b.body || '').trim().slice(0, 2000);
-  const price = kind === 'package' ? num(b.price, 'ราคา', 1, 1000000) : (+b.price || 0);
+  const price = num(b.price, 'ราคา', 1, 1000000);
   const cats = JSON.stringify((Array.isArray(b.cats) ? b.cats : []).map(String).slice(0, 6));
   const brands = JSON.stringify((Array.isArray(b.brands) ? b.brands : []).map(x => String(x).slice(0, 30)).slice(0, 10));
   let photos = (Array.isArray(b.keep) ? b.keep.map(Number).filter(Boolean) : []);
   /* รูปไม่จำกัดต่อโพสต์ — แอปส่งมาเป็นชุดละไม่กี่รูป (คำขอเดียวไม่ใหญ่เกิน) เพดานกันพังไว้ 300 */
   const add = Array.isArray(b.addPhotos) ? b.addPhotos.slice(0, 6) : [];
   if (photos.length + add.length > 300) fail(400, 'รูปในโพสต์เดียวเยอะเกินไป');
-  if (kind === 'work' && photos.length + add.length < 1) fail(400, 'โพสต์ผลงานต้องมีรูปอย่างน้อย 1 รูป');
+  if (!b.id) {
+    const c = await env.DB.prepare("SELECT COUNT(*) AS n FROM tech_gigs WHERE uid = ? AND active = 1 AND kind = 'package'").bind(me.uid).first();
+    if (c.n >= GIG_MAX) fail(400, `โพสต์บริการได้สูงสุด ${GIG_MAX} รายการ ลบหรือแก้รายการเดิมแทน`);
+  }
   for (const x of add) {
     const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(x && x.data || ''));
     if (!m || m[2].length > 1400000) fail(400, 'ไฟล์ต้องเป็นรูปภาพ');
@@ -1087,14 +1117,12 @@ async function saveGig(env, me, b) {
   }
   photos = JSON.stringify(photos.filter(Boolean));
   if (b.id) {
-    const g = await env.DB.prepare('SELECT uid FROM tech_gigs WHERE id = ?').bind(+b.id).first();
-    if (!g || g.uid !== me.uid) fail(404, 'ไม่พบโพสต์');
+    const g = await env.DB.prepare('SELECT uid, active FROM tech_gigs WHERE id = ?').bind(+b.id).first();
+    if (!g || g.uid !== me.uid || !g.active) fail(404, 'ไม่พบโพสต์');
     await env.DB.prepare('UPDATE tech_gigs SET kind=?,title=?,body=?,price=?,cats=?,brands=?,photos=?,updated_at=? WHERE id=?')
       .bind(kind, title, body, price, cats, brands, photos, now(), +b.id).run();
     return { ok: true, id: +b.id };
   }
-  const c = await env.DB.prepare('SELECT COUNT(*) AS n FROM tech_gigs WHERE uid = ? AND active = 1').bind(me.uid).first();
-  if (c.n >= 2000) fail(400, 'โพสต์เยอะเกินไป ลบโพสต์เก่าก่อน');
   const r = await env.DB.prepare('INSERT INTO tech_gigs (uid,tech_id,kind,title,body,price,cats,brands,photos,active,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,1,?,?)')
     .bind(me.uid, t.id, kind, title, body, price, cats, brands, photos, now(), now()).run();
   return { ok: true, id: r.meta && r.meta.last_row_id };
@@ -1104,6 +1132,19 @@ async function delGig(env, me, b) {
   if (!g || (g.uid !== me.uid && !me.staff)) fail(404, 'ไม่พบโพสต์');
   await env.DB.prepare('UPDATE tech_gigs SET active = 0, updated_at = ? WHERE id = ?').bind(now(), +b.id).run();
   return { ok: true };
+}
+
+/* รีวิวลูกค้าของร้าน (หน้าร้านสาธารณะ) — ไม่บอกชื่อ/ทะเบียนลูกค้า มีแค่คะแนน ข้อความ รูป และวันที่ */
+async function listReviews(env, me, url) {
+  const id = String(url.searchParams.get('id') || '');
+  const t = id && await techById(env, id);
+  if (!t || t.suspended || !(t.verified || (t.test && me && me.staff))) fail(404, 'ไม่พบร้าน');
+  const { results } = await env.DB.prepare(
+    'SELECT review, test FROM tech_jobs WHERE tech_id = ? AND review IS NOT NULL ORDER BY updated_at DESC LIMIT 200').bind(t.id).all();
+  const reviews = results.filter(j => !j.test || (me && me.staff)).map(j => parse(j.review)).filter(Boolean)
+    .map(r => ({ rating: r.rating, text: r.text || '', photos: r.photos || [], at: r.at }))
+    .sort((a, b) => b.at - a.at);
+  return { reviews };
 }
 
 async function stats(env, me) {
@@ -1153,7 +1194,7 @@ async function advice(env, me) {
   const med = same.length ? same.map(x => x.from).sort((a, b) => a - b)[Math.floor(same.length / 2)] : null;
   const tips = [];
   const add = (level, title, text, action) => tips.push({ level, title, text, action });
-  if (ph.filter(x => x.kind === 'work').length < 3) add('high', 'เพิ่มรูปผลงาน', 'ร้านที่มีรูปผลงานอย่างน้อย 3 รูป ลูกค้าเชื่อใจมากกว่า ลองถ่ายก่อน-หลังซ่อม', 'photos');
+  if ((s.reviewCount || 0) < 3) add('high', 'เก็บรีวิวจากลูกค้า', 'ร้านที่มีรีวิวพร้อมรูปอย่างน้อย 3 รีวิว ลูกค้าใหม่เชื่อใจมากกว่า ปิดงานแล้วชวนลูกค้าให้คะแนนในแอป', 'reviews');
   if (!ph.some(x => x.kind === 'shop')) add('mid', 'เพิ่มรูปหน้าร้าน', 'ให้ลูกค้าเห็นว่าอู่มีอยู่จริง หาเจอง่าย', 'photos');
   if (!d.about || d.about.length < 40) add('mid', 'เขียนความถนัดให้ชัด', 'บอกรุ่นรถที่ถนัด เครื่องมือที่มี และงานที่ไม่รับ ช่วยให้ AI จับคู่ลูกค้าให้ตรงขึ้น', 'about');
   if (!t.online) add('high', 'เปิดรับงาน', 'ตอนนี้คุณออฟไลน์ ประกาศงานใหม่จะไม่แจ้งเตือน', 'online');
@@ -1202,6 +1243,11 @@ async function route(request, env) {
     let me = null;
     try { me = await who(request, env, false); } catch (e) {}
     return listGigs(env, me, url);
+  }
+  if (p === '/api/tech/reviews' && m === 'GET') {
+    let me = null;
+    try { me = await who(request, env, false); } catch (e) {}
+    return listReviews(env, me, url);
   }
   /* หน้าเว็บใช้เช็กว่าเซิร์ฟเวอร์มีระบบช่างรุ่นนี้แล้ว — ถ้าไม่มี แสดงให้ทีมงานรู้ว่ายังไม่ได้ deploy */
   if (p === '/api/tech/ping') return { ok: true, version: API_VERSION };
