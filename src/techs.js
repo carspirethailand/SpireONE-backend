@@ -124,6 +124,11 @@ const TECH_ALTER = [
   `CREATE TABLE IF NOT EXISTS tech_media (id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, uid TEXT NOT NULL, mime TEXT NOT NULL, data TEXT NOT NULL, created_at INTEGER NOT NULL)`,
   `CREATE INDEX IF NOT EXISTS tech_media_owner ON tech_media(owner)`,
   `CREATE INDEX IF NOT EXISTS tech_jobs_group ON tech_jobs(group_id)`,
+  /* โพสต์ของช่าง: kind = package (บริการพร้อมราคา จองได้) | work (ผลงาน) — ขึ้นหน้าแรกเหมือน Fastwork */
+  `CREATE TABLE IF NOT EXISTS tech_gigs (id INTEGER PRIMARY KEY AUTOINCREMENT, uid TEXT NOT NULL, tech_id TEXT NOT NULL, kind TEXT NOT NULL,
+    title TEXT NOT NULL, body TEXT, price INTEGER, cats TEXT, brands TEXT, photos TEXT, active INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+  `CREATE INDEX IF NOT EXISTS tech_gigs_active ON tech_gigs(active, created_at)`,
 ];
 let techReady = false;
 async function ensureTech(env) {
@@ -249,6 +254,7 @@ function publicTech(r) {
     avatar: d.avatar && (r.photos || []).includes(d.avatar) ? d.avatar : null,
     /* เบอร์โทรโชว์เฉพาะช่างที่เปิดให้ลูกค้าโทรตรง */
     phone: d.showPhone ? String(d.phone || r.phone || '') : '', showPhone: !!d.showPhone,
+    subs: d.subs || [], week: d.week || null, brands2: d.brands2 || [], line: d.line || '', facebook: d.facebook || '', address: d.address || '',
   };
 }
 /* D1 รับตัวแปรได้ไม่เกิน 100 ตัวต่อคำสั่ง — พอช่าง/งานเกินร้อย รายชื่อจะพังทั้งหน้า
@@ -470,7 +476,7 @@ async function appDocs(env, me, uid) {
 async function image(env, request, id) {
   const d = await env.DB.prepare(
     `SELECT d.mime, d.data, p.verified, p.test FROM tech_docs d JOIN tech_profiles p ON p.uid = d.uid
-     WHERE d.id = ? AND d.kind IN ('shop','work') AND p.suspended = 0`).bind(id).first();
+     WHERE d.id = ? AND d.kind IN ('shop','work','gig') AND p.suspended = 0`).bind(id).first();
   /* ร้านทีมงาน (test) ยังไม่ผ่านการตรวจแต่ทีมงานเห็นในรายชื่อ — ถ้าไม่ให้รูปผ่าน ทีมงานเห็นรูปแตก
      แท็ก <img> ส่งโทเคนไม่ได้ จึงเปิดเฉพาะรูปอู่/ผลงาน (ไม่ใช่บัตร) และรหัสรูปมีแค่ในรายชื่อที่ทีมงานเห็น */
   if (!d || !(d.verified || d.test)) return new Response('Not found', { status: 404 });
@@ -658,7 +664,7 @@ async function createJob(env, me, b) {
   if (!t || t.suspended) fail(404, 'ไม่พบช่าง หรือช่างงดรับงานชั่วคราว');
   if (t.test && !me.staff) fail(404, 'ไม่พบช่าง');
   if (!t.test && !t.verified) fail(404, 'ช่างยังไม่ผ่านการตรวจ');
-  if (!t.test && t.uid === me.uid) fail(400, 'ขอราคาจากตัวเองไม่ได้');
+  if (t.uid === me.uid) fail(400, 'ขอราคาจากร้านตัวเองไม่ได้');
   const d = parse(t.data) || {};
   const mode = b.mode === 'mobile' && d.mobile ? 'mobile' : 'shop';
 
@@ -993,6 +999,18 @@ async function editShop(env, me, b) {
   }
   if (b.phone != null) d.phone = String(b.phone).replace(/[^0-9+]/g, '').slice(0, 15);
   if (b.showPhone != null) d.showPhone = !!b.showPhone;
+  const strs = (v, n, len) => (Array.isArray(v) ? v : []).map(x => String(x).trim().slice(0, len)).filter(Boolean).slice(0, n);
+  if (b.subs != null) d.subs = strs(b.subs, 40, 24);
+  if (b.brands2 != null) d.brands2 = strs(b.brands2, 30, 30);
+  if (b.line != null) d.line = String(b.line).trim().slice(0, 60);
+  if (b.facebook != null) d.facebook = String(b.facebook).trim().slice(0, 200);
+  if (b.address != null) d.address = String(b.address).trim().slice(0, 300);
+  /* เวลาทำการรายวัน: 7 ช่อง [จ..อา] แต่ละช่อง {on, open:"08:00", close:"18:00"} */
+  if (b.week != null) {
+    const w = Array.isArray(b.week) ? b.week.slice(0, 7) : [];
+    const hm = v => /^([01]\d|2[0-3]):[0-5]\d$/.test(String(v || '')) ? String(v) : null;
+    d.week = w.length === 7 ? w.map(x => ({ on: !!(x && x.on), open: hm(x && x.open) || '08:00', close: hm(x && x.close) || '18:00' })) : null;
+  }
   if (b.addAvatar) {
     const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(b.addAvatar.data || ''));
     if (!m || m[2].length > 600000) fail(400, 'ไฟล์ต้องเป็นรูปภาพ');
@@ -1023,6 +1041,67 @@ async function editShop(env, me, b) {
     });
   }
   await env.DB.batch(stmts);
+  return { ok: true };
+}
+
+/* ═══ โพสต์ของช่าง (แพ็กเกจบริการ / ผลงาน) ═══ */
+function gigOut(g, t) {
+  return { id: g.id, kind: g.kind, title: g.title, body: g.body || '', price: g.price || 0, cats: parse(g.cats) || [],
+    brands: parse(g.brands) || [], photos: parse(g.photos) || [], createdAt: g.created_at, tech: t ? publicTech(t) : null };
+}
+async function listGigs(env, me, url) {
+  const mine = url.searchParams.get('mine') === '1';
+  let rows;
+  if (mine) {
+    if (!me) fail(401, 'ต้องเข้าสู่ระบบ');
+    rows = (await env.DB.prepare('SELECT * FROM tech_gigs WHERE uid = ? AND active = 1 ORDER BY created_at DESC LIMIT 100').bind(me.uid).all()).results;
+  } else {
+    rows = (await env.DB.prepare('SELECT * FROM tech_gigs WHERE active = 1 ORDER BY created_at DESC LIMIT 300').all()).results;
+  }
+  if (!rows.length) return { gigs: [] };
+  const ids = [...new Set(rows.map(r => r.tech_id))];
+  const techs = await inAll(env, 'SELECT * FROM tech_profiles WHERE id IN ({IN}) AND suspended = 0', ids);
+  const by = Object.fromEntries((await withPhotos(env, techs)).map(t => [t.id, t]));
+  const ok = t => t && (t.verified || (t.test && me && me.staff) || (mine && t.uid === me.uid));
+  return { gigs: rows.filter(r => ok(by[r.tech_id])).map(r => gigOut(r, by[r.tech_id])) };
+}
+async function saveGig(env, me, b) {
+  const t = await myShop(env, me);
+  const kind = b.kind === 'work' ? 'work' : 'package';
+  const title = String(b.title || '').trim().slice(0, 100);
+  if (title.length < 3) fail(400, 'ใส่หัวข้อโพสต์อย่างน้อย 3 ตัวอักษร');
+  const body = String(b.body || '').trim().slice(0, 2000);
+  const price = kind === 'package' ? num(b.price, 'ราคา', 1, 1000000) : (+b.price || 0);
+  const cats = JSON.stringify((Array.isArray(b.cats) ? b.cats : []).map(String).slice(0, 6));
+  const brands = JSON.stringify((Array.isArray(b.brands) ? b.brands : []).map(x => String(x).slice(0, 30)).slice(0, 10));
+  let photos = (Array.isArray(b.keep) ? b.keep.map(Number).filter(Boolean) : []);
+  const add = Array.isArray(b.addPhotos) ? b.addPhotos.slice(0, 8) : [];
+  if (photos.length + add.length > 8) fail(400, 'โพสต์หนึ่งใส่รูปได้ไม่เกิน 8 รูป');
+  if (kind === 'work' && photos.length + add.length < 1) fail(400, 'โพสต์ผลงานต้องมีรูปอย่างน้อย 1 รูป');
+  for (const x of add) {
+    const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(x && x.data || ''));
+    if (!m || m[2].length > 1400000) fail(400, 'ไฟล์ต้องเป็นรูปภาพ');
+    const r = await env.DB.prepare('INSERT INTO tech_docs (uid, kind, mime, data, created_at) VALUES (?,?,?,?,?)').bind(me.uid, 'gig', m[1], m[2], now()).run();
+    photos.push(r.meta && r.meta.last_row_id);
+  }
+  photos = JSON.stringify(photos.filter(Boolean));
+  if (b.id) {
+    const g = await env.DB.prepare('SELECT uid FROM tech_gigs WHERE id = ?').bind(+b.id).first();
+    if (!g || g.uid !== me.uid) fail(404, 'ไม่พบโพสต์');
+    await env.DB.prepare('UPDATE tech_gigs SET kind=?,title=?,body=?,price=?,cats=?,brands=?,photos=?,updated_at=? WHERE id=?')
+      .bind(kind, title, body, price, cats, brands, photos, now(), +b.id).run();
+    return { ok: true, id: +b.id };
+  }
+  const c = await env.DB.prepare('SELECT COUNT(*) AS n FROM tech_gigs WHERE uid = ? AND active = 1').bind(me.uid).first();
+  if (c.n >= 30) fail(400, 'โพสต์ได้สูงสุด 30 โพสต์ ลบโพสต์เก่าก่อน');
+  const r = await env.DB.prepare('INSERT INTO tech_gigs (uid,tech_id,kind,title,body,price,cats,brands,photos,active,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,1,?,?)')
+    .bind(me.uid, t.id, kind, title, body, price, cats, brands, photos, now(), now()).run();
+  return { ok: true, id: r.meta && r.meta.last_row_id };
+}
+async function delGig(env, me, b) {
+  const g = await env.DB.prepare('SELECT uid FROM tech_gigs WHERE id = ?').bind(+b.id).first();
+  if (!g || (g.uid !== me.uid && !me.staff)) fail(404, 'ไม่พบโพสต์');
+  await env.DB.prepare('UPDATE tech_gigs SET active = 0, updated_at = ? WHERE id = ?').bind(now(), +b.id).run();
   return { ok: true };
 }
 
@@ -1118,6 +1197,11 @@ async function route(request, env) {
     try { me = await who(request, env, wantTest); } catch (e) { if (wantTest) throw e; }
     return listTechs(env, me, url);
   }
+  if (p === '/api/tech/gigs' && m === 'GET') {
+    let me = null;
+    try { me = await who(request, env, false); } catch (e) {}
+    return listGigs(env, me, url);
+  }
   /* หน้าเว็บใช้เช็กว่าเซิร์ฟเวอร์มีระบบช่างรุ่นนี้แล้ว — ถ้าไม่มี แสดงให้ทีมงานรู้ว่ายังไม่ได้ deploy */
   if (p === '/api/tech/ping') return { ok: true, version: API_VERSION };
 
@@ -1143,6 +1227,8 @@ async function route(request, env) {
   if (p === '/api/tech/posts/near' && m === 'GET') return nearPosts(env, me);
   if (p === '/api/tech/online' && m === 'POST') return setOnline(env, me, await body());
   if (p === '/api/tech/shop' && m === 'POST') return editShop(env, me, await body());
+  if (p === '/api/tech/gig' && m === 'POST') return saveGig(env, me, await body());
+  if (p === '/api/tech/gig/delete' && m === 'POST') return delGig(env, me, await body());
   if (p === '/api/tech/stats' && m === 'GET') return stats(env, me);
   if (p === '/api/tech/advice' && m === 'GET') return advice(env, me);
   const pd = p.match(/^\/api\/tech\/posts\/([0-9a-f-]{36})$/i);
