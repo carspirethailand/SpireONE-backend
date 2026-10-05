@@ -2,7 +2,7 @@ import { verifyFirebaseToken } from './auth.js';
 import { buildFeatureRequest } from './features-ai.mjs';
 import { handleTech } from './techs.js';
 import { handleVec, kbScores, refreshKb } from './vectors.js';
-import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels, toChatHistory, levelFor, depthNote, featuresBlock, badState, geminiScope, unpark } from './fastai.js';
+import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels, toChatHistory, levelFor, depthNote, featuresBlock, badState, geminiScope, unpark, executeSearchInternal } from './fastai.js';
 
 /*
  * SpireONE backend — security-hardened.
@@ -633,47 +633,62 @@ async function tokensToday(env, uid) {
 async function callGemini(env, { contents, system, search, temp, json: wantJson, maxTokens, meter }) {
   const geminiKey = env.GEMINI_KEY;
   if (!geminiKey) throw new Error('AI is not configured');
-  const model = env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
+  const models = [
+    'gemini-3.5-flash-lite',
+    'gemini-3.1-flash-lite',
+    env.GEMINI_MODEL
+  ].map(m => String(m || '').trim()).filter(Boolean);
+  const modelsToTry = [...new Set(models)];
   const baseUrl = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
-  const url = `${baseUrl}/v1beta/models/${model}:generateContent`;
 
-  const gen = { temperature: typeof temp === 'number' ? Math.min(Math.max(temp, 0), 1) : 0.5 };
-  if (maxTokens) gen.maxOutputTokens = maxTokens;
-  if (wantJson) {
-    // Ask for JSON directly and switch thinking off. On 2.5-flash the thinking
-    // budget can swallow the whole output allowance and come back with an empty
-    // text part, which is what made /api/spares 500 on a valid request.
-    gen.responseMimeType = 'application/json';
-    // thinkingConfig only exists on the thinking-capable models; sending it to
-    // an older one is a 400.
-    if (/2\.5|3\./.test(model)) gen.thinkingConfig = { thinkingBudget: 0 };
-  }
-  const body = { contents, generationConfig: gen };
-  if (system) body.systemInstruction = { parts: [{ text: String(system).slice(0, 8000) }] };
-  // The search tool and a forced JSON mime type cannot be combined.
-  if (search && !wantJson) body.tools = [{ google_search: {} }];
+  let lastErr = null;
+  for (const model of modelsToTry) {
+    const url = `${baseUrl}/v1beta/models/${model}:generateContent`;
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const t = await res.text();
-    /* 429 is the model's own rate/quota limit, not a bug in the request.
-       Give it a stable prefix so callers can show a specific message. */
-    if (res.status === 429) throw new Error('AI quota exhausted');
-    throw new Error(`AI upstream error ${res.status}: ${t.slice(0, 200)}`);
+    const gen = { temperature: typeof temp === 'number' ? Math.min(Math.max(temp, 0), 1) : 0.5 };
+    if (maxTokens) gen.maxOutputTokens = maxTokens;
+    if (wantJson) {
+      // Ask for JSON directly and switch thinking to minimal.
+      gen.responseMimeType = 'application/json';
+      if (/gemini-3|gemini-[4-9]/.test(model)) gen.thinkingConfig = { thinkingLevel: 'minimal' };
+      else if (/2\.5/.test(model)) gen.thinkingConfig = { thinkingBudget: 0 };
+    }
+    const body = { contents, generationConfig: gen };
+    if (system) body.systemInstruction = { parts: [{ text: String(system).slice(0, 8000) }] };
+    // The search tool and a forced JSON mime type cannot be combined.
+    if (search && !wantJson) body.tools = [{ google_search: {} }];
+
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const t = await res.text().catch(() => '');
+        if (res.status === 429) {
+          lastErr = new Error('AI quota exhausted');
+        } else {
+          lastErr = new Error(`AI upstream error ${res.status} (${model}): ${t.slice(0, 200)}`);
+        }
+        continue;
+      }
+      const data = await res.json();
+      readUsage(meter, data, 'gemini');
+      const c = (data.candidates && data.candidates[0]) || {};
+      const text = ((c.content && c.content.parts) || []).map(p => p.text || '').join('').trim();
+      if (!text) {
+        const why = c.finishReason || (data.promptFeedback && data.promptFeedback.blockReason) || 'empty response';
+        lastErr = new Error(`AI returned no text (${why})`);
+        continue;
+      }
+      return text;
+    } catch (e) {
+      lastErr = e;
+    }
   }
-  const data = await res.json();
-  readUsage(meter, data, 'gemini');
-  const c = (data.candidates && data.candidates[0]) || {};
-  const text = ((c.content && c.content.parts) || []).map(p => p.text || '').join('').trim();
-  if (!text) {
-    const why = c.finishReason || (data.promptFeedback && data.promptFeedback.blockReason) || 'empty response';
-    throw new Error(`AI returned no text (${why})`);
-  }
-  return text;
+
+  throw lastErr || new Error('All Gemini models failed');
 }
 
 /* Pulls the first JSON array out of a model reply. Returns null rather than
@@ -1732,8 +1747,7 @@ async function executeDescribeMediaTool(env, messages, prompt) {
   if (!geminiKey) {
     throw new Error('GEMINI_KEY environment variable is not configured');
   }
-  const primaryModel = env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
-  const modelsToTry = [primaryModel, 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.6-flash', 'gemini-3.8-flash'];
+  const modelsToTry = ['gemini-3.1-flash-lite', 'gemini-3.5-flash-lite', 'gemini-3.6-flash', 'gemini-3.8-flash', env.GEMINI_MODEL].filter(Boolean);
   const baseUrl = env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com";
 
   const parts = [];
@@ -1803,71 +1817,9 @@ async function executeDescribeMediaTool(env, messages, prompt) {
   throw lastErr || new Error('Failed to analyze media file with Gemini API');
 }
 
-/* ── ค้นเน็ตผ่าน Gemini ──
-   ของเดิมยิงโมเดลเดียวแล้วโยน error ทิ้งเมื่อพลาด ผลคือฝั่งเรียกได้ค่าว่าง
-   แล้วปล่อยให้โมเดลตอบจากความจำ ซึ่งกลายเป็นมั่วอย่างมั่นใจ
-   ตอนนี้ไล่ลองหลายโมเดลและรูปแบบเครื่องมือทั้งสองแบบ
-   ถ้าไม่ได้จริง ๆ จะคืนค่าว่างพร้อมบอกผู้เรียกให้จัดการอย่างซื่อสัตย์ */
+/* ── ค้นข้อมูลอินเทอร์เน็ต (DuckDuckGo -> Gemini 3.1 -> Gemini 3.5 -> WebSearch) ── */
 async function executeGoogleSearchTool(env, query) {
-  const geminiKey = env.GEMINI_KEY;
-  if (!geminiKey) { console.warn('[search] ไม่มี GEMINI_KEY'); return '' }
-  const baseUrl = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
-  /* ของเดิมไล่ Gemma (ค้นเว็บไม่ได้) และรุ่น 1.5/2.0 ที่ Google ปิดไปแล้ว คูณสามรูปแบบเครื่องมือ
-     ได้ถึง 21 ครั้งต่อหนึ่งคำถาม ทั้งช้าและพลาด — เหลือเฉพาะรุ่นที่ค้นได้จริง รูปแบบเดียว */
-  const models = chatModels(env);
-
-  /* บอกแหล่งที่ยอมรับให้ชัด ไม่งั้นมันไปหยิบบล็อกหรือเว็บรวมข่าวที่คัดลอกกันมา
-     ซึ่งมั่วบ่อยมากโดยเฉพาะเรื่องรถที่เพิ่งเปิดตัว */
-  const prompt = `ค้นข้อมูลล่าสุดในอินเทอร์เน็ตเรื่องนี้ แล้วสรุปเฉพาะข้อเท็จจริงที่ยืนยันได้: ${query}
-
-แหล่งที่เชื่อได้: เว็บผู้ผลิตและศูนย์บริการ สื่อรถยนต์ที่มีกองบรรณาธิการ (ไทยและต่างประเทศ)
-สำนักข่าวหลัก และร้านอะไหล่/ร้านค้าที่แสดงราคาชัดเจน (สำหรับคำถามเรื่องราคาในไทย)
-เลี่ยงฟอรัม ข่าวลือ และเว็บที่คัดลอกข่าวต่อกันมา
-
-รูปแบบการตอบ:
-- เขียนเป็นข้อเท็จจริงสั้น ๆ เป็นข้อ ๆ พร้อมระบุว่ามาจากแหล่งไหน (ชื่อเว็บเฉย ๆ ไม่ต้องใส่ลิงก์)
-- ตัวเลขสเปกให้ระบุเฉพาะที่เจอจริงในแหล่งข้างต้น ถ้าไม่เจอให้เขียนว่า "ยังไม่เปิดเผย"
-- ถ้าค้นแล้วไม่พบข้อมูลที่ยืนยันได้จากแหล่งเหล่านี้เลย ให้ตอบว่า "ไม่พบข้อมูลยืนยัน" คำเดียว
-  ห้ามเดา ห้ามแต่งตัวเลข และห้ามเอาข่าวลือมาตอบ`;
-
-  const toolShapes = [{ google_search: {} }];
-
-  for (const model of models) {
-    for (const toolShape of toolShapes) {
-      try {
-        const res = await fetch(`${baseUrl}/v1beta/models/${model}:generateContent`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey },
-          body: JSON.stringify({
-            contents: [{ role: 'user', parts: [{ text: prompt }] }],
-            tools: [toolShape],
-            generationConfig: { temperature: 0.2 },
-          }),
-        });
-        if (!res.ok) {
-          const errBody = await res.text().catch(() => '');
-          console.warn(`[search] ${model} ตอบ ${res.status}: ${errBody.slice(0, 120)}`);
-          continue;
-        }
-        const data = await res.json();
-        const cand = (data.candidates && data.candidates[0]) || {};
-        const txt = cleanSearch(((cand.content && cand.content.parts) || [])
-          .map(x => x.text || '').join('').trim());
-        if (txt && !/^ไม่พบข้อมูลยืนยัน/.test(txt)) {
-          console.log(`[search] สำเร็จด้วย ${model}`);
-          return txt;
-        }
-        if (/^ไม่พบข้อมูลยืนยัน/.test(txt)) return '';
-      } catch (e) {
-        console.warn(`[search] ${model} ล้มเหลว: ${e.message}`);
-      }
-    }
-  }
-
-  // No verified search result: return empty rather than call a missing provider.
-
-  console.warn('[search] ค้นไม่สำเร็จทุกโมเดล');
-  return '';
+  return await executeSearchInternal(env, query);
 }
 
 function parseJsonLoose(text) {
@@ -4329,6 +4281,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                   search: true,
                   executeSearch: async (q) => await executeGoogleSearchTool(env, q),
                   executeMedia: async (p) => await executeDescribeMediaTool(env, msgs, p),
+                  executeKb: async (q) => await kbFor(env, carInfo, q),
                   depth: body.depth, level: levelFor(body.depth, question, hasMedia, body.skillIds), meter,
                   onThought: d => send({ type: 'reasoning', delta: d }),
                   onSearch: async q => { await send({ type: 'research', q: String(q).slice(0, 120) }); await send({ type: 'status', key: 'search', text: 'กำลังค้น: ' + String(q).slice(0, 60) }) },
@@ -4339,18 +4292,15 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                 });
                 text = r.text;
               } catch (e) {
-                /* Gemini ใช้ไม่ได้ทั้งหมด (คีย์/โควตา/ชื่อรุ่น) — ไปทางสำรองที่เร็วที่สุดที่มี ผู้ใช้ยังได้คำตอบ
-                   และจดสาเหตุไว้ให้เจ้าของดูในหน้าตรวจระบบ (ผู้ใช้ไม่เห็น) */
                 console.error('[stream fast]', e.message);
                 noteAiError(env, e);
-                /* ทางสำรองพังด้วย — แนบสาเหตุของ Gemini ไปด้วย ผู้ดูแลจะเห็นต้นเหตุจริง ไม่ใช่แค่ของทางสำรอง */
-                const r = await fallbackAnswer(env, sys, historyOf(msgs), { depth: body.depth,
-                  geminiError: e, meter, onThought: d => send({ type: 'reasoning', delta: d }),
-                  onText: async d => {
-                    if (firstText) { firstText = false; await send({ type: 'status', key: 'write', text: 'กำลังเขียนคำตอบ' }); }
-                    await send({ type: 'text', delta: d });
-                  } });
-                text = r.text || '';
+                const errMsg = 'ขออภัยครับ ขณะนี้ระบบประมวลผล AI กำลังมีผู้ใช้งานหนาแน่น กรุณาลองใหม่อีกครั้งในอีกสักครู่ครับ';
+                if (firstText) {
+                  firstText = false;
+                  await send({ type: 'status', key: 'write', text: 'ระบบ AI ขัดข้องชั่วคราว' });
+                }
+                await send({ type: 'text', delta: errMsg });
+                text = errMsg;
               }
 
               /* ── ปิดสตรีมให้เร็วที่สุด แล้วค่อยเก็บบัญชี ── */
@@ -4520,6 +4470,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                 search: true,
                 executeSearch: async (q) => await executeGoogleSearchTool(env, q),
                 executeMedia: async (p) => await executeDescribeMediaTool(env, body.contents, p),
+                executeKb: async (q) => await kbFor(env, carInfo, q),
                 depth: body.depth, level: levelFor(body.depth, question, hasMedia, body.skillIds),
                 meter
               });
@@ -4527,8 +4478,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
             } catch (e) {
               console.error('[chat fast]', e.message);
               noteAiError(env, e);
-              const r = await fallbackAnswer(env, sys, historyOf(body.contents), { meter, depth: body.depth });
-              agentOut = { text: cleanReply(r.text), reasoning: (r.thoughts || '').slice(0, 6000) };
+              agentOut = { text: 'ขออภัยครับ ขณะนี้ระบบประมวลผล AI กำลังมีผู้ใช้งานหนาแน่น กรุณาลองใหม่อีกครั้งในอีกสักครู่ครับ', reasoning: '' };
             }
             const text = (agentOut && agentOut.text) || '';
             const reasoning = (agentOut && agentOut.reasoning) || '';

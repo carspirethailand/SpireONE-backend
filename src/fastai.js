@@ -6,7 +6,7 @@
    โมเดลเลือกจาก GEMINI_SEARCH_MODEL (ค่าเริ่มต้น gemini-3.8-flash) แล้วถอยไป GEMINI_MODEL
    ถ้าชื่อโมเดลไหนใช้ไม่ได้ (404/400) จะรู้ภายในเสี้ยววินาทีแล้วข้ามไปตัวถัดไปเอง */
 
-const DEFAULT_MODEL = 'gemini-3.8-flash';
+const DEFAULT_MODEL = 'gemini-3.1-flash-lite';
 
 /* โทเคนโดยประมาณของข้อความล่าสุดที่ผู้ใช้ส่ง (ตัวอักษร/3 + รูปละ 300) — ใช้คิดโควตา */
 function userTokens(contents) {
@@ -17,11 +17,16 @@ function userTokens(contents) {
   return n;
 }
 
-/* โมเดลที่ใช้ตอบ + ค้นเว็บ เรียงตามลำดับที่จะลอง
-   Gemma ใช้เครื่องมือค้นเว็บไม่ได้ จึงไม่เอามาใช้ในงานนี้ แม้จะตั้งไว้ในตัวแปร */
+/* โมเดลที่ใช้ตอบ + ค้นเว็บ เรียงตามลำดับที่จะลอง (gemini 3.1 flash lite และ 3.5 flash lite เป็นหลัก) */
 export function chatModels(env) {
-  /* ท้ายรายการเป็นรุ่นที่ Google เปิดให้ใช้มานานและเสถียร — กันกรณีชื่อรุ่นที่ตั้งไว้ใช้ไม่ได้ทั้งหมด แชตจะไม่ล่มทั้งระบบ */
-  const list = [env.GEMINI_CHAT_MODEL, env.GEMINI_SEARCH_MODEL, DEFAULT_MODEL, env.GEMINI_MODEL, 'gemini-2.5-flash']   /* 2.0-flash ถูก Google ยกเลิกแล้ว (404) */
+  const list = [
+    'gemini-3.1-flash-lite',
+    'gemini-3.5-flash-lite',
+    'gemini-3.6-flash',
+    'gemini-3.8-flash',
+    env?.GEMINI_MODEL,
+    'gemini-2.5-flash'
+  ]
     .map(m => String(m || '').trim())
     .filter(m => m && !/^gemma/i.test(m));
   return [...new Set(list)];
@@ -209,58 +214,310 @@ export function searchQuery(userTexts) {
   const minus = [...neg].filter(w => !pos.includes(w)).map(w => '-' + w);
   return pos.concat(minus).join(' ').slice(0, 160);
 }
+/* ══ สถาปัตยกรรม ReAct (Reason + Act Loop Engine) ══
+   - สมองหลัก: openrouter/free (ผ่าน OpenRouter API)
+   - ตัวสำรอง ReAct: gpt-oss-120b, gpt-oss-20b ผ่าน Groq เท่านั้น */
+export function reactProviders(env) {
+  const L = [];
+  // 1. ตัวหลัก: OpenRouter (openrouter/free)
+  if (env.OPENROUTER_API_KEY && !bad('react|openrouter')) {
+    L.push({
+      src: 'openrouter',
+      url: `${env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1'}/chat/completions`,
+      key: env.OPENROUTER_API_KEY,
+      model: env.OPENROUTER_MODEL || 'openrouter/free',
+      headers: { 'HTTP-Referer': 'https://carspirethailand.com', 'X-Title': 'Cendon' },
+      timeoutMs: 25000
+    });
+  }
+  // 2. ตัวสำรอง ReAct: Groq เท่านั้น (openai/gpt-oss-120b, openai/gpt-oss-20b, llama-3.1-8b-instant)
+  if (env.GROQ_API_KEY && !bad('react|groq')) {
+    const gu = `${env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1'}/chat/completions`;
+    L.push({
+      src: 'groq',
+      url: gu,
+      key: env.GROQ_API_KEY,
+      model: env.GROQ_MODEL || 'openai/gpt-oss-120b',
+      altModel: 'openai/gpt-oss-20b',
+      emergencyModel: 'llama-3.1-8b-instant',
+      timeoutMs: 20000
+    });
+  }
+  return L;
+}
+
+const REACT_SYSTEM_PROMPT = `
+
+[สถาปัตยกรรม ReAct: คุณมีความสามารถในการคิดและเรียกใช้เครื่องมือ]
+เครื่องมือที่คุณสามารถเรียกใช้ได้:
+1. search(query): ค้นหาข้อมูลล่าสุดในอินเทอร์เน็ต เช่น ราคากลาง, สเปกรถปี 2024-2026, โปรโมชั่น, ดอกเบี้ย, ข่าวเปิดตัว, ข้อมูลรถรุ่นใหม่
+2. describe_media(prompt): ตรวจดูและอธิบายรายละเอียดภาพถ่าย วิดีโอ หรือเสียงที่ผู้ใช้แนบมา
+3. query_kb(query): ค้นหาคู่มือรถและฐานความรู้เฉพาะของรถรุ่นนี้
+
+รูปแบบการทำงานในแต่ละรอบ:
+Thought: [อธิบายความคิดสั้น ๆ ว่าทำไมต้องใช้เครื่องมือ หรือพร้อมตอบแล้ว]
+Action: [ชื่อเครื่องมือ]("คำค้นหาหรือคำสั่ง")
+
+ตัวอย่าง:
+Thought: ผู้ใช้ถามเรื่องราคารถ Honda HR-V ปี 2026 ฉันจำเป็นต้องค้นหาข้อมูลล่าสุด
+Action: search("honda hr-v 2026 ราคา สเปก ล่าสุด")
+
+เมื่อระบบค้นหาแล้วจะส่งผลลัพธ์กลับมาเป็น:
+Observation: [ผลการค้นหาจากเครื่องมือ]
+
+คุณสามารถคิดและเรียกเครื่องมือต่อได้ หรือหากมีข้อมูลเพียงพอแล้ว ให้สรุปคำตอบโดยเริ่มจาก Final Answer:
+Thought: ฉันได้ข้อมูลที่จำเป็นครบถ้วนแล้ว พร้อมสรุปคำตอบให้ผู้ใช้
+Final Answer: [คำตอบที่สมบูรณ์ เป็นมิตร ตรงประเด็น และอ้างอิงจาก Observation]
+
+ข้อสำคัญ:
+- ถ้าไม่ต้องเรียกเครื่องมือ ให้ตอบ Final Answer: ได้ทันที
+- ข้อความหลัง Final Answer: คือสิ่งเดียวที่จะแสดงให้ผู้ใช้เห็น
+- ห้ามตอบว่าไม่มีเครื่องมือค้นหา หรือเข้าถึงอินเทอร์เน็ตไม่ได้ เพราะคุณมีเครื่องมือ search ให้เรียกใช้ได้ตลอดเวลา`;
+
+export async function reactAgent(env, opts) {
+  const providers = reactProviders(env);
+  if (!providers.length) return null;
+
+  const history = opts.history || (opts.messages ? toChatHistory(opts.messages) : (opts.contents ? toChatHistory(opts.contents) : []));
+  const sys = (opts.system || '') + REACT_SYSTEM_PROMPT;
+
+  let lastErr = null;
+
+  for (const p of providers) {
+    const t0 = Date.now();
+    let thoughts = '';
+    let didSearch = false;
+    let turn = 0;
+    const maxTurns = 3;
+    let messages = [
+      { role: 'system', content: sys },
+      ...history
+    ];
+
+    try {
+      let finalAnswer = '';
+      while (turn < maxTurns) {
+        turn++;
+        let turnOutput = '';
+        let seenFinalAnswer = false;
+        let finalStreamStarted = false;
+
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort('timeout'), p.timeoutMs || 30000);
+
+        try {
+          const bodyPayload = {
+            model: p.model,
+            messages,
+            temperature: 0.3,
+            stream: true,
+            ...(p.extra || {})
+          };
+
+          let res = await fetch(p.url, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${p.key}`,
+              ...(p.headers || {})
+            },
+            body: JSON.stringify(bodyPayload),
+            signal: ac.signal
+          });
+
+          // Groq fallback if model 404/429/413 (e.g. gpt-oss-120b -> gpt-oss-20b -> llama-3.1-8b-instant)
+          if (!res.ok && p.src === 'groq') {
+            if (p.altModel && (res.status === 404 || res.status === 429 || res.status === 413)) {
+              bodyPayload.model = p.altModel;
+              res = await fetch(p.url, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${p.key}`,
+                  ...(p.headers || {})
+                },
+                body: JSON.stringify(bodyPayload),
+                signal: ac.signal
+              });
+            }
+            if (!res.ok && p.emergencyModel && (res.status === 404 || res.status === 429 || res.status === 413)) {
+              bodyPayload.model = p.emergencyModel;
+              res = await fetch(p.url, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${p.key}`,
+                  ...(p.headers || {})
+                },
+                body: JSON.stringify(bodyPayload),
+                signal: ac.signal
+              });
+            }
+          }
+
+          if (!res.ok) {
+            const errTxt = await res.text().catch(() => '');
+            throw new Error(`${p.src} ${res.status}: ${errTxt.slice(0, 160)}`);
+          }
+
+          const reader = res.body.getReader();
+          const dec = new TextDecoder();
+          let buf = '';
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += dec.decode(value, { stream: true });
+            const lines = buf.split('\n');
+            buf = lines.pop() || '';
+            for (const line of lines) {
+              const t = line.trim();
+              if (!t.startsWith('data:')) continue;
+              const payload = t.slice(5).trim();
+              if (payload === '[DONE]') continue;
+              let d;
+              try { d = JSON.parse(payload); } catch { continue; }
+              const delta = (d.choices && d.choices[0] && d.choices[0].delta) || {};
+              const r = delta.reasoning || delta.reasoning_content;
+              if (r) {
+                thoughts += r;
+                if (opts.onThought) await opts.onThought(r);
+              }
+              if (delta.content) {
+                turnOutput += delta.content;
+                if (!seenFinalAnswer) {
+                  if (/Final Answer:\s*/i.test(turnOutput)) {
+                    seenFinalAnswer = true;
+                    finalStreamStarted = true;
+                    const parts = turnOutput.split(/Final Answer:\s*/i);
+                    const toSend = parts.slice(1).join('Final Answer:');
+                    if (toSend && opts.onText) await opts.onText(toSend);
+                  }
+                } else if (finalStreamStarted && opts.onText) {
+                  await opts.onText(delta.content);
+                }
+              }
+            }
+          }
+        } finally {
+          clearTimeout(timer);
+        }
+
+        // ตรวจสอบว่าโมเดลเรียกใช้ Action หรือไม่
+        const combined = `${turnOutput}\n${thoughts}`;
+        let actionMatch = combined.match(/(?:Action|Tool):\s*(\w+)\s*[:\(]\s*(?:query\s*=\s*|prompt\s*=\s*)?(["'`\u201c\u2018])([\s\S]*?)\2\s*\)?/i);
+        if (!actionMatch) {
+          const loose = combined.match(/(?:Action|Tool):\s*(\w+)\s*\(([^)]+)\)/i);
+          if (loose) {
+            actionMatch = [loose[0], loose[1], '"', loose[2].replace(/^["'`\u201c\u2018]|["'`\u201d\u2019]$/g, '').trim()];
+          }
+        }
+        if (!actionMatch) {
+          const tcMatch = combined.match(/<tool_call>[\s\S]*?"name":\s*"(\w+)"[\s\S]*?"(?:query|prompt)":\s*"([^"]+)"[\s\S]*?<\/tool_call>/i);
+          if (tcMatch) {
+            actionMatch = [tcMatch[0], tcMatch[1], '"', tcMatch[2]];
+          }
+        }
+
+        // ถ้าโมเดลสั่ง Action และยังไม่เกินโควตารอบ (maxTurns)
+        if (actionMatch && turn < maxTurns && !seenFinalAnswer) {
+          const toolName = actionMatch[1].toLowerCase();
+          const toolArg = actionMatch[3];
+          let observation = '';
+
+          if (toolName === 'search' || toolName === 'google_search' || toolName === 'web_search') {
+            if (opts.onSearch) await opts.onSearch(toolArg);
+            const searchFn = opts.executeSearch || (q => executeSearchInternal(env, q));
+            observation = await searchFn(toolArg);
+            didSearch = true;
+          } else if (toolName === 'describe_media' && opts.executeMedia) {
+            observation = await opts.executeMedia(toolArg);
+          } else if (toolName === 'query_kb' && opts.executeKb) {
+            observation = await opts.executeKb(toolArg);
+          } else {
+            observation = 'เครื่องมือนี้ไม่รองรับ';
+          }
+
+          messages.push({
+            role: 'assistant',
+            content: turnOutput.trim() || `Action: ${toolName}("${toolArg}")`
+          });
+          messages.push({
+            role: 'user',
+            content: `Observation: ${observation || 'ไม่พบข้อมูล'}` + (turn === maxTurns - 1 ? '\n\nคำสั่ง: ข้อมูลครบถ้วนแล้ว ให้สรุปคำตอบสุดท้ายโดยขึ้นต้นด้วย Final Answer:' : '')
+          });
+
+          continue;
+        }
+
+        // กรณีตอบเสร็จสิ้นแล้ว หรือไม่มี Action
+        let clean = turnOutput;
+        const faMatch = clean.match(/Final Answer:\s*([\s\S]+)$/i);
+        if (faMatch) clean = faMatch[1];
+        clean = stripToolCalls(clean).trim();
+
+        if (!finalStreamStarted && clean && opts.onText) {
+          await opts.onText(clean);
+        }
+
+        finalAnswer = clean;
+        break;
+      }
+
+      if (finalAnswer && finalAnswer.trim()) {
+        trail(opts.meter, { model: p.src + ':' + p.model, level: null, search: didSearch, ok: true, ms: Date.now() - t0, grounded: didSearch });
+        return {
+          text: finalAnswer,
+          thoughts,
+          grounded: didSearch,
+          model: p.src + ':' + p.model
+        };
+      }
+    } catch (err) {
+      lastErr = err;
+      console.warn(`[reactAgent] Provider ${p.src} failed:`, err.message || err);
+      if (/429|rate/i.test(err.message || '')) markBad('react|' + p.src, 30000);
+      else if (/40[1234]:/i.test(err.message || '')) markBad('react|' + p.src, 3600000);
+      else markBad('react|' + p.src, 15000);
+    }
+  }
+
+  throw lastErr || new Error('reactAgent failed across all providers');
+}
+
 export async function fastAnswer(env, opts) {
-  if (!env.GEMINI_KEY) throw new Error('AI is not configured');
-  let last = null;
-  const want = opts.level || 'low';
-  const ladder = want === 'medium' ? ['medium', 'low', null] : want === 'minimal' ? ['minimal', 'low', null] : ['low', null];
-  /* งบเวลารวมก่อนได้คำแรก 14 วินาที — เกินนั้นไปทางสำรองเลย ผู้ใช้ไม่ต้องนั่งรอไล่ลองทีละรุ่น */
-  /* A 429 may be RPM/TPM or model-specific, not exhaustion of every model. */
-  const scope = await geminiScope(env);
-  const until = Date.now() + 14000;
-  for (const model of chatModels(env)) {
-    const scoped = key => scope + '|' + key;
-    if (bad(scoped(model))) { trail(opts.meter, { model, ok: false, ms: 0, err: 'ข้าม: รุ่นนี้เพิ่งล้ม (พักชั่วคราว)' }); continue; }
-    /* Google Search ของ Gemini ใช้ได้เฉพาะโปรเจกต์ที่เปิด billing — Free Tier ได้ 429 ทุกครั้ง เสียโควตาและเวลาเปล่า
-       ปิดไว้ก่อน ใช้ตัวค้นเว็บของเราแทน · เปิด billing แล้วตั้ง GEMINI_GROUNDING=1 */
-    let search = !!opts.search && env.GEMINI_GROUNDING === '1' && !bad(scoped(model + '|search'));
-    if (opts.search && !search && !opts._web) { const t1 = Date.now(); opts._web = await webSearch(env, lastQ(opts.contents), { depth: opts.depth == null ? 1 : +opts.depth });
-      trail(opts.meter, { model: 'ค้นเว็บ:' + (opts._web.src || 'ไม่พบ'), ok: !!opts._web.text, ms: Date.now() - t1, err: opts._web.stat || (opts._web.text ? '' : 'no results') });
-      if (opts._web.text) opts = { ...opts, system: (opts.system || '') + webBlock(opts._web) }; }
-    for (let i = 0; i < ladder.length; i++) {
-      const level = ladder[i];
-      if (level && bad(scoped(model + '|' + level))) continue;
-      const left = until - Date.now();
-      if (left < 1500) throw last || new Error('gemini: time budget used');
-      const t0 = Date.now();
-      try {
-        const r = await streamOnce(env, model, { ...opts, level, search, headerMs: Math.min(search ? 16000 : 9000, left) });
-        trail(opts.meter, { model, level, search, ok: true, ms: Date.now() - t0, grounded: r.grounded });
-        return r;
-      } catch (e) {
-        const em = String(e.message || e), qd = (em.match(/quota[_ ]?metric[^,}]*|metric: [^\n,]*|limit: ?\d+|quotaValue[^,}]*/gi) || []).join(' · ');
-        trail(opts.meter, { model, level, search, ok: false, ms: Date.now() - t0, err: (em.slice(0, 120) + (qd ? ' ‖ ' + qd : '')).slice(0, 300) });
-        last = e;
-        if (e.partial) return { text: e.partial, thoughts: '', grounded: false, queries: [], model, cut: true };
-        /* Try without grounding once, then the next model; never assume all
-           models or a newly configured project share this failure.
-           Free Tier ใช้ Google Search ผ่าน API ไม่ได้ — ค้นเองแล้วแนบผลให้รุ่นเดิมตอบ */
-        if (e.quota && search) {
-          markBad(scoped(model + '|search'), 60000); search = false; i--;
-          if (!opts._web) { const t1 = Date.now(); opts._web = await webSearch(env, lastQ(opts.contents), { depth: opts.depth == null ? 1 : +opts.depth });
-            trail(opts.meter, { model: 'ค้นเว็บ:' + (opts._web.src || 'ไม่พบ'), ok: !!opts._web.text, ms: Date.now() - t1, err: opts._web.stat || (opts._web.text ? '' : 'no results') });
-            if (opts._web.text) { opts = { ...opts, system: (opts.system || '') + webBlock(opts._web) }; try { opts.onSearch && opts.onSearch([lastQ(opts.contents)]) } catch (_) {} } }
-          continue; }
-        if (e.thinking && level) { markBad(scoped(model + '|' + level)); continue; }
-        /* ค้นเว็บใช้ไม่ได้ในรุ่นนี้ — ลองรุ่นเดิมแบบไม่ค้น (โควตาค้นเต็มจำไว้แค่ 1 นาที) */
-        if (e.tool && search && !(e.quota && !opts.search)) { markBad(scoped(model + '|search'), e.quota ? 60000 : 600000); search = false; i--; continue; }
-        if (e.dead) markBad(scoped(model));
-        else if (e.quota || e.busy) markBad(scoped(model), 60000);
-        break;                                                                 /* ข้ามไปรุ่นถัดไป */
+  // 1. สมองหลัก ReAct (OpenRouter -> Cerebras -> Groq)
+  try {
+    const res = await reactAgent(env, opts);
+    if (res && res.text && res.text.trim()) {
+      return res;
+    }
+  } catch (e) {
+    console.warn('[fastAnswer reactAgent error]', e.message || e);
+  }
+
+  // 2. ถ้า ReAct ล้มเหลว ถอยไปที่ Gemini (3.1 flash lite -> 3.5 flash lite เท่านั้น)
+  if (env.GEMINI_KEY && !bad('gemini|quota') && !bad('gemini|region')) {
+    const scope = await geminiScope(env);
+    const ladder = ['low', null];
+    const models = ['gemini-3.1-flash-lite', 'gemini-3.5-flash-lite'];
+    for (const model of models) {
+      const scoped = key => scope + '|' + key;
+      if (bad(scoped(model))) continue;
+      for (const level of ladder) {
+        try {
+          const r = await streamOnce(env, model, { ...opts, level, search: false });
+          trail(opts.meter, { model, level, search: false, ok: true, ms: 0, grounded: r.grounded });
+          return r;
+        } catch (e) {
+          if (e.quota) markBad(scoped(model), 60000);
+          break;
+        }
       }
     }
   }
-  throw last || new Error('no model available');
+
+  throw new Error('All configured models failed: ReAct (OpenRouter, Groq) and Gemini (3.1-flash-lite, 3.5-flash-lite)');
 }
 
 /* ══ ทางสำรองเมื่อ Gemini ใช้ไม่ได้ ══
@@ -368,18 +625,14 @@ export function fallbackProviders(env, media) {
       headers: { 'HTTP-Referer': 'https://carspirethailand.com', 'X-Title': 'Cendon' } });
     return L.filter(p => !bad('fb|' + p.src));
   }
-  /* Cerebras ก่อน (เจ้าของเลือกเป็นตัวสำรองหลัก เสถียร เร็ว) → Groq → Workers AI → OpenRouter */
-  if (env.CEREBRAS_API_KEY) L.push({ src: 'cerebras', url: `${env.CEREBRAS_BASE_URL || 'https://api.cerebras.ai/v1'}/chat/completions`,
-    key: env.CEREBRAS_API_KEY, model: env.CEREBRAS_MODEL || 'gpt-oss-120b', extra: { reasoning_effort: 'low' } });
-  /* Groq (ฟรี เร็ว) — ถ้าชื่อรุ่นหลักใช้ไม่ได้กับคีย์นี้ มีรุ่นสำรอง (ตัวเดียวกับที่ใช้ดูรูป) */
+  /* สำรองเฉพาะ Groq และ OpenRouter */
   if (env.GROQ_API_KEY) {
     const gu = `${env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1'}/chat/completions`;
     L.push({ src: 'groq', url: gu, key: env.GROQ_API_KEY, model: env.GROQ_MODEL || 'openai/gpt-oss-120b' });
-    L.push({ src: 'groq-alt', url: gu, key: env.GROQ_API_KEY, model: env.GROQ_ALT_MODEL || 'llama-3.3-70b-versatile' });
+    L.push({ src: 'groq-alt', url: gu, key: env.GROQ_API_KEY, model: env.GROQ_ALT_MODEL || 'llama-3.1-8b-instant' });
   }
-  if (env.AI) L.push({ src: 'workers-ai', ai: true, model: env.CF_AI_FALLBACK_MODEL || '@cf/meta/llama-3.3-70b-instruct-fp8-fast' });
   if (env.OPENROUTER_API_KEY) L.push({ src: 'openrouter', url: `${env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1'}/chat/completions`,
-    key: env.OPENROUTER_API_KEY, model: env.OPENROUTER_MODEL || 'openrouter/free',   /* รุ่นฟรีเฉพาะชื่อถูกถอดบ่อย ใช้ตัวเลือกฟรีอัตโนมัติ แล้วกรองคำตอบขยะด้วย isJunk */
+    key: env.OPENROUTER_API_KEY, model: env.OPENROUTER_MODEL || 'openrouter/free',
     headers: { 'HTTP-Referer': 'https://carspirethailand.com', 'X-Title': 'Cendon' } });
   return L.filter(p => !bad('fb|' + p.src));
 }
@@ -589,7 +842,7 @@ export function badState(scope) {
 }
 export function unpark(key) { if (key) BAD.delete(key); else BAD.clear() }
 
-/* ค้นเว็บสำรองด้วย DuckDuckGo (หน้า HTML ไม่ต้องใช้คีย์) — ใช้ตอน Gemini ค้นไม่ได้
+/* ค้นเว็บด้วย DuckDuckGo (หน้า HTML ไม่ต้องใช้คีย์)
    คืนเป็นข้อความสรุป: หัวข้อ + เนื้อหาย่อ + ลิงก์ ไม่เกิน 6 รายการ · ล้มเหลว/ไม่เจอ = '' */
 export async function fetchDuckDuckGoSearch(query, { limit = 6, timeoutMs = 6000 } = {}) {
   const q = String(query || '').trim();
@@ -598,7 +851,11 @@ export async function fetchDuckDuckGoSearch(query, { limit = 6, timeoutMs = 6000
   const timer = setTimeout(() => ac.abort(), timeoutMs);
   try {
     const res = await fetch('https://html.duckduckgo.com/html/?q=' + encodeURIComponent(q), {
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; CendonBot/1.0)', 'Accept-Language': 'th,en;q=0.8' },
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'th-TH,th;q=0.9,en;q=0.8'
+      },
       signal: ac.signal
     });
     if (!res.ok) return '';
@@ -607,9 +864,10 @@ export async function fetchDuckDuckGoSearch(query, { limit = 6, timeoutMs = 6000
       .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
     const link = h => { const m = /[?&]uddg=([^&]+)/.exec(h || ''); try { return m ? decodeURIComponent(m[1]) : h } catch (e) { return h } };
     const out = [];
-    const re = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+    const re = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?class="result__snippet"[^>]*>([\s\S]*?)<\/(?:a|span|div)>/g;
     let m;
     while ((m = re.exec(html)) && out.length < limit) {
+      if (/result--ad|badge--ad/i.test(m[0])) continue;
       const title = txt(m[2]), snip = txt(m[3]);
       if (title && snip) out.push(`- ${title}: ${snip} (${link(m[1])})`);
     }
@@ -620,6 +878,78 @@ export async function fetchDuckDuckGoSearch(query, { limit = 6, timeoutMs = 6000
     clearTimeout(timer);
   }
 }
+
+/* ══ ฟังก์ชันค้นหาหลักของระบบ (ReAct & Tools) ══
+   1. ตัวหลัก: DuckDuckGo (เร็ว <1s, ฟรี, ไม่มีโควตา, เลี่ยงปัญหา Cloudflare Region Block)
+   2. ตัวสำรอง: Gemini Google Search (gemini-3.1-flash-lite -> gemini-3.5-flash-lite)
+   3. ตัวสำรองฉุกเฉิน: webSearch (Tavily / Brave / Google News RSS / Bing / Wikipedia) */
+export async function executeSearchInternal(env, query) {
+  const q = String(query || '').trim();
+  if (!q) return '';
+
+  // 1. DuckDuckGo ค้นหาจริง
+  try {
+    const ddg = await fetchDuckDuckGoSearch(q);
+    if (ddg && ddg.trim()) {
+      console.log(`[search] สำเร็จด้วย DuckDuckGo: "${q.slice(0, 40)}"`);
+      return ddg;
+    }
+  } catch (e) {
+    console.warn('[search] DuckDuckGo error:', e.message || e);
+  }
+
+  // 2. Gemini Google Search (gemini-3.1-flash-lite -> gemini-3.5-flash-lite)
+  if (env.GEMINI_KEY && !bad('gemini|quota') && !bad('gemini|region')) {
+    const geminiKey = env.GEMINI_KEY;
+    const baseUrl = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
+    const models = ['gemini-3.1-flash-lite', 'gemini-3.5-flash-lite'];
+    const prompt = `ค้นข้อมูลล่าสุดในอินเทอร์เน็ตเรื่องนี้ แล้วสรุปเฉพาะข้อเท็จจริงที่ยืนยันได้: ${q}
+แหล่งที่เชื่อได้: เว็บผู้ผลิต ศูนย์บริการ สื่อรถยนต์ที่มีกองบรรณาธิการ สำนักข่าวหลัก ร้านค้าที่มีราคาชัดเจน
+รูปแบบการตอบ: ข้อเท็จจริงสั้น ๆ เป็นข้อ ๆ พร้อมระบุชื่อเว็บแหล่งที่มา ห้ามแต่งตัวเลข ถ้าไม่พบข้อมูลให้ตอบ "ไม่พบข้อมูลยืนยัน"`;
+
+    for (const m of models) {
+      try {
+        const res = await fetch(`${baseUrl}/v1beta/models/${m}:generateContent`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey },
+          body: JSON.stringify({
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            tools: [{ google_search: {} }],
+            generationConfig: { temperature: 0.2 },
+          }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const cand = (data.candidates && data.candidates[0]) || {};
+          const txt = stripToolCalls(((cand.content && cand.content.parts) || []).map(x => x.text || '').join('').trim());
+          if (txt && !/^ไม่พบข้อมูลยืนยัน/.test(txt)) {
+            console.log(`[search] สำเร็จด้วย Gemini (${m})`);
+            return txt;
+          }
+        } else if (res.status === 429) {
+          markBad('gemini|quota', 60000);
+        } else if (res.status === 400) {
+          const errBody = await res.text().catch(() => '');
+          if (/location|region/i.test(errBody)) markBad('gemini|region', 300000);
+        }
+      } catch (e) {
+        console.warn(`[search] Gemini ${m} error:`, e.message || e);
+      }
+    }
+  }
+
+  // 3. ตัวสำรองฉุกเฉิน (Tavily / Brave / Google News RSS / Bing / Wikipedia)
+  try {
+    const ws = await webSearch(env, q);
+    if (ws && ws.text) {
+      console.log(`[search] สำเร็จด้วย webSearch (${ws.src})`);
+      return ws.text;
+    }
+  } catch (e) {}
+
+  return '';
+}
+
 
 
 /* ══ ค้นเว็บแยกจาก Gemini ══
