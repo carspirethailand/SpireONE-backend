@@ -1,70 +1,41 @@
-import { test } from 'node:test';
+import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import { screenApplication, nameMatch, ageFromBirth } from '../src/tech-screen.js';
-
-const AT = Date.UTC(2026, 9, 1);
-const app = (over = {}) => ({ data: JSON.stringify({ name: 'นายสมชาย ใจดี', idNo: '1101700203450', age: 30, birth: '1996-05-01', hasCert: true, ...over }) });
-const img = (kind, hash) => ({ kind, mime: 'image/jpeg', data: 'AAAA', hash });
-const docs = [img('id', 'h1'), img('selfie', 'h2'), img('shop', 'h3'), img('work', 'h4'), img('work', 'h5'), img('work', 'h6')];
-
-/* Gemini ปลอม: คืน JSON ที่กำหนด และจดว่ามีรูปบัตรถูกส่งไปไหม */
-function fakeGemini(out) {
-  const seen = { calls: 0, kinds: [] };
-  globalThis.fetch = async (_url, init) => {
-    seen.calls++;
-    const body = JSON.parse(init.body);
-    seen.kinds = body.contents[0].parts.filter(p => p.text && /^\[\w+\]$/.test(p.text)).map(p => p.text.slice(1, -1));
-    return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify(out) }] } }] }), { status: 200 });
-  };
-  return seen;
-}
-const goodWork = { work: [{ label: 'shop', real_car_repair_or_tools: true }, { label: 'work', real_car_repair_or_tools: true }], summary: 'ดูปกติ' };
-
-test('helpers: name match ignores titles/spaces; Buddhist-era birth years', () => {
-  assert.equal(nameMatch('นายสมชาย ใจดี', 'สมชาย ใจดี'), true);
-  assert.equal(nameMatch('สมชาย ใจดี', 'นาย สมศักดิ์ รักดี'), false);
-  assert.equal(ageFromBirth('2539-05-01', AT), 30);
-  assert.equal(ageFromBirth('1996-05-01', AT), 30);
+import {screenApplication,ageFromBirth,screeningSnapshot} from '../src/tech-screen.js';
+import {applicantErrors,imageInfo,approvalError} from '../src/tech-vetting.js';
+import {form,png,fakeGemini,evidence} from './tech-fixtures.mjs';
+const AT=Date.UTC(2026,9,1),data=form(),app={revision:1,test:0,data:JSON.stringify(data)},docs=data.docs.map((x,i)=>({kind:x.kind,mime:'image/png',data:x.data.split(',')[1],hash:'hash_'+i}));
+const screen=(env={GEMINI_KEY:'mock'},a=app,images=docs)=>screenApplication(env,{app:a,docs:images},{at:AT});
+test('names, impossible experience, malformed dates and mismatched age are caught',()=>{
+  for(const d of [{name:'Hasdjjgiohwigrs'},{years:1000},{years:20},{years:2.5},{birth:'1996-02-31'},{birth:'2027-01-01'},{age:31},{phone:'0000000000'},{about:'random'}])assert.ok(applicantErrors({...data,...d},AT).length,JSON.stringify(d));
+  assert.equal(applicantErrors(data,AT).length,0);assert.equal(ageFromBirth('2539-05-01',AT),30);
 });
-
-test('clean application with good work photos passes', async () => {
-  const seen = fakeGemini(goodWork);
-  const r = await screenApplication({ GEMINI_KEY: 'k' }, { app: app(), docs }, { at: AT });
-  assert.equal(r.verdict, 'pass'); assert.equal(r.score, 100);
-  assert.deepEqual(seen.kinds.filter(k => k === 'id' || k === 'selfie'), [], 'ID/selfie must NOT be sent without TECH_AI_IDS=1');
+test('valid image headers/dimensions accepted; MIME spoof, tiny and truncated images rejected',()=>{
+  const bytes=png();assert.deepEqual(imageInfo('image/png',bytes.toString('base64')),{width:400,height:300});
+  assert.throws(()=>imageInfo('image/jpeg',bytes.toString('base64')));assert.throws(()=>imageInfo('image/png',png(1,50,50).toString('base64')));
+  assert.throws(()=>imageInfo('image/png',bytes.subarray(0,40).toString('base64')));assert.throws(()=>imageInfo('image/jpeg',Buffer.from('random').toString('base64')));
 });
-
-test('duplicate ID across accounts + reused image → fail', async () => {
-  fakeGemini(goodWork);
-  const r = await screenApplication({ GEMINI_KEY: 'k' }, { app: app(), docs: [...docs.slice(0, 5), img('work', 'h4')], dupIdCount: 1 }, { at: AT });
-  assert.equal(r.verdict, 'fail');
-  assert.ok(r.flags.some(f => /บัญชีอื่น/.test(f.msg)));
-  assert.ok(r.flags.some(f => /ใช้รูปเดียวกันซ้ำ/.test(f.msg)));
+test('real multimodal request covers EVERY shop/work image and excludes identities even with legacy flag',async()=>{
+  const seen=fakeGemini(),r=await screen({GEMINI_KEY:'mock',TECH_AI_IDS:'1'});assert.equal(r.status,'complete');assert.equal(r.verdict,'pass');assert.equal(r.score,null);
+  assert.equal(r.images.length,4);const request=seen.requests[0],text=JSON.stringify(request);
+  assert.equal(request.contents[0].parts.filter(x=>x.inlineData).length,4);assert.ok(!text.includes(data.idNo));assert.ok(!text.includes(data.name));
+  assert.ok(!request.contents[0].parts.some(x=>x.text&&/"kind":"(id|selfie)"/.test(x.text)));assert.ok(request.generationConfig.responseSchema);assert.match(request.systemInstruction.parts[0].text,/UNTRUSTED/);
 });
-
-test('age that does not match birth date → needs review', async () => {
-  fakeGemini(goodWork);
-  const r = await screenApplication({ GEMINI_KEY: 'k' }, { app: app({ age: 45 }), docs }, { at: AT });
-  assert.equal(r.verdict, 'review');
+test('all additional photos are covered instead of truncating to first seven',async()=>{fakeGemini();const more=[...docs,...Array.from({length:3},(_,i)=>({kind:'work',mime:'image/png',data:'AAAA',hash:'extra_'+i}))];const r=await screen(undefined,app,more);assert.equal(r.images.length,7);});
+test('legacy incomplete evidence cannot pass after rescreening',async()=>{fakeGemini();const r=await screen(undefined,app,docs.filter(x=>x.kind!=='id'));assert.equal(r.verdict,'fail');assert.ok(r.flags.some(x=>x.code==='document_count_id'));});
+for(const bad of [{images:[]},{images:[{imageId:'made-up',kind:'work',relevance:'relevant',concern:false,note:''}]},{descriptionRelevant:'yes',images:[]},{summary:'nothing checked'}])test('malformed/incomplete AI result cannot pass: '+JSON.stringify(bad),async()=>{fakeGemini(()=>bad);const r=await screen();assert.equal(r.status,'failed');assert.notEqual(r.verdict,'pass');});
+test('quota, absent key and missing consent never create a successful AI check',async()=>{
+  globalThis.fetch=async()=>new Response('private provider details',{status:429});let r=await screen();assert.equal(r.status,'failed');assert.ok(!r.error.includes('private'));
+  r=await screen({});assert.equal(r.status,'unavailable');r=await screen({GEMINI_KEY:'mock'}, {...app,data:JSON.stringify({...data,aiConsent:false})});assert.equal(r.status,'unavailable');
 });
-
-test('with TECH_AI_IDS=1: card name/number mismatch and fake card are flagged', async () => {
-  const seen = fakeGemini({ id_card: { is_thai_id_card: true, photo_of_screen_or_printout: true, readable: true, name_on_card: 'นายสมศักดิ์ รักดี', id_on_card: '3100500123456' },
-    selfie: { person_holding_id_card: true, same_person_as_card: 'no' }, ...goodWork });
-  const r = await screenApplication({ GEMINI_KEY: 'k', TECH_AI_IDS: '1' }, { app: app(), docs }, { at: AT });
-  assert.ok(seen.kinds.includes('id') && seen.kinds.includes('selfie'));
-  assert.equal(r.verdict, 'fail');
-  for (const re of [/ถ่ายจากจอ/, /เลขบนบัตรไม่ตรง/, /ชื่อบนบัตร/, /ไม่น่าจะเป็นคนเดียวกับ/]) assert.ok(r.flags.some(f => re.test(f.msg)), String(re));
+test('non-repair or uncertain images require meaningful human review, not automatic rejection',async()=>{
+  fakeGemini(out=>({...out,images:out.images.map(x=>({...x,relevance:'unrelated',concern:true,note:'Mock: unrelated screenshot'}))}));const r=await screen();assert.equal(r.status,'complete');assert.equal(r.verdict,'review');assert.equal(r.flags.filter(x=>x.source==='vision').length,8);
+  assert.ok(approvalError({app,ai:r,snapshot:r.snapshot,evidence:evidence(),resolutions:{}}));
+  const resolutions=Object.fromEntries(r.flags.filter(x=>x.source==='vision').map(x=>[x.code,{outcome:'false_positive',note:'Human reviewer verified independent supporting work evidence; test only.'}]));
+  assert.equal(approvalError({app,ai:r,snapshot:r.snapshot,evidence:evidence(),resolutions}), '');
 });
-
-test('stock / non-repair work photos are flagged', async () => {
-  fakeGemini({ work: [{ real_car_repair_or_tools: false, stock_or_internet_photo_suspected: true }, { real_car_repair_or_tools: false, stock_or_internet_photo_suspected: true }, { real_car_repair_or_tools: true }] });
-  const r = await screenApplication({ GEMINI_KEY: 'k' }, { app: app(), docs }, { at: AT });
-  assert.equal(r.verdict, 'fail');
-});
-
-test('Gemini down → still returns local checks, marked for human review', async () => {
-  globalThis.fetch = async () => new Response('quota', { status: 429 });
-  const r = await screenApplication({ GEMINI_KEY: 'k' }, { app: app(), docs }, { at: AT });
-  assert.equal(r.verdict, 'review'); assert.match(r.error, /429/);
+test('snapshot/revision/evidence fail closed and deterministic bad data cannot be overridden',async()=>{
+  fakeGemini();const r=await screen(),args={app,ai:r,snapshot:r.snapshot,evidence:evidence(),resolutions:{}};assert.equal(approvalError(args),'');
+  assert.ok(approvalError({...args,snapshot:'changed'}));assert.ok(approvalError({...args,app:{...app,revision:2}}));assert.ok(approvalError({...args,evidence:{}}));
+  const bad=await screen(undefined,{...app,data:JSON.stringify({...data,name:'Hasdjjgiohwigrs',years:1000})});assert.equal(bad.verdict,'fail');assert.ok(approvalError({...args,ai:bad,snapshot:bad.snapshot}));
+  assert.notEqual(await screeningSnapshot(app,docs),await screeningSnapshot(app,[...docs].reverse()));
 });

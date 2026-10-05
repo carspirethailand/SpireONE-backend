@@ -12,7 +12,8 @@
  *   - เบอร์กับที่อยู่ลูกค้าเปิดให้ช่างเห็นหลังลูกค้ายืนยันราคาแล้วเท่านั้น
  */
 import { verifyFirebaseToken } from './auth.js';
-import { screenApplication } from './tech-screen.js';
+import { screenApplication, screeningSnapshot } from './tech-screen.js';
+import { applicantErrors, imageInfo, approvalError } from './tech-vetting.js';
 const CATS = ['body', 'ev', 'tyre', 'air', 'eng'];
 const CAT_TH = { body: 'ตัวถัง & สี', ev: 'ไฟฟ้า & EV', tyre: 'ยาง & ช่วงล่าง', air: 'แอร์รถยนต์', eng: 'เครื่องยนต์' };
 /* ด่านที่ทีมงานต้องตรวจเองก่อนอนุมัติ — ชื่อต้องตรงกับหน้าเว็บ (tech.html) */
@@ -22,13 +23,15 @@ const CHECKS = ['identity', 'phone', 'work', 'skills', 'shop', 'terms'];
    ใบรับรองฝีมือไม่บังคับ — ช่างเก่งจำนวนมากไม่มีใบ ทีมงานสัมภาษณ์ทักษะแทนได้ */
 const DOCS = [['id', 1, 1], ['selfie', 1, 1], ['shop', 1, 3], ['work', 3, 6], ['cert', 0, 2]];
 const PRIVATE_DOCS = ['id', 'selfie', 'cert'];
-const API_VERSION = 5;
+const API_VERSION = 6;
 const PHONE = /^0\d{8,9}$/;
 const now = () => Date.now();
 
 
 /* ── ตาราง ── สร้างเองครั้งแรกที่มีคนเรียก /api/tech แบบเดียวกับ ensureSchema ของระบบหลัก */
 const TECH_SQL = [
+  `CREATE TABLE IF NOT EXISTS tech_limits (scope TEXT, uid TEXT, bucket INTEGER, n INTEGER NOT NULL, PRIMARY KEY(scope,uid,bucket))`,
+  `CREATE TABLE IF NOT EXISTS tech_identity_claims (id_hash TEXT PRIMARY KEY, uid TEXT NOT NULL UNIQUE)`,
   `CREATE TABLE IF NOT EXISTS tech_applications (
   uid        TEXT PRIMARY KEY,
   email      TEXT,
@@ -125,12 +128,20 @@ const TECH_ALTER = [
   `CREATE INDEX IF NOT EXISTS tech_media_owner ON tech_media(owner)`,
   `CREATE INDEX IF NOT EXISTS tech_jobs_group ON tech_jobs(group_id)`,
 ];
-let techReady = false;
+const techReady = new WeakMap();
 async function ensureTech(env) {
-  if (techReady) return;
-  for (const sql of TECH_SQL) await env.DB.prepare(sql).run();
-  for (const sql of TECH_ALTER) { try { await env.DB.prepare(sql).run(); } catch (e) { /* มีอยู่แล้ว */ } }
-  techReady = true;
+  if (!techReady.has(env.DB)) {
+    const task=(async()=>{for(const sql of TECH_SQL)await env.DB.prepare(sql).run();
+      for(const sql of TECH_ALTER)try{await env.DB.prepare(sql).run()}catch(e){if(!/duplicate column|already exists/i.test(e.message||''))throw e;}})();
+    techReady.set(env.DB,task);task.catch(()=>techReady.delete(env.DB));
+  }
+  await techReady.get(env.DB);
+}
+async function limit(env,scope,uid,max){
+  const bucket=Math.floor(now()/86400000);
+  const row=await env.DB.prepare(`INSERT INTO tech_limits(scope,uid,bucket,n) VALUES(?,?,?,1)
+    ON CONFLICT(scope,uid,bucket) DO UPDATE SET n=n+1 WHERE n<? RETURNING n`).bind(scope,uid,bucket,max).first();
+  if(!row)fail(429,'ตรวจหรือส่งข้อมูลบ่อยเกินไป กรุณาลองใหม่วันถัดไป');
 }
 
 /* ── ตอบกลับ ── */
@@ -162,27 +173,19 @@ const json = (data, status, headers) => new Response(JSON.stringify(data), {
 function owners(env) {
   return (env.OWNERS || 'anapatmaliwong@gmail.com,carspirethailand@gmail.com').toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
 }
-async function who(request, env, required = true) {
+async function who(request, env, required = true, verifyToken = verifyFirebaseToken) {
   const h = request.headers.get('Authorization') || '';
   if (!h.startsWith('Bearer ')) return required ? fail(401, 'กรุณาเข้าสู่ระบบ') : null;
   const token = h.slice(7);
-  let uid, email;
-  /* ทางลัดสำหรับรันทดสอบในเครื่องเท่านั้น — เปิดด้วยตัวแปร DEV_AUTH ซึ่งไม่มีใน wrangler.jsonc
-     บนเซิร์ฟเวอร์จริงทางนี้จึงไม่มีอยู่ ใครส่ง dev: มาก็ถูกปฏิเสธเหมือนโทเคนปลอมทั่วไป */
-  if (env.DEV_AUTH === '1' && token.startsWith('dev:')) {
-    [, uid, email] = token.split(':');
-  } else {
-    try {
-      const payload = await verifyFirebaseToken(token, env.FIREBASE_PROJECT_ID);
-      uid = payload.sub; email = payload.email || '';
-    } catch (e) { return fail(401, 'เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่'); }
-  }
+  let uid,email,emailVerified=false;
+  try{const payload=await verifyToken(token,env.FIREBASE_PROJECT_ID);uid=payload.sub;email=payload.email||'';emailVerified=payload.email_verified===true;}
+  catch(e){return fail(401,'เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่');}
   if (!uid) return fail(401, 'กรุณาเข้าสู่ระบบ');
   email = String(email || '').toLowerCase();
   /* ผู้ดูแลระบบช่าง = OWNERS หรือคนที่ระบบหลักตั้งยศ admin ขึ้นไป
      บัญชีที่ถูกแบนในระบบหลัก ใช้ระบบช่างไม่ได้ด้วย */
   /* staff = ผู้ดูแลกับทีมงาน (moderator) — เห็นช่างทดสอบ ตรวจใบสมัคร และจัดการระบบช่างได้ */
-  let admin = owners(env).includes(email), staff = admin;
+  let admin = emailVerified && owners(env).includes(email), staff = admin;
   try {
     const u = await env.DB.prepare('SELECT role, banned FROM users WHERE uid = ?').bind(uid).first();
     if (u && u.banned) fail(403, 'บัญชีนี้ถูกระงับ');
@@ -337,6 +340,7 @@ function docList(b) {
     if (!m) fail(400, 'ไฟล์ต้องเป็นรูปภาพ');
     if (m[2].length > 1400000) fail(400, 'รูปใหญ่เกินไป');
     if (!DOCS.some(([k]) => k === d.kind)) fail(400, 'ชนิดเอกสารไม่ถูกต้อง');
+    try{imageInfo(m[1],m[2])}catch(e){fail(400,e.message)}
     out.push({ kind: d.kind, mime: m[1], data: m[2] });
   }
   const label = { id: 'บัตรประชาชน', selfie: 'รูปถ่ายคู่บัตร', shop: 'รูปอู่หรือเครื่องมือ', work: 'รูปผลงาน', cert: 'ใบรับรอง' };
@@ -354,6 +358,9 @@ async function apply(env, me, b) {
     /* ช่างทดสอบของทีมงาน — ใช้แค่ตำแหน่งอู่ ข้ามเกณฑ์และเอกสารทั้งหมด
        เห็นได้เฉพาะทีมงาน คนทั่วไปไม่เห็น รีวิวไม่ถูกนับ */
     adminOnly(me);
+    if(!me.admin)fail(403,'โหมดข้ามเกณฑ์ใช้ได้เฉพาะ admin');
+    const real=await env.DB.prepare('SELECT status,test FROM tech_applications WHERE uid=?').bind(me.uid).first();
+    if(real&&!real.test&&real.status!=='rejected')fail(409,'บัญชีนี้มีใบสมัครจริง ใช้บัญชี admin แยกสำหรับทดสอบ');
     /* ทีมงานกด "ข้าม" ได้โดยไม่ส่งตำแหน่ง — ใช้ตำแหน่งเดิมของร้านทีมงาน ถ้าไม่มีใช้กลางกรุงเทพฯ แก้ทีหลังในแท็บร้าน */
     let c;
     if (b.lat == null || b.lng == null) {
@@ -389,7 +396,7 @@ async function apply(env, me, b) {
 
   const cats = [...new Set((Array.isArray(b.cats) ? b.cats : []).filter(c => CATS.includes(c)))];
   if (!cats.length) fail(400, 'เลือกงานที่รับอย่างน้อย 1 อย่าง');
-  if (b.consent !== true) fail(400, 'ต้องกดยินยอมก่อนส่งใบสมัคร');
+  if (b.consent !== true || b.aiConsent !== true) fail(400, 'ต้องยินยอมให้ตรวจใบสมัครและให้ Gemini ตรวจรูปอู่/ผลงานก่อนส่ง');
   const idNo = String(b.idNo || '').replace(/\D/g, '');
   if (!thaiId(idNo)) fail(400, 'เลขประจำตัวประชาชนไม่ถูกต้อง');
   const c = coord(b);
@@ -402,35 +409,46 @@ async function apply(env, me, b) {
     radius: num(b.radius, 'รัศมีบริการ', 0, 200), lat: c.lat, lng: c.lng,
     cats, mobile: !!b.mobile, urgent: !!b.urgent, hasCert: false, consentAt: t,
     title: ['นาย', 'นาง', 'นางสาว'].includes(b.title) ? b.title : '', idNo,
-    birth: /^\d{4}-\d{2}-\d{2}$/.test(String(b.birth || '')) ? b.birth : '',
+    birth: /^\d{4}-\d{2}-\d{2}$/.test(String(b.birth || '')) ? b.birth : '', aiConsent:true,
     appNo: 'CP-' + (await sha(me.uid)).slice(0, 6).toUpperCase(), submittedAt: t,
   };
+  if(typeof b.age==='boolean'||typeof b.years==='boolean')fail(400,'อายุและประสบการณ์ต้องเป็นตัวเลข');
+  const invalid=applicantErrors(d,t);if(invalid.length)fail(400,invalid.map(x=>x.msg).join(' · '));
   const docs = docList(b);
   for (const x of docs) x.hash = await sha(x.data);
+  if(new Set(docs.map(x=>x.hash)).size!==docs.length)fail(400,'ต้องใช้รูปต่างกัน ไม่ใช้รูปเดียวซ้ำหลายช่อง');
   const idHash = await sha('cendon-id:' + idNo);
+  const duplicate=await env.DB.prepare("SELECT uid FROM tech_applications WHERE id_hash=? AND uid!=? AND test=0 AND status!='rejected'").bind(idHash,me.uid).first();
+  if(duplicate)fail(409,'ข้อมูลตัวตนนี้มีใบสมัครอยู่แล้ว กรุณาติดต่อทีมงาน');
+  await limit(env,'apply',me.uid,4);
   d.hasCert = docs.some(x => x.kind === 'cert');
+  d.submissionId=crypto.randomUUID();const packed=JSON.stringify(d);
   /* ส่งใหม่หลังถูกตีกลับ = เอกสารชุดใหม่ทั้งชุด ลบชุดเก่าทิ้ง */
-  await env.DB.batch([
-    env.DB.prepare('DELETE FROM tech_docs WHERE uid = ?').bind(me.uid),
-    ...docs.map(x => env.DB.prepare('INSERT INTO tech_docs (uid, kind, mime, data, created_at, hash) VALUES (?,?,?,?,?,?)')
-      .bind(me.uid, x.kind, x.mime, x.data, t, x.hash)),
+  const stored=await env.DB.batch([
     env.DB.prepare(`INSERT INTO tech_applications (uid,email,data,status,test,review,revision,created_at,updated_at)
       VALUES (?,?,?,'pending',0,NULL,1,?,?)
-      ON CONFLICT(uid) DO UPDATE SET data=excluded.data,status='pending',test=0,review=NULL,ai=NULL,revision=revision+1,updated_at=excluded.updated_at`)
-      .bind(me.uid, me.email, JSON.stringify(d), t, t),
-    env.DB.prepare('UPDATE tech_applications SET id_hash = ? WHERE uid = ?').bind(idHash, me.uid),
+      ON CONFLICT(uid) DO UPDATE SET data=excluded.data,status='pending',test=0,review=NULL,ai=NULL,revision=revision+1,updated_at=excluded.updated_at
+      WHERE tech_applications.status='rejected' OR tech_applications.test=1`)
+      .bind(me.uid,me.email,packed,t,t),
+    env.DB.prepare('INSERT INTO tech_identity_claims(id_hash,uid) SELECT ?,? FROM tech_applications WHERE uid=? AND data=? ON CONFLICT(uid) DO UPDATE SET id_hash=excluded.id_hash').bind(idHash,me.uid,me.uid,packed),
+    env.DB.prepare('DELETE FROM tech_docs WHERE uid=? AND EXISTS(SELECT 1 FROM tech_applications WHERE uid=? AND data=?)').bind(me.uid,me.uid,packed),
+    ...docs.map(x=>env.DB.prepare('INSERT INTO tech_docs(uid,kind,mime,data,created_at,hash) SELECT ?,?,?,?,?,? FROM tech_applications WHERE uid=? AND data=?').bind(me.uid,x.kind,x.mime,x.data,t,x.hash,me.uid,packed)),
+    env.DB.prepare('UPDATE tech_applications SET id_hash=? WHERE uid=? AND data=?').bind(idHash,me.uid,packed),
   ]);
+  if(!stored[0].meta.changes)fail(409,'ใบสมัครถูกส่งแล้ว กรุณาโหลดสถานะ ไม่ส่งซ้ำ');
   /* AI คัดกรองทันทีหลังส่ง — ล้มก็ไม่กระทบการสมัคร ทีมงานกด "ตรวจอีกครั้ง" ได้ */
-  try { await runScreen(env, me.uid); } catch (e) { console.warn('[tech-screen]', e.message); }
-  return { ok: true };
+  let ai=null;try{ai=await runScreen(env,me.uid)}catch{ /* stays pending, never approved */ }
+  return {ok:true,status:'pending',screening:ai?{status:ai.status,verdict:ai.verdict}:null};
 }
 
 /* รัน AI คัดกรองแล้วเก็บผลไว้ในใบสมัคร (ทีมงานเห็นเท่านั้น ผู้สมัครไม่เห็น) */
 async function runScreen(env, uid) {
   const app = await env.DB.prepare('SELECT * FROM tech_applications WHERE uid = ?').bind(uid).first();
   if (!app || app.test) return null;
+  if(app.status!=='pending')fail(409,'ตรวจได้เฉพาะใบสมัครที่รอตรวจ');
+  await limit(env,'screen',uid,6);await limit(env,'screen_global','all',200);
   const { results: docs } = await env.DB.prepare('SELECT kind, mime, data, hash FROM tech_docs WHERE uid = ? ORDER BY id').bind(uid).all();
-  const dupId = app.id_hash ? await env.DB.prepare('SELECT COUNT(*) AS n FROM tech_applications WHERE id_hash = ? AND uid != ?').bind(app.id_hash, uid).first() : null;
+  const dupId = app.id_hash ? await env.DB.prepare("SELECT COUNT(*) AS n FROM tech_applications WHERE id_hash=? AND uid!=? AND test=0 AND status!='rejected'").bind(app.id_hash,uid).first() : null;
   const hashes = docs.map(x => x.hash).filter(Boolean);
   let dupImageKinds = [];
   if (hashes.length) {
@@ -439,11 +457,13 @@ async function runScreen(env, uid) {
     dupImageKinds = docs.filter(x => dup.has(x.hash)).map(x => x.kind);
   }
   const ai = await screenApplication(env, { app, docs, dupIdCount: dupId ? dupId.n : 0, dupImageKinds });
-  await env.DB.prepare('UPDATE tech_applications SET ai = ? WHERE uid = ?').bind(JSON.stringify(ai), uid).run();
+  const saved=await env.DB.prepare("UPDATE tech_applications SET ai=? WHERE uid=? AND revision=? AND status='pending'").bind(JSON.stringify(ai),uid,app.revision).run();
+  if(!saved.meta.changes)fail(409,'ใบสมัครเปลี่ยนระหว่างตรวจ กรุณาโหลดใหม่');
   return ai;
 }
 async function rescreen(env, me, b) {
   adminOnly(me);
+  await limit(env,'rescreen_admin',me.uid,30);
   const uid = String(b.uid || '');
   const a = await env.DB.prepare('SELECT status FROM tech_applications WHERE uid = ?').bind(uid).first();
   if (!a) fail(404, 'ไม่พบใบสมัคร');
@@ -484,25 +504,38 @@ async function pendingApps(env, me) {
    บันทึกว่าใครตรวจ ตรวจอะไร เมื่อไร — ถ้ามีปัญหาทีหลังจะย้อนดูได้ว่าพลาดที่ด่านไหน */
 async function review(env, me, b) {
   adminOnly(me);
+  if(!me.admin)fail(403,'เฉพาะ admin ที่อนุมัติใบสมัครจริงได้');
   const a = await env.DB.prepare('SELECT * FROM tech_applications WHERE uid = ?').bind(String(b.uid || '')).first();
   if (!a) fail(404, 'ไม่พบใบสมัคร');
   if (a.status !== 'pending') fail(409, 'ใบสมัครนี้ถูกตรวจไปแล้ว');
   if (Number(b.revision) !== a.revision) fail(409, 'ผู้สมัครเพิ่งแก้ใบสมัคร กรุณาโหลดใหม่ก่อนตรวจ');
-  const checks = Object.fromEntries(CHECKS.map(k => [k, !!(b.checks && b.checks[k])]));
+  if(a.test)fail(409,'ใบสมัครทดสอบไม่สามารถรับรองเป็นร้านจริง');
+  if(me.uid===a.uid)fail(403,'ต้องให้ admin คนอื่นตรวจใบสมัครจริง ไม่อนุมัติตัวเอง');
+  const checks = Object.fromEntries(CHECKS.map(k => [k, b.checks?.[k]===true]));
   const note = str(b.note, 'บันทึกการตรวจ', 10, 2000);
-  const decision = b.decision === 'approve' ? 'approve' : 'reject';
+  if(!['approve','reject'].includes(b.decision))fail(400,'คำตัดสินไม่ถูกต้อง');
+  const decision = b.decision;
   if (decision === 'approve' && !CHECKS.every(k => checks[k])) fail(400, 'อนุมัติได้เมื่อตรวจครบทุกข้อเท่านั้น');
+  let evidence={},resolutions={};
+  if(decision==='approve'){
+    const {results:docs}=await env.DB.prepare('SELECT kind,mime,data,hash FROM tech_docs WHERE uid=? ORDER BY id').bind(a.uid).all();
+    const ai=parse(a.ai),error=approvalError({app:a,ai,snapshot:await screeningSnapshot(a,docs),evidence:b.evidence,resolutions:b.resolutions});if(error)fail(400,error);
+    const duplicate=await env.DB.prepare("SELECT uid FROM tech_applications WHERE id_hash=? AND uid!=? AND test=0 AND status!='rejected'").bind(a.id_hash,a.uid).first();
+    if(duplicate)fail(409,'พบข้อมูลตัวตนซ้ำ ต้องตรวจและแก้ไขก่อน');
+    evidence=Object.fromEntries(CHECKS.map(k=>[k,{method:b.evidence[k].method,note:b.evidence[k].note.trim()}]));
+    resolutions=Object.fromEntries((ai.flags||[]).filter(f=>f.level!=='low'&&f.source==='vision').map(f=>[f.code,{outcome:b.resolutions[f.code].outcome,note:b.resolutions[f.code].note.trim()}]));
+  }
   const t = now();
-  const rv = JSON.stringify({ by: me.email, note, checks, decision, at: t });
+  const rv = JSON.stringify({id:crypto.randomUUID(),by:me.email,note,checks,evidence,resolutions,decision,at:t,screeningSnapshot:parse(a.ai)?.snapshot||null});
   /* ตรวจเสร็จแล้วเก็บเลขบัตรไว้แค่ 4 หลักท้าย พอให้ย้อนตรวจได้ แต่ไม่พอเอาไปใช้ปลอมตัว */
   const dd = parse(a.data) || {};
   if (dd.idNo) dd.idNo = 'x-xxxx-xxxxx-' + String(dd.idNo).slice(-3, -1) + '-' + String(dd.idNo).slice(-1);
-  const stmts = [env.DB.prepare('UPDATE tech_applications SET status=?, review=?, data=?, updated_at=? WHERE uid=?')
-    .bind(decision === 'approve' ? 'approved' : 'rejected', rv, JSON.stringify(dd), t, a.uid),
+  const stmts = [env.DB.prepare("UPDATE tech_applications SET status=?,review=?,data=?,updated_at=?,revision=revision+1 WHERE uid=? AND status='pending' AND revision=? AND ai IS ?")
+    .bind(decision === 'approve' ? 'approved' : 'rejected', rv, JSON.stringify(dd), t, a.uid,a.revision,a.ai),
     /* ตรวจเสร็จแล้ว ลบรูปบัตร เซลฟี่ และใบรับรองทิ้งทันที ไม่เก็บไว้เกินจำเป็น (PDPA)
        เหลือแค่บันทึกว่าใครตรวจอะไรไปเมื่อไร */
-    env.DB.prepare(`DELETE FROM tech_docs WHERE uid = ? AND kind IN (${PRIVATE_DOCS.map(() => '?').join(',')})`)
-      .bind(a.uid, ...PRIVATE_DOCS)];
+    env.DB.prepare(`DELETE FROM tech_docs WHERE uid=? AND kind IN (${PRIVATE_DOCS.map(() => '?').join(',')}) AND EXISTS(SELECT 1 FROM tech_applications WHERE uid=? AND review=?)`)
+      .bind(a.uid,...PRIVATE_DOCS,a.uid,rv)];
   if (decision === 'approve') {
     const d = parse(a.data) || {};
     const id = 't_' + (await sha(a.uid)).slice(0, 16);
@@ -510,11 +543,12 @@ async function review(env, me, b) {
       from: d.from, warranty: d.warranty, radius: d.radius, mobile: d.mobile, urgent: d.urgent,
       lat: d.lat, lng: d.lng, cert: !!d.hasCert };
     stmts.push(env.DB.prepare(`INSERT INTO tech_profiles (id,uid,phone,data,verified,test,suspended,created_at,updated_at)
-      VALUES (?,?,?,?,1,0,0,?,?)
+      SELECT ?,?,?,?,1,0,0,?,? FROM tech_applications WHERE uid=? AND status='approved' AND review=?
       ON CONFLICT(uid) DO UPDATE SET data=excluded.data,phone=excluded.phone,verified=1,test=0,suspended=0,updated_at=excluded.updated_at`)
-      .bind(id, a.uid, d.phone, JSON.stringify(profile), t, t));
+      .bind(id,a.uid,d.phone,JSON.stringify(profile),t,t,a.uid,rv));
   }
-  await env.DB.batch(stmts);
+  if(decision==='reject')stmts.push(env.DB.prepare('DELETE FROM tech_identity_claims WHERE uid=? AND EXISTS(SELECT 1 FROM tech_applications WHERE uid=? AND review=?)').bind(a.uid,a.uid,rv));
+  const result=await env.DB.batch(stmts);if(!result[0].meta.changes)fail(409,'ใบสมัครเปลี่ยนแล้ว กรุณาโหลดใหม่');
   return { ok: true };
 }
 
@@ -968,10 +1002,14 @@ async function setOnline(env, me, b) {
 async function editShop(env, me, b) {
   const t = await myShop(env, me);
   const d = parse(t.data) || {};
+  if(!t.test){
+    const changed=['about','cats','lat','lng'].some(k=>b[k]!=null&&JSON.stringify(k==='cats'&&Array.isArray(b[k])?[...b[k]].sort():b[k])!==JSON.stringify(k==='cats'&&Array.isArray(d[k])?[...d[k]].sort():d[k]));
+    if(changed||b.addPhotos?.length||b.removePhotos?.length)fail(409,'ข้อมูลทักษะ ตำแหน่ง และรูปที่รับรองแล้ว ต้องให้ทีมงานตรวจใหม่ก่อนเปลี่ยน ติดต่อทีมงาน');
+  }
   if (b.shop != null) d.shop = String(b.shop).trim().slice(0, 120);
   if (b.about != null) d.about = String(b.about).trim().slice(0, 1000);
   if (b.from != null) d.from = num(b.from, 'ราคาเริ่มต้น', 0, 1000000);
-  if (b.warranty != null) d.warranty = num(b.warranty, 'รับประกัน', 0, 365);
+  if (b.warranty != null) d.warranty = num(b.warranty, 'รับประกัน', t.test?0:7, 365);
   if (b.radius != null) d.radius = num(b.radius, 'รัศมีบริการ', 0, 200);
   if (b.hours != null) d.hours = String(b.hours).trim().slice(0, 120);
   if (Array.isArray(b.cats)) { const c = [...new Set(b.cats.filter(x => CATS.includes(x)))]; if (!c.length) fail(400, 'เลือกงานที่รับอย่างน้อย 1 อย่าง'); d.cats = c; }
@@ -1075,23 +1113,25 @@ async function advice(env, me) {
 }
 
 /* ── เส้นทาง ── */
-async function route(request, env) {
+async function route(request, env, verifyToken) {
   const url = new URL(request.url);
   const p = url.pathname.replace(/\/+$/, '');
   const m = request.method;
-  const body = async () => { try { return await request.json(); } catch { return fail(400, 'ข้อมูลไม่ถูกต้อง'); } };
+  const body=async()=>{const reader=request.body?.getReader();if(!reader)fail(400,'ข้อมูลไม่ถูกต้อง');let total=0,raw='';const decoder=new TextDecoder();
+    for(;;){const {done,value}=await reader.read();if(done)break;total+=value.byteLength;if(total>20*1024*1024){await reader.cancel();fail(413,'ข้อมูลใหญ่เกินไป');}raw+=decoder.decode(value,{stream:true});}raw+=decoder.decode();
+    let data;try{data=JSON.parse(raw)}catch{fail(400,'ข้อมูลไม่ถูกต้อง');}if(!data||typeof data!=='object'||Array.isArray(data))fail(400,'ข้อมูลไม่ถูกต้อง');return data;};
 
   if (p === '/api/tech' && m === 'GET') {
     /* รายชื่อเปิดให้ทุกคน — โทเคนหมดอายุต้องไม่ทำให้คนทั่วไปดูรายชื่อไม่ได้ */
     const wantTest = url.searchParams.get('test') === '1';
     let me = null;
-    try { me = await who(request, env, wantTest); } catch (e) { if (wantTest) throw e; }
+    try { me = await who(request, env, wantTest,verifyToken); } catch (e) { if (wantTest) throw e; }
     return listTechs(env, me, url);
   }
   /* หน้าเว็บใช้เช็กว่าเซิร์ฟเวอร์มีระบบช่างรุ่นนี้แล้ว — ถ้าไม่มี แสดงให้ทีมงานรู้ว่ายังไม่ได้ deploy */
   if (p === '/api/tech/ping') return { ok: true, version: API_VERSION };
 
-  const me = await who(request, env);
+  const me = await who(request, env,true,verifyToken);
   if (p === '/api/tech/me' && m === 'GET') return meInfo(env, me);
   if (p === '/api/tech/apply' && m === 'POST') return apply(env, me, await body());
   if (p === '/api/tech/applications' && m === 'GET') return pendingApps(env, me);
@@ -1130,14 +1170,14 @@ async function route(request, env) {
 }
 
 /* worker.js เรียกฟังก์ชันนี้สำหรับทุกคำขอที่ขึ้นต้นด้วย /api/tech */
-export async function handleTech(request, env, corsHeaders) {
+export async function handleTech(request, env, corsHeaders, options={}) {
   const h = corsHeaders || cors(env, request);
   if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: h });
   try {
     await ensureTech(env);
     const img = new URL(request.url).pathname.match(/^\/api\/tech\/img\/(\d+)$/);
     if (img) return await image(env, request, Number(img[1]));
-    return json(await route(request, env), 200, h);
+    return json(await route(request, env,options.verifyToken), 200, h);
   } catch (e) {
     if (e instanceof HttpError) return json({ error: e.message }, e.status, h);
     console.error(e);

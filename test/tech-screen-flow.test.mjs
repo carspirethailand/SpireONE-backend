@@ -1,43 +1,66 @@
-import { test } from 'node:test';
+import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import { DatabaseSync } from 'node:sqlite';
-import { handleTech } from '../src/techs.js';
-
-/* D1 ปลอมบน SQLite — ตารางสร้างเองจาก ensureTech ของ techs.js */
-function D1() {
-  const s = new DatabaseSync(':memory:');
-  const st = sql => { let v = []; return { bind(...a) { v = a; return this }, async first() { return s.prepare(sql).get(...v) || null },
-    async all() { return { results: s.prepare(sql).all(...v) } }, async run() { const r = s.prepare(sql).run(...v); return { meta: { changes: Number(r.changes) } } } } };
-  return { prepare: st, async batch(list) { for (const x of list) await x.run() } , exec: q => s.exec(q) };
-}
-const JPG = 'data:image/jpeg;base64,' + Buffer.from('x'.repeat(30)).toString('base64');
-const pic = (kind, n) => ({ kind, data: 'data:image/jpeg;base64,' + Buffer.from(kind + n).toString('base64') });
-const form = (over = {}) => ({ name: 'นายสมชาย ใจดี', phone: '0812345678', area: 'บางนา กรุงเทพ', age: 30, years: 5, from: 500, warranty: 30, radius: 10,
-  lat: 13.7, lng: 100.6, cats: [], consent: true, idNo: '1101700203450', birth: '1996-05-01',
-  docs: [pic('id', 1), pic('selfie', 1), pic('shop', 1), pic('work', 1), pic('work', 2), pic('work', 3)], ...over });
-
-test('apply stores AI screening for staff; duplicate ID on 2nd account is caught; rescreen works', async () => {
-  globalThis.fetch = async () => new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify({ work: [{ real_car_repair_or_tools: true }], summary: 'ok' }) }] } }] }));
-  const env = { DB: D1(), DEV_AUTH: '1', GEMINI_KEY: 'k', OWNERS: 'boss@x.com' };
-  const call = async (tok, path, body) => {
-    const r = await handleTech(new Request('https://t' + path, { method: body ? 'POST' : 'GET', headers: { Authorization: 'Bearer ' + tok, 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined }), env);
-    return { status: r.status, ...(await r.json()) };
-  };
-  /* หมวดงานต้องมีจริงในระบบ — ดึงจาก ping ไม่ได้ จึงลองหมวดยอดนิยม */
-  let res;
-  for (const c of ['eng']) { res = await call('dev:u1:a@x.com', '/api/tech/apply', form({ cats: [c] })); if (res.status !== 400 || !/งานที่รับ/.test(res.error || res.message || '')) break; }
-  assert.equal(res.status, 200, JSON.stringify(res));
-  const cat = (await call('dev:boss:boss@x.com', '/api/tech/applications')).applications[0].cats[0];
-  let apps = (await call('dev:boss:boss@x.com', '/api/tech/applications')).applications;
-  assert.equal(apps.length, 1); assert.ok(apps[0].ai, 'AI result stored'); assert.ok(['pass', 'review'].includes(apps[0].ai.verdict));
-  /* บัญชีที่สองใช้เลขบัตรเดิม + รูปบัตรเดิม */
-  assert.equal((await call('dev:u2:b@x.com', '/api/tech/apply', form({ cats: [cat], name: 'นายสมศักดิ์ รักดี' }))).status, 200);
-  apps = (await call('dev:boss:boss@x.com', '/api/tech/applications')).applications;
-  const second = apps.find(a => a.uid === 'u2');
-  assert.equal(second.ai.verdict, 'fail');
-  assert.ok(second.ai.flags.some(f => /บัญชีอื่น/.test(f.msg)));
-  /* ผู้สมัครทั่วไปเรียกตรวจซ้ำไม่ได้ ทีมงานได้ */
-  assert.equal((await call('dev:u2:b@x.com', '/api/tech/rescreen', { uid: 'u2' })).status, 403);
-  const rs = await call('dev:boss:boss@x.com', '/api/tech/rescreen', { uid: 'u2' });
-  assert.equal(rs.status, 200); assert.equal(rs.ai.verdict, 'fail');
+import {handleTech} from '../src/techs.js';
+import {fixture,form,fakeGemini,pending,review,USER,ADMIN} from './tech-fixtures.mjs';
+test('full onboarding requires fresh AI and human evidence, then appears publicly without identity docs',async()=>{
+  fakeGemini();const f=fixture(),a=await pending(f);assert.equal(a.ai.status,'complete');assert.equal((await f.call('', '/api/tech')).techs.length,0);
+  assert.equal((await f.call(ADMIN,'/api/tech/review',review(a,{evidence:{}}))).status,400);
+  assert.equal((await f.call(ADMIN,'/api/tech/review',review(a))).status,200);
+  const list=(await f.call('','/api/tech')).techs;assert.equal(list.length,1);assert.equal(list[0].verified,true);assert.equal(list[0].phone,undefined);
+  assert.equal(f.sqlite.prepare("SELECT COUNT(*) n FROM tech_docs WHERE kind IN ('id','selfie','cert')").get().n,0);
+  assert.equal((await f.call(ADMIN,'/api/tech/review',review(a))).status,409);
+});
+test('direct API rejects nonsense and 1000 years before charging AI',async()=>{
+  const seen=fakeGemini(),f=fixture();for(const over of [{name:'Hasdjjgiohwigrs'},{years:1000},{years:29},{age:30.5},{aiConsent:false},{docs:[{kind:'id',data:'data:image/jpeg;base64,AAAA'}]}])assert.equal((await f.call(USER,'/api/tech/apply',form(over))).status,400);
+  assert.equal(seen.calls,0);
+});
+test('duplicate identity across accounts and duplicate images are rejected',async()=>{
+  fakeGemini();const f=fixture();await pending(f);assert.equal((await f.call('other|other@unit.test','/api/tech/apply',form())).status,409);
+  const g=fixture(),d=form();d.docs[5]=d.docs[4];assert.equal((await g.call(USER,'/api/tech/apply',d)).status,400);
+});
+test('concurrent same-account submission cannot replace the winning evidence',async()=>{
+  const seen=fakeGemini(),f=fixture();const results=await Promise.all([f.call(USER,'/api/tech/apply',form()),f.call(USER,'/api/tech/apply',form({about:'Different concurrent application with different claimed automotive skill details'}))]);
+  assert.deepEqual(results.map(x=>x.status).sort(),[200,409]);assert.equal(seen.calls,1);assert.equal(f.sqlite.prepare('SELECT COUNT(*) n FROM tech_docs').get().n,6);
+});
+test('failed AI cannot be approved merely by ticking every check',async()=>{
+  globalThis.fetch=async()=>new Response('quota',{status:429});const f=fixture(),a=await pending(f);assert.equal(a.ai.status,'failed');assert.equal((await f.call(ADMIN,'/api/tech/review',review(a))).status,400);assert.equal((await f.call('','/api/tech')).techs.length,0);
+});
+test('stale result cannot approve modified evidence; rescreen actually repairs the result',async()=>{
+  fakeGemini();const f=fixture(),a=await pending(f);f.sqlite.prepare("UPDATE tech_docs SET hash='changed' WHERE kind='work'").run();assert.equal((await f.call(ADMIN,'/api/tech/review',review(a))).status,400);
+  assert.equal((await f.call(USER,'/api/tech/rescreen',{uid:a.uid})).status,403);
+  assert.equal((await f.call(ADMIN,'/api/tech/rescreen',{uid:a.uid})).status,200);
+});
+test('admin cannot approve own real application or convert test store to verified',async()=>{
+  fakeGemini();const f=fixture();await f.call(ADMIN,'/api/tech/apply',form());const a=(await f.call(ADMIN,'/api/tech/applications')).applications[0];assert.equal((await f.call(ADMIN,'/api/tech/review',review(a))).status,403);
+  assert.equal((await f.call(ADMIN,'/api/tech/apply',{test:true})).status,409);
+});
+test('only admin can bypass in explicitly isolated test mode',async()=>{
+  const seen=fakeGemini(),f=fixture();assert.equal((await f.call(USER,'/api/tech/apply',{test:true})).status,403);
+  f.sqlite.prepare("INSERT INTO users VALUES('moderator','moderator',0)").run();assert.equal((await f.call('moderator|mod@unit.test','/api/tech/apply',{test:true})).status,403);
+  assert.equal((await f.call(ADMIN,'/api/tech/apply',{test:true,name:'test'})).status,200);assert.equal(seen.calls,0);
+  assert.equal((await f.call('','/api/tech')).techs.length,0);const t=(await f.call(ADMIN,'/api/tech?test=1')).techs[0];assert.equal(t.verified,false);
+});
+test('unverified owner email and DEV_AUTH tokens cannot gain admin privilege',async()=>{
+  const f=fixture({DEV_AUTH:'1'});assert.equal((await f.call('other|boss@unit.test|unverified','/api/tech/apply',{test:true})).status,403);
+  const r=await handleTech(new Request('https://unit.test/api/tech/me',{headers:{Authorization:'Bearer dev:boss:boss@unit.test'}}),f.env);assert.equal(r.status,401);
+});
+test('AI retry flooding is bounded without trusting frontend',async()=>{
+  fakeGemini();const f=fixture(),a=await pending(f);for(let i=0;i<5;i++)assert.equal((await f.call(ADMIN,'/api/tech/rescreen',{uid:a.uid})).status,200);assert.equal((await f.call(ADMIN,'/api/tech/rescreen',{uid:a.uid})).status,429);
+});
+test('moderator cannot approve and unauthorized users cannot read identity evidence',async()=>{
+  fakeGemini();const f=fixture(),a=await pending(f);f.sqlite.prepare("INSERT INTO users VALUES('moderator','moderator',0)").run();
+  assert.equal((await f.call('moderator|mod@unit.test','/api/tech/review',review(a))).status,403);
+  assert.equal((await f.call('','/api/tech/docs?uid='+a.uid)).status,401);
+  assert.equal((await f.call('other|other@unit.test','/api/tech/docs?uid='+a.uid)).status,403);
+  assert.equal((await f.call(ADMIN,'/api/tech/review',review(a,{checks:{identity:'true',phone:true,work:true,skills:true,shop:true,terms:true}}))).status,400);
+});
+test('concurrent approvals produce only one winning review and one public profile',async()=>{
+  fakeGemini();const f=fixture(),a=await pending(f),r=await Promise.all([f.call(ADMIN,'/api/tech/review',review(a)),f.call(ADMIN,'/api/tech/review',review(a))]);
+  assert.deepEqual(r.map(x=>x.status).sort(),[200,409]);assert.equal((await f.call('','/api/tech')).techs.length,1);
+});
+test('verified portfolio cannot be swapped to unreviewed pictures or warranty reduced below seven days',async()=>{
+  fakeGemini();const f=fixture(),a=await pending(f);await f.call(ADMIN,'/api/tech/review',review(a));
+  assert.equal((await f.call(USER,'/api/tech/shop',{addPhotos:form().docs.slice(2,3)})).status,409);
+  assert.equal((await f.call(USER,'/api/tech/shop',{warranty:0})).status,400);
+  assert.equal((await f.call(USER,'/api/tech/shop',{from:600,hours:'09:00–18:00'})).status,200);
 });
