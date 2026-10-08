@@ -42,11 +42,11 @@ test('LINE menu: regular users cannot change it, and a LINE error sets nothing',
   assert.equal(r.status,502);assert.match(r.error,/invalid area/);assert.ok(!seen.some(s=>s.u.includes('/user/all/richmenu')));
 });
 
-test('LINE bot: a word like CENDON is not taken as a link code; newcomers learn both ways to connect',async()=>{
+test('LINE bot: a word like CENDON is not taken as a link code; newcomers learn how to connect from the app',async()=>{
   const {call,seen}=setup();
   const body=JSON.stringify({events:[{type:'message',replyToken:'rt',source:{userId:'Unew'},message:{type:'text',text:'สวัสดี CENDON'}}]});
   const sig=createHmac('sha256','test-only-secret').update(body).digest('base64');
   assert.equal((await call('','/api/line/webhook',body,{'X-Line-Signature':sig})).status,200);
   const reply=JSON.parse(seen.find(s=>s.u==='https://api.line.me/v2/bot/message/reply').init.body).messages[0].text;
-  assert.doesNotMatch(reply,/รหัสนี้ใช้ไม่ได้/);assert.match(reply,/เข้าสู่ระบบแอปด้วย LINE/);assert.match(reply,/บัญชี → เชื่อม LINE/);
+  assert.doesNotMatch(reply,/รหัสนี้ใช้ไม่ได้/);assert.match(reply,/รหัส 6 ตัว/);assert.match(reply,/บัญชี → เชื่อม LINE/);
 });

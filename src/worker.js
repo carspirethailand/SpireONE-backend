@@ -1,4 +1,4 @@
-import { verifyFirebaseToken, firebaseCustomToken } from './auth.js';
+import { verifyFirebaseToken } from './auth.js';
 import { buildFeatureRequest } from './features-ai.mjs';
 import { handleTech } from './techs.js';
 import { richMenuStatus, setupRichMenu } from './line-menu.js';
@@ -2957,11 +2957,9 @@ async function lineHandleText(env, ev, link) {
     + '\n\nส่งรูปใบเสร็จมาได้เลยครับ จะได้แม่นขึ้น');
 }
 
-/* ทักครั้งแรก / คนที่ยังไม่ได้ผูกบัญชี
-   เข้าสู่ระบบด้วย LINE = ผูกให้อัตโนมัติ (แต่ LINE ส่ง follow มาก่อนที่เว็บจะผูกเสร็จ จึงต้องบอกไว้ตรงนี้) */
+/* ทักครั้งแรก / คนที่ยังไม่ได้ผูกบัญชี — ผู้ใช้มาจากแอปก่อนเสมอ จึงบอกทางเชื่อมจากในแอป */
 const LINE_HOWTO = `สวัสดีครับ ผมคือ ${BRAND.ai} ผู้ช่วยดูแลรถและหาช่าง\n\n`
-  + 'ถ้าเพิ่งเข้าสู่ระบบแอปด้วย LINE ไม่ต้องทำอะไรเพิ่มครับ งานช่าง ราคา และข้อความจะแจ้งเข้าที่นี่เอง\n\n'
-  + 'ถ้าใช้บัญชี Google: เปิดแอป → บัญชี → เชื่อม LINE แล้วกดส่งรหัส 6 ตัวมาที่นี่\n\n'
+  + 'รับแจ้งเตือนงานช่าง ราคา และข้อความทาง LINE: เปิดแอป → บัญชี → เชื่อม LINE แล้วกดส่งรหัส 6 ตัวมาที่นี่\n\n'
   + 'กดเมนูด้านล่างเพื่อหาช่าง ถามอาการรถ หรือดูงานของคุณได้เลย';
 
 async function lineWebhook(env, ev) {
@@ -3294,42 +3292,6 @@ async function runDueJobs(env) {
   } catch (e) {}
 }
 
-/* ─────────── เข้าสู่ระบบด้วย LINE ───────────
-   ต้องตั้ง: LINE_LOGIN_CHANNEL_ID / LINE_LOGIN_CHANNEL_SECRET (ช่อง LINE Login)
-            FIREBASE_SA_EMAIL / FIREBASE_SA_KEY (service account ของ Firebase ไว้เซ็น custom token)
-   ช่อง LINE Login กับ LINE OA (Messaging API) อยู่ provider เดียวกัน → LINE user id ตรงกัน
-   จึงผูกรับแจ้งเตือนให้อัตโนมัติ ไม่ต้องส่งรหัส 6 ตัวอีก */
-async function lineLogin(env, b) {
-  const id = env.LINE_LOGIN_CHANNEL_ID, secret = env.LINE_LOGIN_CHANNEL_SECRET;
-  if (!id || !secret || !env.FIREBASE_SA_KEY) return [{ error: 'ยังไม่ได้เปิดใช้การเข้าสู่ระบบด้วย LINE' }, 503];
-  const code = String(b.code || ''), redirect = String(b.redirectUri || ''), nonce = String(b.nonce || '');
-  /* nonce บังคับ: ผูก id_token กับคำขอล็อกอินครั้งนี้ของหน้าเว็บ (กันเอาโทเคนเก่ามาใช้ซ้ำ) */
-  if (!code || !nonce || !/^https:\/\/[^/]+\/login$/.test(redirect) && !/^http:\/\/localhost(:\d+)?\/login$/.test(redirect))
-    return [{ error: 'ข้อมูลเข้าสู่ระบบไม่ถูกต้อง' }, 400];
-  const form = (o) => ({ method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(o) });
-  let tok, who;
-  try {
-    const tr = await fetch('https://api.line.me/oauth2/v2.1/token',
-      form({ grant_type: 'authorization_code', code, redirect_uri: redirect, client_id: id, client_secret: secret }));
-    tok = await tr.json();
-    if (!tr.ok || !tok.id_token) return [{ error: 'LINE ไม่ยืนยันการเข้าสู่ระบบ ลองใหม่อีกครั้ง' }, 401];
-    const vr = await fetch('https://api.line.me/oauth2/v2.1/verify', form({ id_token: tok.id_token, client_id: id, nonce }));
-    who = await vr.json();
-    if (!vr.ok || !who.sub) return [{ error: 'ตรวจสอบบัญชี LINE ไม่ผ่าน ลองใหม่อีกครั้ง' }, 401];
-  } catch (e) { return [{ error: 'ติดต่อ LINE ไม่ได้ ลองใหม่อีกครั้ง' }, 502]; }
-  const uid = 'line:' + who.sub;
-  let token;
-  try { token = await firebaseCustomToken(env, uid, { provider: 'line' }); }
-  catch (e) { console.error('custom token', e); return [{ error: 'ระบบเข้าสู่ระบบขัดข้อง ลองใหม่อีกครั้ง' }, 500]; }
-  /* รับแจ้งเตือนทาง LINE ได้ทันที — ถ้า LINE นี้ยังไม่ได้ผูกกับบัญชีอื่นอยู่ */
-  try {
-    await env.DB.prepare(`INSERT INTO line_link (line_uid, uid, lang, active, linked_at) VALUES (?, ?, 'th', 1, ?)
-      ON CONFLICT(line_uid) DO UPDATE SET uid = excluded.uid, active = 1, linked_at = excluded.linked_at WHERE line_link.active = 0`)
-      .bind(who.sub, uid, Date.now()).run();
-  } catch (e) { /* ผูกไม่ได้ก็ยังล็อกอินได้ */ }
-  return [{ token, name: String(who.name || '').slice(0, 120), picture: String(who.picture || '').slice(0, 500) }, 200];
-}
-
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -3364,18 +3326,6 @@ export default {
     const readBody = async () => { try { return await request.json(); } catch { return null; } };
 
     try {
-
-      /* ===== PUBLIC: เข้าสู่ระบบด้วย LINE =====
-         config  → บอกหน้าเว็บว่าเปิดใช้หรือยัง (clientId ว่าง = ยังไม่ได้ตั้ง ซ่อนปุ่ม)
-         POST    → หน้าเว็บส่ง code ที่ LINE ให้มา เราแลกเป็นโทเคน ตรวจกับ LINE ว่าเป็นใคร
-                   แล้วออก custom token ของ Firebase (uid = line:<LINE user id>) */
-      if (url.pathname === '/api/auth/line/config' && request.method === 'GET') {
-        const ready = env.LINE_LOGIN_CHANNEL_ID && env.LINE_LOGIN_CHANNEL_SECRET && env.FIREBASE_SA_EMAIL && env.FIREBASE_SA_KEY;
-        return json({ clientId: ready ? String(env.LINE_LOGIN_CHANNEL_ID) : '' });
-      }
-      if (url.pathname === '/api/auth/line' && request.method === 'POST') {
-        return json(...await lineLogin(env, (await readBody()) || {}));
-      }
 
       /* ===== PUBLIC: site config (announcement / maintenance) ===== */
       if (url.pathname === '/api/config' && request.method === 'GET') {
