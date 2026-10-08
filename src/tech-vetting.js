@@ -1,5 +1,6 @@
 /* Server-owned rules, not proof of identity or professional competence. */
-export const VETTING_VERSION=2;
+/* 3 = เพิ่มด่านตรวจบัตรประชาชน (ผลตรวจรุ่นเก่าต้องตรวจใหม่ก่อนอนุมัติ) */
+export const VETTING_VERSION=3;
 export function fullNameError(value){
   if(typeof value!=='string')return 'กรอกชื่อและนามสกุลตามเอกสาร';
   const n=value.normalize('NFKC').trim();
@@ -48,7 +49,7 @@ export const EVIDENCE_METHODS={identity:['document_review'],phone:['live_call'],
 export function approvalError({app,ai,snapshot,evidence,resolutions}){
   if(app.test)return 'โปรไฟล์ทดสอบไม่สามารถรับรองเป็นร้านจริง';
   if(!ai||ai.status!=='complete'||ai.policyVersion!==VETTING_VERSION||ai.revision!==app.revision||ai.snapshot!==snapshot)return 'ต้องตรวจ AI สำเร็จด้วยข้อมูลและรูปชุดล่าสุดก่อนอนุมัติ';
-  for(const f of ai.flags||[]){if(f.source==='rules'&&f.level==='high')return 'ข้อมูลไม่ผ่านกฎพื้นฐาน ต้องให้ผู้สมัครแก้ไขก่อน';if(f.level==='low')continue;const r=resolutions?.[f.code];
+  for(const f of ai.flags||[]){if(f.block)return 'อนุมัติไม่ได้: '+f.msg;if(f.source==='rules'&&f.level==='high')return 'ข้อมูลไม่ผ่านกฎพื้นฐาน ต้องให้ผู้สมัครแก้ไขก่อน';if(f.level==='low')continue;const r=resolutions?.[f.code];
     if(r?.outcome!=='false_positive'||typeof r.note!=='string'||r.note.trim().length<30||r.note.length>1000)return 'ต้องตรวจและบันทึกหลักฐานตอบข้อสงสัยของ AI ทุกข้อ หรือส่งกลับให้แก้ไข';}
   for(const [key,methods] of Object.entries(EVIDENCE_METHODS)){const i=evidence?.[key];if(!methods.includes(i?.method)||typeof i.note!=='string'||i.note.trim().length<20||i.note.length>1000)return 'ต้องบันทึกวิธีและหลักฐานการตรวจครบทั้ง 6 ข้อ ไม่ใช่ติ๊กอย่างเดียว';}return '';
 }

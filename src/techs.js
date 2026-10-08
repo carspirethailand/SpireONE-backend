@@ -23,7 +23,7 @@ const CHECKS = ['identity', 'phone', 'work', 'skills', 'shop', 'terms'];
    ใบรับรองฝีมือไม่บังคับ — ช่างเก่งจำนวนมากไม่มีใบ ทีมงานสัมภาษณ์ทักษะแทนได้ */
 const DOCS = [['id', 1, 1], ['selfie', 1, 1], ['shop', 1, 3], ['work', 3, 6], ['cert', 0, 2]];
 const PRIVATE_DOCS = ['id', 'selfie', 'cert'];
-const API_VERSION = 6;
+const API_VERSION = 7;
 const PHONE = /^0\d{8,9}$/;
 const now = () => Date.now();
 
@@ -310,11 +310,12 @@ async function listTechs(env, me, url) {
   return { techs: (await withPhotos(env, results)).map(publicTech) };
 }
 
-function appOut(a) {
+/* staff = ทีมงานเห็นผล AI ครบ · ผู้สมัครเห็นแค่สถานะ (ไม่เห็นจุดสงสัย กันการลองหาทางหลบระบบ) */
+function appOut(a, staff = false) {
   if (!a) return null;
-  const d = parse(a.data) || {};
+  const d = parse(a.data) || {}, ai = parse(a.ai);
   return { ...d, uid: a.uid, email: a.email, status: a.status, test: !!a.test,
-    review: parse(a.review), revision: a.revision, createdAt: a.created_at, ai: parse(a.ai) };
+    review: parse(a.review), revision: a.revision, createdAt: a.created_at, ai: staff ? ai : ai ? { status: ai.status } : null };
 }
 
 async function meInfo(env, me) {
@@ -422,6 +423,8 @@ async function apply(env, me, b) {
   const cats = [...new Set((Array.isArray(b.cats) ? b.cats : []).filter(c => CATS.includes(c)))];
   if (!cats.length) fail(400, 'เลือกงานที่รับอย่างน้อย 1 อย่าง');
   if (b.consent !== true || b.aiConsent !== true) fail(400, 'ต้องยินยอมให้ตรวจใบสมัครและให้ Gemini ตรวจรูปอู่/ผลงานก่อนส่ง');
+  /* เลขบัตรที่กรอกต้องตรงกับรูปบัตร — ต้องยินยอมให้ระบบตรวจบัตร · การเทียบใบหน้าเป็นความยินยอมแยก ไม่บังคับ (ข้อมูลอ่อนไหว) */
+  if (b.idConsent !== true) fail(400, 'ต้องยินยอมให้ระบบตรวจเลขบนรูปบัตรประชาชนก่อนส่ง');
   const idNo = String(b.idNo || '').replace(/\D/g, '');
   if (!thaiId(idNo)) fail(400, 'เลขประจำตัวประชาชนไม่ถูกต้อง');
   const c = coord(b);
@@ -434,7 +437,7 @@ async function apply(env, me, b) {
     radius: num(b.radius, 'รัศมีบริการ', 0, 200), lat: c.lat, lng: c.lng,
     cats, mobile: !!b.mobile, urgent: !!b.urgent, hasCert: false, consentAt: t,
     title: ['นาย', 'นาง', 'นางสาว'].includes(b.title) ? b.title : '', idNo,
-    birth: /^\d{4}-\d{2}-\d{2}$/.test(String(b.birth || '')) ? b.birth : '', aiConsent:true,
+    birth: /^\d{4}-\d{2}-\d{2}$/.test(String(b.birth || '')) ? b.birth : '', aiConsent:true, idConsent:true, faceConsent:b.faceConsent===true,
     appNo: 'CP-' + (await sha(me.uid)).slice(0, 6).toUpperCase(), submittedAt: t,
   };
   if(typeof b.age==='boolean'||typeof b.years==='boolean')fail(400,'อายุและประสบการณ์ต้องเป็นตัวเลข');
@@ -463,7 +466,19 @@ async function apply(env, me, b) {
   if(!stored[0].meta.changes)fail(409,'ใบสมัครถูกส่งแล้ว กรุณาโหลดสถานะ ไม่ส่งซ้ำ');
   /* AI คัดกรองทันทีหลังส่ง — ล้มก็ไม่กระทบการสมัคร ทีมงานกด "ตรวจอีกครั้ง" ได้ */
   let ai=null;try{ai=await runScreen(env,me.uid)}catch{ /* stays pending, never approved */ }
-  return {ok:true,status:'pending',screening:ai?{status:ai.status,verdict:ai.verdict}:null};
+  /* ข้อที่ไม่ผ่านแน่นอน (เลขบนบัตรไม่ตรงกับที่กรอก อ่านไม่ได้ บัตรหมดอายุ ฯลฯ) ตีกลับทันทีพร้อมเหตุผล
+     ผู้สมัครแก้แล้วส่งใหม่ได้เลย ไม่ต้องรอทีมงาน · ลบรูปบัตร/เซลฟี่ และปล่อยเลขบัตรคืน (กันคนกรอกเลขคนอื่นแล้วจองไว้) */
+  const blocks=(ai?.flags||[]).filter(f=>f.block);
+  if(blocks.length){
+    const reasons=blocks.map(f=>f.msg),rv=JSON.stringify({id:crypto.randomUUID(),by:'system',auto:true,decision:'reject',note:reasons.join(' · '),reasons,at:now()});
+    await env.DB.batch([
+      env.DB.prepare("UPDATE tech_applications SET status='rejected',review=?,updated_at=?,revision=revision+1 WHERE uid=? AND status='pending' AND revision=?").bind(rv,now(),me.uid,ai.revision),
+      env.DB.prepare(`DELETE FROM tech_docs WHERE uid=? AND kind IN (${PRIVATE_DOCS.map(() => '?').join(',')}) AND EXISTS(SELECT 1 FROM tech_applications WHERE uid=? AND review=?)`).bind(me.uid,...PRIVATE_DOCS,me.uid,rv),
+      env.DB.prepare('DELETE FROM tech_identity_claims WHERE uid=? AND EXISTS(SELECT 1 FROM tech_applications WHERE uid=? AND review=?)').bind(me.uid,me.uid,rv),
+    ]);
+    return {ok:true,status:'rejected',result:'rejected',reasons};
+  }
+  return {ok:true,status:'pending',result:'pending',screening:ai?{status:ai.status,verdict:ai.verdict}:null};
 }
 
 /* รัน AI คัดกรองแล้วเก็บผลไว้ในใบสมัคร (ทีมงานเห็นเท่านั้น ผู้สมัครไม่เห็น) */
@@ -521,7 +536,7 @@ async function pendingApps(env, me) {
   adminOnly(me);
   const { results } = await env.DB.prepare(
     "SELECT * FROM tech_applications WHERE status = 'pending' ORDER BY created_at ASC").all();
-  return { applications: results.map(appOut) };
+  return { applications: results.map(a => appOut(a, true)) };
 }
 
 /* ── ด่านคัดเลือกช่าง ──
@@ -548,7 +563,7 @@ async function review(env, me, b) {
     const duplicate=await env.DB.prepare("SELECT uid FROM tech_applications WHERE id_hash=? AND uid!=? AND test=0 AND status!='rejected'").bind(a.id_hash,a.uid).first();
     if(duplicate)fail(409,'พบข้อมูลตัวตนซ้ำ ต้องตรวจและแก้ไขก่อน');
     evidence=Object.fromEntries(CHECKS.map(k=>[k,{method:b.evidence[k].method,note:b.evidence[k].note.trim()}]));
-    resolutions=Object.fromEntries((ai.flags||[]).filter(f=>f.level!=='low'&&f.source==='vision').map(f=>[f.code,{outcome:b.resolutions[f.code].outcome,note:b.resolutions[f.code].note.trim()}]));
+    resolutions=Object.fromEntries((ai.flags||[]).filter(f=>f.level!=='low'&&f.source!=='rules').map(f=>[f.code,{outcome:b.resolutions[f.code].outcome,note:b.resolutions[f.code].note.trim()}]));
   }
   const t = now();
   const rv = JSON.stringify({id:crypto.randomUUID(),by:me.email,note,checks,evidence,resolutions,decision,at:t,screeningSnapshot:parse(a.ai)?.snapshot||null});

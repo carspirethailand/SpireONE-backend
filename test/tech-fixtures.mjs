@@ -9,7 +9,7 @@ export function png(seed=1,w=400,h=300){
   return Buffer.concat([Buffer.from([137,80,78,71,13,10,26,10]),chunk('IHDR',head),chunk('IDAT',deflateSync(raw)),chunk('IEND',Buffer.alloc(0))]);
 }
 export const pic=(kind,n)=>({kind,data:'data:image/png;base64,'+png(n).toString('base64')});
-export const form=(over={})=>({title:'นาย',name:'สมชาย ใจดี',phone:'0812345678',area:'บางนา กรุงเทพ',age:30,birth:'1996-05-01',years:5,from:500,warranty:30,radius:10,lat:13.7,lng:100.6,cats:['eng'],consent:true,aiConsent:true,idNo:'1101700203450',about:'ซ่อมเครื่องยนต์และระบบแอร์ มีเครื่องตรวจและเครื่องมือประจำอู่',docs:[pic('id',1),pic('selfie',2),pic('shop',3),pic('work',4),pic('work',5),pic('work',6)],...over});
+export const form=(over={})=>({title:'นาย',name:'สมชาย ใจดี',phone:'0812345678',area:'บางนา กรุงเทพ',age:30,birth:'1996-05-01',years:5,from:500,warranty:30,radius:10,lat:13.7,lng:100.6,cats:['eng'],consent:true,aiConsent:true,idConsent:true,idNo:'1101700203450',about:'ซ่อมเครื่องยนต์และระบบแอร์ มีเครื่องตรวจและเครื่องมือประจำอู่',docs:[pic('id',1),pic('selfie',2),pic('shop',3),pic('work',4),pic('work',5),pic('work',6)],...over});
 export const evidence=()=>Object.fromEntries(Object.entries({identity:'document_review',phone:'live_call',work:'portfolio_review',skills:'interview',shop:'video_call',terms:'written_agreement'}).map(([key,method])=>[key,{method,note:'Test-only human review record; not a real applicant verification.'}]));
 export function fakeGemini(transform=out=>out){
   const seen={calls:0,requests:[]};globalThis.fetch=async(url,init)=>{seen.calls++;const body=JSON.parse(init.body);seen.requests.push(body);
@@ -27,4 +27,21 @@ export function fixture(extra={}){
 }
 export const USER='applicant|person@unit.test',ADMIN='boss|boss@unit.test';
 export async function pending(f,over={}){const r=await f.call(USER,'/api/tech/apply',form(over));if(r.status!==200)throw Error(JSON.stringify(r));return (await f.call(ADMIN,'/api/tech/applications')).applications[0];}
-export const review=(a,over={})=>({uid:a.uid,revision:a.revision,decision:'approve',checks:Object.fromEntries(['identity','phone','work','skills','shop','terms'].map(k=>[k,true])),evidence:evidence(),resolutions:{},note:'Test-only completed human review with evidence.',...over});
+/* ข้อสงสัยด่านบัตร (เช่น "เทียบเลขบัตรเอง" ตอน AI ตรวจบัตรปิดอยู่) ต้องมีบันทึกของทีมงาน — เติมให้เฉพาะด่านบัตร ด่านรูปผลงานยังให้แต่ละเทสต์กำหนดเอง */
+export const idNotes=a=>Object.fromEntries((a.ai?.flags||[]).filter(f=>f.source==='identity'&&f.level!=='low'&&!f.block).map(f=>[f.code,{outcome:'false_positive',note:'Test-only: compared the ID number digit by digit with the form.'}]));
+export const review=(a,over={})=>({uid:a.uid,revision:a.revision,decision:'approve',checks:Object.fromEntries(['identity','phone','work','skills','shop','terms'].map(k=>[k,true])),evidence:evidence(),note:'Test-only completed human review with evidence.',...over,resolutions:{...idNotes(a),...(over.resolutions||{})}});
+
+/* Gemini ปลอมที่แยกตอบตามชนิดคำขอ: ตรวจรูปผลงาน / อ่านบัตร / อ่านเลขรอบสอง / เทียบใบหน้า
+   card/ocr/face = ค่าที่จะตอบ (ฟังก์ชันได้ รับลำดับครั้งที่เรียก) · บันทึกคำขอแต่ละชนิดไว้ตรวจ */
+export function fakeGeminiAll({card={},ocr={idNumber:'',clear:false},face={personHoldingCard:true,samePerson:'yes',cardNumberInSelfie:''},transform=out=>out}={}){
+  const seen={calls:0,work:[],card:[],ocr:[],face:[]};
+  const goodCard={isThaiIdCard:true,photoOfScreenOrCopy:false,editedSuspected:false,idNumber:'1101700203450',expiry:'2031-01-01',nameOnCard:'สมชาย ใจดี',birthOnCard:'1996-05-01'};
+  globalThis.fetch=async(url,init)=>{seen.calls++;const body=JSON.parse(init.body),sys=body.systemInstruction?.parts?.[0]?.text||'';let out;
+    if(/Thai national ID card photo/.test(sys)){seen.card.push(body);out={...goodCard,...(typeof card==='function'?card(seen.card.length):card)};}
+    else if(/Read ONLY the 13-digit/.test(sys)){seen.ocr.push(body);out=typeof ocr==='function'?ocr(seen.ocr.length):ocr;}
+    else if(/explicitly consented to this face comparison/.test(sys)){seen.face.push(body);out=face;}
+    else{seen.work.push(body);const images=body.contents[0].parts.filter(p=>p.text).map(p=>{try{return JSON.parse(p.text)}catch{return null}}).filter(x=>x?.imageId).map(x=>({...x,relevance:'relevant',concern:false,note:'Test-only mocked image analysis'}));
+      out=transform({images,descriptionRelevant:'yes',summary:'Mocked response for unit tests only'});}
+    return Response.json({candidates:[{finishReason:'STOP',content:{parts:[{text:JSON.stringify(out)}]}}]});};
+  return seen;
+}

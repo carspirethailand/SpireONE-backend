@@ -1,7 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {handleTech} from '../src/techs.js';
-import {fixture,form,fakeGemini,pending,review,USER,ADMIN} from './tech-fixtures.mjs';
+import {fixture,form,fakeGemini,fakeGeminiAll,pending,review,USER,ADMIN} from './tech-fixtures.mjs';
 test('full onboarding requires fresh AI and human evidence, then appears publicly without identity docs',async()=>{
   fakeGemini();const f=fixture(),a=await pending(f);assert.equal(a.ai.status,'complete');assert.equal((await f.call('', '/api/tech')).techs.length,0);
   assert.equal((await f.call(ADMIN,'/api/tech/review',review(a,{evidence:{}}))).status,400);
@@ -63,4 +63,27 @@ test('verified portfolio cannot be swapped to unreviewed pictures or warranty re
   assert.equal((await f.call(USER,'/api/tech/shop',{addPhotos:form().docs.slice(2,3)})).status,409);
   assert.equal((await f.call(USER,'/api/tech/shop',{warranty:0})).status,400);
   assert.equal((await f.call(USER,'/api/tech/shop',{from:600,hours:'09:00–18:00'})).status,200);
+});
+
+/* ── เลขบัตรที่กรอกต้องตรงกับรูปบัตร (TECH_AI_IDS=1) ── */
+test('typed ID ≠ number on card photo → rejected instantly with reason; docs + ID claim released; applicant sees no AI flags',async()=>{
+  fakeGeminiAll({card:{idNumber:'3100500123458'},ocr:{idNumber:'3100500123458',clear:true}});const f=fixture({TECH_AI_IDS:'1'});
+  const r=await f.call(USER,'/api/tech/apply',form());assert.equal(r.status,200);assert.equal(r.result,'rejected');assert.ok(r.reasons.some(x=>/ไม่ตรงกับเลขบนบัตร/.test(x)));
+  const mine=(await f.call(USER,'/api/tech/me')).application;assert.equal(mine.status,'rejected');assert.equal(mine.review.auto,true);assert.deepEqual(Object.keys(mine.ai||{}),['status']);
+  assert.equal(f.sqlite.prepare("SELECT COUNT(*) n FROM tech_docs WHERE kind IN ('id','selfie','cert')").get().n,0);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) n FROM tech_identity_claims').get().n,0,'a wrong/stolen ID number must not stay reserved');
+  /* แก้แล้วส่งใหม่ได้ทันที */
+  fakeGeminiAll();assert.equal((await f.call(USER,'/api/tech/apply',form())).result,'pending');
+});
+test('missing ID consent is refused before any AI call',async()=>{
+  const seen=fakeGeminiAll(),f=fixture({TECH_AI_IDS:'1'});const r=await f.call(USER,'/api/tech/apply',form({idConsent:false}));assert.equal(r.status,400);assert.equal(seen.calls,0);
+});
+test('matching card → pending; staff can approve only with ID evidence; a later mismatch on rescreen locks approval',async()=>{
+  fakeGeminiAll();const f=fixture({TECH_AI_IDS:'1'}),a=await pending(f);assert.equal(a.ai.identity.result,'match');assert.equal(a.ai.verdict,'pass');
+  fakeGeminiAll({card:{idNumber:'3100500123458'},ocr:{idNumber:'3100500123458',clear:true}});
+  const rs=await f.call(ADMIN,'/api/tech/rescreen',{uid:a.uid});assert.equal(rs.ai.identity.result,'mismatch');
+  const b=(await f.call(ADMIN,'/api/tech/applications')).applications[0];const ap=await f.call(ADMIN,'/api/tech/review',review(b));
+  assert.equal(ap.status,400);assert.match(ap.error,/อนุมัติไม่ได้/);
+  fakeGeminiAll();await f.call(ADMIN,'/api/tech/rescreen',{uid:a.uid});const c=(await f.call(ADMIN,'/api/tech/applications')).applications[0];
+  assert.equal((await f.call(ADMIN,'/api/tech/review',review(c))).status,200);
 });
