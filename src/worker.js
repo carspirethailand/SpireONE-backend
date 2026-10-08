@@ -3305,7 +3305,7 @@ export default {
     await ensureSchema(env);
 
     /* ระบบช่าง (Cendon Care) อยู่ในไฟล์ techs.js ทั้งหมด */
-    if (/^\/api\/tech(\/|$)/.test(url.pathname)) return handleTech(request, env, cors);
+    if (/^\/api\/tech(\/|$)/.test(url.pathname)) return handleTech(request, env, cors, { ctx });
 
     // Wraps a handler with auth + minimum-role + ban checks.
     const guarded = (minRole, handler) => async () => {
@@ -3443,7 +3443,8 @@ export default {
           const r = await env.DB.prepare(
             'SELECT line_uid, linked_at, active FROM line_link WHERE uid = ? AND active = 1'
           ).bind(actor.payload.sub).first();
-          return json({ linked: !!r, linkedAt: r ? r.linked_at : null });
+          /* oa = ชื่อบัญชี LINE OA (เช่น @cendon) — ว่าง = ยังไม่ได้ตั้ง LINE หน้าแอปจะไม่โชว์ปุ่มเชื่อม */
+          return json({ linked: !!r, linkedAt: r ? r.linked_at : null, oa: env.LINE_CHANNEL_TOKEN ? (env.LINE_OA_ID || '') : '' });
         })();
       }
       if (url.pathname === '/api/line/link' && request.method === 'DELETE') {

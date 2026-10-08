@@ -14,6 +14,7 @@
 import { verifyFirebaseToken } from './auth.js';
 import { screenApplication, screeningSnapshot } from './tech-screen.js';
 import { applicantErrors, imageInfo, approvalError } from './tech-vetting.js';
+import { notify, jobCard, card, once, appUrl } from './line-notify.js';
 const CATS = ['body', 'ev', 'tyre', 'air', 'eng'];
 const CAT_TH = { body: 'ตัวถัง & สี', ev: 'ไฟฟ้า & EV', tyre: 'ยาง & ช่วงล่าง', air: 'แอร์รถยนต์', eng: 'เครื่องยนต์' };
 /* ด่านที่ทีมงานต้องตรวจเองก่อนอนุมัติ — ชื่อต้องตรงกับหน้าเว็บ (tech.html) */
@@ -659,6 +660,11 @@ async function review(env, me, b) {
   if(decision==='reject')stmts.push(env.DB.prepare('DELETE FROM tech_identity_claims WHERE uid=? AND EXISTS(SELECT 1 FROM tech_applications WHERE uid=? AND review=?)').bind(a.uid,a.uid,rv));
   const result=await env.DB.batch(stmts);if(!result[0].meta.changes)fail(409,'ใบสมัครเปลี่ยนแล้ว กรุณาโหลดใหม่');
   await audit(env, me, decision, a.uid, decision === 'approve' ? 'ผ่านการตรวจครบทุกข้อ' : note.slice(0, 200));
+  tell(env, a.uid, () => decision === 'approve'
+    ? card({ tag: 'ผ่านการตรวจ', title: 'ร้านของคุณเปิดใน Cendon แล้ว', url: appUrl(env, '/?studio=1'), label: 'เปิด Studio',
+        lines: ['ตั้งค่าร้าน ลงบริการพร้อมราคา แล้วเริ่มรับงานได้เลย'] })
+    : card({ tag: 'ใบสมัครช่าง', title: 'ใบสมัครยังไม่ผ่าน', url: appUrl(env, '/?join=1'), label: 'ดูสิ่งที่ต้องแก้',
+        lines: [note, 'แก้ไขแล้วส่งใหม่ได้ในแอป'] }));
   return { ok: true };
 }
 
@@ -845,8 +851,18 @@ async function createJob(env, me, b) {
       .bind(id, t.uid, 'technician', d.autoReply.text, ts + 1).run();
   }
   await bumpView(env, t.id, 'book');
+  tell(env, t.uid, async () => jobCard(env, 'request', await env.DB.prepare('SELECT * FROM tech_jobs WHERE id = ?').bind(id).first(), shopOf(t)));
   return { id };
 }
+
+/* แจ้งอีกฝ่ายทาง LINE เบื้องหลัง — ผู้กดไม่ต้องรอ LINE ตอบ และ LINE ล่มก็ไม่ทำให้ใบงานพัง
+   make = ฟังก์ชันสร้างการ์ด (ถ้าต้องอ่านฐานข้อมูลก็ไปทำเบื้องหลังด้วย) · ยังไม่ตั้ง LINE = ไม่ทำอะไรเลย */
+function tell(env, uid, make) {
+  if (!uid || !env.LINE_CHANNEL_TOKEN) return;
+  const p = (async () => { const m = await make(); if (m) await notify(env, uid, m); })().catch(() => {});
+  if (env.bg) env.bg(p);
+}
+const shopOf = (t) => { const d = parse(t && t.data) || {}; return d.shop || d.name || 'ร้านช่าง'; };
 
 const DAY = 86400000;
 async function bumpView(env, techId, kind) {
@@ -896,6 +912,10 @@ async function sendMessage(env, me, ctx, b) {
     .bind(j.id, me.uid, as, text, ts).run();
   await env.DB.prepare('UPDATE tech_jobs SET updated_at = ? WHERE id = ?').bind(ts, j.id).run();
   await markRead(env, j.id, me.uid, r.meta.last_row_id);
+  /* แจ้งข้อความใหม่ทาง LINE ไม่เกิน 1 ครั้ง / 30 นาที / ใบงาน — คุยกันรัว ๆ ไม่ให้ LINE เด้งทุกข้อความ */
+  const to = as === 'technician' ? j.customer_uid : (ctx.t && ctx.t.uid);
+  if (to && to !== me.uid) tell(env, to, async () => (await once(env, 'line-msg:' + j.id, to, 1800000))
+    ? jobCard(env, 'message', j, shopOf(ctx.t), { from: as === 'technician' ? shopOf(ctx.t) : 'ลูกค้า', text }) : null);
   return { ok: true, message: { id: r.meta.last_row_id, role: as, text, at: ts } };
 }
 
@@ -1019,6 +1039,12 @@ async function updateJob(env, me, id, b) {
   }
   if (extra.length) await env.DB.batch(extra);
   if (stagePhotos.length) await saveMedia(env, j.id + (action === 'start' ? ':before' : ':after'), me.uid, stagePhotos);
+  /* แจ้งอีกฝ่ายทาง LINE เฉพาะจังหวะที่เขาต้องรู้หรือต้องทำอะไรต่อ (เริ่มซ่อม/ทีมงานปิดเรื่อง ไม่แจ้ง) */
+  const jj = { ...j, ...set }, shop = shopOf(t), techUid = t && t.uid, other = by === 'customer' ? techUid : j.customer_uid;
+  const dest = { quote: j.customer_uid, accept: techUid, enroute: j.customer_uid, done: j.customer_uid,
+    complete: techUid, review: techUid, cancel: other, dispute: other }[action];
+  if (dest && dest !== me.uid) tell(env, dest, () => jobCard(env, action, jj, shop, {
+    note: b.note, by, rating: b.rating && Math.round(Number(b.rating)), text: b.note }));
   return { ok: true };
 }
 
@@ -1093,6 +1119,10 @@ async function extraWork(env, ctx, action, b) {
   const r = await env.DB.prepare('UPDATE tech_jobs SET extras = ?, history = ?, updated_at = ?, revision = revision + 1 WHERE id = ? AND revision = ?')
     .bind(JSON.stringify(list), JSON.stringify(hist), ts, j.id, j.revision).run();
   if (!r.meta.changes) fail(409, 'ใบงานเพิ่งถูกอัปเดต กรุณารีเฟรชแล้วลองอีกครั้ง');
+  /* ขอทำงานเพิ่ม → ลูกค้าต้องตอบ · ลูกค้าตอบแล้ว → ช่างรู้ทันที */
+  const x = action === 'extra' ? list[list.length - 1] : list.find(e => e.id === String(b.extraId || ''));
+  const to = action === 'extra' ? j.customer_uid : (ctx.t && ctx.t.uid);
+  tell(env, to, () => jobCard(env, action, j, shopOf(ctx.t), x || {}));
   return { ok: true };
 }
 
@@ -1640,6 +1670,10 @@ async function route(request, env, verifyToken) {
 export async function handleTech(request, env, corsHeaders, options={}) {
   const h = corsHeaders || cors(env, request);
   if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: h });
+  /* งานเบื้องหลังของคำขอนี้ (แจ้ง LINE) — ctx.waitUntil ให้ Worker ทำต่อหลังตอบผู้ใช้ไปแล้ว
+     ห่อ env เป็นชั้นใหม่ต่อคำขอ ไม่แก้ env ตัวจริงที่ใช้ร่วมกันทั้ง isolate */
+  const ctx = options.ctx;
+  env = Object.create(env, { bg: { value: (p) => { const q = Promise.resolve(p).catch(() => {}); if (ctx && ctx.waitUntil) ctx.waitUntil(q); return q; } } });
   try {
     await ensureTech(env);
     const img = new URL(request.url).pathname.match(/^\/api\/tech\/img\/(\d+)$/);
