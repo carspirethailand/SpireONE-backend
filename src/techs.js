@@ -110,6 +110,11 @@ const TECH_SQL = [
 ];
 /* คอลัมน์ที่เพิ่มทีหลัง — ALTER ซ้ำจะ error ว่ามีอยู่แล้ว ซึ่งเป็นเรื่องปกติ ข้ามไปได้ */
 const TECH_ALTER = [
+  /* รหัสเริ่มงาน (ลูกค้าบอกช่างเมื่อพบกันจริง) และงานเพิ่มที่ลูกค้าต้องกดยอมรับ */
+  `ALTER TABLE tech_jobs ADD COLUMN start_code TEXT`,
+  `ALTER TABLE tech_jobs ADD COLUMN start_exp INTEGER`,
+  `ALTER TABLE tech_jobs ADD COLUMN start_tries INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE tech_jobs ADD COLUMN extras TEXT`,
   `ALTER TABLE tech_applications ADD COLUMN ai TEXT`,
   `ALTER TABLE tech_applications ADD COLUMN id_hash TEXT`,
   `ALTER TABLE tech_docs ADD COLUMN hash TEXT`,
@@ -132,6 +137,10 @@ const TECH_ALTER = [
     title TEXT NOT NULL, body TEXT, price INTEGER, cats TEXT, brands TEXT, photos TEXT, active INTEGER NOT NULL DEFAULT 1,
     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
   `CREATE INDEX IF NOT EXISTS tech_gigs_active ON tech_gigs(active, created_at)`,
+  /* บันทึกการกระทำของทีมงาน (ใครดูเอกสาร อนุมัติ ตีกลับ ระงับ) — ไม่เก็บเลขบัตรเต็มหรือ key */
+  `CREATE TABLE IF NOT EXISTS tech_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT, detail TEXT)`,
+  /* ลิงก์แชร์ใบงานให้คนที่ไว้ใจ — หมดอายุ ยกเลิกได้ ไม่มีที่อยู่/เบอร์ */
+  `CREATE TABLE IF NOT EXISTS tech_shares (token TEXT PRIMARY KEY, job_id TEXT NOT NULL, uid TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0)`,
   /* ยอดเข้าชมรายวันของร้าน (Studio → สถิติ): kind = shop | gig | call | book */
   `CREATE TABLE IF NOT EXISTS tech_views (tech_id TEXT NOT NULL, day INTEGER NOT NULL, kind TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tech_id, day, kind))`,
 ];
@@ -233,6 +242,58 @@ function mask(text) {
     .replace(/(line|ไลน์)\s*(id)?\s*[:：]?\s*@?[a-z0-9._-]{3,}/gi, '[ซ่อนไลน์ไว้จนกว่าจะยืนยันงาน]');
 }
 
+/* ── ลบข้อมูลแฝงในรูปก่อนเก็บ ──
+   มือถือหลายรุ่นฝังพิกัด GPS ที่ถ่าย (มักเป็นบ้านลูกค้า) และข้อมูลเครื่องไว้ในไฟล์รูป
+   JPEG: ตัด APP1 (EXIF/XMP), APP13 (IPTC), COM · PNG: ตัด eXIf / tEXt / iTXt / zTXt
+   ไฟล์ที่อ่านโครงสร้างไม่ออก คืนตามเดิม (ด่านตรวจไฟล์จริงจัดการต่อ) — แอปเราย่อรูปผ่าน canvas อยู่แล้ว นี่คือด่านสำรองฝั่งเซิร์ฟเวอร์ */
+function b64bytes(b64) { return Uint8Array.from(atob(b64), c => c.charCodeAt(0)); }
+function bytesb64(parts) {
+  let s = '';
+  for (const u of parts) for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode(...u.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+export function stripMeta(mime, b64) {
+  let b; try { b = b64bytes(b64); } catch { return b64; }
+  if (mime === 'image/jpeg') {
+    if (b[0] !== 0xFF || b[1] !== 0xD8) return b64;
+    const out = [b.subarray(0, 2)]; let p = 2, sos = false;
+    while (p + 2 <= b.length) {
+      if (b[p] !== 0xFF) return b64;
+      let q = p; while (q < b.length && b[q] === 0xFF) q++;
+      const mk = b[q];
+      if (mk === 0xDA || mk === 0xD9) { out.push(b.subarray(p)); sos = true; break; }
+      if ((mk >= 0xD0 && mk <= 0xD7) || mk === 0x01) { out.push(b.subarray(p, q + 1)); p = q + 1; continue; }
+      if (q + 2 >= b.length) return b64;
+      const len = (b[q + 1] << 8) | b[q + 2], end = q + 1 + len;
+      if (len < 2 || end > b.length) return b64;
+      if (mk !== 0xE1 && mk !== 0xED && mk !== 0xFE) out.push(b.subarray(p, end));
+      p = end;
+    }
+    return sos ? bytesb64(out) : b64;
+  }
+  if (mime === 'image/png') {
+    if (b.length < 8 || b[0] !== 137 || b[1] !== 80) return b64;
+    const out = [b.subarray(0, 8)], drop = new Set(['eXIf', 'tEXt', 'iTXt', 'zTXt']); let p = 8, end = false;
+    while (p + 12 <= b.length) {
+      const n = ((b[p] << 24) >>> 0) + (b[p + 1] << 16) + (b[p + 2] << 8) + b[p + 3], type = String.fromCharCode(...b.subarray(p + 4, p + 8)), e = p + 12 + n;
+      if (e > b.length) return b64;
+      if (!drop.has(type)) out.push(b.subarray(p, e));
+      p = e; if (type === 'IEND') { end = true; break; }
+    }
+    return end ? bytesb64(out) : b64;
+  }
+  return b64;
+}
+const imgClean = m => { if (m) m[2] = stripMeta(m[1], m[2]); return m; };
+
+const audit = (env, me, action, target, detail = '') => env.DB.prepare('INSERT INTO tech_audit (at, actor, action, target, detail) VALUES (?,?,?,?,?)')
+  .bind(now(), String(me.email || me.uid), action, String(target || ''), String(detail).slice(0, 300)).run().catch(() => {});
+async function auditLog(env, me) {
+  if (!me.admin) fail(403, 'เฉพาะ admin');
+  const { results } = await env.DB.prepare('SELECT at, actor, action, target, detail FROM tech_audit ORDER BY id DESC LIMIT 200').all();
+  return { log: results };
+}
+
 async function sha(s) {
   const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
   return [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('');
@@ -268,6 +329,7 @@ function publicTech(r) {
     subs: d.subs || [], week: d.week || null, brands2: d.brands2 || [], line: d.line || '', facebook: d.facebook || '', address: d.address || '',
     /* โหมดพักร้อน: แสดงบนหน้าร้าน และงดรับคำขอใหม่จนกว่าจะถึงวันที่ตั้ง */
     vacation: vacationOf(d), greet: d.greet || '', theme: d.theme || '',
+    vetting: d.vetting && r.verified ? { at: d.vetting.at, identity: !!d.vetting.identity, phone: !!d.vetting.phone, shop: d.vetting.shop || '', skills: d.vetting.skills || '', cats: d.vetting.cats || [], mobile: !!d.vetting.mobile } : null,
   };
 }
 /* D1 รับตัวแปรได้ไม่เกิน 100 ตัวต่อคำสั่ง — พอช่าง/งานเกินร้อย รายชื่อจะพังทั้งหน้า
@@ -361,7 +423,7 @@ function docList(b) {
   if (docs.length > 14) fail(400, 'แนบรูปได้ไม่เกิน 14 รูป');
   const out = [];
   for (const d of docs) {
-    const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(d && d.data || ''));
+    const m = imgClean(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(d && d.data || '')));
     if (!m) fail(400, 'ไฟล์ต้องเป็นรูปภาพ');
     if (m[2].length > 1400000) fail(400, 'รูปใหญ่เกินไป');
     if (!DOCS.some(([k]) => k === d.kind)) fail(400, 'ชนิดเอกสารไม่ถูกต้อง');
@@ -505,6 +567,7 @@ async function rescreen(env, me, b) {
   adminOnly(me);
   await limit(env,'rescreen_admin',me.uid,30);
   const uid = String(b.uid || '');
+  await audit(env, me, 'rescreen', uid);
   const a = await env.DB.prepare('SELECT status FROM tech_applications WHERE uid = ?').bind(uid).first();
   if (!a) fail(404, 'ไม่พบใบสมัคร');
   if (a.status !== 'pending') fail(409, 'ตรวจได้เฉพาะใบที่รอตรวจ (เอกสารของใบที่ตรวจแล้วถูกลบไปแล้ว)');
@@ -514,6 +577,7 @@ async function rescreen(env, me, b) {
 /* เอกสารของผู้สมัคร — ทีมงานเท่านั้น */
 async function appDocs(env, me, uid) {
   adminOnly(me);
+  await audit(env, me, 'view_docs', uid);
   const { results } = await env.DB.prepare('SELECT id, kind, mime, data FROM tech_docs WHERE uid = ? ORDER BY id').bind(uid).all();
   return { docs: results.map(d => ({ id: d.id, kind: d.kind, url: `data:${d.mime};base64,${d.data}` })) };
 }
@@ -582,14 +646,19 @@ async function review(env, me, b) {
     const profile = { name: d.name, shop: d.shop, area: d.area, cats: d.cats, about: d.about, years: d.years,
       from: d.from, warranty: d.warranty, radius: d.radius, mobile: d.mobile, urgent: d.urgent,
       lat: d.lat, lng: d.lng, cert: !!d.hasCert };
+    /* ป้ายบนหน้าร้านมาจากสิ่งที่ทีมงานตรวจจริง แยกเป็นเรื่อง ๆ (ตัวตน / เบอร์ / สถานที่ / ทักษะรายหมวด) พร้อมวันที่
+       ไม่มีป้าย "ปลอดภัย" เหมารวม — ยืนยันตัวตน ≠ รับรองฝีมือ ≠ รับประกันทุกเหตุการณ์ */
+    const vetting = { at: t, identity: true, phone: true, shop: evidence.shop.method, skills: evidence.skills.method, cats: d.cats || [], mobile: !!d.mobile };
+    profile.vetting = vetting;
     stmts.push(env.DB.prepare(`INSERT INTO tech_profiles (id,uid,phone,data,verified,test,suspended,created_at,updated_at)
       SELECT ?,?,?,?,1,0,0,?,? FROM tech_applications WHERE uid=? AND status='approved' AND review=?
       /* ร้านเดิมที่ช่างแก้ไว้แล้วต้องไม่ถูกข้อมูลจากใบสมัครเขียนทับ (บั๊ก "บันทึกแล้วกลับเป็นค่าเดิม") */
-      ON CONFLICT(uid) DO UPDATE SET data=CASE WHEN tech_profiles.data IS NULL OR tech_profiles.data='' OR tech_profiles.data='{}' THEN excluded.data ELSE tech_profiles.data END,phone=excluded.phone,verified=1,test=0,suspended=0,updated_at=excluded.updated_at`)
-      .bind(id,a.uid,d.phone,JSON.stringify(profile),t,t,a.uid,rv));
+      ON CONFLICT(uid) DO UPDATE SET data=json_set(CASE WHEN tech_profiles.data IS NULL OR tech_profiles.data='' OR tech_profiles.data='{}' THEN excluded.data ELSE tech_profiles.data END,'$.vetting',json(?)),phone=excluded.phone,verified=1,test=0,suspended=0,updated_at=excluded.updated_at`)
+      .bind(id,a.uid,d.phone,JSON.stringify(profile),t,t,a.uid,rv,JSON.stringify(vetting)));
   }
   if(decision==='reject')stmts.push(env.DB.prepare('DELETE FROM tech_identity_claims WHERE uid=? AND EXISTS(SELECT 1 FROM tech_applications WHERE uid=? AND review=?)').bind(a.uid,a.uid,rv));
   const result=await env.DB.batch(stmts);if(!result[0].meta.changes)fail(409,'ใบสมัครเปลี่ยนแล้ว กรุณาโหลดใหม่');
+  await audit(env, me, decision, a.uid, decision === 'approve' ? 'ผ่านการตรวจครบทุกข้อ' : note.slice(0, 200));
   return { ok: true };
 }
 
@@ -598,6 +667,7 @@ async function moderate(env, me, b) {
   const r = await env.DB.prepare('UPDATE tech_profiles SET suspended=?, updated_at=? WHERE id=?')
     .bind(b.suspend === false ? 0 : 1, now(), String(b.id || '')).run();
   if (!r.meta.changes) fail(404, 'ไม่พบช่าง');
+  await audit(env, me, b.suspend === false ? 'unsuspend' : 'suspend', b.id);
   return { ok: true };
 }
 
@@ -639,7 +709,18 @@ function jobOut(j, t, role, messages) {
     review: parse(j.review), history: parse(j.history) || [],
     createdAt: j.created_at, acceptedAt: j.accepted_at,
     messages: messages || [], note: j.note || '',
+    /* ลูกค้าใช้ตรวจว่าคนที่มาถึงคือช่างที่ตกลงไว้ — รูปโปรไฟล์และสิ่งที่ทีมงานตรวจแล้ว (ข้อมูลเดียวกับหน้าร้านสาธารณะ) */
+    techAvatar: d.avatar || null, techVerified: !!(t && t.verified),
+    techVetting: d.vetting && t && t.verified ? { identity: !!d.vetting.identity, cats: d.vetting.cats || [], at: d.vetting.at } : null,
   };
+  /* งานเพิ่ม: ยอดที่ตกลงแล้ว = ราคาที่ยืนยัน + งานเพิ่มที่ลูกค้ากดยอมรับเท่านั้น */
+  out.extras = parse(j.extras) || [];
+  const q = out.quote;
+  out.agreedTotal = q ? Math.round((q.total + out.extras.filter(x => x.status === 'accepted').reduce((n, x) => n + x.total, 0)) * 100) / 100 : null;
+  /* รหัสเริ่มงาน: ลูกค้าเห็นรหัส · ช่างรู้แค่ว่าต้องขอรหัสจากลูกค้า · ทีมงานไม่เห็นรหัส */
+  const codeOpen = ['accepted', 'enroute'].includes(j.status) && !!j.start_code;
+  if (codeOpen && (role === 'customer' || role === 'both')) { out.startCode = j.start_code; out.startCodeExp = j.start_exp; }
+  out.startCodeRequired = codeOpen;
   /* ลูกค้าเห็นที่อยู่ของตัวเองเสมอ ช่างเห็นหลังลูกค้ายืนยันราคาแล้วเท่านั้น */
   if (role === 'customer' || role === 'both' || role === 'admin' || accepted) out.address = j.address;
   if (accepted) { out.customerPhone = j.phone; out.technicianPhone = (t && t.phone) || ''; }
@@ -696,7 +777,7 @@ function mediaIn(b) {
   const list = Array.isArray(b.photos) ? b.photos : [];
   if (list.length > 3) fail(400, 'แนบรูปได้ไม่เกิน 3 รูป');
   return list.map(x => {
-    const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(x || ''));
+    const m = imgClean(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(x || '')));
     if (!m || m[2].length > 1400000) fail(400, 'ไฟล์ต้องเป็นรูปภาพ');
     return { mime: m[1], data: m[2] };
   });
@@ -781,6 +862,12 @@ async function getJob(env, me, id) {
   if (role !== 'admin') await markRead(env, id, me.uid, messages.length ? messages[messages.length - 1].id : 0);
   const out = jobOut(j, t, role, messages);
   out.photos = await mediaOf(env, [j.id, j.group_id]);
+  out.photosBefore = await mediaOf(env, [j.id + ':before']);
+  out.photosAfter = await mediaOf(env, [j.id + ':after']);
+  if (role === 'customer' || role === 'both') {
+    const sh = await env.DB.prepare('SELECT token, expires_at FROM tech_shares WHERE job_id = ? AND revoked = 0 AND expires_at > ? ORDER BY created_at DESC LIMIT 1').bind(j.id, now()).first();
+    out.share = sh ? { token: sh.token, expiresAt: sh.expires_at } : null;
+  }
   return { job: out };
 }
 
@@ -796,6 +883,8 @@ async function sendMessage(env, me, ctx, b) {
   const { j, role, isCustomer } = ctx;
   if (role === 'admin') fail(403, 'ผู้ดูแลอ่านได้อย่างเดียว');
   if (['completed', 'cancelled'].includes(j.status)) fail(409, 'ใบงานปิดแล้ว ส่งข้อความไม่ได้');
+  /* กันส่งข้อความรัว/สแปม — คนคุยงานจริงไม่ถึง 300 ข้อความต่อวัน */
+  await limit(env, 'msg', me.uid, 300);
   let text = str(b.message ?? b.text, 'ข้อความ', 1, 2000);
   if (!j.accepted_at) text = mask(text);
   /* งานทดสอบที่ผู้ดูแลเป็นทั้งลูกค้าและช่าง ให้เลือกได้ว่าพิมพ์ในบทไหน
@@ -817,6 +906,9 @@ async function updateJob(env, me, id, b) {
   /* ข้อความไม่ต้องเช็ก revision — สองฝ่ายพิมพ์พร้อมกันเป็นเรื่องปกติของการคุยกัน
      ถ้าบังคับ revision ข้อความจะเด้งทุกครั้งที่อีกฝ่ายเพิ่งกดอะไรไป */
   if (action === 'message') return sendMessage(env, me, ctx, b);
+  if (action === 'newcode') return newStartCode(env, me, ctx);
+  if (action === 'share' || action === 'unshare') return shareJob(env, me, ctx, action);
+  if (action === 'extra' || action === 'extra_ok' || action === 'extra_no') return extraWork(env, ctx, action, b);
 
   const rule = NEXT[action];
   if (!rule) fail(400, 'ไม่รู้จักคำสั่งนี้');
@@ -827,9 +919,25 @@ async function updateJob(env, me, id, b) {
   if (!from.includes(j.status)) fail(409, 'สถานะใบงานเปลี่ยนไปแล้ว กรุณารีเฟรช');
   if (Number(b.revision) !== j.revision) fail(409, 'ใบงานเพิ่งถูกอัปเดต กรุณารีเฟรชแล้วลองอีกครั้ง');
   if (action === 'enroute' && j.mode !== 'mobile') fail(400, 'งานนี้ลูกค้านำรถไปที่อู่');
+  if (action === 'done' && (parse(j.extras) || []).some(x => x.status === 'pending')) fail(409, 'มีรายการงานเพิ่มที่รอลูกค้าตอบ — รอลูกค้ากดยอมรับหรือปฏิเสธก่อน');
 
   const ts = now();
   const set = {};
+  /* เริ่มงานได้ต่อเมื่อช่างใส่รหัสที่ลูกค้าให้ตอนพบกันจริง — ใช้ครั้งเดียว มีวันหมดอายุ ใส่ผิดได้จำกัด
+     ช่วยกันการกด "เริ่มงาน" ทั้งที่ยังไม่ได้พบลูกค้า แต่ไม่ใช่หลักฐานรับประกันว่าพบกันจริง */
+  let codeOk = false;
+  if (action === 'start' && j.start_code) {
+    if ((j.start_tries || 0) >= CODE_TRIES) fail(429, 'ใส่รหัสผิดครบ 5 ครั้งแล้ว ให้ลูกค้ากด "ขอรหัสใหม่" ในใบงาน');
+    if (j.start_exp && j.start_exp < ts) fail(410, 'รหัสเริ่มงานหมดอายุแล้ว ให้ลูกค้ากด "ขอรหัสใหม่" ในใบงาน');
+    if (String(b.code || '').replace(/\D/g, '') !== j.start_code) {
+      await env.DB.prepare('UPDATE tech_jobs SET start_tries = start_tries + 1 WHERE id = ?').bind(j.id).run();
+      const left = CODE_TRIES - (j.start_tries || 0) - 1;
+      fail(400, left > 0 ? `รหัสเริ่มงานไม่ถูกต้อง ลองได้อีก ${left} ครั้ง` : 'ใส่รหัสผิดครบ 5 ครั้งแล้ว ให้ลูกค้ากด "ขอรหัสใหม่" ในใบงาน');
+    }
+    set.start_code = null; codeOk = true;
+  }
+  /* รูปก่อนเริ่ม/หลังเสร็จ (ไม่บังคับ) — เก็บกับใบงานไว้เป็นหลักฐานถ้ามีข้อพิพาท */
+  const stagePhotos = action === 'start' || action === 'done' ? mediaIn(b) : [];
   let next = to;
   const by = isTech && !isCustomer ? 'technician' : isCustomer && !isTech ? 'customer'
     : who_ === 'tech' ? 'technician' : who_ === 'admin' ? 'admin' : 'customer';
@@ -847,6 +955,7 @@ async function updateJob(env, me, id, b) {
   if (action === 'accept') {
     if (b.consent !== true) fail(400, 'ต้องยอมรับขอบเขตงานและราคาก่อน');
     set.accepted_at = ts;
+    set.start_code = startCode(); set.start_exp = ts + CODE_TTL; set.start_tries = 0;
   }
   if (action === 'done') set.completion = str(b.note, 'สรุปงาน', 10, 2000);
   if (action === 'cancel') set.resolution = 'ยกเลิก: ' + str(b.note, 'เหตุผล', 5, 2000);
@@ -863,7 +972,7 @@ async function updateJob(env, me, id, b) {
     /* รูปจากลูกค้า (สูงสุด 4) — เก็บเป็นของร้านนั้น (uid ช่าง) เพื่อให้ /api/tech/img เปิดได้เฉพาะร้านที่ผ่านการตรวจ */
     const add = Array.isArray(b.photos) ? b.photos.slice(0, 4) : [];
     const pics = add.map(x => {
-      const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(x && x.data || x || ''));
+      const m = imgClean(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(x && x.data || x || '')));
       if (!m || m[2].length > 1400000) fail(400, 'ไฟล์ต้องเป็นรูปภาพ');
       return m;
     });
@@ -881,7 +990,7 @@ async function updateJob(env, me, id, b) {
       'UPDATE tech_profiles SET rating_sum = rating_sum + ?, review_count = review_count + 1 WHERE id = ?').bind(rating, t.id));
   }
   const hist = parse(j.history) || [];
-  if (next) { set.status = next; hist.push({ status: next, at: ts, by }); }
+  if (next) { set.status = next; hist.push({ status: next, at: ts, by, ...(codeOk ? { code: true } : {}) }); }
   else hist.push({ status: action, at: ts, by });
   set.history = JSON.stringify(hist);
   set.updated_at = ts;
@@ -909,6 +1018,81 @@ async function updateJob(env, me, id, b) {
     }
   }
   if (extra.length) await env.DB.batch(extra);
+  if (stagePhotos.length) await saveMedia(env, j.id + (action === 'start' ? ':before' : ':after'), me.uid, stagePhotos);
+  return { ok: true };
+}
+
+/* แชร์ใบงานให้คนที่ไว้ใจ (เฉพาะลูกค้า ระหว่างที่งานยังดำเนินอยู่) — ลิงก์อายุ 24 ชม. ยกเลิกได้ทุกเมื่อ */
+const SHARE_TTL = 86400000, SHARE_OPEN = ['accepted', 'enroute', 'working', 'done'];
+async function shareJob(env, me, ctx, action) {
+  const { j, isCustomer } = ctx;
+  if (!isCustomer) fail(403, 'เฉพาะลูกค้าที่แชร์ใบงานได้');
+  if (action === 'unshare') {
+    await env.DB.prepare('UPDATE tech_shares SET revoked = 1 WHERE job_id = ? AND revoked = 0').bind(j.id).run();
+    return { ok: true };
+  }
+  if (!SHARE_OPEN.includes(j.status)) fail(409, 'แชร์ได้ตั้งแต่ยืนยันราคาจนงานเสร็จ');
+  await limit(env, 'share', me.uid, 20);
+  const raw = crypto.getRandomValues(new Uint8Array(24));
+  const token = btoa(String.fromCharCode(...raw)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const ts = now();
+  await env.DB.batch([
+    /* ลิงก์ใหม่แทนลิงก์เก่าของใบเดียวกัน — มีลิงก์ใช้งานได้ทีละอันเท่านั้น */
+    env.DB.prepare('UPDATE tech_shares SET revoked = 1 WHERE job_id = ? AND revoked = 0').bind(j.id),
+    env.DB.prepare('INSERT INTO tech_shares (token, job_id, uid, created_at, expires_at) VALUES (?,?,?,?,?)').bind(token, j.id, me.uid, ts, ts + SHARE_TTL),
+  ]);
+  return { ok: true, token, expiresAt: ts + SHARE_TTL };
+}
+/* หน้าที่คนที่ไว้ใจเปิดดู (ไม่ต้องล็อกอิน): ใครมา รถอะไร นัดเมื่อไร สถานะตอนนี้ — ไม่มีที่อยู่ เบอร์ หรือข้อมูลลูกค้า */
+async function shareView(env, token) {
+  const s0 = await env.DB.prepare('SELECT * FROM tech_shares WHERE token = ?').bind(token).first();
+  if (!s0 || s0.revoked || s0.expires_at < now()) fail(404, 'ลิงก์นี้หมดอายุหรือถูกยกเลิกแล้ว');
+  const j = await env.DB.prepare('SELECT * FROM tech_jobs WHERE id = ?').bind(s0.job_id).first();
+  if (!j) fail(404, 'ลิงก์นี้หมดอายุหรือถูกยกเลิกแล้ว');
+  const t = await techById(env, j.tech_id), d = parse(t && t.data) || {}, q = parse(j.quote) || {}, h = parse(j.history) || [];
+  return { trip: { status: j.status, updatedAt: (h[h.length - 1] || {}).at || j.updated_at, car: j.car, area: j.area, mode: j.mode,
+    appointment: q.appointment || j.requested_time, expiresAt: s0.expires_at,
+    tech: { name: d.shop || d.name || 'ช่าง', avatar: d.avatar || null, verified: !!(t && t.verified),
+      vetting: d.vetting && t && t.verified ? { identity: !!d.vetting.identity, cats: d.vetting.cats || [] } : null } } };
+}
+
+const CODE_TTL = 7 * 86400000, CODE_TRIES = 5;
+const startCode = () => String(crypto.getRandomValues(new Uint32Array(1))[0] % 10000).padStart(4, '0');
+/* ลูกค้าขอรหัสเริ่มงานใหม่ (หมดอายุ / ใส่ผิดครบ / อยากเปลี่ยน) */
+async function newStartCode(env, me, ctx) {
+  const { j, isCustomer } = ctx;
+  if (!isCustomer) fail(403, 'เฉพาะลูกค้าที่ขอรหัสเริ่มงานใหม่ได้');
+  if (!['accepted', 'enroute'].includes(j.status)) fail(409, 'ขอรหัสได้หลังยืนยันราคาแล้ว และก่อนเริ่มงาน');
+  await limit(env, 'startcode', me.uid, 20);
+  const code = startCode();
+  await env.DB.prepare('UPDATE tech_jobs SET start_code = ?, start_exp = ?, start_tries = 0 WHERE id = ?').bind(code, now() + CODE_TTL, j.id).run();
+  return { ok: true, startCode: code };
+}
+/* งานเพิ่มระหว่างทำ: ช่างเสนอ → ลูกค้ากดยอมรับ/ปฏิเสธ · ราคาที่ยืนยันแล้วแก้ย้อนหลังไม่ได้ */
+async function extraWork(env, ctx, action, b) {
+  const { j, isCustomer, isTech } = ctx;
+  if (!['accepted', 'enroute', 'working'].includes(j.status)) fail(409, 'เสนองานเพิ่มได้หลังยืนยันราคา และก่อนแจ้งซ่อมเสร็จ');
+  if (Number(b.revision) !== j.revision) fail(409, 'ใบงานเพิ่งถูกอัปเดต กรุณารีเฟรชแล้วลองอีกครั้ง');
+  const list = parse(j.extras) || [], hist = parse(j.history) || [], ts = now();
+  if (action === 'extra') {
+    if (!isTech) fail(403, 'เฉพาะช่างที่เสนองานเพิ่มได้');
+    if (list.some(x => x.status === 'pending')) fail(409, 'มีรายการงานเพิ่มที่รอลูกค้าตอบอยู่แล้ว');
+    if (list.length >= 10) fail(400, 'เสนองานเพิ่มได้ไม่เกิน 10 รายการต่อใบงาน');
+    const labor = num(b.labor, 'ค่าแรง', 0, 1000000), parts = num(b.parts, 'อะไหล่', 0, 1000000);
+    if (labor + parts <= 0) fail(400, 'ราคางานเพิ่มต้องมากกว่า 0');
+    list.push({ id: crypto.randomUUID().slice(0, 8), desc: str(b.desc, 'รายละเอียดงานเพิ่ม', 5, 500), labor, parts,
+      total: Math.round((labor + parts) * 100) / 100, status: 'pending', at: ts });
+    hist.push({ status: 'extra', at: ts, by: 'technician' });
+  } else {
+    if (!isCustomer) fail(403, 'เฉพาะลูกค้าที่ตอบรายการงานเพิ่มได้');
+    const x = list.find(e => e.id === String(b.extraId || '') && e.status === 'pending');
+    if (!x) fail(404, 'ไม่พบรายการงานเพิ่มที่รอตอบ');
+    x.status = action === 'extra_ok' ? 'accepted' : 'declined'; x.decidedAt = ts;
+    hist.push({ status: action, at: ts, by: 'customer' });
+  }
+  const r = await env.DB.prepare('UPDATE tech_jobs SET extras = ?, history = ?, updated_at = ?, revision = revision + 1 WHERE id = ? AND revision = ?')
+    .bind(JSON.stringify(list), JSON.stringify(hist), ts, j.id, j.revision).run();
+  if (!r.meta.changes) fail(409, 'ใบงานเพิ่งถูกอัปเดต กรุณารีเฟรชแล้วลองอีกครั้ง');
   return { ok: true };
 }
 
@@ -941,11 +1125,20 @@ async function offerId(postId, techId) {
   const h = await sha(postId + ':' + techId);
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
 }
-function postOut(p, extra) {
+/* ตำแหน่งโดยประมาณสำหรับช่างที่ลูกค้ายังไม่ได้เลือก — จุดจริงมักเป็นบ้านลูกค้า
+   ปัดเข้ากึ่งกลางช่องตาราง ~2 กม. (คงที่ ไม่สุ่ม — ถ้าสุ่มใหม่ทุกครั้ง เปิดดูหลายรอบแล้วเฉลี่ยจะได้จุดจริง)
+   จุดจริงอยู่ในที่อยู่ของใบงาน ซึ่งช่างเห็นหลังลูกค้ายืนยันราคาแล้วเท่านั้น */
+const APPROX = 0.02, APPROX_KM = 1.6;
+const approx = v => Math.round((Math.floor(v / APPROX) + 0.5) * APPROX * 1e4) / 1e4;
+/* exact = เจ้าของประกาศ/ทีมงาน · ช่างได้แค่พื้นที่โดยประมาณ */
+function postOut(p, extra, exact = false) {
+  const loc = exact ? { lat: p.lat, lng: p.lng } : { lat: approx(p.lat), lng: approx(p.lng), approxKm: APPROX_KM };
   return { id: p.id, status: p.status, test: !!p.test, car: p.car, symptom: p.symptom, cat: p.cat,
-    lat: p.lat, lng: p.lng, area: p.area, requestedTime: p.requested_time, mode: p.mode, urgent: !!p.urgent,
+    ...loc, area: p.area, requestedTime: p.requested_time, mode: p.mode, urgent: !!p.urgent,
     note: p.note || '', createdAt: p.created_at, expiresAt: p.created_at + POST_TTL, ...(extra || {}) };
 }
+/* ระยะทางให้ช่างดู: ปัดขึ้นเป็นกิโลเมตรเต็ม กันการเอาระยะจากหลายจุดมาคำนวณย้อนหาบ้านลูกค้า */
+const roughKm = d => Math.max(1, Math.ceil(d));
 
 async function createPost(env, me, b) {
   const id = String(b.id || '');
@@ -978,7 +1171,7 @@ async function postDetail(env, me, id) {
     const t = await env.DB.prepare('SELECT test, suspended FROM tech_profiles WHERE uid = ?').bind(me.uid).first();
     if (!t || t.suspended || (p.test && !t.test)) fail(404, 'ไม่พบประกาศ');
   }
-  return { post: postOut(p, { photos: await mediaOf(env, [p.id]) }) };
+  return { post: postOut(p, { photos: await mediaOf(env, [p.id]) }, p.customer_uid === me.uid || me.staff) };
 }
 
 async function myPosts(env, me) {
@@ -987,7 +1180,7 @@ async function myPosts(env, me) {
   for (const p of results) {
     const o = await env.DB.prepare("SELECT COUNT(*) AS n, MIN(CASE WHEN quote IS NOT NULL THEN json_extract(quote,'$.total') END) AS lo FROM tech_jobs WHERE group_id = ? AND status != 'cancelled'").bind(p.id).first();
     const expired = p.status === 'open' && p.created_at + POST_TTL < now();
-    out.push(postOut({ ...p, status: expired ? 'expired' : p.status }, { offers: o.n, lowest: o.lo, address: p.address }));
+    out.push(postOut({ ...p, status: expired ? 'expired' : p.status }, { offers: o.n, lowest: o.lo, address: p.address }, true));
   }
   return { posts: out };
 }
@@ -1016,7 +1209,7 @@ async function nearPosts(env, me) {
   const posts = results.map(p => ({ p, dist: km(d.lat, d.lng, p.lat, p.lng) }))
     .filter(x => x.dist <= radius && (!x.p.cat || (d.cats || []).includes(x.p.cat) || t.test))
     .sort((a, b) => (b.p.urgent - a.p.urgent) || a.dist - b.dist)
-    .map(x => postOut(x.p, { dist: x.dist, mine: mine[x.p.id] || null, photos: pc[x.p.id] || 0 }));
+    .map(x => postOut(x.p, { dist: roughKm(x.dist), mine: mine[x.p.id] || null, photos: pc[x.p.id] || 0 }));
   return { posts, radius, center: { lat: d.lat, lng: d.lng } };
 }
 
@@ -1124,14 +1317,14 @@ async function editShop(env, me, b) {
     d.week = w.length === 7 ? w.map(x => ({ on: !!(x && x.on), open: hm(x && x.open) || '08:00', close: hm(x && x.close) || '18:00' })) : null;
   }
   if (b.addAvatar) {
-    const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(b.addAvatar.data || ''));
+    const m = imgClean(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(b.addAvatar.data || '')));
     if (!m || m[2].length > 600000) fail(400, 'ไฟล์ต้องเป็นรูปภาพ');
     const r = await env.DB.prepare('INSERT INTO tech_docs (uid, kind, mime, data, created_at) VALUES (?,?,?,?,?)').bind(me.uid, 'shop', m[1], m[2], now()).run();
     if (d.avatar) await env.DB.prepare("DELETE FROM tech_docs WHERE id = ? AND uid = ? AND kind = 'shop'").bind(d.avatar, me.uid).run();
     d.avatar = r.meta && r.meta.last_row_id || null;
   }
   if (b.addCover) {
-    const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(b.addCover.data || ''));
+    const m = imgClean(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(b.addCover.data || '')));
     if (!m || m[2].length > 1400000) fail(400, 'ไฟล์ต้องเป็นรูปภาพ');
     const have = await env.DB.prepare("SELECT COUNT(*) AS n FROM tech_docs WHERE uid = ? AND kind IN ('shop','work')").bind(me.uid).first();
     if (have.n >= 1000) fail(400, 'รูปร้านเยอะเกินไป');
@@ -1146,7 +1339,7 @@ async function editShop(env, me, b) {
     const have = await env.DB.prepare("SELECT COUNT(*) AS n FROM tech_docs WHERE uid = ? AND kind IN ('shop','work')").bind(me.uid).first();
     if (have.n + b.addPhotos.length > 1000) fail(400, 'รูปร้านเยอะเกินไป');
     b.addPhotos.forEach(x => {
-      const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(x && x.data || ''));
+      const m = imgClean(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(x && x.data || '')));
       if (!m || m[2].length > 1400000) fail(400, 'ไฟล์ต้องเป็นรูปภาพ');
       stmts.push(env.DB.prepare('INSERT INTO tech_docs (uid, kind, mime, data, created_at) VALUES (?,?,?,?,?)')
         .bind(me.uid, x.kind === 'shop' ? 'shop' : 'work', m[1], m[2], now()));
@@ -1183,6 +1376,10 @@ async function listGigs(env, me, url) {
   const ok = t => t && (t.verified || (t.test && me && me.staff) || (mine && t.uid === me.uid));
   return { gigs: rows.filter(r => ok(by[r.tech_id])).map(r => gigOut(r, by[r.tech_id])) };
 }
+/* หมวดบริการ (ชุดเดียวกับแถวหมวดหน้าแรก) → หมวดหลักที่ทีมงานตรวจทักษะ */
+const GIG_BASE = { air: 'air', 'air-clean': 'air', eng: 'eng', oil: 'eng', service: 'eng', gear: 'eng', cool: 'eng', exhaust: 'eng',
+  tyre: 'tyre', brake: 'tyre', susp: 'tyre', align: 'tyre', ev: 'ev', battery: 'ev', audio: 'ev',
+  body: 'body', detail: 'body', glass: 'body', wash: 'body', mobile: 'mobile', tow: 'mobile' };
 async function saveGig(env, me, b) {
   const t = await myShop(env, me);
   const kind = 'package';
@@ -1193,6 +1390,13 @@ async function saveGig(env, me, b) {
   /* ทุกบริการต้องอยู่ในหมวด — หน้าแรกแบ่งบริการตามหมวด ลูกค้าหาเจอจากหมวดนั้น */
   const catList = (Array.isArray(b.cats) ? b.cats : []).map(x => String(x).slice(0, 24)).filter(Boolean).slice(0, 6);
   if (!catList.length) fail(400, 'เลือกหมวดหมู่บริการก่อน');
+  /* ช่างลงบริการได้เฉพาะหมวดที่ผ่านการตรวจทักษะ — ผ่านงานแอร์ ไม่ได้แปลว่าผ่านงานเบรกหรือ EV */
+  const sd = parse(t.data) || {};
+  for (const c of catList) {
+    const base = GIG_BASE[c];
+    if (!base) fail(400, 'หมวดหมู่บริการไม่ถูกต้อง');
+    if (!t.test && (base === 'mobile' ? !sd.mobile : !(sd.cats || []).includes(base))) fail(403, 'ลงบริการได้เฉพาะหมวดที่ผ่านการตรวจทักษะแล้ว — ถ้าต้องการรับหมวดนี้ ติดต่อทีมงานเพื่อตรวจเพิ่ม');
+  }
   const cats = JSON.stringify(catList);
   const brands = JSON.stringify((Array.isArray(b.brands) ? b.brands : []).map(x => String(x).slice(0, 30)).slice(0, 10));
   let photos = (Array.isArray(b.keep) ? b.keep.map(Number).filter(Boolean) : []);
@@ -1204,7 +1408,7 @@ async function saveGig(env, me, b) {
     if (c.n >= GIG_MAX) fail(400, `โพสต์บริการได้สูงสุด ${GIG_MAX} รายการ ลบหรือแก้รายการเดิมแทน`);
   }
   for (const x of add) {
-    const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(x && x.data || ''));
+    const m = imgClean(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(x && x.data || '')));
     if (!m || m[2].length > 1400000) fail(400, 'ไฟล์ต้องเป็นรูปภาพ');
     const r = await env.DB.prepare('INSERT INTO tech_docs (uid, kind, mime, data, created_at) VALUES (?,?,?,?,?)').bind(me.uid, 'gig', m[1], m[2], now()).run();
     photos.push(r.meta && r.meta.last_row_id);
@@ -1381,6 +1585,8 @@ async function route(request, env, verifyToken) {
     if (t && !t.suspended) await bumpView(env, t.id, kind);
     return { ok: true };
   }
+  const shm = p.match(/^\/api\/tech\/share\/([A-Za-z0-9_-]{20,64})$/);
+  if (shm && m === 'GET') return shareView(env, shm[1]);
   if (p === '/api/tech/reviews' && m === 'GET') {
     let me = null;
     try { me = await who(request, env, false); } catch (e) {}
@@ -1393,6 +1599,7 @@ async function route(request, env, verifyToken) {
   if (p === '/api/tech/me' && m === 'GET') return meInfo(env, me);
   if (p === '/api/tech/apply' && m === 'POST') return apply(env, me, await body());
   if (p === '/api/tech/applications' && m === 'GET') return pendingApps(env, me);
+  if (p === '/api/tech/audit' && m === 'GET') return auditLog(env, me);
   if (p === '/api/tech/docs' && m === 'GET') return appDocs(env, me, String(url.searchParams.get('uid') || ''));
   if (p === '/api/tech/review' && m === 'POST') return review(env, me, await body());
   if (p === '/api/tech/rescreen' && m === 'POST') return rescreen(env, me, await body());
