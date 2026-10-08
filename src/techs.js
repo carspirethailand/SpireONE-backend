@@ -264,7 +264,7 @@ function publicTech(r) {
     /* รูปโปรไฟล์แยกจากรูปผลงาน — ไม่มีก็ใช้ตัวอักษรย่อ (ไม่เอารูปผลงานมาแทนแล้ว) */
     avatar: d.avatar && (r.photos || []).includes(d.avatar) ? d.avatar : null,
     /* เบอร์โทรโชว์เฉพาะช่างที่เปิดให้ลูกค้าโทรตรง */
-    phone: d.showPhone ? String(d.phone || r.phone || '') : '', showPhone: !!d.showPhone,
+    phone: d.showPhone ? String(d.phone || r.phone || '') : undefined, showPhone: !!d.showPhone,
     subs: d.subs || [], week: d.week || null, brands2: d.brands2 || [], line: d.line || '', facebook: d.facebook || '', address: d.address || '',
     /* โหมดพักร้อน: แสดงบนหน้าร้าน และงดรับคำขอใหม่จนกว่าจะถึงวันที่ตั้ง */
     vacation: vacationOf(d), greet: d.greet || '', theme: d.theme || '',
@@ -568,15 +568,10 @@ async function review(env, me, b) {
       from: d.from, warranty: d.warranty, radius: d.radius, mobile: d.mobile, urgent: d.urgent,
       lat: d.lat, lng: d.lng, cert: !!d.hasCert };
     stmts.push(env.DB.prepare(`INSERT INTO tech_profiles (id,uid,phone,data,verified,test,suspended,created_at,updated_at)
-<<<<<<< HEAD
       SELECT ?,?,?,?,1,0,0,?,? FROM tech_applications WHERE uid=? AND status='approved' AND review=?
-      ON CONFLICT(uid) DO UPDATE SET data=excluded.data,phone=excluded.phone,verified=1,test=0,suspended=0,updated_at=excluded.updated_at`)
-      .bind(id,a.uid,d.phone,JSON.stringify(profile),t,t,a.uid,rv));
-=======
-      VALUES (?,?,?,?,1,0,0,?,?)
+      /* ร้านเดิมที่ช่างแก้ไว้แล้วต้องไม่ถูกข้อมูลจากใบสมัครเขียนทับ (บั๊ก "บันทึกแล้วกลับเป็นค่าเดิม") */
       ON CONFLICT(uid) DO UPDATE SET data=CASE WHEN tech_profiles.data IS NULL OR tech_profiles.data='' OR tech_profiles.data='{}' THEN excluded.data ELSE tech_profiles.data END,phone=excluded.phone,verified=1,test=0,suspended=0,updated_at=excluded.updated_at`)
-      .bind(id, a.uid, d.phone, JSON.stringify(profile), t, t));
->>>>>>> 35fad0aa1d2f9062459cbd117a8f862c34cb2887
+      .bind(id,a.uid,d.phone,JSON.stringify(profile),t,t,a.uid,rv));
   }
   if(decision==='reject')stmts.push(env.DB.prepare('DELETE FROM tech_identity_claims WHERE uid=? AND EXISTS(SELECT 1 FROM tech_applications WHERE uid=? AND review=?)').bind(a.uid,a.uid,rv));
   const result=await env.DB.batch(stmts);if(!result[0].meta.changes)fail(409,'ใบสมัครเปลี่ยนแล้ว กรุณาโหลดใหม่');
