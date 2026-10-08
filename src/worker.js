@@ -1,6 +1,7 @@
 import { verifyFirebaseToken, firebaseCustomToken } from './auth.js';
 import { buildFeatureRequest } from './features-ai.mjs';
 import { handleTech } from './techs.js';
+import { richMenuStatus, setupRichMenu } from './line-menu.js';
 import { handleVec, kbScores, refreshKb } from './vectors.js';
 import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels, toChatHistory, levelFor, depthNote, featuresBlock, badState, geminiScope, unpark, executeSearchInternal } from './fastai.js';
 
@@ -2913,7 +2914,8 @@ async function lineHandleText(env, ev, link) {
   const t = String(ev.message.text || '').trim();
 
   if (!link) {
-    const m = t.toUpperCase().match(/\b([A-Z2-9]{6})\b/);
+    /* ตัวอักษรชุดเดียวกับ newCode (ไม่มี I O 0 1) — คำอย่าง CENDON ไม่ถูกหยิบไปเป็นรหัส */
+    const m = t.toUpperCase().match(/\b([A-HJ-NP-Z2-9]{6})\b/);
     if (m) {
       const uid = await lineLinkByCode(env, ev.source.userId, m[1]);
       if (uid) return txt('เชื่อมบัญชีเรียบร้อยครับ\n\n'
@@ -2923,9 +2925,7 @@ async function lineHandleText(env, ev, link) {
         + 'ผมจะไม่ทักบ่อยครับ อย่างมากสองสัปดาห์ครั้ง เฉพาะเรื่องที่สำคัญจริง');
       return txt('รหัสนี้ใช้ไม่ได้หรือหมดอายุแล้วครับ เปิดแอปแล้วขอรหัสใหม่ได้เลย');
     }
-    return txt(`สวัสดีครับ ผมคือ ${BRAND.ai} ผู้ช่วยดูแลรถของ ${BRAND.company}\n\n`
-      + `เปิดแอป ${BRAND.ai} → ตั้งค่า → เชื่อม LINE\n`
-      + 'แล้วส่งรหัส 6 ตัวที่เห็นมาที่นี่ครับ');
+    return txt(LINE_HOWTO);
   }
 
   if (/^(หยุด|เงียบ|พัก|mute|stop)/i.test(t)) {
@@ -2957,16 +2957,23 @@ async function lineHandleText(env, ev, link) {
     + '\n\nส่งรูปใบเสร็จมาได้เลยครับ จะได้แม่นขึ้น');
 }
 
+/* ทักครั้งแรก / คนที่ยังไม่ได้ผูกบัญชี
+   เข้าสู่ระบบด้วย LINE = ผูกให้อัตโนมัติ (แต่ LINE ส่ง follow มาก่อนที่เว็บจะผูกเสร็จ จึงต้องบอกไว้ตรงนี้) */
+const LINE_HOWTO = `สวัสดีครับ ผมคือ ${BRAND.ai} ผู้ช่วยดูแลรถและหาช่าง\n\n`
+  + 'ถ้าเพิ่งเข้าสู่ระบบแอปด้วย LINE ไม่ต้องทำอะไรเพิ่มครับ งานช่าง ราคา และข้อความจะแจ้งเข้าที่นี่เอง\n\n'
+  + 'ถ้าใช้บัญชี Google: เปิดแอป → บัญชี → เชื่อม LINE แล้วกดส่งรหัส 6 ตัวมาที่นี่\n\n'
+  + 'กดเมนูด้านล่างเพื่อหาช่าง ถามอาการรถ หรือดูงานของคุณได้เลย';
+
 async function lineWebhook(env, ev) {
   if (!ev || !ev.source || !ev.source.userId) return;
   const lineUid = ev.source.userId;
   const link = await lineUidFor(env, lineUid);
 
   if (ev.type === 'follow') {
-    return await lineReply(env, ev.replyToken, [txt(
-      `สวัสดีครับ ผมคือ ${BRAND.ai} ผู้ช่วยดูแลรถของ ${BRAND.company}\n\n`
-      + 'เปิดแอป → ตั้งค่า → เชื่อม LINE แล้วส่งรหัส 6 ตัวมาที่นี่ครับ\n\n'
-      + 'เชื่อมแล้วผมจะเตือนเรื่องรถให้ตรงเวลา และคุณส่งใบเสร็จจากอู่มาให้ผมอ่านได้เลย')]);
+    return await lineReply(env, ev.replyToken, [txt(link
+      ? `ยินดีต้อนรับกลับครับ LINE นี้เชื่อมกับบัญชี ${BRAND.ai} อยู่แล้ว\n\n`
+        + 'งานช่าง ราคา และข้อความจะแจ้งเข้าที่นี่ · กดเมนูด้านล่างเพื่อเปิดแอปได้เลย'
+      : LINE_HOWTO)]);
   }
   if (ev.type === 'unfollow') {
     await env.DB.prepare('UPDATE line_link SET active = 0 WHERE line_uid = ?')
@@ -2978,7 +2985,7 @@ async function lineWebhook(env, ev) {
   let msg;
   try {
     if (ev.message.type === 'image') {
-      if (!link) msg = txt('เชื่อมบัญชีก่อนนะครับ — เปิดแอป → ตั้งค่า → เชื่อม LINE');
+      if (!link) msg = txt('เชื่อมบัญชีก่อนนะครับ — เปิดแอป → บัญชี → เชื่อม LINE');
       else msg = await lineHandleImage(env, ev, link);
     } else if (ev.message.type === 'text') {
       msg = await lineHandleText(env, ev, link);
@@ -5123,6 +5130,18 @@ ${convo}`;
           ]);
           await logAudit(env, actor.email, 'data.export', '', `${users.length} users, ${cars.length} cars`);
           return json({ exportedAt: Date.now(), users, cars, magazine, audit, shop, warnings: w });
+        })();
+      }
+
+      /* ===== ADMIN: เมนูในห้องแชต LINE (ดู line-menu.js) ===== */
+      if (url.pathname === '/api/admin/line/richmenu' && (request.method === 'GET' || request.method === 'POST')) {
+        return await guarded('admin', async (actor) => {
+          if (request.method === 'GET') return json(await richMenuStatus(env));
+          try {
+            const r = await setupRichMenu(env);
+            await logAudit(env, actor.email, 'line.richmenu', r.richMenuId, `removed ${r.removed}`);
+            return json(r);
+          } catch (e) { return deny(e.message, e.status || 500); }
         })();
       }
 
