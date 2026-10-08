@@ -2,6 +2,7 @@ import { verifyFirebaseToken } from './auth.js';
 import { buildFeatureRequest } from './features-ai.mjs';
 import { handleTech } from './techs.js';
 import { richMenuStatus, setupRichMenu } from './line-menu.js';
+import { appUrl } from './line-notify.js';
 import { handleVec, kbScores, refreshKb } from './vectors.js';
 import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels, toChatHistory, levelFor, depthNote, featuresBlock, badState, geminiScope, unpark, executeSearchInternal } from './fastai.js';
 
@@ -3159,7 +3160,9 @@ async function runOdoRound(env) {
     if (line) {
       const lang = line.lang || 'th';
       const { title, body } = digestText(due, est, lang, carName);
-      const link = (env.SITE_URL || '') + deepLink;
+      /* ลิงก์เต็มที่กดได้ใน LINE และเปิดในเบราว์เซอร์ของเครื่อง
+         (เดิมใช้ SITE_URL ซึ่งไม่เคยตั้ง → ได้แค่ /garage.html?… ที่กดไม่ได้) */
+      const link = appUrl(env, deepLink.replace(/^\/garage\.html/, '/garage'));
       try {
         const r = await linePush(env, line.line_uid,
           [txt(`${title}\n\n${body}${link ? '\n\n' + link : ''}`)]);
