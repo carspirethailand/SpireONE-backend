@@ -3,6 +3,7 @@ import { buildFeatureRequest } from './features-ai.mjs';
 import { handleTech } from './techs.js';
 import { richMenuStatus, setupRichMenu, lineStatus, lineFixWebhook } from './line-menu.js';
 import { appUrl, card } from './line-notify.js';
+import { refreshNews, newsStatus } from './news.js';
 import { LINE_AI, LINE_TALK, LINE_MARK, linePlain, lineChunks, lineCodeIn } from './line-chat.js';
 import { handleVec, kbScores, refreshKb } from './vectors.js';
 import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels, toChatHistory, levelFor, depthNote, featuresBlock, badState, geminiScope, unpark, executeSearchInternal } from './fastai.js';
@@ -91,7 +92,7 @@ function rank(role) { return ROLE_RANK[role] || 0; }
    ยกเว้น ALTER TABLE สองบรรทัดที่ต้องดักข้อผิดพลาด "มีคอลัมน์นี้แล้ว" ทิ้ง
    ══════════════════════════════════════════════════════════════════ */
 
-const SCHEMA_VERSION = 15;
+const SCHEMA_VERSION = 16;
 
 const SCHEMA_SQL = [
   /* ── ข้อมูลของผู้ใช้ที่ต้องเหมือนกันทุกเครื่อง ──
@@ -203,6 +204,14 @@ const SCHEMA_SQL = [
   type TEXT,
   created_at INTEGER NOT NULL
 )`,
+  /* นิตยสารแบบรวมข่าว (news.js): แหล่งข่าว ลิงก์ต้นฉบับ รูป เวลา ที่มา (feed/ai/manual) ประเด็นสำคัญ ลำดับ */
+  `ALTER TABLE magazine ADD COLUMN source TEXT`,
+  `ALTER TABLE magazine ADD COLUMN url TEXT`,
+  `ALTER TABLE magazine ADD COLUMN image TEXT`,
+  `ALTER TABLE magazine ADD COLUMN published_at INTEGER`,
+  `ALTER TABLE magazine ADD COLUMN origin TEXT`,
+  `ALTER TABLE magazine ADD COLUMN points TEXT`,
+  `ALTER TABLE magazine ADD COLUMN sort INTEGER`,
   `ALTER TABLE users ADD COLUMN created_at INTEGER`,
   `ALTER TABLE users ADD COLUMN banned INTEGER DEFAULT 0`,
   `ALTER TABLE users ADD COLUMN plan TEXT DEFAULT 'free'`,
@@ -1872,51 +1881,8 @@ async function getGeminiDiagnosis(env, carInfo, symptoms) {
 }
 
 /* ===== Magazine news via Gemini ===== */
-async function getGeminiNews(env) {
-  const prompt = `ค้นเว็บหาข่าวและบทความเกี่ยวกับรถยนต์ล่าสุดในไทยวันนี้ โดยใช้ข้อมูลจากแหล่งข่าวที่น่าเชื่อถือ ทั้งข่าวไทยและต่างประเทศ เช่น Car And Driver, Top Gear, autolifethailand, headlightmag, motorexpo, thairath, prachatai, manager ฯลฯ สรุปออกมา 10-20 ข่าว/บทความที่น่าสนใจที่สุด
-
-ตอบเป็น JSON array เท่านั้น ห้ามเขียนคำนำ คำอธิบาย หรือ markdown ใดๆ นอกจาก JSON
-
-แต่ละรายการต้องมีฟิลด์ดังนี้:
-1. title: พาดหัวข่าวที่กระชับและดึงดูดความสนใจ
-2. shortDescription: สรุปสั้น 1-2 ประโยค สำหรับแสดงในการ์ดข่าว
-3. fullDescription: เนื้อหาข่าวฉบับเต็มที่ละเอียด ครบถ้วน และถูกต้องที่สุด ความยาวอย่างน้อย 50-350 ประโยค ครอบคลุม: บริบทและที่มาของข่าว, ข้อเท็จจริงสำคัญทั้งหมด (ตัวเลข ราคา สเปค ฯลฯ), ผลกระทบหรือความสำคัญต่อผู้ใช้รถในไทย, ข้อมูลเพิ่มเติมที่เป็นประโยชน์
-4. type: ประเภทข่าว เลือกจาก: ข่าวเด่น, รีวิว, เทคโนโลยี, เคล็ดลับ, EV, ราคา, อุบัติเหตุ, นโยบาย
-
-ตัวอย่าง JSON:
-[
-  {
-    "title": "พาดหัวข่าว",
-    "shortDescription": "สรุปสั้น 1-2 ประโยค",
-    "fullDescription": "เนื้อหาข่าวฉบับเต็มที่ละเอียดและครบถ้วน อธิบายบริบท ข้อเท็จจริง ตัวเลข และผลกระทบอย่างครอบคลุม...",
-    "type": "ข่าวเด่น"
-  }
-]`;
-
-  const text = await callGemini(env, {
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    search: true, temp: 0.4,
-  });
-  const parsed = parseJsonArray(text);
-  if (!parsed) throw new Error('AI response is not a JSON array');
-  return parsed;
-}
-
-async function fetchAndSaveNews(env) {
-  if (!env.DB) throw new Error('D1 Database connection is not configured');
-  const newsList = await getGeminiNews(env);
-  if (!Array.isArray(newsList) || newsList.length === 0) throw new Error('Fetched news array is empty');
-
-  await env.DB.prepare('DELETE FROM magazine').run();
-  const stmt = env.DB.prepare(
-    'INSERT INTO magazine (title, short_description, full_description, type, created_at) VALUES (?, ?, ?, ?, ?)'
-  );
-  const now = Date.now();
-  await env.DB.batch(newsList.map(n => stmt.bind(
-    n.title || '', n.shortDescription || n.short_description || '',
-    n.fullDescription || n.full_description || '', n.type || 'ข่าวเด่น', now
-  )));
-}
+const NEWS_CRON = '30 */3 * * *';
+/* ข่าวนิตยสาร: ดู news.js (รวมข่าวจาก RSS ของแหล่งข่าวจริง + Gemini แยกจากแชต) */
 
 /* ===== SHOP: AI-sourced parts & accessories ===== */
 async function getGeminiShop(env) {
@@ -4911,16 +4877,22 @@ ${convo}`;
 
       /* ===== MAGAZINE (public read) ===== */
       if (url.pathname === '/api/magazine' && request.method === 'GET') {
-        const { results } = await env.DB.prepare('SELECT * FROM magazine ORDER BY id ASC').all();
+        /* บทความที่ทีมงานเขียนเองขึ้นก่อน แล้วตามลำดับที่รอบอัปเดตจัดไว้ (ข่าวเด่นสุดก่อน) */
+        const { results } = await env.DB.prepare(
+          "SELECT * FROM magazine ORDER BY CASE WHEN origin = 'manual' THEN 0 ELSE 1 END, COALESCE(sort, 9999), id DESC").all();
         return json(results);
+      }
+      if (url.pathname === '/api/magazine/status' && request.method === 'GET') {
+        return await guarded('moderator', async () => json(await newsStatus(env) || {}))();
       }
 
       /* ===== MAGAZINE MANAGEMENT (moderator+) ===== */
       if (url.pathname === '/api/magazine/sync' && request.method === 'POST') {
         return await guarded('moderator', async (actor) => {
-          await fetchAndSaveNews(env);
-          await logAudit(env, actor.email, 'magazine.sync', '', 'AI refresh');
-          return json({ success: true });
+          const st = await refreshNews(env, { force: true });
+          await logAudit(env, actor.email, 'magazine.sync', '', st.error ? 'ไม่สำเร็จ: ' + st.error.slice(0, 80) : `${st.kept} ข่าว`);
+          if (st.error) return json({ success: false, error: st.error, status: st }, 502);
+          return json({ success: true, status: st });
         })();
       }
 
@@ -4929,9 +4901,10 @@ ${convo}`;
           const b = await readBody();
           if (!b || !b.title) return deny('Missing title', 400);
           await env.DB.prepare(
-            'INSERT INTO magazine (title, short_description, full_description, type, created_at) VALUES (?, ?, ?, ?, ?)'
+            `INSERT INTO magazine (title, short_description, full_description, type, created_at, origin, sort, published_at, source)
+             VALUES (?, ?, ?, ?, ?, 'manual', 0, ?, 'Cendon')`
           ).bind(String(b.title).slice(0, 300), String(b.short_description || '').slice(0, 1000),
-            String(b.full_description || '').slice(0, 20000), String(b.type || 'ข่าวเด่น').slice(0, 40), Date.now()).run();
+            String(b.full_description || '').slice(0, 20000), String(b.type || 'ข่าวเด่น').slice(0, 40), Date.now(), Date.now()).run();
           await logAudit(env, actor.email, 'magazine.create', String(b.title).slice(0, 80), '');
           return json({ success: true });
         })();
@@ -5710,8 +5683,10 @@ ${convo}`;
     ctx.waitUntil(ensureSchema(env));
     // รอบถี่ทำเฉพาะงานที่นัดเวลาไว้ ส่วนงานหนักปล่อยให้รอบวันละครั้งทำ
     ctx.waitUntil(runDueJobs(env));
+    /* นิตยสารอัปเดตทุก 3 ชั่วโมง (รอบของตัวเอง ไม่พ่วงงานหนักรายวัน) */
+    if (event.cron === NEWS_CRON) { ctx.waitUntil(refreshNews(env)); return; }
     if (event.cron !== '*/10 * * * *') {
-      ctx.waitUntil(fetchAndSaveNews(env));
+      ctx.waitUntil(refreshNews(env));
       ctx.waitUntil(runPushRound(env));
       ctx.waitUntil(runOdoRound(env));
       ctx.waitUntil(refreshKb(env).catch(() => {}));
