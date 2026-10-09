@@ -3,12 +3,14 @@ import assert from 'node:assert/strict';
 import {createHmac} from 'node:crypto';
 import {fixture} from './tech-fixtures.mjs';
 import worker from '../src/worker.js';
+import {LINE_AI} from '../src/line-chat.js';
 
 /* เมนูในห้องแชต LINE + ข้อความทักทายของบอท (LINE ในเทสต์เป็นของปลอมทั้งหมด) */
 const PNG=new Uint8Array([0x89,0x50,0x4e,0x47,1,2,3]);
 function setup({failCreate=false}={}){
   const f=fixture({DEV_AUTH:'1',FIREBASE_PROJECT_ID:'unit-test',LINE_CHANNEL_TOKEN:'test-only-token',LINE_CHANNEL_SECRET:'test-only-secret',APP_URL:'https://app.unit.test'});
   f.sqlite.exec("CREATE TABLE IF NOT EXISTS line_link (line_uid TEXT PRIMARY KEY, uid TEXT NOT NULL, lang TEXT NOT NULL DEFAULT 'th', active INTEGER NOT NULL DEFAULT 1, linked_at INTEGER NOT NULL)");
+  f.sqlite.exec("CREATE TABLE IF NOT EXISTS line_chat (line_uid TEXT PRIMARY KEY, history TEXT NOT NULL DEFAULT '[]', day TEXT NOT NULL DEFAULT '', n INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL)");
   const seen=[];
   globalThis.fetch=async(url,init={})=>{const u=String(url),m=init.method||'GET';seen.push({u,m,init});
     if(u==='https://app.unit.test/img/line-richmenu.png')return new Response(PNG,{headers:{'Content-Type':'image/png'}});
@@ -42,11 +44,13 @@ test('LINE menu: regular users cannot change it, and a LINE error sets nothing',
   assert.equal(r.status,502);assert.match(r.error,/invalid area/);assert.ok(!seen.some(s=>s.u.includes('/user/all/richmenu')));
 });
 
-test('LINE bot: a word like CENDON is not taken as a link code; newcomers learn how to connect from the app',async()=>{
-  const {call,seen}=setup();
-  const body=JSON.stringify({events:[{type:'message',replyToken:'rt',source:{userId:'Unew'},message:{type:'text',text:'สวัสดี CENDON'}}]});
-  const sig=createHmac('sha256','test-only-secret').update(body).digest('base64');
-  assert.equal((await call('','/api/line/webhook',body,{'X-Line-Signature':sig})).status,200);
-  const reply=JSON.parse(seen.find(s=>s.u==='https://api.line.me/v2/bot/message/reply').init.body).messages[0].text;
-  assert.doesNotMatch(reply,/รหัสนี้ใช้ไม่ได้/);assert.match(reply,/รหัส 6 ตัว/);assert.match(reply,/บัญชี → เชื่อม LINE/);
+test('LINE bot: a word like CENDON is not taken as a link code (it goes to the AI); new followers learn how to connect',async()=>{
+  const {call,seen}=setup();const asked=[];LINE_AI.ask=async(env,o)=>{asked.push(o.question);return {text:'สวัสดีครับ'};};
+  const post=async ev=>{const body=JSON.stringify({events:[ev]});const sig=createHmac('sha256','test-only-secret').update(body).digest('base64');
+    assert.equal((await call('','/api/line/webhook',body,{'X-Line-Signature':sig})).status,200);
+    return JSON.parse(seen.filter(s=>s.u==='https://api.line.me/v2/bot/message/reply').at(-1).init.body).messages[0].text;};
+  const reply=await post({type:'message',replyToken:'rt',source:{userId:'Unew'},message:{type:'text',text:'สวัสดี CENDON'}});
+  assert.doesNotMatch(reply,/รหัส|เชื่อมบัญชีไม่สำเร็จ/);assert.deepEqual(asked,['สวัสดี CENDON']);
+  const hi=await post({type:'follow',replyToken:'rt2',source:{userId:'Unew'}});
+  assert.match(hi,/พิมพ์ถามเรื่องรถได้เลย/);assert.match(hi,/บัญชี → เชื่อม LINE/);assert.match(hi,/รหัส 6 ตัว/);
 });

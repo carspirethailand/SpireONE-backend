@@ -2,7 +2,8 @@ import { verifyFirebaseToken } from './auth.js';
 import { buildFeatureRequest } from './features-ai.mjs';
 import { handleTech } from './techs.js';
 import { richMenuStatus, setupRichMenu } from './line-menu.js';
-import { appUrl } from './line-notify.js';
+import { appUrl, card } from './line-notify.js';
+import { LINE_AI, LINE_TALK, LINE_MARK, linePlain, lineChunks, lineCodeIn } from './line-chat.js';
 import { handleVec, kbScores, refreshKb } from './vectors.js';
 import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels, toChatHistory, levelFor, depthNote, featuresBlock, badState, geminiScope, unpark, executeSearchInternal } from './fastai.js';
 
@@ -90,7 +91,7 @@ function rank(role) { return ROLE_RANK[role] || 0; }
    ยกเว้น ALTER TABLE สองบรรทัดที่ต้องดักข้อผิดพลาด "มีคอลัมน์นี้แล้ว" ทิ้ง
    ══════════════════════════════════════════════════════════════════ */
 
-const SCHEMA_VERSION = 14;
+const SCHEMA_VERSION = 15;
 
 const SCHEMA_SQL = [
   /* ── ข้อมูลของผู้ใช้ที่ต้องเหมือนกันทุกเครื่อง ──
@@ -370,6 +371,14 @@ const SCHEMA_SQL = [
   linked_at INTEGER NOT NULL
 )`,
   `CREATE INDEX IF NOT EXISTS idx_line_uid ON line_link(uid)`,
+  /* บทสนทนากับ AI ในแชต LINE — จำแค่ 8 ข้อความล่าสุด · n = จำนวนคำถามของวัน day */
+  `CREATE TABLE IF NOT EXISTS line_chat (
+  line_uid   TEXT PRIMARY KEY,
+  history    TEXT NOT NULL DEFAULT '[]',
+  day        TEXT NOT NULL DEFAULT '',
+  n          INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL
+)`,
   `CREATE TABLE IF NOT EXISTS line_code (
   code       TEXT PRIMARY KEY,
   uid        TEXT NOT NULL,
@@ -2837,19 +2846,6 @@ function newCode() {
   return s;
 }
 
-async function lineLinkByCode(env, lineUid, code) {
-  const row = await env.DB.prepare(
-    'SELECT * FROM line_code WHERE code = ? AND used = 0 AND expires_at > ?'
-  ).bind(String(code).toUpperCase(), Date.now()).first();
-  if (!row) return null;
-  await env.DB.prepare('UPDATE line_code SET used = 1 WHERE code = ?').bind(row.code).run();
-  await env.DB.prepare(
-    `INSERT INTO line_link (line_uid, uid, lang, active, linked_at) VALUES (?, ?, 'th', 1, ?)
-     ON CONFLICT(line_uid) DO UPDATE SET uid = excluded.uid, active = 1, linked_at = excluded.linked_at`
-  ).bind(lineUid, row.uid, Date.now()).run();
-  return row.uid;
-}
-
 const lineUidFor = async (env, lineUid) =>
   await env.DB.prepare('SELECT * FROM line_link WHERE line_uid = ? AND active = 1')
     .bind(lineUid).first();
@@ -2911,45 +2907,90 @@ async function lineHandleImage(env, ev, link) {
 /* ─────────── ข้อความตัวอักษร ───────────
    ตอบให้สั้นและมีประโยชน์ ไม่ต้องทำเป็นแชตบอตคุยเล่น
    เพราะคนทักบอทนี้เพราะมีเรื่องกับรถ ไม่ได้อยากคุย */
+/* ผูก LINE นี้กับเจ้าของรหัส — บอกผลชัด ๆ ทุกกรณี ไม่ปล่อยให้ผู้ใช้เดาว่าสำเร็จไหม */
+async function lineLinkCode(env, lineUid, code) {
+  const row = await env.DB.prepare('SELECT * FROM line_code WHERE code = ?').bind(code).first();
+  const cur = await lineUidFor(env, lineUid);
+  if (!row) return { ok: false, reason: 'notfound' };
+  if (row.used) return cur && cur.uid === row.uid ? { ok: true, already: true, uid: row.uid } : { ok: false, reason: 'used' };
+  if (row.expires_at <= Date.now()) return { ok: false, reason: 'expired' };
+  /* จองรหัสแบบอะตอม — ส่งรหัสเดียวกันซ้อนกันสองครั้ง ใช้ได้ครั้งเดียว */
+  const claim = await env.DB.prepare('UPDATE line_code SET used = 1 WHERE code = ? AND used = 0 AND expires_at > ?')
+    .bind(code, Date.now()).run();
+  if (!claim.meta.changes) return { ok: false, reason: 'used' };
+  await env.DB.batch([
+    env.DB.prepare(`INSERT INTO line_link (line_uid, uid, lang, active, linked_at) VALUES (?, ?, 'th', 1, ?)
+      ON CONFLICT(line_uid) DO UPDATE SET uid = excluded.uid, active = 1, linked_at = excluded.linked_at`)
+      .bind(lineUid, row.uid, Date.now()),
+    /* บัญชีหนึ่งรับแจ้งเตือนที่ LINE เดียว — LINE เดิมของบัญชีนี้เลิกรับ */
+    env.DB.prepare('UPDATE line_link SET active = 0 WHERE uid = ? AND line_uid <> ?').bind(row.uid, lineUid),
+  ]);
+  return { ok: true, uid: row.uid, moved: !!(cur && cur.uid !== row.uid) };
+}
+
+async function lineLinkReply(env, lineUid, code) {
+  let r;
+  try { r = await lineLinkCode(env, lineUid, code); }
+  catch (e) { return txt('เชื่อมบัญชีไม่สำเร็จครับ ระบบขัดข้องชั่วคราว ลองส่งรหัสเดิมอีกครั้งในอีกสักครู่'); }
+  const again = '\n\nขอรหัสใหม่: เปิดแอป Cendon → ตั้งค่า → บัญชี → เชื่อม LINE';
+  if (!r.ok) return txt('เชื่อมบัญชีไม่สำเร็จครับ\n\n' + ({
+    expired: `รหัส ${code} หมดอายุแล้ว (รหัสใช้ได้ 20 นาที)`,
+    used: `รหัส ${code} ถูกใช้ไปแล้ว`,
+    notfound: `ไม่พบรหัส ${code} ลองดูว่าพิมพ์ถูกทุกตัว`,
+  }[r.reason] || 'รหัสนี้ใช้ไม่ได้') + again);
+  let name = '';
+  try { const u = await env.DB.prepare('SELECT name FROM users WHERE uid = ?').bind(r.uid).first(); name = (u && u.name) || ''; } catch (e) {}
+  const who = name ? `บัญชี ${name}` : 'บัญชี Cendon ของคุณ';
+  if (r.already) return txt(`LINE นี้เชื่อมกับ${who} อยู่แล้วครับ ✓ ไม่ต้องทำอะไรเพิ่ม`);
+  return card({
+    tag: 'เชื่อมบัญชีสำเร็จ', title: `เชื่อม LINE กับ${who} แล้ว ✓`,
+    url: appUrl(env, '/profile'), label: 'เปิด Cendon',
+    lines: [
+      r.moved ? 'ย้ายการแจ้งเตือนจากบัญชีเดิมมาที่บัญชีนี้แล้ว' : '',
+      'จากนี้แจ้งที่นี่: งานช่าง ราคา ข้อความในใบงาน และเตือนดูแลรถ',
+      'พิมพ์ถามเรื่องรถได้ตลอด หรือส่งรูปใบเสร็จจากอู่ให้ผมอ่านเลขไมล์เก็บไว้',
+    ],
+  });
+}
+
+/* ─────────── คำสั่งสั้น ๆ (ต้องพิมพ์มาทั้งข้อความ) ───────────
+   เดิมดูแค่คำขึ้นต้น "เปิดแอร์แล้วมีกลิ่น" เลยกลายเป็นคำสั่งเปิดเตือน — ตอนนี้ต้องตรงทั้งข้อความ */
+const CMD_MUTE = /^(หยุด|หยุดเตือน|เงียบ|พักเตือน|พักการเตือน|mute|stop)$/i;
+const CMD_UNMUTE = /^(เปิดเตือน|เปิดการเตือน|unmute|start)$/i;
+const CMD_MILES = /^((เลข\s*)?ไมล์(\s*รถ)?(\s*(เท่าไร|เท่าไหร่|ตอนนี้))?|mileage)\s*\??$/i;
+const CMD_HELP = /^(เมนู|ช่วยเหลือ|วิธีใช้|ทำอะไรได้บ้าง|help|menu)\s*\??$/i;
+
 async function lineHandleText(env, ev, link) {
   const t = String(ev.message.text || '').trim();
+  const code = lineCodeIn(t);
+  if (code) return await lineLinkReply(env, ev.source.userId, code);
 
-  if (!link) {
-    /* ตัวอักษรชุดเดียวกับ newCode (ไม่มี I O 0 1) — คำอย่าง CENDON ไม่ถูกหยิบไปเป็นรหัส */
-    const m = t.toUpperCase().match(/\b([A-HJ-NP-Z2-9]{6})\b/);
-    if (m) {
-      const uid = await lineLinkByCode(env, ev.source.userId, m[1]);
-      if (uid) return txt('เชื่อมบัญชีเรียบร้อยครับ\n\n'
-        + 'จากนี้:\n'
-        + '• ผมจะเตือนเมื่อรถถึงกำหนดเปลี่ยนอะไหล่ หรือใกล้หมดภาษี/ประกัน\n'
-        + '• ส่งรูปใบเสร็จจากอู่มาที่นี่ได้เลย ผมอ่านเลขไมล์เก็บให้เอง\n\n'
-        + 'ผมจะไม่ทักบ่อยครับ อย่างมากสองสัปดาห์ครั้ง เฉพาะเรื่องที่สำคัญจริง');
-      return txt('รหัสนี้ใช้ไม่ได้หรือหมดอายุแล้วครับ เปิดแอปแล้วขอรหัสใหม่ได้เลย');
+  if (CMD_HELP.test(t)) return txt(link ? LINE_HELP : LINE_HOWTO);
+  if (CMD_MUTE.test(t) || CMD_UNMUTE.test(t) || CMD_MILES.test(t)) {
+    if (!link) return txt('ต้องเชื่อมบัญชีก่อนครับ — เปิดแอป Cendon → ตั้งค่า → บัญชี → เชื่อม LINE แล้วกดส่งรหัสมาที่นี่');
+    if (CMD_MUTE.test(t)) {
+      await env.DB.prepare('UPDATE notify_state SET muted_until = ? WHERE uid = ?')
+        .bind(Date.now() + 90 * 86400000, link.uid).run();
+      return txt('พักการเตือนดูแลรถให้ 90 วันครับ พิมพ์ "เปิดเตือน" เมื่อไรก็กลับมาได้\n(แจ้งเตือนงานช่างยังส่งตามปกติ)');
     }
-    return txt(LINE_HOWTO);
+    if (CMD_UNMUTE.test(t)) {
+      await env.DB.prepare('UPDATE notify_state SET muted_until = NULL WHERE uid = ?').bind(link.uid).run();
+      return txt('เปิดการเตือนดูแลรถแล้วครับ');
+    }
+    return await lineMileage(env, link);
   }
+  /* ที่เหลือคือคุยกับ AI */
+  return await lineAsk(env, ev, link, t);
+}
 
-  if (/^(หยุด|เงียบ|พัก|mute|stop)/i.test(t)) {
-    await env.DB.prepare(
-      'UPDATE notify_state SET muted_until = ? WHERE uid = ?'
-    ).bind(Date.now() + 90 * 86400000, link.uid).run();
-    return txt('พักการเตือนให้ 90 วันครับ พิมพ์ "เปิดเตือน" เมื่อไรก็กลับมาได้');
-  }
-  if (/^(เปิดเตือน|เปิด|unmute|start)/i.test(t)) {
-    await env.DB.prepare('UPDATE notify_state SET muted_until = NULL WHERE uid = ?')
-      .bind(link.uid).run();
-    return txt('เปิดการเตือนแล้วครับ');
-  }
-
-  /* ถามเลขไมล์ — ตอบด้วยค่าที่ระบบใช้จริง ไม่ใช่คำนวณใหม่อีกชุด */
+/* ถามเลขไมล์ — ตอบด้วยค่าที่ระบบใช้จริง ไม่ใช่คำนวณใหม่อีกชุด */
+async function lineMileage(env, link) {
   const cars = await env.DB.prepare('SELECT * FROM cars WHERE uid = ?').bind(link.uid).all();
   const list = (cars.results || []);
   if (!list.length) return txt('ยังไม่มีรถในระบบครับ เพิ่มรถในแอปก่อนนะครับ');
-
   const lines = [];
   for (const c of list) {
-    const st = await env.DB.prepare('SELECT * FROM odo_state WHERE car_id = ?')
-      .bind(c.id).first();
+    const st = await env.DB.prepare('SELECT * FROM odo_state WHERE car_id = ?').bind(c.id).first();
     if (!st) { lines.push(`${c.make} ${c.model} — ยังไม่มีข้อมูลไมล์`); continue; }
     const e = estimateAt(st, Date.now());
     lines.push(`${c.make} ${c.model}\n  ~${e.km.toLocaleString('en-US')} กม. (±${e.sigma.toLocaleString('en-US')})`);
@@ -2958,10 +2999,119 @@ async function lineHandleText(env, ev, link) {
     + '\n\nส่งรูปใบเสร็จมาได้เลยครับ จะได้แม่นขึ้น');
 }
 
+/* ─────────── คุยกับ AI ในแชต LINE ───────────
+   ตอบด้วย reply (ฟรี ไม่กินโควตา push ของ OA) · จำ 8 ข้อความล่าสุด ลืมเองเมื่อเงียบไป 2 ชั่วโมง
+   เชื่อมบัญชีแล้ว = ใช้โควตา AI ก้อนเดียวกับในแอป และ AI รู้จักรถของเขา
+   ยังไม่เชื่อม = ถามได้วันละ anonDaily ข้อความต่อ LINE หนึ่งคน */
+async function lineAsk(env, ev, link, text) {
+  const lineUid = ev.source.userId, now = Date.now(), day = new Date(now).toISOString().slice(0, 10);
+  /* จุด "กำลังพิมพ์…" ในแชตระหว่างรอ AI (ฟรี) */
+  lineCall(env, '/chat/loading/start', { chatId: lineUid, loadingSeconds: 30 }).catch(() => {});
+
+  let mem = null;
+  try { mem = await env.DB.prepare('SELECT * FROM line_chat WHERE line_uid = ?').bind(lineUid).first(); } catch (e) {}
+  let hist = [];
+  try { if (mem && now - mem.updated_at < 2 * 3600000) hist = JSON.parse(mem.history || '[]'); } catch (e) {}
+  if (!Array.isArray(hist)) hist = [];
+  const usedToday = mem && mem.day === day ? (mem.n || 0) : 0;
+
+  let role = 'user', name = '';
+  if (link) {
+    try { const u = await env.DB.prepare('SELECT role, name FROM users WHERE uid = ?').bind(link.uid).first();
+      role = (u && u.role) || 'user'; name = (u && u.name) || ''; } catch (e) {}
+  }
+  const maint = await getConfig(env, 'maintenance', { enabled: false });
+  if (maint.enabled && rank(role) < rank('moderator')) return txt('ตอนนี้ Cendon กำลังปรับปรุงระบบครับ ลองถามใหม่อีกครั้งในอีกสักพัก');
+  if (link) {
+    if (rank(role) < rank('admin')) {
+      const q = await quotaState(env, link.uid, role);
+      if (q && q.used >= q.limit) {
+        const at = q.resetAt ? new Date(q.resetAt).toLocaleTimeString('th-TH', { timeZone: 'Asia/Bangkok', hour: '2-digit', minute: '2-digit' }) : '';
+        return txt(`โควตา AI รอบนี้หมดแล้วครับ${at ? ` ใช้ต่อได้ตอน ${at} น.` : ''}\nระหว่างนี้กดเมนู "หาช่าง" เพื่อดูช่างของ Cendon ได้เลย`);
+      }
+    }
+  } else {
+    const lim = (await getConfig(env, 'limits', {})).anonDaily || parseInt(env.AI_ANON_DAILY_LIMIT || '15', 10);
+    if (usedToday >= lim) return txt(`วันนี้ถามครบ ${lim} ข้อความแล้วครับ\nเชื่อมบัญชี Cendon เพื่อถามต่อได้มากขึ้น และให้ผมรู้จักรถของคุณ: เปิดแอป → ตั้งค่า → บัญชี → เชื่อม LINE`);
+  }
+
+  let carInfo = { make: '', model: '', year: '', mileage: '' }, carId = null;
+  if (link) {
+    try {
+      const c = await env.DB.prepare('SELECT id, make, model, year, mileage FROM cars WHERE uid = ? ORDER BY created_at DESC LIMIT 1')
+        .bind(link.uid).first();
+      if (c) { carId = c.id; carInfo = { make: c.make || '', model: c.model || '', year: c.year != null ? String(c.year) : '', mileage: c.mileage != null ? String(c.mileage) : '' }; }
+    } catch (e) {}
+  }
+  const [userBlock, kbBlock] = await Promise.all([
+    link ? userContext(env, link.uid, carId, { userName: name }).catch(() => '') : '',
+    kbFor(env, carInfo, text).catch(() => ''),
+  ]);
+  const carContext = (carInfo.make || carInfo.model)
+    ? `\n[รถที่กำลังคุยถึง]\nรถของผู้ใช้: ${carInfo.make} ${carInfo.model} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` : '';
+  const sys = `${IDENTITY}\n\n${STREAM_TALK}\n\n${LINE_TALK}${carContext}${userBlock || ''}${kbBlock || ''}${needsFresh(text) ? FORCE_SEARCH : ''}`;
+  const contents = [...hist, { role: 'user', parts: [{ text: text.slice(0, 2000) }] }];
+  const meter = newMeter();
+
+  let answer = '';
+  try {
+    const r = await Promise.race([
+      LINE_AI.ask(env, {
+        system: sys, contents: toGeminiContents(contents), history: toChatHistory(contents), messages: contents,
+        question: text, hasMedia: false, carInfo, search: true,
+        executeSearch: async (q) => await executeGoogleSearchTool(env, q),
+        executeMedia: async () => '',
+        executeKb: async (q) => await kbFor(env, carInfo, q),
+        level: levelFor(undefined, text, false, []), meter,
+      }),
+      new Promise((_, no) => setTimeout(() => no(new Error('LINE AI timeout')), LINE_AI.timeoutMs)),
+    ]);
+    answer = cleanReply((r && r.text) || '');
+  } catch (e) {
+    noteAiError(env, e);
+    return txt('ตอนนี้ AI มีคนใช้เยอะครับ ลองถามใหม่อีกครั้งในอีกสักครู่');
+  }
+  const mk = LINE_MARK.exec(answer);
+  const term = mk ? mk[1].trim() : '';
+  answer = linePlain(answer) || 'ขอโทษครับ ตอบเรื่องนี้ไม่ได้ ลองถามใหม่อีกแบบนะครับ';
+
+  const keep = [...contents, { role: 'model', parts: [{ text: answer.slice(0, 1500) }] }]
+    .slice(-8).map((m) => ({ role: m.role, parts: [{ text: String((m.parts[0] && m.parts[0].text) || '').slice(0, 1500) }] }));
+  try {
+    await env.DB.prepare(`INSERT INTO line_chat (line_uid, history, day, n, updated_at) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(line_uid) DO UPDATE SET history = excluded.history, day = excluded.day, n = excluded.n, updated_at = excluded.updated_at`)
+      .bind(lineUid, JSON.stringify(keep), day, usedToday + 1, now).run();
+  } catch (e) {}
+  if (link) {
+    try {
+      await meterTokens(env, link.uid, meter);
+      await env.DB.prepare(`INSERT INTO chat_logs (uid, car_id, prompt, response, in_tok, out_tok, total_tok, model, day, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(link.uid, carId, ('[LINE] ' + text).slice(0, 4000), answer.slice(0, 8000),
+        meter.in, meter.out, meter.in + meter.out, (meter.src && meter.src.join(',')) || 'line', day, now).run();
+    } catch (e) {}
+  }
+
+  const msgs = lineChunks(answer).map(txt);
+  if (term) msgs.push(card({
+    tag: 'ช่างของ Cendon', title: `ดูช่าง "${term}" ใน Cendon`, label: 'ดูรายชื่อช่าง',
+    url: appUrl(env, '/?q=' + encodeURIComponent(term)),
+    lines: ['เทียบราคา รีวิว และระยะทาง แล้วขอราคาได้ในแอป'],
+  }));
+  return msgs;
+}
+
 /* ทักครั้งแรก / คนที่ยังไม่ได้ผูกบัญชี — ผู้ใช้มาจากแอปก่อนเสมอ จึงบอกทางเชื่อมจากในแอป */
 const LINE_HOWTO = `สวัสดีครับ ผมคือ ${BRAND.ai} ผู้ช่วยดูแลรถและหาช่าง\n\n`
-  + 'รับแจ้งเตือนงานช่าง ราคา และข้อความทาง LINE: เปิดแอป → บัญชี → เชื่อม LINE แล้วกดส่งรหัส 6 ตัวมาที่นี่\n\n'
-  + 'กดเมนูด้านล่างเพื่อหาช่าง ถามอาการรถ หรือดูงานของคุณได้เลย';
+  + 'พิมพ์ถามเรื่องรถได้เลยครับ เช่น "แอร์ไม่เย็นเกิดจากอะไร" หรือ "ผ้าเบรกควรเปลี่ยนตอนไหน"\n\n'
+  + 'รับแจ้งเตือนงานช่าง ราคา และข้อความทาง LINE: เปิดแอป → ตั้งค่า → บัญชี → เชื่อม LINE แล้วกดส่งรหัส 6 ตัวมาที่นี่\n\n'
+  + 'กดเมนูด้านล่างเพื่อหาช่าง หรือดูงานของคุณได้เลย';
+/* คนที่เชื่อมแล้วพิมพ์ "เมนู" / "help" */
+const LINE_HELP = 'ผมช่วยอะไรได้บ้าง\n\n'
+  + '• พิมพ์ถามเรื่องรถได้ทุกเรื่อง ผมรู้จักรถในการาจของคุณ\n'
+  + '• ส่งรูปใบเสร็จจากอู่ ผมอ่านเลขไมล์เก็บให้\n'
+  + '• พิมพ์ "ไมล์" ดูเลขไมล์ที่ประเมินไว้\n'
+  + '• พิมพ์ "หยุด" พักเตือนดูแลรถ 90 วัน · "เปิดเตือน" เปิดกลับ\n\n'
+  + 'งานช่าง ราคา และข้อความในใบงานจะแจ้งที่นี่อัตโนมัติ';
 
 async function lineWebhook(env, ev) {
   if (!ev || !ev.source || !ev.source.userId) return;
@@ -2989,12 +3139,13 @@ async function lineWebhook(env, ev) {
     } else if (ev.message.type === 'text') {
       msg = await lineHandleText(env, ev, link);
     } else {
-      msg = txt('ส่งรูปใบเสร็จหรือพิมพ์ข้อความมาได้ครับ');
+      msg = txt('พิมพ์ถามเรื่องรถ หรือส่งรูปใบเสร็จจากอู่มาได้เลยครับ');
     }
   } catch (e) {
     msg = txt('ระบบขัดข้องชั่วคราวครับ ลองใหม่อีกครั้ง');
   }
-  await lineReply(env, ev.replyToken, [msg]);
+  if (!msg) return;
+  await lineReply(env, ev.replyToken, (Array.isArray(msg) ? msg : [msg]).slice(0, 5));
 }
 
 
