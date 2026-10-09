@@ -4,6 +4,8 @@ import { handleTech } from './techs.js';
 import { richMenuStatus, setupRichMenu, lineStatus, lineFixWebhook } from './line-menu.js';
 import { appUrl, card } from './line-notify.js';
 import { refreshNews, newsStatus } from './news.js';
+import { ensureSpec, getSpec, specKey, validQuery, reportSpec, listSpecs, verifySpec } from './carspec.js';
+import { decodeVin, vpic, cleanInfo } from './vin.js';
 import { LINE_AI, LINE_TALK, LINE_MARK, linePlain, lineChunks, lineCodeIn } from './line-chat.js';
 import { handleVec, kbScores, refreshKb } from './vectors.js';
 import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels, toChatHistory, levelFor, depthNote, featuresBlock, badState, geminiScope, unpark, executeSearchInternal } from './fastai.js';
@@ -92,7 +94,7 @@ function rank(role) { return ROLE_RANK[role] || 0; }
    ยกเว้น ALTER TABLE สองบรรทัดที่ต้องดักข้อผิดพลาด "มีคอลัมน์นี้แล้ว" ทิ้ง
    ══════════════════════════════════════════════════════════════════ */
 
-const SCHEMA_VERSION = 18;
+const SCHEMA_VERSION = 19;
 
 /* ประเภทตัวถังที่แอปมีภาพรถให้ (ตรงกับ BODY_TYPES ในหน้าการาจ) */
 const CAR_BODIES = ['sedan', 'hatchback', 'suv', 'pickup', 'mpv', 'van', 'coupe', 'ev'];
@@ -222,6 +224,40 @@ const SCHEMA_SQL = [
   /* รถในการาจ: สีที่ผู้ใช้เลือก (#RRGGBB) และประเภทตัวถัง — ภาพรถในแอปใช้สองค่านี้ */
   `ALTER TABLE cars ADD COLUMN color TEXT`,
   `ALTER TABLE cars ADD COLUMN body TEXT`,
+  /* ข้อมูลเพิ่มเติมที่เจ้าของกรอกเอง (ไม่บังคับ): เลขตัวถัง รุ่นย่อย เครื่อง เกียร์ ทะเบียน วันต่อภาษี/ประกัน ขนาดยาง — JSON */
+  `ALTER TABLE cars ADD COLUMN info TEXT`,
+  /* คลังสเปกรถ (carspec.js): ค้นจริงครั้งเดียวต่อ ยี่ห้อ|รุ่น|ปี ทุกคนใช้ร่วมกัน */
+  `CREATE TABLE IF NOT EXISTS car_specs (
+  k          TEXT PRIMARY KEY,
+  make       TEXT NOT NULL,
+  model      TEXT NOT NULL,
+  year       TEXT NOT NULL,
+  status     TEXT NOT NULL,
+  body       TEXT,
+  data       TEXT,
+  sources    TEXT,
+  models     TEXT,
+  error      TEXT,
+  hits       INTEGER NOT NULL DEFAULT 0,
+  reports    INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  by_uid     TEXT
+)`,
+  `CREATE TABLE IF NOT EXISTS car_spec_reports (
+  id   INTEGER PRIMARY KEY AUTOINCREMENT,
+  k    TEXT NOT NULL,
+  note TEXT,
+  who  TEXT,
+  at   INTEGER NOT NULL
+)`,
+  `CREATE INDEX IF NOT EXISTS idx_specrep_k ON car_spec_reports(k)`,
+  `CREATE TABLE IF NOT EXISTS spec_quota (
+  who TEXT NOT NULL,
+  day TEXT NOT NULL,
+  n   INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (who, day)
+)`,
   `ALTER TABLE users ADD COLUMN created_at INTEGER`,
   `ALTER TABLE users ADD COLUMN banned INTEGER DEFAULT 0`,
   `ALTER TABLE users ADD COLUMN plan TEXT DEFAULT 'free'`,
@@ -4872,6 +4908,68 @@ ${convo}`;
         }
       }
 
+      /* ===== คลังสเปกรถ (carspec.js) =====
+       * ไม่ต้องล็อกอินก็ดึงได้ (คนเพิ่มรถได้โดยไม่ล็อกอิน) — การค้นรุ่นใหม่ด้วย AI มีโควตาต่อคน/ต่อ IP */
+      if (url.pathname === '/api/car-spec' || url.pathname === '/api/car-spec/report' || url.pathname.startsWith('/api/vin/')) {
+        let actor = null;
+        if ((request.headers.get('Authorization') || '').startsWith('Bearer ')) {
+          try { actor = await getActor(request, env); } catch (e) { /* ใช้แบบไม่ล็อกอิน */ }
+        }
+        if (actor && actor.banned) return deny('Account suspended', 403);
+        const who = actor ? 'u:' + actor.payload.sub : 'ip:' + (request.headers.get('CF-Connecting-IP') || 'unknown');
+        try {
+          if (url.pathname === '/api/car-spec' && request.method === 'GET') {
+            const v = validQuery(Object.fromEntries(url.searchParams));
+            if (!v) return deny('ชื่อรถหรือปีไม่ถูกต้อง', 400);
+            return json((await getSpec(env, specKey(v.make, v.model, v.year))) || { status: 'none' });
+          }
+          if (url.pathname === '/api/car-spec' && request.method === 'POST') {
+            const b = await readBody();
+            return json(await ensureSpec(env, b || {}, { who, user: !!actor, staff: !!actor && rank(actor.role) >= rank('admin') }));
+          }
+          if (url.pathname === '/api/car-spec/report' && request.method === 'POST') {
+            const b = await readBody() || {};
+            return json(await reportSpec(env, b.key, b.note, who));
+          }
+          if (url.pathname.startsWith('/api/vin/') && request.method === 'GET') {
+            const d = decodeVin(decodeURIComponent(url.pathname.slice('/api/vin/'.length)));
+            if (!d.valid) return json(d);
+            const day = new Date().toISOString().slice(0, 10);
+            const q = await env.DB.prepare(`INSERT INTO spec_quota (who, day, n) VALUES (?, ?, 1)
+              ON CONFLICT(who, day) DO UPDATE SET n = n + 1 RETURNING n`).bind('vin:' + who, day).first();
+            return json({ ...d, vpic: q && q.n > 40 ? null : await vpic(d.vin) });
+          }
+        } catch (e) { return deny(e.message || 'Server error', e.status || 500); }
+      }
+      if (url.pathname === '/api/admin/car-specs' && request.method === 'GET') {
+        return await guarded('moderator', async () => json(await listSpecs(env)))();
+      }
+      if (url.pathname === '/api/admin/car-specs/redo' && request.method === 'POST') {
+        return await guarded('admin', async (actor) => {
+          const b = await readBody() || {};
+          const [make, model, year] = String(b.key || '').split('|');
+          const r = await getSpec(env, String(b.key || ''));
+          if (!r) return deny('ไม่พบรุ่นนี้ในคลัง', 404);
+          /* ค้นใหม่ทับ แล้วล้างรายงานเดิม (รายงานเป็นของข้อมูลชุดเก่า) */
+          const out = await ensureSpec(env, { make: r.make || make, model: r.model || model, year: r.year || year },
+            { who: 'u:' + actor.payload.sub, staff: true, force: true });
+          await env.DB.batch([
+            env.DB.prepare('DELETE FROM car_spec_reports WHERE k = ?').bind(r.key),
+            env.DB.prepare('UPDATE car_specs SET reports = 0 WHERE k = ?').bind(r.key),
+          ]);
+          await logAudit(env, actor.email || actor.payload.sub, 'spec_redo', r.key, '');
+          return json({ ...out, reports: 0 });
+        })();
+      }
+      if (url.pathname === '/api/admin/car-specs/verify' && request.method === 'POST') {
+        return await guarded('admin', async (actor) => {
+          const b = await readBody() || {};
+          const out = await verifySpec(env, b.key, b.on !== false);
+          await logAudit(env, actor.email || actor.payload.sub, b.on !== false ? 'spec_verify' : 'spec_unverify', String(b.key || ''), '');
+          return json(out);
+        })();
+      }
+
       /* ===== CARS ===== */
       if (url.pathname === '/api/cars' && request.method === 'GET') {
         return await guarded('user', async (actor) => {
@@ -4896,17 +4994,20 @@ ${convo}`;
           /* สีกับประเภทตัวถังไม่บังคับ — ไม่ส่งมาก็คงค่าเดิมไว้ (ส่งรถคันเดิมซ้ำเพื่อเปลี่ยนสีได้) */
           const color = /^#[0-9a-f]{6}$/i.test(String(bodyData.color || '')) ? String(bodyData.color).toUpperCase() : null;
           const body = CAR_BODIES.includes(bodyData.body) ? bodyData.body : null;
+          /* ข้อมูลเพิ่มเติม: ไม่ส่งมา = คงค่าเดิม · ส่งมา = แทนทั้งชุด (ช่องที่ลบออกก็หายจริง) */
+          const info = bodyData.info === undefined ? null : JSON.stringify(cleanInfo(bodyData.info) || {});
           const result = await env.DB.prepare(`
-            INSERT INTO cars (id, uid, make, model, year, mileage, color, body, created_at)
-            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+            INSERT INTO cars (id, uid, make, model, year, mileage, color, body, info, created_at)
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             WHERE NOT EXISTS (SELECT 1 FROM user_state WHERE uid = ? AND k = ?)
             ON CONFLICT(id) DO UPDATE SET
               make = excluded.make, model = excluded.model,
               year = excluded.year, mileage = excluded.mileage,
-              color = COALESCE(excluded.color, cars.color), body = COALESCE(excluded.body, cars.body)
+              color = COALESCE(excluded.color, cars.color), body = COALESCE(excluded.body, cars.body),
+              info = COALESCE(excluded.info, cars.info)
             WHERE cars.uid = excluded.uid
           `).bind(carId, actor.payload.sub, String(make).slice(0, 60), String(model).slice(0, 60),
-            String(year || '').slice(0, 8), String(mileage || '').slice(0, 12), color, body, now,
+            String(year || '').slice(0, 8), String(mileage || '').slice(0, 12), color, body, info, now,
             actor.payload.sub, CAR_DELETED_PREFIX + carId).run();
           if (result.meta && result.meta.changes === 0) {
             const marker = await env.DB.prepare('SELECT t FROM user_state WHERE uid = ? AND k = ?')
@@ -4914,7 +5015,7 @@ ${convo}`;
             if (marker) return deny('Car was deleted; add it again with a new ID', 410);
             return deny('Car ID is unavailable', 409);
           }
-          return json({ id: carId, uid: actor.payload.sub, make, model, year: year || '', mileage: mileage || '', color, body, created_at: now });
+          return json({ id: carId, uid: actor.payload.sub, make, model, year: year || '', mileage: mileage || '', color, body, info, created_at: now });
         })();
       }
 

@@ -7,7 +7,7 @@ import worker from '../src/worker.js';
 function setup(){
   const f=fixture({DEV_AUTH:'1',FIREBASE_PROJECT_ID:'unit-test'});
   f.sqlite.exec(`CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT); INSERT INTO config VALUES ('schema_version','999');
-    CREATE TABLE cars (id TEXT PRIMARY KEY, uid TEXT NOT NULL, make TEXT NOT NULL, model TEXT NOT NULL, year TEXT, mileage TEXT, created_at INTEGER NOT NULL, color TEXT, body TEXT);
+    CREATE TABLE cars (id TEXT PRIMARY KEY, uid TEXT NOT NULL, make TEXT NOT NULL, model TEXT NOT NULL, year TEXT, mileage TEXT, created_at INTEGER NOT NULL, color TEXT, body TEXT, info TEXT);
     CREATE TABLE user_state (uid TEXT NOT NULL, k TEXT NOT NULL, v TEXT NOT NULL, t INTEGER NOT NULL, PRIMARY KEY(uid,k));`);
   const call=async(method,path,body,uid='cust')=>{const r=await worker.fetch(new Request('https://api.unit.test'+path,{method,headers:{'Content-Type':'application/json',Authorization:`Bearer dev:${uid}:${uid}@unit.test`},body:body&&JSON.stringify(body)}),f.env,{waitUntil(){}});return {status:r.status,json:await r.json()}};
   return {f,call};
