@@ -1,7 +1,7 @@
 import { verifyFirebaseToken } from './auth.js';
 import { buildFeatureRequest } from './features-ai.mjs';
 import { handleTech } from './techs.js';
-import { richMenuStatus, setupRichMenu } from './line-menu.js';
+import { richMenuStatus, setupRichMenu, lineStatus, lineFixWebhook } from './line-menu.js';
 import { appUrl, card } from './line-notify.js';
 import { LINE_AI, LINE_TALK, LINE_MARK, linePlain, lineChunks, lineCodeIn } from './line-chat.js';
 import { handleVec, kbScores, refreshKb } from './vectors.js';
@@ -3100,6 +3100,14 @@ async function lineAsk(env, ev, link, text) {
   return msgs;
 }
 
+/* จดเหตุการณ์ล่าสุดของ LINE ลง config (ไม่ทำให้งานหลักพังถ้าเขียนไม่ได้) */
+async function lineNote(env, key, data) {
+  try {
+    await env.DB.prepare('INSERT INTO config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+      .bind(key, JSON.stringify({ at: Date.now(), ...data })).run();
+  } catch (e) {}
+}
+
 /* ทักครั้งแรก / คนที่ยังไม่ได้ผูกบัญชี — ผู้ใช้มาจากแอปก่อนเสมอ จึงบอกทางเชื่อมจากในแอป */
 const LINE_HOWTO = `สวัสดีครับ ผมคือ ${BRAND.ai} ผู้ช่วยดูแลรถและหาช่าง\n\n`
   + 'พิมพ์ถามเรื่องรถได้เลยครับ เช่น "แอร์ไม่เย็นเกิดจากอะไร" หรือ "ผ้าเบรกควรเปลี่ยนตอนไหน"\n\n'
@@ -3145,7 +3153,12 @@ async function lineWebhook(env, ev) {
     msg = txt('ระบบขัดข้องชั่วคราวครับ ลองใหม่อีกครั้ง');
   }
   if (!msg) return;
-  await lineReply(env, ev.replyToken, (Array.isArray(msg) ? msg : [msg]).slice(0, 5));
+  const r = await lineReply(env, ev.replyToken, (Array.isArray(msg) ? msg : [msg]).slice(0, 5));
+  if (r && !r.ok) {
+    let detail = '';
+    try { const j = await r.json(); detail = String(j.message || '').slice(0, 200); } catch (e) {}
+    await lineNote(env, 'line_last_reply_error', { status: r.status, detail });
+  }
 }
 
 
@@ -3568,9 +3581,14 @@ export default {
       if (url.pathname === '/api/line/webhook' && request.method === 'POST') {
         const raw = await request.text();
         const sig = request.headers.get('X-Line-Signature') || '';
-        if (!(await lineVerify(env, raw, sig))) return deny('Bad signature', 401);
+        /* บันทึกไว้ให้หน้าแอดมินบอกได้ว่า LINE ส่งมาถึงไหม และลายเซ็นผ่านไหม */
+        if (!(await lineVerify(env, raw, sig))) {
+          if (sig) ctx.waitUntil(lineNote(env, 'line_last_bad_sig', {}));
+          return deny('Bad signature', 401);
+        }
         let payload = null;
         try { payload = JSON.parse(raw); } catch (e) { return json({ ok: true }); }
+        ctx.waitUntil(lineNote(env, 'line_last_event', { n: (payload.events || []).length }));
         /* ตอบ 200 กลับทันทีแล้วค่อยทำงานเบื้องหลัง — LINE ตัดที่ไม่กี่วินาที
            ถ้ารอ AI อ่านใบเสร็จเสร็จก่อนค่อยตอบ มันจะ timeout แล้วส่งซ้ำ */
         ctx.waitUntil((async () => {
@@ -5234,6 +5252,30 @@ ${convo}`;
           ]);
           await logAudit(env, actor.email, 'data.export', '', `${users.length} users, ${cars.length} cars`);
           return json({ exportedAt: Date.now(), users, cars, magazine, audit, shop, warnings: w });
+        })();
+      }
+
+      /* ===== ADMIN: ตรวจการเชื่อม LINE / ตั้งและทดสอบ Webhook (ดู line-menu.js) ===== */
+      if (url.pathname === '/api/admin/line/status' && request.method === 'GET') {
+        return await guarded('admin', async () => {
+          const notes = {};
+          try {
+            const rows = await env.DB.prepare("SELECT key, value FROM config WHERE key IN ('line_last_event','line_last_bad_sig','line_last_reply_error')").all();
+            for (const r of rows.results || []) {
+              const v = JSON.parse(r.value);
+              notes[{ line_last_event: 'event', line_last_bad_sig: 'badSig', line_last_reply_error: 'replyErr' }[r.key]] = v;
+            }
+          } catch (e) {}
+          return json(await lineStatus(env, url.origin, notes));
+        })();
+      }
+      if (url.pathname === '/api/admin/line/webhook' && request.method === 'POST') {
+        return await guarded('admin', async (actor) => {
+          try {
+            const r = await lineFixWebhook(env, url.origin);
+            await logAudit(env, actor.email, 'line.webhook', r.endpoint, r.ok ? 'ok' : r.why);
+            return json(r);
+          } catch (e) { return deny(e.message, e.status || 500); }
         })();
       }
 

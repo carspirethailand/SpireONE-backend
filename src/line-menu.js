@@ -93,3 +93,62 @@ export async function setupRichMenu(env) {
   for (const m of old) if (m.name === NAME && m.richMenuId !== id && await drop(m.richMenuId)) removed++;
   return { richMenuId: id, removed, tiles: MENU_TILES.map((t) => t[0]) };
 }
+
+/* ══════════════════════════════════════════════════════════════════
+   ตรวจการเชื่อม LINE (หน้าแอดมิน) — ไม่ต้องเดาว่าทำไมบอทเงียบ
+   ดูทีละขั้น: มีค่าลับครบไหม → token ใช้ได้ไหม → LINE ตั้ง Webhook มาที่เราหรือยัง/เปิดใช้หรือยัง
+   → ข้อความล่าสุดที่ LINE ส่งมา / ลายเซ็นไม่ผ่าน / ตอบกลับไม่สำเร็จ (บันทึกไว้ใน config ตอนเกิดจริง)
+   ══════════════════════════════════════════════════════════════════ */
+const thTime = (ms) => ms ? new Date(ms).toLocaleString('th-TH', { timeZone: 'Asia/Bangkok', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : '';
+
+export async function lineStatus(env, origin, notes = {}) {
+  const want = origin + '/api/line/webhook';
+  const out = { secret: !!env.LINE_CHANNEL_SECRET, token: !!env.LINE_CHANNEL_TOKEN, oa: env.LINE_OA_ID || '',
+    want, bot: null, webhook: null, notes, problems: [] };
+  const P = (s) => out.problems.push(s);
+  if (!out.secret) P('หลังบ้านยังไม่มี LINE_CHANNEL_SECRET — ใส่ด้วย npx wrangler secret put LINE_CHANNEL_SECRET แล้ว deploy');
+  if (!out.token) { P('หลังบ้านยังไม่มี LINE_CHANNEL_TOKEN — ใส่ด้วย npx wrangler secret put LINE_CHANNEL_TOKEN แล้ว deploy'); return out; }
+  const H = auth(env);
+  try {
+    const r = await fetch(BOT + '/info', { headers: H });
+    if (r.ok) { const j = await r.json(); out.bot = { name: j.displayName || '', basicId: j.basicId || '', chatMode: j.chatMode || '', pictureUrl: j.pictureUrl || '' }; }
+    else out.tokenStatus = r.status;
+  } catch (e) { out.tokenStatus = 0; }
+  if (!out.bot) { P('LINE ไม่รับ LINE_CHANNEL_TOKEN (ตอบ ' + (out.tokenStatus || 'ไม่ได้') + ') — ก๊อป Channel access token (long-lived) ใหม่จากแท็บ Messaging API แล้วใส่ใหม่'); return out; }
+  if (out.oa && out.bot.basicId && out.oa.toLowerCase() !== out.bot.basicId.toLowerCase())
+    P(`LINE_OA_ID (${out.oa}) ไม่ตรงกับบัญชีจริง (${out.bot.basicId}) — ปุ่มเชื่อมในแอปจะเปิดผิดห้อง`);
+  try {
+    const r = await fetch(BOT + '/channel/webhook/endpoint', { headers: H });
+    if (r.ok) { const j = await r.json(); out.webhook = { endpoint: j.endpoint || '', active: !!j.active }; }
+  } catch (e) {}
+  if (out.webhook) {
+    if (out.webhook.endpoint !== want) P('Webhook URL ใน LINE ยังไม่ได้ชี้มาที่หลังบ้านของเรา — กดปุ่ม "ตั้งและทดสอบ Webhook"');
+    if (!out.webhook.active) P('ยังไม่ได้เปิด "Use webhook" — LINE Developers → ช่อง Messaging API → แท็บ Messaging API → Webhook settings → เปิด Use webhook');
+  }
+  if (notes.badSig && (!notes.event || notes.badSig.at > notes.event.at))
+    P(`LINE ส่งข้อความมาแล้วแต่ลายเซ็นไม่ผ่าน (${thTime(notes.badSig.at)}) — LINE_CHANNEL_SECRET ไม่ตรงกับช่องนี้ ก๊อป Channel secret จากแท็บ Basic settings มาใส่ใหม่`);
+  if (notes.replyErr && (!notes.event || notes.replyErr.at >= notes.event.at))
+    P(`ตอบกลับไม่สำเร็จ (${thTime(notes.replyErr.at)}, LINE ตอบ ${notes.replyErr.status}) ${notes.replyErr.detail || ''}`.trim());
+  return out;
+}
+
+/* ตั้ง Webhook URL ให้ชี้มาที่หลังบ้านนี้ แล้วให้ LINE ยิงทดสอบจริงหนึ่งครั้ง */
+export async function lineFixWebhook(env, origin) {
+  if (!env.LINE_CHANNEL_TOKEN) throw Object.assign(new Error('หลังบ้านยังไม่มี LINE_CHANNEL_TOKEN'), { status: 503 });
+  const want = origin + '/api/line/webhook', H = { ...auth(env), 'Content-Type': 'application/json' };
+  const set = await fetch(BOT + '/channel/webhook/endpoint', { method: 'PUT', headers: H, body: JSON.stringify({ endpoint: want }) });
+  if (!set.ok) {
+    const j = await set.json().catch(() => ({}));
+    throw Object.assign(new Error('ตั้ง Webhook URL ไม่สำเร็จ: ' + (j.message || set.status)), { status: 502 });
+  }
+  let test = null;
+  try {
+    const r = await fetch(BOT + '/channel/webhook/test', { method: 'POST', headers: H, body: JSON.stringify({ endpoint: want }) });
+    test = await r.json();
+  } catch (e) {}
+  const ok = !!(test && test.success);
+  const why = ok ? '' : test && test.statusCode === 401 ? 'หลังบ้านปฏิเสธลายเซ็น — LINE_CHANNEL_SECRET ไม่ตรงกับช่องนี้'
+    : test && test.statusCode === 404 ? 'หลังบ้านยังไม่มีทางรับ webhook — ยังไม่ได้ deploy รุ่นล่าสุด'
+    : test ? `LINE ทดสอบไม่ผ่าน: ${test.statusCode || ''} ${test.reason || ''} ${test.detail || ''}`.trim() : 'ทดสอบไม่ได้';
+  return { endpoint: want, ok, why, test };
+}
