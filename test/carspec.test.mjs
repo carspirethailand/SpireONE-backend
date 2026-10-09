@@ -133,3 +133,35 @@ test('car info: optional fields are cleaned, saved with the car, and kept when n
   await call('POST','/api/cars',{id:'c1',make:'Toyota',model:'Hilux',year:'2019',info:{plate:'กข 1234'}},CUST);
   assert.deepEqual(JSON.parse(f.sqlite.prepare('SELECT info FROM cars').get().info),{plate:'กข 1234'},'sent = replaced, removed fields are gone');
 });
+
+test('car spec: a messy answer from web search is turned back into JSON by a light model (no new facts, no web)',async()=>{
+  const {f,ai}=setup();
+  const real=globalThis.fetch;
+  globalThis.fetch=async(url,init={})=>{const u=String(url);
+    if(u.includes('generativelanguage')){const body=JSON.parse(init.body);
+      if(body.tools){ai.push({u,body});return Response.json({candidates:[{finishReason:'STOP',content:{parts:[{text:'จากการค้นพบว่า Pajero Sport 2020 มีที่นั่ง 7 ที่นั่ง {"found":true, "seats":7, ตัวถัง suv'}]},groundingMetadata:{groundingChunks:[{web:{uri:'https://g/x',title:'example.com'}}]}}]});}
+      ai.push({u,body,repair:true});
+      assert.equal(body.generationConfig.responseMimeType,'application/json');assert.ok(!body.tools,'repair does not search the web');
+      return Response.json({candidates:[{content:{parts:[{text:JSON.stringify({found:true,body:'suv',seats:7})}]}}]});}
+    return real(url,init);};
+  const {ensureSpec}=await import('../src/carspec.js');
+  const r=await ensureSpec(f.env,pajero,{who:'u:cust',user:true});
+  assert.equal(r.status,'ready');assert.equal(r.data.facts.seats.v,7);assert.ok(ai.some(c=>c.repair));
+  assert.ok(ai.filter(c=>!c.repair).every(c=>c.body.generationConfig.thinkingConfig),'thinking is capped so the answer is not cut off');
+});
+
+test('car spec: a slow lookup answers "pending" quickly and finishes in the background; admins see why a lookup failed',async()=>{
+  const {f}=setup();
+  const real=globalThis.fetch;let release;const gate=new Promise(z=>release=z);
+  globalThis.fetch=async(url,init)=>{if(String(url).includes('generativelanguage'))await gate;return real(url,init)};
+  const {ensureSpec,getSpec}=await import('../src/carspec.js');
+  let bg=null;
+  const r=await ensureSpec(f.env,pajero,{who:'u:cust',user:true,waitMs:30,defer:p=>{bg=p}});
+  assert.equal(r.status,'pending');assert.ok(bg,'work continues after the response');
+  release();await bg;
+  assert.equal((await getSpec(f.env,r.key)).status,'ready');
+  globalThis.fetch=async(url)=>String(url).includes('generativelanguage')?new Response('nope',{status:404}):real(url);
+  await ensureSpec(f.env,{make:'Honda',model:'Zzz',year:'2020'},{who:'u:cust',user:true});
+  const {listSpecs}=await import('../src/carspec.js');
+  assert.match((await listSpecs(f.env)).find(x=>x.model==='Zzz').error,/ตอบ 404/);
+});

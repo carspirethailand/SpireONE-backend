@@ -41,12 +41,17 @@ export function specAI(env) {
   const chatMain = own ? [] : chatModels(env).slice(0, 2);
   const models = [env.GEMINI_SPEC_MODEL, ...SPEC_MODELS.filter((m) => !chatMain.includes(m))]
     .map((m) => norm(m)).filter(Boolean);
-  return { key, own, models: [...new Set(models)] };
+  const repair = ['gemini-3.5-flash-lite', 'gemini-2.5-flash-lite', 'gemini-3.1-flash-lite'].filter((m) => !chatMain.includes(m));
+  return { key, own, models: [...new Set(models)], repair };
 }
 
+/* โมเดลที่คิดนานกินโทเคนคำตอบไปกับการคิด (นับรวมใน maxOutputTokens) จน JSON โดนตัดกลางทาง
+   และใช้เวลานานเกิน — ตั้งให้คิดน้อยพอให้ค้นเว็บแล้วสรุปได้ */
+const thinking = (model, json) => /gemini-3|gemini-[4-9]/.test(model) ? { thinkingLevel: json ? 'minimal' : 'low' }
+  : /2\.5/.test(model) ? { thinkingBudget: json ? 0 : 512 } : undefined;
 async function searchCall(env, ai, model, prompt) {
   const base = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
-  const ac = new AbortController(), t = setTimeout(() => ac.abort(), 26000);
+  const ac = new AbortController(), t = setTimeout(() => ac.abort(), 20000);
   try {
     const r = await fetch(`${base}/v1beta/models/${model}:generateContent`, {
       method: 'POST', signal: ac.signal,
@@ -54,18 +59,45 @@ async function searchCall(env, ai, model, prompt) {
       body: JSON.stringify({
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
         tools: [{ google_search: {} }],                 /* ค้นเว็บใช้คู่กับบังคับ JSON ไม่ได้ — ให้ตอบ JSON ในข้อความ */
-        generationConfig: { temperature: 0.1, maxOutputTokens: 6000 },
+        generationConfig: { temperature: 0.1, maxOutputTokens: 8192, ...(thinking(model, false) ? { thinkingConfig: thinking(model, false) } : {}) },
       }),
     });
     if (!r.ok) throw new Error(`${model} ตอบ ${r.status}`);
     const j = await r.json();
     const c = (j.candidates && j.candidates[0]) || {};
+    if (c.finishReason && !/STOP|MAX_TOKENS/.test(c.finishReason)) throw new Error(`${model} หยุดเพราะ ${c.finishReason}`);
     const text = ((c.content && c.content.parts) || []).map((p) => p.text || '').join('');
     const chunks = (c.groundingMetadata && c.groundingMetadata.groundingChunks) || [];
     const sources = chunks.map((x) => x && x.web).filter((w) => w && w.uri)
       .map((w) => ({ title: norm(w.title).slice(0, 120), url: String(w.uri).slice(0, 1000) }));
     return { text, sources, model };
+  } catch (e) {
+    throw e && e.name === 'AbortError' ? new Error(model + ' ค้นนานเกิน 20 วินาที') : e;
   } finally { clearTimeout(t); }
+}
+
+/* คำตอบจากการค้นเว็บบางครั้งมีข้อความปน หรือ JSON ไม่ครบ — ให้โมเดลเบาแปลงเป็น JSON ตามรูปแบบอีกครั้ง (ไม่ค้นเว็บ ไม่แต่งเพิ่ม) */
+async function repairJson(env, ai, text) {
+  const base = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
+  for (const model of ai.repair) {
+    const ac = new AbortController(), t = setTimeout(() => ac.abort(), 12000);
+    try {
+      const r = await fetch(`${base}/v1beta/models/${model}:generateContent`, {
+        method: 'POST', signal: ac.signal, headers: { 'Content-Type': 'application/json', 'x-goog-api-key': ai.key },
+        body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: `แปลงข้อมูลสเปกรถด้านล่างเป็น JSON object ตามรูปแบบนี้ ใช้เฉพาะข้อมูลที่มีในข้อความ ห้ามเพิ่มหรือเดาค่าใหม่ ค่าที่ไม่มีให้เป็น null
+รูปแบบ: ${SHAPE}
+
+ข้อมูล:
+${String(text).slice(0, 12000)}` }] }],
+          generationConfig: { temperature: 0, maxOutputTokens: 8192, responseMimeType: 'application/json', ...(thinking(model, true) ? { thinkingConfig: thinking(model, true) } : {}) } }),
+      });
+      if (!r.ok) continue;
+      const j = await r.json();
+      const o = parseObj(((((j.candidates || [])[0] || {}).content || {}).parts || []).map((p) => p.text || '').join(''));
+      if (o) return o;
+    } catch (e) { /* ลองตัวถัดไป */ } finally { clearTimeout(t); }
+  }
+  return null;
 }
 
 export function parseObj(text) {
@@ -106,14 +138,15 @@ ${SHAPE}`;
 
 /* ลองรุ่นโมเดลตามลำดับจนได้ JSON ที่อ่านได้ (เริ่มคนละตัวในสองรอบ = สองความเห็นที่ไม่ลอกกัน) */
 async function lookup(env, ai, prompt, start) {
-  const order = [...ai.models.slice(start), ...ai.models.slice(0, start)];
+  /* ไม่เกิน 2 รุ่นต่อรอบ — ทั้งงานต้องเสร็จในเวลาที่ผู้ใช้รอไหว */
+  const order = [...ai.models.slice(start), ...ai.models.slice(0, start)].slice(0, 2);
   let last = null;
   for (const m of order) {
     try {
       const r = await searchCall(env, ai, m, prompt);
-      const o = parseObj(r.text);
+      const o = parseObj(r.text) || (r.text.trim() ? await repairJson(env, ai, r.text) : null);
       if (o) return { ...r, data: o };
-      last = new Error(m + ' ตอบไม่เป็น JSON');
+      last = new Error(m + (r.text.trim() ? ' ตอบไม่เป็น JSON' : ' ตอบว่าง'));
     } catch (e) { last = e; }
   }
   throw last || new Error('ไม่มีรุ่น Gemini ให้ใช้');
@@ -199,7 +232,8 @@ export async function research(env, q) {
   const ai = specAI(env);
   if (!ai.key) throw new Error('ยังไม่ได้ตั้งคีย์ Gemini');
   /* สองรอบพร้อมกัน เริ่มจากรุ่นโมเดลคนละตัว */
-  const [a, b] = await Promise.allSettled([lookup(env, ai, promptA(q), 0), lookup(env, ai, promptB(q), Math.min(1, ai.models.length - 1))]);
+  const cap = (p) => Promise.race([p, new Promise((_, no) => setTimeout(() => no(new Error('ค้นนานเกินกำหนด')), 45000))]);
+  const [a, b] = await Promise.allSettled([cap(lookup(env, ai, promptA(q), 0)), cap(lookup(env, ai, promptB(q), Math.min(1, ai.models.length - 1)))]);
   const A = a.status === 'fulfilled' ? a.value : null, B = b.status === 'fulfilled' ? b.value : null;
   if (!A && !B) throw (a.reason || b.reason || new Error('ค้นข้อมูลไม่สำเร็จ'));
   const first = A || B, second = A ? B : null;
@@ -234,7 +268,7 @@ async function spend(env, who, limit) {
 
 /* ขอข้อมูลรุ่นนี้: มีในคลัง → ส่งเลย · ยังไม่มี → ค้นครั้งเดียวแล้วเก็บ
    who: 'u:<uid>' หรือ 'ip:<ip>' · staff: ข้ามโควตา · force: ค้นใหม่ทับ (แอดมิน) */
-export async function ensureSpec(env, q, { who = 'ip:unknown', user = false, staff = false, force = false } = {}) {
+export async function ensureSpec(env, q, { who = 'ip:unknown', user = false, staff = false, force = false, defer = null, waitMs = 22000 } = {}) {
   const v = validQuery(q);
   if (!v) throw Object.assign(new Error('ชื่อรถหรือปีไม่ถูกต้อง'), { status: 400 });
   const k = specKey(v.make, v.model, v.year), now = Date.now();
@@ -245,7 +279,7 @@ export async function ensureSpec(env, q, { who = 'ip:unknown', user = false, sta
       return row2out(have);
     }
     if (have.status === 'pending' && now - have.updated_at < 90000) return row2out(have);
-    if (have.status === 'failed' && now - have.updated_at < 10 * 60000) return row2out(have);
+    if (have.status === 'failed' && now - have.updated_at < 2 * 60000) return row2out(have);
   }
   if (have && have.status === 'verified' && force && !staff) return row2out(have);
   if (!staff) {
@@ -257,17 +291,25 @@ export async function ensureSpec(env, q, { who = 'ip:unknown', user = false, sta
       VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)
       ON CONFLICT(k) DO UPDATE SET status = 'pending', updated_at = excluded.updated_at, error = NULL`)
     .bind(k, v.make, v.model, v.year, now, now, who).run();
-  let res;
-  try { res = await research(env, v); }
-  catch (e) {
-    await env.DB.prepare("UPDATE car_specs SET status = 'failed', error = ?, updated_at = ? WHERE k = ?")
-      .bind(String((e && e.message) || e).slice(0, 200), Date.now(), k).run();
+  const job = (async () => {
+    let res;
+    try { res = await research(env, v); }
+    catch (e) {
+      await env.DB.prepare("UPDATE car_specs SET status = 'failed', error = ?, updated_at = ? WHERE k = ?")
+        .bind(String((e && e.message) || e).slice(0, 200), Date.now(), k).run();
+      return getSpec(env, k);
+    }
+    await env.DB.prepare(`UPDATE car_specs SET status = ?, body = ?, data = ?, sources = ?, models = ?, error = NULL, updated_at = ?
+        WHERE k = ?`).bind(res.status, res.data && res.data.body, res.data ? JSON.stringify(res.data) : null,
+      JSON.stringify(res.sources || []), JSON.stringify(res.models || []), Date.now(), k).run();
     return getSpec(env, k);
-  }
-  await env.DB.prepare(`UPDATE car_specs SET status = ?, body = ?, data = ?, sources = ?, models = ?, error = NULL, updated_at = ?
-      WHERE k = ?`).bind(res.status, res.data && res.data.body, res.data ? JSON.stringify(res.data) : null,
-    JSON.stringify(res.sources || []), JSON.stringify(res.models || []), Date.now(), k).run();
-  return getSpec(env, k);
+  })();
+  if (!defer) return job;
+  /* ค้นนานกว่าที่ควรรอในคำขอเดียว → ตอบ "กำลังค้น" ไปก่อน งานทำต่อเบื้องหลัง หน้าเว็บถามซ้ำเอง */
+  const done = await Promise.race([job, new Promise((z) => setTimeout(() => z(null), waitMs))]);
+  if (done) return done;
+  defer(job);
+  return { status: 'pending', key: k, make: v.make, model: v.model, year: v.year };
 }
 
 /* ผู้ใช้แจ้งว่าข้อมูลผิด — วันละไม่เกิน 5 ครั้งต่อคน */
@@ -284,13 +326,13 @@ export async function reportSpec(env, k, note, who) {
 
 /* หน้าแอดมิน: รุ่นที่มีคนแจ้งผิดขึ้นก่อน */
 export async function listSpecs(env) {
-  const { results = [] } = await env.DB.prepare(`SELECT k, make, model, year, status, body, hits, reports, updated_at, sources, data
+  const { results = [] } = await env.DB.prepare(`SELECT k, make, model, year, status, body, hits, reports, updated_at, sources, data, error
     FROM car_specs ORDER BY reports DESC, updated_at DESC LIMIT 300`).all();
   const { results: reps = [] } = await env.DB.prepare('SELECT k, note, at FROM car_spec_reports ORDER BY at DESC LIMIT 300').all();
   return results.map((r) => {
     let score = null; try { score = r.data ? JSON.parse(r.data).score : null; } catch (e) {}
     let n = 0; try { n = r.sources ? JSON.parse(r.sources).length : 0; } catch (e) {}
-    return { key: r.k, make: r.make, model: r.model, year: r.year, status: r.status, body: r.body, hits: r.hits, reports: r.reports,
+    return { key: r.k, make: r.make, model: r.model, year: r.year, status: r.status, body: r.body, hits: r.hits, reports: r.reports, error: r.error || '',
       updated_at: r.updated_at, sources: n, score, notes: reps.filter((x) => x.k === r.k).slice(0, 5).map((x) => ({ note: x.note, at: x.at })) };
   });
 }
