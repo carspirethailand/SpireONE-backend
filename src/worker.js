@@ -92,7 +92,10 @@ function rank(role) { return ROLE_RANK[role] || 0; }
    ยกเว้น ALTER TABLE สองบรรทัดที่ต้องดักข้อผิดพลาด "มีคอลัมน์นี้แล้ว" ทิ้ง
    ══════════════════════════════════════════════════════════════════ */
 
-const SCHEMA_VERSION = 16;
+const SCHEMA_VERSION = 17;
+
+/* ประเภทตัวถังที่แอปมีภาพรถให้ (ตรงกับ BODY_TYPES ในหน้าการาจ) */
+const CAR_BODIES = ['sedan', 'hatchback', 'suv', 'pickup', 'mpv', 'van', 'coupe', 'ev'];
 
 const SCHEMA_SQL = [
   /* ── ข้อมูลของผู้ใช้ที่ต้องเหมือนกันทุกเครื่อง ──
@@ -212,6 +215,9 @@ const SCHEMA_SQL = [
   `ALTER TABLE magazine ADD COLUMN origin TEXT`,
   `ALTER TABLE magazine ADD COLUMN points TEXT`,
   `ALTER TABLE magazine ADD COLUMN sort INTEGER`,
+  /* รถในการาจ: สีที่ผู้ใช้เลือก (#RRGGBB) และประเภทตัวถัง — ภาพรถในแอปใช้สองค่านี้ */
+  `ALTER TABLE cars ADD COLUMN color TEXT`,
+  `ALTER TABLE cars ADD COLUMN body TEXT`,
   `ALTER TABLE users ADD COLUMN created_at INTEGER`,
   `ALTER TABLE users ADD COLUMN banned INTEGER DEFAULT 0`,
   `ALTER TABLE users ADD COLUMN plan TEXT DEFAULT 'free'`,
@@ -4851,16 +4857,20 @@ ${convo}`;
           if (!make || !model) return deny('Missing required fields: make, model', 400);
           const carId = (typeof id === 'string' && id.length < 60 ? id : '') || 'c' + Date.now();
           const now = Date.now();
+          /* สีกับประเภทตัวถังไม่บังคับ — ไม่ส่งมาก็คงค่าเดิมไว้ (ส่งรถคันเดิมซ้ำเพื่อเปลี่ยนสีได้) */
+          const color = /^#[0-9a-f]{6}$/i.test(String(bodyData.color || '')) ? String(bodyData.color).toUpperCase() : null;
+          const body = CAR_BODIES.includes(bodyData.body) ? bodyData.body : null;
           await env.DB.prepare(`
-            INSERT INTO cars (id, uid, make, model, year, mileage, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO cars (id, uid, make, model, year, mileage, color, body, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
               make = excluded.make, model = excluded.model,
-              year = excluded.year, mileage = excluded.mileage
+              year = excluded.year, mileage = excluded.mileage,
+              color = COALESCE(excluded.color, cars.color), body = COALESCE(excluded.body, cars.body)
             WHERE cars.uid = excluded.uid
           `).bind(carId, actor.payload.sub, String(make).slice(0, 60), String(model).slice(0, 60),
-            String(year || '').slice(0, 8), String(mileage || '').slice(0, 12), now).run();
-          return json({ id: carId, uid: actor.payload.sub, make, model, year: year || '', mileage: mileage || '', created_at: now });
+            String(year || '').slice(0, 8), String(mileage || '').slice(0, 12), color, body, now).run();
+          return json({ id: carId, uid: actor.payload.sub, make, model, year: year || '', mileage: mileage || '', color, body, created_at: now });
         })();
       }
 
