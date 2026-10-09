@@ -20,6 +20,10 @@ function userTokens(contents) {
 /* โมเดลที่ใช้ตอบ + ค้นเว็บ เรียงตามลำดับที่จะลอง (gemini 3.1 flash lite และ 3.5 flash lite เป็นหลัก) */
 export function chatModels(env) {
   const list = [
+    env?.GEMINI_CHAT_MODEL,
+    env?.GEMINI_SEARCH_MODEL,
+    env?.GEMINI_MODEL,
+    'gemini-2.5-flash',
     'gemini-3.1-flash-lite',
     'gemini-3.5-flash-lite',
     'gemini-3.6-flash',
@@ -45,8 +49,8 @@ export function thinkingFor(question, hasMedia, skillIds) {
 /* thinkingConfig คนละแบบตามรุ่น — รุ่น 3 ใช้ระดับ รุ่น 2.5 ใช้งบโทเคน */
 function thinkingConfig(model, level) {
   if (!level) return null;
-  if (/gemini-3|gemini-[4-9]/.test(model)) return level === 'minimal' ? { thinkingLevel: 'minimal' } : { thinkingLevel: level, includeThoughts: true };
-  if (/gemini-2\.5/.test(model)) return level === 'minimal' ? { thinkingBudget: 0 } : { thinkingBudget: level === 'medium' ? 2048 : 512, includeThoughts: true };
+  if (/gemini-3|gemini-[4-9]/.test(model)) return { thinkingLevel: level, includeThoughts: false };
+  if (/gemini-2\.5/.test(model)) return { thinkingBudget: level === 'minimal' ? 0 : level === 'medium' ? 1024 : 256, includeThoughts: false };
   return null;
 }
 
@@ -227,7 +231,7 @@ export function reactProviders(env) {
       key: env.OPENROUTER_API_KEY,
       model: env.OPENROUTER_MODEL || 'openrouter/free',
       headers: { 'HTTP-Referer': 'https://carspirethailand.com', 'X-Title': 'Cendon' },
-      timeoutMs: 25000
+      timeoutMs: 10000
     });
   }
   // 2. ตัวสำรอง ReAct: Groq เท่านั้น (openai/gpt-oss-120b, openai/gpt-oss-20b, llama-3.1-8b-instant)
@@ -240,10 +244,10 @@ export function reactProviders(env) {
       model: env.GROQ_MODEL || 'openai/gpt-oss-120b',
       altModel: 'openai/gpt-oss-20b',
       emergencyModel: 'llama-3.1-8b-instant',
-      timeoutMs: 20000
+      timeoutMs: 10000
     });
   }
-  return L;
+  return L.sort((a,b)=>(a.src==='groq'?0:1)-(b.src==='groq'?0:1));
 }
 
 const REACT_SYSTEM_PROMPT = `
@@ -486,38 +490,47 @@ export async function reactAgent(env, opts) {
 }
 
 export async function fastAnswer(env, opts) {
-  // 1. สมองหลัก ReAct (OpenRouter -> Cerebras -> Groq)
-  try {
-    const res = await reactAgent(env, opts);
-    if (res && res.text && res.text.trim()) {
-      return res;
-    }
-  } catch (e) {
-    console.warn('[fastAnswer reactAgent error]', e.message || e);
-  }
-
-  // 2. ถ้า ReAct ล้มเหลว ถอยไปที่ Gemini (3.1 flash lite -> 3.5 flash lite เท่านั้น)
-  if (env.GEMINI_KEY && !bad('gemini|quota') && !bad('gemini|region')) {
+  let webResult;
+  const freshSystem=async()=>{
+    if(webResult===undefined)webResult=opts.question&&opts.executeSearch?await opts.executeSearch(opts.question).catch(()=> ''):'';
+    return (opts.system||'')+'\nผลค้นเว็บจริง:\n'+String(webResult||'ยังยืนยันข้อมูลล่าสุดไม่ได้ ต้องแจ้งผู้ใช้ตรง ๆ').slice(0,9000);
+  };
+  // Start the single-pass streaming route before the slower multi-turn free agent.
+  if (env.GEMINI_KEY) {
     const scope = await geminiScope(env);
-    const ladder = ['low', null];
-    const models = ['gemini-3.1-flash-lite', 'gemini-3.5-flash-lite'];
+    const models = chatModels(env);
     for (const model of models) {
       const scoped = key => scope + '|' + key;
       if (bad(scoped(model))) continue;
-      for (const level of ladder) {
+      let search=opts.search===true&&!bad(scoped(model+'|grounding'));
+      let system=opts.system,level=opts.level||'minimal';
+      if(opts.search===true&&!search&&opts.question)system=await freshSystem();
+      for (let attempt=0;attempt<3;attempt++) {
         try {
-          const r = await streamOnce(env, model, { ...opts, level, search: false });
-          trail(opts.meter, { model, level, search: false, ok: true, ms: 0, grounded: r.grounded });
-          return r;
+          const t0=Date.now();
+          const r = await streamOnce(env, model, { ...opts, system, level, search, onThought:undefined, headerMs:6000 });
+          trail(opts.meter, { model, level, search, ok: true, ms:Date.now()-t0, grounded: r.grounded });
+          return {...r,thoughts:''};
         } catch (e) {
-          if (e.quota) markBad(scoped(model), 60000);
+          if(e.partial)return {text:e.partial,thoughts:'',model,grounded:false,partial:true};
+          if(e.thinking&&level){level=level==='minimal'?null:'minimal';continue;}
+          if(e.tool&&search){
+            search=false;markBad(scoped(model+'|grounding'),60000);
+            // Keep fresh answers grounded even where Google's search quota is unavailable.
+            if(opts.question&&opts.executeSearch){
+              system=await freshSystem();
+            }
+            continue;
+          }
+          if(e.quota||e.dead)markBad(scoped(model),60000);
           break;
         }
       }
     }
   }
-
-  throw new Error('All configured models failed: ReAct (OpenRouter, Groq) and Gemini (3.1-flash-lite, 3.5-flash-lite)');
+  const fallback=await reactAgent(env,{...opts,onThought:undefined});
+  if(fallback&&fallback.text?.trim())return {...fallback,thoughts:'',reasoning:''};
+  throw new Error('All configured AI providers failed');
 }
 
 /* ══ ทางสำรองเมื่อ Gemini ใช้ไม่ได้ ══

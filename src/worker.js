@@ -4422,12 +4422,11 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                   question,
                   hasMedia,
                   carInfo,
-                  search: true,
+                  search: fresh,
                   executeSearch: async (q) => await executeGoogleSearchTool(env, q),
                   executeMedia: async (p) => await executeDescribeMediaTool(env, msgs, p),
                   executeKb: async (q) => await kbFor(env, carInfo, q),
                   depth: body.depth, level: levelFor(body.depth, question, hasMedia, body.skillIds), meter,
-                  onThought: d => send({ type: 'reasoning', delta: d }),
                   onSearch: async q => { await send({ type: 'research', q: String(q).slice(0, 120) }); await send({ type: 'status', key: 'search', text: 'กำลังค้น: ' + String(q).slice(0, 60) }) },
                   onText: async d => {
                     if (firstText) { firstText = false; await send({ type: 'status', key: 'write', text: 'กำลังเขียนคำตอบ' }); }
@@ -4611,7 +4610,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                 question,
                 hasMedia,
                 carInfo,
-                search: true,
+                search: fresh,
                 executeSearch: async (q) => await executeGoogleSearchTool(env, q),
                 executeMedia: async (p) => await executeDescribeMediaTool(env, body.contents, p),
                 executeKb: async (q) => await kbFor(env, carInfo, q),
@@ -4705,7 +4704,8 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
             bidiGenerateContentSetup: {
               model: 'models/' + liveModel,
               /* ความหน่วง: ปิดการคิดยาวของรุ่น 2.5 (คิดก่อนพูดทำให้เงียบไป 1-3 วิ) */
-              generationConfig: { responseModalities: ['AUDIO'], ...(/2\.5/.test(liveModel) ? { thinkingConfig: { thinkingBudget: 0 } } : {}) },
+              generationConfig: { responseModalities: ['AUDIO'], ...(/2\.5/.test(liveModel) ? { thinkingConfig: { thinkingBudget: 0, includeThoughts:false } } : /gemini-3\.1/.test(liveModel) ? { thinkingConfig:{thinkingLevel:'minimal',includeThoughts:false} } : /extended-thinking/.test(liveModel) ? { thinkingConfig:{thinkingLevel:'low',includeThoughts:false} } : {}) },
+              contextWindowCompression:{slidingWindow:{}},
               /* จับจังหวะพูดไวขึ้น: รู้ว่าเริ่มพูดเร็ว และเงียบแค่ 0.35 วิ ก็ถือว่าพูดจบ ส่งให้ AI ตอบทันที */
               realtimeInputConfig: { automaticActivityDetection: {
                 startOfSpeechSensitivity: 'START_SENSITIVITY_HIGH', endOfSpeechSensitivity: 'END_SENSITIVITY_HIGH',
