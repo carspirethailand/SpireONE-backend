@@ -96,6 +96,8 @@ const SCHEMA_VERSION = 17;
 
 /* ประเภทตัวถังที่แอปมีภาพรถให้ (ตรงกับ BODY_TYPES ในหน้าการาจ) */
 const CAR_BODIES = ['sedan', 'hatchback', 'suv', 'pickup', 'mpv', 'van', 'coupe', 'ev'];
+/* Reserved server-only markers: a stale device must never recreate a deleted ID. */
+const CAR_DELETED_PREFIX = '_car_deleted:';
 
 const SCHEMA_SQL = [
   /* ── ข้อมูลของผู้ใช้ที่ต้องเหมือนกันทุกเครื่อง ──
@@ -1256,6 +1258,26 @@ async function stateOf(env, uid, key) {
     if (!r || !r.v) return null;
     return JSON.parse(r.v);
   } catch (e) { return null }
+}
+
+async function carDeletions(env, uid) {
+  const rs = await env.DB.prepare('SELECT k, t FROM user_state WHERE uid = ? AND substr(k, 1, 13) = ?')
+    .bind(uid, CAR_DELETED_PREFIX).all();
+  const ids = new Set();
+  let t = 0;
+  for (const r of rs.results || []) {
+    ids.add(r.k.slice(CAR_DELETED_PREFIX.length));
+    t = Math.max(t, Number(r.t) || 0);
+  }
+  return { ids, t };
+}
+
+function withoutDeletedCars(key, value, deleted) {
+  if (key === 'garage' && Array.isArray(value)) {
+    return value.filter(c => !c || !deleted.ids.has(String(c.id)));
+  }
+  if (key === 'selCar' && deleted.ids.has(String(value))) return '';
+  return value;
 }
 
 async function userContext(env, uid, carId, hint) {
@@ -3835,11 +3857,14 @@ export default {
             args.push(...only);
           }
           const rs = await env.DB.prepare(sql).bind(...args).all();
+          const deleted = await carDeletions(env, actor.payload.sub);
           const state = {};
           (rs.results || []).forEach((r) => {
+            if (r.k.startsWith(CAR_DELETED_PREFIX)) return;
             let v = null;
             try { v = JSON.parse(r.v); } catch (e) { v = r.v; }
-            state[r.k] = { v, t: r.t };
+            v = withoutDeletedCars(r.k, v, deleted);
+            state[r.k] = { v, t: (r.k === 'garage' || r.k === 'selCar') ? Math.max(Number(r.t) || 0, deleted.t) : r.t };
           });
           return json({ state, now: Date.now() });
         })();
@@ -3853,13 +3878,17 @@ export default {
           const now = Date.now();
           const saved = [];
           const skipped = [];
+          const deleted = (Object.hasOwn(items, 'garage') || Object.hasOwn(items, 'selCar'))
+            ? await carDeletions(env, uid) : { ids: new Set(), t: 0 };
           for (const k of Object.keys(items).slice(0, 40)) {
-            if (!/^[A-Za-z0-9_:.-]{1,64}$/.test(k)) { skipped.push(k); continue; }
+            if (k.startsWith(CAR_DELETED_PREFIX) || !/^[A-Za-z0-9_:.-]{1,64}$/.test(k)) { skipped.push(k); continue; }
             const item = items[k] || {};
-            const raw = JSON.stringify(item.v === undefined ? null : item.v);
+            const value = withoutDeletedCars(k, item.v === undefined ? null : item.v, deleted);
+            const raw = JSON.stringify(value);
             /* กันคนยัดข้อมูลก้อนใหญ่จนฐานข้อมูลบวม 256KB ต่อคีย์พอสำหรับบทสนทนาเป็นร้อย */
             if (raw.length > 256 * 1024) { skipped.push(k); continue; }
-            const t = Number(item.t) > 0 ? Number(item.t) : now;
+            let t = Number(item.t) > 0 ? Number(item.t) : now;
+            if (k === 'garage' || k === 'selCar') t = Math.max(t, deleted.t);
             await env.DB.prepare(`
               INSERT INTO user_state (uid, k, v, t) VALUES (?, ?, ?, ?)
               ON CONFLICT(uid, k) DO UPDATE SET v = excluded.v, t = excluded.t
@@ -4845,6 +4874,10 @@ ${convo}`;
         return await guarded('user', async (actor) => {
           const { results } = await env.DB.prepare('SELECT * FROM cars WHERE uid = ? ORDER BY created_at DESC')
             .bind(actor.payload.sub).all();
+          if (url.searchParams.get('sync') === '1') {
+            const deleted = await carDeletions(env, actor.payload.sub);
+            return json({ cars: results.filter(c => !deleted.ids.has(String(c.id))), deleted: [...deleted.ids] });
+          }
           return json(results);
         })();
       }
@@ -4860,27 +4893,47 @@ ${convo}`;
           /* สีกับประเภทตัวถังไม่บังคับ — ไม่ส่งมาก็คงค่าเดิมไว้ (ส่งรถคันเดิมซ้ำเพื่อเปลี่ยนสีได้) */
           const color = /^#[0-9a-f]{6}$/i.test(String(bodyData.color || '')) ? String(bodyData.color).toUpperCase() : null;
           const body = CAR_BODIES.includes(bodyData.body) ? bodyData.body : null;
-          await env.DB.prepare(`
+          const result = await env.DB.prepare(`
             INSERT INTO cars (id, uid, make, model, year, mileage, color, body, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+            WHERE NOT EXISTS (SELECT 1 FROM user_state WHERE uid = ? AND k = ?)
             ON CONFLICT(id) DO UPDATE SET
               make = excluded.make, model = excluded.model,
               year = excluded.year, mileage = excluded.mileage,
               color = COALESCE(excluded.color, cars.color), body = COALESCE(excluded.body, cars.body)
             WHERE cars.uid = excluded.uid
           `).bind(carId, actor.payload.sub, String(make).slice(0, 60), String(model).slice(0, 60),
-            String(year || '').slice(0, 8), String(mileage || '').slice(0, 12), color, body, now).run();
+            String(year || '').slice(0, 8), String(mileage || '').slice(0, 12), color, body, now,
+            actor.payload.sub, CAR_DELETED_PREFIX + carId).run();
+          if (result.meta && result.meta.changes === 0) {
+            const marker = await env.DB.prepare('SELECT t FROM user_state WHERE uid = ? AND k = ?')
+              .bind(actor.payload.sub, CAR_DELETED_PREFIX + carId).first();
+            if (marker) return deny('Car was deleted; add it again with a new ID', 410);
+            return deny('Car ID is unavailable', 409);
+          }
           return json({ id: carId, uid: actor.payload.sub, make, model, year: year || '', mileage: mileage || '', color, body, created_at: now });
         })();
       }
 
       if (url.pathname.startsWith('/api/cars/') && request.method === 'DELETE') {
         return await guarded('user', async (actor) => {
-          const carId = url.pathname.split('/').pop();
-          if (!carId) return deny('Missing car ID', 400);
-          const result = await env.DB.prepare('DELETE FROM cars WHERE id = ? AND uid = ?')
-            .bind(carId, actor.payload.sub).run();
-          if (result.meta && result.meta.changes === 0) return deny('Car not found or unauthorized', 404);
+          let carId;
+          try { carId = decodeURIComponent(url.pathname.split('/').pop()); }
+          catch (e) { return deny('Invalid car ID', 400); }
+          if (!carId || carId.length >= 60) return deny('Invalid car ID', 400);
+          const uid = actor.payload.sub;
+          const now = Date.now();
+          /* One transaction: an in-flight POST either precedes this deletion or is
+             blocked by its marker. Missing local-only cars may also be deleted. */
+          const results = await env.DB.batch([
+            env.DB.prepare(`INSERT INTO user_state (uid, k, v, t)
+              SELECT ?, ?, 'true', ?
+              WHERE NOT EXISTS (SELECT 1 FROM cars WHERE id = ? AND uid <> ?)
+              ON CONFLICT(uid, k) DO UPDATE SET t = MAX(user_state.t, excluded.t)`)
+              .bind(uid, CAR_DELETED_PREFIX + carId, now, carId, uid),
+            env.DB.prepare('DELETE FROM cars WHERE id = ? AND uid = ?').bind(carId, uid),
+          ]);
+          if (results[0].meta && results[0].meta.changes === 0) return deny('Car not found or unauthorized', 404);
           return json({ success: true });
         })();
       }
