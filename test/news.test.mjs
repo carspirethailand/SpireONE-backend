@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {fixture} from './tech-fixtures.mjs';
 import worker from '../src/worker.js';
 import {parseFeed, pick, refreshNews, newsAI} from '../src/news.js';
+import {chatModels} from '../src/fastai.js';
 
 /* นิตยสาร: รวมข่าวจากฟีดจริง + Gemini แยกจากแชต — เว็บข่าวและ AI ในเทสต์เป็นของปลอมทั้งหมด */
 const NOW=Date.UTC(2026,9,9,6,0,0);
@@ -37,7 +38,7 @@ function setup(env={},{feedsFail=false,aiFail=false}={}){
   const f=fixture({GEMINI_KEY:'chat-key-test-only',...env});
   f.sqlite.exec(`CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT); INSERT INTO config VALUES ('schema_version','999');
     CREATE TABLE magazine (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, short_description TEXT, full_description TEXT, type TEXT, created_at INTEGER NOT NULL,
-      source TEXT, url TEXT, image TEXT, published_at INTEGER, origin TEXT, points TEXT, sort INTEGER);
+      source TEXT, url TEXT, image TEXT, published_at INTEGER, origin TEXT, points TEXT, sort INTEGER, src_key TEXT);
     INSERT INTO magazine (title, created_at, origin, sort) VALUES ('บทความทีมงาน',1,'manual',0),('ข่าวรอบก่อน',1,'feed',1);`);
   const ai=[];
   globalThis.fetch=async(url,init={})=>{const u=String(url);
@@ -55,20 +56,63 @@ function setup(env={},{feedsFail=false,aiFail=false}={}){
   return {f,ai};
 }
 
-test('refresh: real headlines become Thai stories with images, links and order; team articles stay',async()=>{
+const feedRows=f=>f.sqlite.prepare("SELECT * FROM magazine WHERE origin <> 'manual' ORDER BY created_at DESC, sort").all();
+const usedModel=(c,m)=>c.u.includes('/models/'+m+':');
+
+test('refresh: new headlines are added as Thai stories with images and links; earlier stories and team articles stay',async()=>{
   const {f,ai}=setup();
   const st=await refreshNews(f.env,{force:true});
   assert.equal(st.error,'');assert.equal(st.mode,'feeds',JSON.stringify(st));
   assert.equal(st.feeds.find(x=>x.name==='Headlightmag').n,5);assert.ok(st.feeds.find(x=>x.name==='Electrek').err,'a broken feed is reported, not fatal');
-  const rows=f.sqlite.prepare("SELECT * FROM magazine ORDER BY CASE WHEN origin='manual' THEN 0 ELSE 1 END, sort").all();
-  assert.equal(rows[0].title,'บทความทีมงาน');assert.ok(!rows.some(r=>r.title==='ข่าวรอบก่อน'),'last round is replaced');
+  assert.equal(st.added,6,'empty slots are filled: everything new that is car news');
+  const rows=feedRows(f);
+  assert.ok(rows.some(r=>r.title==='ข่าวรอบก่อน'),'earlier stories stay');
+  assert.ok(f.sqlite.prepare("SELECT 1 FROM magazine WHERE title='บทความทีมงาน'").get());
   assert.ok(!rows.some(r=>/โฆษณา/.test(r.title)),'AI drops what is not car news');
-  const top=rows[1];assert.match(top.title,/^พาดหัว /);assert.ok(top.url.startsWith('https://'));assert.ok(top.image.startsWith('https://'));
-  assert.deepEqual(JSON.parse(top.points),['ราคา 799,000 บาท']);assert.equal(top.origin,'feed');
+  const top=rows[0];assert.match(top.title,/^พาดหัว /);assert.ok(top.url.startsWith('https://'));assert.ok(top.image.startsWith('https://'));
+  assert.deepEqual(JSON.parse(top.points),['ราคา 799,000 บาท']);assert.equal(top.origin,'feed');assert.ok(top.src_key);
   assert.ok(rows.some(r=>r.type==='รถใหม่'));assert.ok(!rows.some(r=>r.type==='ไม่มีหมวดนี้'),'unknown categories fall back');
   assert.equal(rows.find(r=>r.url==='https://th.example/news-4').image,'https://img.example/og.jpg','missing image comes from the article page');
-  assert.ok(ai.every(c=>!/flash-lite/.test(c.u)),'without its own key, news avoids the models chat uses first');
+  const main=chatModels(f.env).slice(0,2);
+  assert.ok(ai.length&&ai.every(c=>!main.some(m=>usedModel(c,m))),'without its own key, news never uses the models chat answers with first: '+main);
   assert.ok(ai.every(c=>c.key==='chat-key-test-only'));
+});
+
+test('refresh: the same stories are not added twice, and AI is not asked again',async()=>{
+  const {f,ai}=setup();
+  await refreshNews(f.env,{force:true});const n=ai.length,count=feedRows(f).length;
+  const st=await refreshNews(f.env,{force:true});
+  assert.equal(st.error,'');assert.equal(st.fresh,0);assert.equal(st.added,0);
+  assert.equal(feedRows(f).length,count);assert.equal(ai.length,n,'no AI call when nothing is new');
+});
+
+test('refresh: 20 slots — new stories come in, the oldest drop out, team articles never do',async()=>{
+  const {f}=setup();
+  f.sqlite.exec("DELETE FROM magazine WHERE title='ข่าวรอบก่อน'");
+  const ins=f.sqlite.prepare("INSERT INTO magazine (title, created_at, origin, sort, url) VALUES (?,?,?,?,?)");
+  for(let k=1;k<=20;k++)ins.run('เก่า '+k,k*1000,'feed',1,'https://old.example/'+k);
+  /* ข่าวที่ 21 เข้ามา → ข่าวที่เก่าที่สุดหลุด */
+  let st=await refreshNews({...f.env,NEWS_PER_ROUND:'1'},{force:true});
+  assert.equal(st.added,1);assert.equal(st.removed,1);assert.equal(st.total,20);
+  let rows=feedRows(f);assert.equal(rows.length,20);
+  assert.ok(!rows.some(r=>r.title==='เก่า 1'),'the oldest one is out');assert.ok(rows.some(r=>r.title==='เก่า 2'));
+  assert.match(rows[0].title,/^พาดหัว /,'the new one is on top');
+  /* รอบปกติ: ไม่เกินรอบละ 6 ข่าว ข่าวเก่าที่เหลือยังอยู่ */
+  st=await refreshNews(f.env,{force:true});
+  assert.ok(st.added>=1&&st.added<=6,JSON.stringify(st));assert.equal(st.removed,st.added);
+  rows=feedRows(f);assert.equal(rows.length,20);assert.ok(rows.some(r=>r.title==='เก่า 20'),'recent old stories stay');
+  assert.ok(f.sqlite.prepare("SELECT 1 FROM magazine WHERE title='บทความทีมงาน'").get(),'team article is never removed');
+});
+
+test('refresh: runs every 5 hours (hourly cron is skipped in between); a failed round retries an hour later',async()=>{
+  const {f}=setup();
+  const save=(at,error='')=>f.sqlite.prepare("INSERT INTO config VALUES ('news_status',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(JSON.stringify({at,error}));
+  save(Date.now()-3*3600000);
+  assert.equal((await refreshNews(f.env)).skipped,true,'3 hours after the last round: wait');
+  save(Date.now()-5*3600000);
+  assert.ok(!(await refreshNews(f.env)).skipped,'5 hours after: update');
+  save(Date.now()-3600000,'AI สรุปข่าวไม่สำเร็จ');
+  assert.ok(!(await refreshNews(f.env)).skipped,'last round failed: try again an hour later');
 });
 
 test('refresh: a separate news key keeps news off the chat quota entirely',async()=>{
@@ -78,7 +122,7 @@ test('refresh: a separate news key keeps news off the chat quota entirely',async
   assert.ok(ai.length>0&&ai.every(c=>c.key==='news-key-test-only'));
 });
 
-test('refresh: no feeds reachable → AI searches the web; AI down → old stories stay and the error is recorded',async()=>{
+test('refresh: no feeds reachable → AI searches the web; AI down → stories stay and the error is recorded',async()=>{
   let {f,ai}=setup({},{feedsFail:true});
   let st=await refreshNews(f.env,{force:true});
   assert.equal(st.mode,'ai');assert.ok(ai[0].body.tools,'uses web search');
@@ -90,10 +134,10 @@ test('refresh: no feeds reachable → AI searches the web; AI down → old stori
   assert.ok(JSON.parse(f.sqlite.prepare("SELECT value FROM config WHERE key='news_status'").get().value).error);
 });
 
-test('magazine API: team articles first, then the order the round chose',async()=>{
+test('magazine API: team articles first, then the newest round, in the order that round chose',async()=>{
   const {f}=setup();
-  f.sqlite.exec("INSERT INTO magazine (title, created_at, origin, sort) VALUES ('ข่าวอันดับ 2',1,'feed',2),('ข่าวอันดับ 1',1,'feed',1)");
+  f.sqlite.exec("INSERT INTO magazine (title, created_at, origin, sort) VALUES ('ข่าวอันดับ 2',5,'feed',2),('ข่าวอันดับ 1',5,'feed',1),('ข่าวรอบเก่า',2,'feed',1)");
   f.sqlite.exec("DELETE FROM magazine WHERE title='ข่าวรอบก่อน'");
   const r=await worker.fetch(new Request('https://api.unit.test/api/magazine'),f.env,{waitUntil(){}});
-  assert.deepEqual((await r.json()).map(x=>x.title),['บทความทีมงาน','ข่าวอันดับ 1','ข่าวอันดับ 2']);
+  assert.deepEqual((await r.json()).map(x=>x.title),['บทความทีมงาน','ข่าวอันดับ 1','ข่าวอันดับ 2','ข่าวรอบเก่า']);
 });

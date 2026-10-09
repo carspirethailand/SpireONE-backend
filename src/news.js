@@ -1,3 +1,5 @@
+import { chatModels } from './fastai.js';
+
 /* ══════════════════════════════════════════════════════════════════
    นิตยสาร Cendon — รวมข่าวรถจากแหล่งข่าวจริง แบบ Google News
 
@@ -6,9 +8,17 @@
       AI เขียนจากเนื้อข่าวที่ดึงมาเท่านั้น ห้ามแต่งข้อเท็จจริงเพิ่ม และทุกข่าวมีลิงก์ไปต้นฉบับ
    3) ถ้าดึงฟีดได้น้อยเกินไป ถอยไปให้ AI ค้นเว็บเอง (แบบเดิม) — นิตยสารต้องไม่ว่าง
 
+   ช่องข่าวแบบเลื่อน (20 ช่อง) — อัปเดตทุก 5 ชั่วโมง
+   - แต่ละรอบเพิ่มเฉพาะข่าวที่ยังไม่มี (เทียบลิงก์และพาดหัวต้นฉบับ) ข่าวเดิมอยู่ต่อ
+   - รอบละไม่เกิน 6 ข่าว (ข่าวเด่นสุดของรอบ) ยกเว้นตอนช่องยังว่าง จะเติมจนเต็ม
+   - ข่าวเกิน 20 เมื่อไร ข่าวที่เก่าที่สุดหลุดออกไป (ข่าวใหม่เข้า ข่าวเก่าสุดออก)
+   - ส่งให้ AI สรุปเฉพาะข่าวใหม่ จึงใช้โควตาน้อยลงมาก
+   - บทความที่ทีมงานเขียนเอง (origin = manual) ไม่นับในช่อง และไม่ถูกลบ
+
    Gemini ของนิตยสารแยกจากแชต (โควตาไม่ชนกัน):
    - ตั้ง GEMINI_NEWS_KEY (คีย์จากอีกโปรเจกต์ Google) = แยกโควตาขาดจากแชตทั้งหมด
-   - ยังไม่ตั้ง = ใช้คีย์เดิมแต่เลือกรุ่นที่แชตไม่ได้ใช้เป็นหลัก (แชตใช้ flash-lite ก่อนเสมอ)
+   - ยังไม่ตั้ง = ใช้คีย์เดิม แต่ไม่ใช้รุ่นที่แชตใช้ตอบเป็นหลัก (อ่านจากรายการของแชตเองทุกครั้ง
+     แชตเปลี่ยนลำดับรุ่นเมื่อไร นิตยสารหลบตามเอง) — Gemini นับโควตาแยกตามรุ่น
    - GEMINI_NEWS_MODEL บังคับรุ่นเองได้
 
    ผลแต่ละรอบ (แหล่งไหนได้กี่ข่าว ใช้รุ่นไหน ผิดพลาดอะไร) เก็บใน config: news_status ให้หน้าแอดมินดู
@@ -31,6 +41,11 @@ export const FEEDS = [
 export const CATS = ['ข่าวเด่น', 'รถใหม่', 'EV', 'รีวิว', 'เทคโนโลยี', 'ราคา', 'ตลาดรถ', 'มอเตอร์สปอร์ต', 'เคล็ดลับ', 'นโยบาย'];
 
 const DAY = 86400000;
+export const NEWS_SLOTS = 20;                 // ช่องข่าวทั้งหมด (ไม่นับบทความทีมงาน)
+export const NEWS_PER_ROUND = 6;              // ข่าวใหม่ต่อรอบ (ช่องยังว่างจะเติมจนเต็ม)
+export const NEWS_EVERY = 5 * 3600000;        // อัปเดตทุก 5 ชั่วโมง
+const slotsOf = (env) => Math.max(1, Math.min(60, Number(env.NEWS_SLOTS) || NEWS_SLOTS));
+const perRoundOf = (env) => Math.max(1, Math.min(30, Number(env.NEWS_PER_ROUND) || NEWS_PER_ROUND));
 
 /* ─────────── อ่าน RSS / Atom (Workers ไม่มี DOMParser — แยกด้วย regex ให้เบา CPU) ─────────── */
 const ENT = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', hellip: '…', ndash: '–', mdash: '—',
@@ -162,13 +177,16 @@ export function pick(items, now = Date.now()) {
 }
 
 /* ─────────── Gemini ของนิตยสาร ─────────── */
+const NEWS_MODELS = ['gemini-2.5-flash-lite', 'gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'];
 export function newsAI(env) {
   const own = !!env.GEMINI_NEWS_KEY;
+  /* คีย์เดียวกับแชต: ตัดรุ่นที่แชตใช้ตอบเป็นหลัก (สองตัวแรกในรายการของแชต) ออก */
+  const chatMain = own ? [] : chatModels(env).slice(0, 2);
   const models = [env.GEMINI_NEWS_MODEL, ...(own
     ? ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.6-flash']
-    : ['gemini-3.6-flash', 'gemini-2.5-flash', 'gemini-3.8-flash'])]
+    : NEWS_MODELS.filter((m) => !chatMain.includes(m)))]
     .map((m) => String(m || '').trim()).filter(Boolean);
-  return { key: env.GEMINI_NEWS_KEY || env.GEMINI_KEY || '', own, models: [...new Set(models)] };
+  return { key: env.GEMINI_NEWS_KEY || env.GEMINI_KEY || '', own, models: [...new Set(models)], chatMain };
 }
 
 async function gemini(env, ai, { prompt, json = true, search = false, maxTokens = 8192 }) {
@@ -294,8 +312,13 @@ async function note(env, key, value) {
 
 export async function refreshNews(env, { force = false } = {}) {
   const now = Date.now();
-  /* กันรันซ้อน (cron กับปุ่มในหน้าแอดมินพร้อมกัน) — ล็อกไว้ 10 นาที */
+  const SLOTS = slotsOf(env), PER = perRoundOf(env);
   if (!force) {
+    /* cron เรียกทุกชั่วโมง แต่ทำงานจริงเมื่อครบ 5 ชั่วโมงจากรอบล่าสุด
+       (รอบล่าสุดพลาด ลองใหม่ในชั่วโมงถัดไป ไม่ต้องรอ 5 ชั่วโมง) */
+    const last = await newsStatus(env);
+    if (last && last.at && now - last.at < (last.error ? 50 * 60000 : NEWS_EVERY - 15 * 60000)) return { skipped: true, next_at: last.next_at || 0 };
+    /* กันรันซ้อน (cron กับปุ่มในหน้าแอดมินพร้อมกัน) — ล็อกไว้ 10 นาที */
     try {
       const l = await env.DB.prepare("SELECT value FROM config WHERE key = 'news_lock'").first();
       if (l && now - JSON.parse(l.value) < 600000) return { skipped: true };
@@ -303,8 +326,21 @@ export async function refreshNews(env, { force = false } = {}) {
   }
   await note(env, 'news_lock', now);
   const ai = newsAI(env);
-  const status = { at: now, mode: 'feeds', own: ai.own, model: '', feeds: [], picked: 0, kept: 0, error: '' };
+  const status = { at: now, next_at: now + NEWS_EVERY, mode: 'feeds', own: ai.own, model: '', feeds: [], picked: 0,
+    fresh: 0, added: 0, removed: 0, total: 0, slots: SLOTS, error: '' };
   try {
+    /* ข่าวที่มีอยู่แล้ว — ใช้กันข่าวซ้ำ และดูว่าช่องยังว่างกี่ช่อง */
+    const { results: have = [] } = await env.DB.prepare(
+      "SELECT url, src_key, title FROM magazine WHERE origin IS NULL OR origin <> 'manual'").all();
+    const seenUrl = new Set(have.map((r) => r.url).filter(Boolean));
+    const seenKey = new Set(have.flatMap((r) => [r.src_key, keyOf(r.title)]).filter(Boolean));
+    /* ข่าวที่ AI เคยคัดทิ้ง (ไม่ใช่ข่าวรถ) จำไว้ จะได้ไม่ส่งให้ AI ดูซ้ำทุกรอบ */
+    let skip = [];
+    try { const r = await env.DB.prepare("SELECT value FROM config WHERE key = 'news_skip'").first(); skip = r ? JSON.parse(r.value) : []; } catch (e) {}
+    const skipSet = new Set(Array.isArray(skip) ? skip : []);
+    const isNew = (x) => !(x.url && seenUrl.has(x.url)) && !seenKey.has(keyOf(x.title)) && !skipSet.has(x.url || keyOf(x.title));
+    const want = Math.max(PER, SLOTS - have.length);
+
     const feeds = feedsOf(env);
     const got = await Promise.all(feeds.map(async (f) => {
       try {
@@ -319,31 +355,47 @@ export async function refreshNews(env, { force = false } = {}) {
     const picked = pick(got.flat(), now);
     status.picked = picked.length;
 
-    let result;
+    let result = { items: [], model: '' };
     if (picked.length >= 6) {
-      result = await enrich(env, ai, picked);
-      /* รูปปกที่ฟีดไม่ได้ให้มา — ดูจากหน้าเว็บต้นฉบับ (ข้ามลิงก์ของ Google News ที่เป็นหน้าพาไปต่อ) */
-      const need = rank(result.items, now).filter((x) => !x.image && x.url && !/news\.google\./.test(x.url)).slice(0, 8);
-      await Promise.all(need.map(async (x) => { x.image = await ogImage(x.url); }));
+      /* ส่งให้ AI เฉพาะข่าวใหม่ (เผื่อ AI คัดข่าวที่ไม่ใช่ข่าวรถทิ้งบ้าง) */
+      const fresh = picked.filter(isNew).map((x) => ({ ...x, srcKey: keyOf(x.title) }));
+      status.fresh = fresh.length;
+      if (fresh.length) {
+        const sent = fresh.slice(0, Math.min(28, want * 2 + 4));
+        result = await enrich(env, ai, sent);
+        const kept = new Set(result.items.map((x) => x.srcKey));
+        const dropped = sent.filter((x) => !kept.has(x.srcKey)).map((x) => x.url || x.srcKey);
+        if (dropped.length) await note(env, 'news_skip', [...skipSet, ...dropped].slice(-400));
+        /* รูปปกที่ฟีดไม่ได้ให้มา — ดูจากหน้าเว็บต้นฉบับ (ข้ามลิงก์ของ Google News ที่เป็นหน้าพาไปต่อ) */
+        const need = rank(result.items, now).slice(0, want).filter((x) => !x.image && x.url && !/news\.google\./.test(x.url)).slice(0, 8);
+        await Promise.all(need.map(async (x) => { x.image = await ogImage(x.url); }));
+      }
     } else {
       status.mode = 'ai';
       result = await aiSearchNews(env, ai);
+      result.items = result.items.filter(isNew).map((x) => ({ ...x, srcKey: keyOf(x.title) }));
+      status.fresh = result.items.length;
     }
     status.model = result.model;
-    const rows = rank(result.items, now).slice(0, 24);
-    status.kept = rows.length;
-    if (!rows.length) throw new Error('ไม่มีข่าวที่ผ่านการคัด');
+    const rows = rank(result.items, now).slice(0, want);
+    status.added = rows.length;
 
     const INS = `INSERT INTO magazine (title, short_description, full_description, type, created_at,
-      source, url, image, published_at, origin, points, sort) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
-    /* ลบเฉพาะข่าวรอบก่อน — บทความที่ทีมงานเขียนเอง (origin = manual) อยู่ต่อ */
-    await env.DB.batch([
-      env.DB.prepare("DELETE FROM magazine WHERE origin IS NULL OR origin <> 'manual'"),
+      source, url, image, published_at, origin, points, sort, src_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+    /* ข่าวใหม่เข้า → เกิน 20 ช่องเมื่อไร ข่าวที่เก่าที่สุดหลุดออก (รอบเก่าสุดก่อน ในรอบเดียวกันข่าวอันดับท้ายก่อน)
+       บทความที่ทีมงานเขียนเอง (origin = manual) ไม่นับและไม่ถูกลบ */
+    const out = await env.DB.batch([
       ...rows.map((x, k) => env.DB.prepare(INS).bind(x.title, x.summary, x.body, x.category, now, x.source || '', x.url || '', x.image || '',
-        x.at || now, status.mode === 'ai' ? 'ai' : 'feed', JSON.stringify(x.points || []), k + 1)),
+        x.at || now, status.mode === 'ai' ? 'ai' : 'feed', JSON.stringify(x.points || []), k + 1, x.srcKey || keyOf(x.title))),
+      env.DB.prepare(`DELETE FROM magazine WHERE id IN (SELECT id FROM magazine WHERE origin IS NULL OR origin <> 'manual'
+        ORDER BY created_at DESC, COALESCE(sort, 9999) ASC, id DESC LIMIT -1 OFFSET ?)`).bind(SLOTS),
     ]);
+    const del = out[out.length - 1];
+    status.removed = (del && del.meta && Number(del.meta.changes)) || 0;
+    status.total = Math.min(SLOTS, have.length + rows.length);
   } catch (e) {
     status.error = String((e && e.message) || e).slice(0, 300);
+    status.next_at = now + 3600000;
   }
   await note(env, 'news_status', status);
   await note(env, 'news_lock', 0);

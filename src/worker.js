@@ -92,7 +92,7 @@ function rank(role) { return ROLE_RANK[role] || 0; }
    ยกเว้น ALTER TABLE สองบรรทัดที่ต้องดักข้อผิดพลาด "มีคอลัมน์นี้แล้ว" ทิ้ง
    ══════════════════════════════════════════════════════════════════ */
 
-const SCHEMA_VERSION = 17;
+const SCHEMA_VERSION = 18;
 
 /* ประเภทตัวถังที่แอปมีภาพรถให้ (ตรงกับ BODY_TYPES ในหน้าการาจ) */
 const CAR_BODIES = ['sedan', 'hatchback', 'suv', 'pickup', 'mpv', 'van', 'coupe', 'ev'];
@@ -217,6 +217,8 @@ const SCHEMA_SQL = [
   `ALTER TABLE magazine ADD COLUMN origin TEXT`,
   `ALTER TABLE magazine ADD COLUMN points TEXT`,
   `ALTER TABLE magazine ADD COLUMN sort INTEGER`,
+  /* พาดหัวต้นฉบับแบบย่อ (ก่อน AI เขียนใหม่) — ใช้กันข่าวเดิมเข้าซ้ำในรอบถัดไป */
+  `ALTER TABLE magazine ADD COLUMN src_key TEXT`,
   /* รถในการาจ: สีที่ผู้ใช้เลือก (#RRGGBB) และประเภทตัวถัง — ภาพรถในแอปใช้สองค่านี้ */
   `ALTER TABLE cars ADD COLUMN color TEXT`,
   `ALTER TABLE cars ADD COLUMN body TEXT`,
@@ -1909,7 +1911,8 @@ async function getGeminiDiagnosis(env, carInfo, symptoms) {
 }
 
 /* ===== Magazine news via Gemini ===== */
-const NEWS_CRON = '30 */3 * * *';
+/* ทุกชั่วโมง (นาทีที่ 30) — refreshNews ทำงานจริงเมื่อครบ 5 ชั่วโมงจากรอบล่าสุดเท่านั้น */
+const NEWS_CRON = '30 * * * *';
 /* ข่าวนิตยสาร: ดู news.js (รวมข่าวจาก RSS ของแหล่งข่าวจริง + Gemini แยกจากแชต) */
 
 /* ===== SHOP: AI-sourced parts & accessories ===== */
@@ -4940,9 +4943,9 @@ ${convo}`;
 
       /* ===== MAGAZINE (public read) ===== */
       if (url.pathname === '/api/magazine' && request.method === 'GET') {
-        /* บทความที่ทีมงานเขียนเองขึ้นก่อน แล้วตามลำดับที่รอบอัปเดตจัดไว้ (ข่าวเด่นสุดก่อน) */
+        /* บทความที่ทีมงานเขียนเองขึ้นก่อน แล้วข่าวรอบล่าสุดก่อน ในรอบเดียวกันเรียงตามความเด่นที่รอบนั้นจัดไว้ (ข่าวเด่นสุดก่อน) */
         const { results } = await env.DB.prepare(
-          "SELECT * FROM magazine ORDER BY CASE WHEN origin = 'manual' THEN 0 ELSE 1 END, COALESCE(sort, 9999), id DESC").all();
+          "SELECT * FROM magazine ORDER BY CASE WHEN origin = 'manual' THEN 0 ELSE 1 END, created_at DESC, COALESCE(sort, 9999), id DESC").all();
         return json(results);
       }
       if (url.pathname === '/api/magazine/status' && request.method === 'GET') {
@@ -5746,10 +5749,9 @@ ${convo}`;
     ctx.waitUntil(ensureSchema(env));
     // รอบถี่ทำเฉพาะงานที่นัดเวลาไว้ ส่วนงานหนักปล่อยให้รอบวันละครั้งทำ
     ctx.waitUntil(runDueJobs(env));
-    /* นิตยสารอัปเดตทุก 3 ชั่วโมง (รอบของตัวเอง ไม่พ่วงงานหนักรายวัน) */
+    /* นิตยสาร: เช็กทุกชั่วโมง อัปเดตจริงทุก 5 ชั่วโมง (รอบของตัวเอง ไม่พ่วงงานหนักรายวัน) */
     if (event.cron === NEWS_CRON) { ctx.waitUntil(refreshNews(env)); return; }
     if (event.cron !== '*/10 * * * *') {
-      ctx.waitUntil(refreshNews(env));
       ctx.waitUntil(runPushRound(env));
       ctx.waitUntil(runOdoRound(env));
       ctx.waitUntil(refreshKb(env).catch(() => {}));
