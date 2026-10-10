@@ -65,28 +65,41 @@ async function searchCall(env, ai, model, prompt) {
         generationConfig: { temperature: 0.1, maxOutputTokens: 8192, ...(think ? { thinkingConfig: think } : {}) },
       }),
     });
-    let r = await send(thinking(model, false));
+    let r = await send(thinking(model, false)), retried = false;
     /* บางรุ่นไม่รับค่าการคิดที่ตั้งไป (ตอบ 400) — ลองอีกครั้งแบบไม่ตั้ง */
-    if (r.status === 400 && thinking(model, false)) r = await send(undefined);
-    if (!r.ok) throw new Error(`${model} ตอบ ${r.status}`);
+    if (r.status === 400 && thinking(model, false)) { retried = true; r = await send(undefined); }
+    if (!r.ok) throw Object.assign(new Error(`${model} ตอบ ${r.status}: ${await errText(r)}`), { http: r.status, retried });
     const j = await r.json();
     const c = (j.candidates && j.candidates[0]) || {};
-    if (c.finishReason && !/STOP|MAX_TOKENS/.test(c.finishReason)) throw new Error(`${model} หยุดเพราะ ${c.finishReason}`);
+    if (!j.candidates || !j.candidates.length) {
+      const why = j.promptFeedback && (j.promptFeedback.blockReason || JSON.stringify(j.promptFeedback).slice(0, 120));
+      throw Object.assign(new Error(`${model} ไม่ส่งคำตอบกลับ${why ? ' (' + why + ')' : ''}`), { http: 200, retried });
+    }
+    if (c.finishReason && !/STOP|MAX_TOKENS/.test(c.finishReason)) throw Object.assign(new Error(`${model} หยุดเพราะ ${c.finishReason}`), { http: 200, retried });
     const text = ((c.content && c.content.parts) || []).map((p) => p.text || '').join('');
     const chunks = (c.groundingMetadata && c.groundingMetadata.groundingChunks) || [];
     const sources = chunks.map((x) => x && x.web).filter((w) => w && w.uri)
       .map((w) => ({ title: norm(w.title).slice(0, 120), url: String(w.uri).slice(0, 1000) }));
-    return { text, sources, model };
+    return { text, sources, model, finish: c.finishReason || '', retried };
   } catch (e) {
     throw e && e.name === 'AbortError' ? new Error(model + ' ค้นนานเกิน ' + CALL_MS / 1000 + ' วินาที') : e;
   } finally { clearTimeout(t); }
 }
 
+/* ข้อความผิดพลาดจริงจาก Gemini (เช่น คีย์ผิด · ไม่มีรุ่นนี้ · โควตาหมด) — เดิมเหลือแค่เลขสถานะ ไล่หาสาเหตุไม่ได้ */
+async function errText(r) {
+  const t = await r.text().catch(() => '');
+  let m = '';
+  try { const e = JSON.parse(t).error || {}; m = [e.status, e.message].filter(Boolean).join(' · '); } catch (e) { m = t; }
+  return String(m || 'ไม่มีรายละเอียด').replace(/\s+/g, ' ').slice(0, 240);
+}
+
 /* คำตอบจากการค้นเว็บบางครั้งมีข้อความปน หรือ JSON ไม่ครบ — ให้โมเดลเบาแปลงเป็น JSON ตามรูปแบบอีกครั้ง (ไม่ค้นเว็บ ไม่แต่งเพิ่ม) */
-async function repairJson(env, ai, text) {
+async function repairJson(env, ai, text, log, pass) {
   const base = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
   for (const model of ai.repair) {
-    const ac = new AbortController(), t = setTimeout(() => ac.abort(), 12000);
+    const ac = new AbortController(), t = setTimeout(() => ac.abort(), 12000), t0 = Date.now();
+    const note = (o) => log && log.push({ p: pass, step: 'repair', m: model, ms: Date.now() - t0, ...o });
     try {
       const r = await fetch(`${base}/v1beta/models/${model}:generateContent`, {
         method: 'POST', signal: ac.signal, headers: { 'Content-Type': 'application/json', 'x-goog-api-key': ai.key },
@@ -97,11 +110,12 @@ async function repairJson(env, ai, text) {
 ${String(text).slice(0, 12000)}` }] }],
           generationConfig: { temperature: 0, maxOutputTokens: 8192, responseMimeType: 'application/json', ...(thinking(model, true) ? { thinkingConfig: thinking(model, true) } : {}) } }),
       });
-      if (!r.ok) continue;
+      if (!r.ok) { note({ ok: false, st: r.status, err: await errText(r) }); continue; }
       const j = await r.json();
       const o = parseObj(((((j.candidates || [])[0] || {}).content || {}).parts || []).map((p) => p.text || '').join(''));
+      note({ ok: !!o, st: 200, err: o ? '' : 'แปลงเป็น JSON ไม่ได้' });
       if (o) return o;
-    } catch (e) { /* ลองตัวถัดไป */ } finally { clearTimeout(t); }
+    } catch (e) { note({ ok: false, err: e && e.name === 'AbortError' ? 'เกิน 12 วินาที' : String((e && e.message) || e).slice(0, 200) }); } finally { clearTimeout(t); }
   }
   return null;
 }
@@ -143,17 +157,28 @@ ${SHAPE}`;
 }
 
 /* ลองรุ่นโมเดลตามลำดับจนได้ JSON ที่อ่านได้ (เริ่มคนละตัวในสองรอบ = สองความเห็นที่ไม่ลอกกัน) */
-async function lookup(env, ai, prompt, start) {
+/* log: ทุกครั้งที่เรียกโมเดล บันทึก รอบ · รุ่น · เวลา · สถานะ HTTP · ความยาวคำตอบ · จำนวนแหล่ง · อ่าน JSON ได้ไหม · ข้อผิดพลาดจริง */
+async function lookup(env, ai, prompt, start, log = [], pass = 'A') {
   /* ไม่เกิน 3 รุ่นต่อรอบ — รุ่นที่ใช้ไม่ได้ (404/400/429) ตอบกลับเร็ว ส่วนที่ช้าคือการค้นเว็บจริง */
   const order = [...ai.models.slice(start), ...ai.models.slice(0, start)].slice(0, 3);
   let last = null;
   for (const m of order) {
+    const t0 = Date.now();
     try {
       const r = await searchCall(env, ai, m, prompt);
-      const o = parseObj(r.text) || (r.text.trim() ? await repairJson(env, ai, r.text) : null);
+      const direct = parseObj(r.text);
+      const step = { p: pass, step: 'search', m, ms: 0, st: 200, len: r.text.length, src: r.sources.length, fin: r.finish, retried: r.retried || undefined };
+      log.push(step);
+      const o = direct || (r.text.trim() ? await repairJson(env, ai, r.text, log, pass) : null);
+      step.ms = Date.now() - t0; step.ok = !!o; step.json = direct ? 'ok' : o ? 'ซ่อมแล้ว' : r.text.trim() ? 'อ่านไม่ได้' : 'ว่าง';
+      if (!o) step.head = r.text.slice(0, 160);
       if (o) return { ...r, data: o };
       last = new Error(m + (r.text.trim() ? ' ตอบไม่เป็น JSON' : ' ตอบว่าง'));
-    } catch (e) { last = e; }
+      step.err = last.message;
+    } catch (e) {
+      log.push({ p: pass, step: 'search', m, ms: Date.now() - t0, ok: false, st: e.http, retried: e.retried || undefined, err: String((e && e.message) || e).slice(0, 300) });
+      last = e;
+    }
   }
   throw last || new Error('ไม่มีรุ่น Gemini ให้ใช้');
 }
@@ -234,12 +259,13 @@ export function merge(A, B) {
   };
 }
 
-export async function research(env, q) {
+export async function research(env, q, log = []) {
   const ai = specAI(env);
+  log.push({ step: 'setup', ok: !!ai.key, keyFrom: env.GEMINI_SPEC_KEY ? 'GEMINI_SPEC_KEY' : env.GEMINI_NEWS_KEY ? 'GEMINI_NEWS_KEY' : env.GEMINI_KEY ? 'GEMINI_KEY' : 'ไม่มี', models: ai.models });
   if (!ai.key) throw new Error('ยังไม่ได้ตั้งคีย์ Gemini');
   /* สองรอบพร้อมกัน เริ่มจากรุ่นโมเดลคนละตัว */
-  const cap = (p) => Promise.race([p, new Promise((_, no) => setTimeout(() => no(new Error('ค้นนานเกินกำหนด')), 80000))]);
-  const [a, b] = await Promise.allSettled([cap(lookup(env, ai, promptA(q), 0)), cap(lookup(env, ai, promptB(q), Math.min(1, ai.models.length - 1)))]);
+  const cap = (p, pass) => { let t; return Promise.race([p.finally(() => clearTimeout(t)), new Promise((_, no) => { t = setTimeout(() => { log.push({ p: pass, step: 'cap', ok: false, err: 'รอบนี้ค้นนานเกิน 80 วินาที ตัดทิ้ง' }); no(new Error('ค้นนานเกินกำหนด')); }, 80000); })]); };
+  const [a, b] = await Promise.allSettled([cap(lookup(env, ai, promptA(q), 0, log, 'A'), 'A'), cap(lookup(env, ai, promptB(q), Math.min(1, ai.models.length - 1), log, 'B'), 'B')]);
   const A = a.status === 'fulfilled' ? a.value : null, B = b.status === 'fulfilled' ? b.value : null;
   if (!A && !B) throw (a.reason || b.reason || new Error('ค้นข้อมูลไม่สำเร็จ'));
   const first = A || B, second = A ? B : null;
@@ -272,25 +298,50 @@ async function spend(env, who, limit) {
   return !r || r.n <= limit;
 }
 
+/* ─────────── บันทึกการค้นสเปก (แผงผู้ดูแลแบบลอย แสดงทุกหน้า) ───────────
+   ทุกคำขอที่มาถึงหลังบ้าน: ใคร (ย่อ) · รุ่นอะไร · ผลเป็นอะไร (ได้จากคลัง / ติดโควตา / ค้นใหม่ …)
+   ถ้าค้นใหม่ เก็บทุกขั้นที่เรียก Gemini พร้อมข้อผิดพลาดจริง · เก็บแค่ 300 แถวล่าสุด */
+const LOG_TABLE = `CREATE TABLE IF NOT EXISTS spec_log (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER, k TEXT, who TEXT,
+  kind TEXT, ok INTEGER, ms INTEGER, status TEXT, trail TEXT, err TEXT)`;
+export async function logSpec(env, ev) {
+  const ins = () => env.DB.prepare('INSERT INTO spec_log (at, k, who, kind, ok, ms, status, trail, err) VALUES (?,?,?,?,?,?,?,?,?)')
+    .bind(Date.now(), String(ev.k || '').slice(0, 120), String(ev.who || '').replace(/^ip:(.+)$/, (m, ip) => 'ip:' + ip.split(/[.:]/).slice(0, 2).join('.') + '…').slice(0, 14),
+      String(ev.kind || ''), ev.ok ? 1 : 0, ev.ms | 0, String(ev.status || ''), JSON.stringify(ev.trail || []).slice(0, 8000), String(ev.err || '').slice(0, 400)).run();
+  try {
+    /* ตารางสร้างเองครั้งแรกที่ต้องใช้ ไม่ต้องรอเลื่อนรุ่นฐานข้อมูล */
+    try { await ins(); } catch (e) { if (!/no such table/i.test(String(e && e.message))) throw e; await env.DB.prepare(LOG_TABLE).run(); await ins(); }
+    if (Math.random() < 0.05) await env.DB.prepare('DELETE FROM spec_log WHERE id <= (SELECT MAX(id) - 300 FROM spec_log)').run();
+  } catch (e) { console.error('[spec_log]', e); }
+}
+export async function specLogList(env, limit = 40) {
+  try {
+    const { results = [] } = await env.DB.prepare('SELECT at, k, who, kind, ok, ms, status, trail, err FROM spec_log ORDER BY id DESC LIMIT ?').bind(limit).all();
+    return results.map((r) => ({ ...r, trail: (() => { try { return JSON.parse(r.trail || '[]'); } catch (e) { return []; } })() }));
+  } catch (e) { return []; }
+}
+
 /* ขอข้อมูลรุ่นนี้: มีในคลัง → ส่งเลย · ยังไม่มี → ค้นครั้งเดียวแล้วเก็บ
    who: 'u:<uid>' หรือ 'ip:<ip>' · staff: ข้ามโควตา · force: ค้นใหม่ทับ (แอดมิน) */
 export async function ensureSpec(env, q, { who = 'ip:unknown', user = false, staff = false, force = false, retry = false, defer = null, waitMs = 85000 } = {}) {
   const v = validQuery(q);
   if (!v) throw Object.assign(new Error('ชื่อรถหรือปีไม่ถูกต้อง'), { status: 400 });
   const k = specKey(v.make, v.model, v.year), now = Date.now();
+  const note = (kind, ok, status, err) => logSpec(env, { k, who, kind, ok, status, err, ms: Date.now() - now });
   const have = await env.DB.prepare('SELECT * FROM car_specs WHERE k = ?').bind(k).first();
   if (have && !force) {
     if (['ready', 'verified', 'notfound'].includes(have.status)) {
       await env.DB.prepare('UPDATE car_specs SET hits = hits + 1 WHERE k = ?').bind(k).run();
+      await note('cache', true, have.status);
       return row2out(have);
     }
-    if (have.status === 'pending' && now - have.updated_at < 180000) return row2out(have);
+    if (have.status === 'pending' && now - have.updated_at < 180000) { await note('wait', true, 'pending', 'มีคนกำลังค้นรุ่นนี้อยู่ (เริ่ม ' + Math.round((now - have.updated_at) / 1000) + ' วิที่แล้ว)'); return row2out(have); }
     /* ค้นไม่สำเร็จ: ผู้ใช้กด "ลองใหม่" = ค้นใหม่ทันที (นับโควตา) · เปิดเฉย ๆ = รอ 2 นาทีก่อนลองเอง */
-    if (have.status === 'failed' && !retry && now - have.updated_at < 2 * 60000) return row2out(have);
+    if (have.status === 'failed' && !retry && now - have.updated_at < 2 * 60000) { await note('failed-recent', false, 'failed', 'ยังไม่ครบ 2 นาทีหลังค้นไม่สำเร็จ: ' + (have.error || '')); return row2out(have); }
   }
   if (have && have.status === 'verified' && force && !staff) return row2out(have);
   if (!staff) {
     if (!(await spend(env, who, user ? LIMIT.user : LIMIT.guest)) || !(await spend(env, '*', LIMIT.all))) {
+      await note('limited', false, 'limited', user ? `ผู้ใช้คนนี้ค้นครบ ${LIMIT.user} รุ่นวันนี้ หรือทั้งระบบครบ ${LIMIT.all}` : `ไม่ได้ล็อกอิน (นับตาม IP) ค้นครบ ${LIMIT.guest} รุ่นวันนี้ หรือทั้งระบบครบ ${LIMIT.all}`);
       return { status: 'limited', key: k, make: v.make, model: v.model, year: v.year };
     }
   }
@@ -298,25 +349,30 @@ export async function ensureSpec(env, q, { who = 'ip:unknown', user = false, sta
       VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)
       ON CONFLICT(k) DO UPDATE SET status = 'pending', updated_at = excluded.updated_at, error = NULL`)
     .bind(k, v.make, v.model, v.year, now, now, who).run();
+  const trail = [];
   const job = (async () => {
     let res;
-    try { res = await research(env, v); }
+    try { res = await research(env, v, trail); }
     catch (e) {
+      const msg = String((e && e.message) || e).slice(0, 300);
       await env.DB.prepare("UPDATE car_specs SET status = 'failed', error = ?, updated_at = ? WHERE k = ?")
-        .bind(String((e && e.message) || e).slice(0, 200), Date.now(), k).run();
-      return getSpec(env, k);
+        .bind(msg, Date.now(), k).run();
+      await logSpec(env, { k, who, kind: force ? 'redo' : retry ? 'retry' : 'research', ok: false, status: 'failed', err: msg, trail, ms: Date.now() - now });
+      return { ...(await getSpec(env, k)), ...(staff ? { trace: trail } : {}) };
     }
     await env.DB.prepare(`UPDATE car_specs SET status = ?, body = ?, data = ?, sources = ?, models = ?, error = NULL, updated_at = ?
         WHERE k = ?`).bind(res.status, res.data && res.data.body, res.data ? JSON.stringify(res.data) : null,
       JSON.stringify(res.sources || []), JSON.stringify(res.models || []), Date.now(), k).run();
-    return getSpec(env, k);
+    await logSpec(env, { k, who, kind: force ? 'redo' : retry ? 'retry' : 'research', ok: true, status: res.status,
+      err: res.passes === 1 ? 'ได้ผลรอบเดียว (อีกรอบไม่สำเร็จ) — ค่าทุกช่องยังไม่ได้ยืนยันซ้ำ' : '', trail, ms: Date.now() - now });
+    return { ...(await getSpec(env, k)), ...(staff ? { trace: trail } : {}) };
   })();
   if (!defer) return job;
   /* ค้นนานกว่าที่ควรรอในคำขอเดียว → ตอบ "กำลังค้น" ไปก่อน งานทำต่อเบื้องหลัง หน้าเว็บถามซ้ำเอง */
   const done = await Promise.race([job, new Promise((z) => setTimeout(() => z(null), waitMs))]);
   if (done) return done;
   defer(job);
-  return { status: 'pending', key: k, make: v.make, model: v.model, year: v.year };
+  return { status: 'pending', key: k, make: v.make, model: v.model, year: v.year, ...(staff ? { trace: trail } : {}) };
 }
 
 /* ผู้ใช้แจ้งว่าข้อมูลผิด — วันละไม่เกิน 5 ครั้งต่อคน */

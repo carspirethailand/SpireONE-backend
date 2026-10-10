@@ -4,7 +4,7 @@ import { handleTech } from './techs.js';
 import { richMenuStatus, setupRichMenu, lineStatus, lineFixWebhook } from './line-menu.js';
 import { appUrl, card } from './line-notify.js';
 import { refreshNews, newsStatus } from './news.js';
-import { ensureSpec, getSpec, specKey, validQuery, reportSpec, listSpecs, verifySpec } from './carspec.js';
+import { ensureSpec, getSpec, specKey, validQuery, reportSpec, listSpecs, verifySpec, specLogList, specAI } from './carspec.js';
 import { decodeVin, vpic, cleanInfo } from './vin.js';
 import { LINE_AI, LINE_TALK, LINE_MARK, linePlain, lineChunks, lineCodeIn } from './line-chat.js';
 import { handleVec, kbScores, refreshKb } from './vectors.js';
@@ -4925,7 +4925,9 @@ ${convo}`;
           }
           if (url.pathname === '/api/car-spec' && request.method === 'POST') {
             const b = await readBody();
-            return json(await ensureSpec(env, b || {}, { who, user: !!actor, staff: !!actor && rank(actor.role) >= rank('admin'), retry: !!(b && b.retry), defer: (p) => ctx.waitUntil(p) }));
+            const staff = !!actor && rank(actor.role) >= rank('admin');
+            /* แอดมินกด "ทดสอบค้นสเปก" จากแผงลอย = ค้นใหม่ทับ (force) และได้ขั้นตอนทั้งหมดกลับไปดู */
+            return json(await ensureSpec(env, b || {}, { who, user: !!actor, staff, retry: !!(b && b.retry), force: staff && !!(b && b.force), defer: (p) => ctx.waitUntil(p) }));
           }
           if (url.pathname === '/api/car-spec/report' && request.method === 'POST') {
             const b = await readBody() || {};
@@ -5259,13 +5261,16 @@ ${convo}`;
           } catch (e) {}
           try { const le = await env.DB.prepare("SELECT value FROM config WHERE key = 'ai_last_error'").first(); lastAiError = le && le.value ? JSON.parse(le.value) : null } catch (e) {}
           const parked = badState(await geminiScope(env));
+          /* บันทึกการค้นสเปกรถ (ทุกคน ทุกหน้า) + รุ่นที่ใช้ค้น */
+          const specLog = await specLogList(env, 40);
+          const sa = specAI(env), spec = { models: sa.models, key: env.GEMINI_SPEC_KEY ? 'GEMINI_SPEC_KEY' : env.GEMINI_NEWS_KEY ? 'GEMINI_NEWS_KEY' : env.GEMINI_KEY ? 'GEMINI_KEY' : '' };
           const primaryModel = env.OPENROUTER_MODEL || 'openrouter/free';
           const fullChain = [primaryModel].concat(chatModels(env));
           return json({ now: Date.now(),
             chain: fullChain.map(m => ({ name: m, parked: parked.find(p => p.model === m) || null, searchParked: parked.find(p => p.model === m + '|search') || null })),
             fallbacks: fallbackProviders(env).concat(fallbackProviders(env, true)).map(p => ({ name: p.src + ':' + p.model })),
             keys: { gemini: !!env.GEMINI_KEY, groq: !!env.GROQ_API_KEY, cerebras: !!env.CEREBRAS_API_KEY, openrouter: !!env.OPENROUTER_API_KEY, workersAI: !!env.AI },
-            parked, stats, events, lastAiError });
+            parked, stats, events, lastAiError, specLog, spec });
         })();
       }
       if (url.pathname === '/api/admin/unpark' && request.method === 'POST') {

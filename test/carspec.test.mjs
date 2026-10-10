@@ -186,3 +186,39 @@ test('car spec: "try again" really searches again; unavailable models fall back 
   const firstChat=seen.findIndex(x=>main.includes(x.m));assert.ok(firstChat>0&&seen.slice(0,firstChat).every(x=>!main.includes(x.m)),'models chat answers with are tried last');
   globalThis.fetch=real;
 });
+
+test('car spec log: real Gemini error text and every attempt reach the floating admin panel',async()=>{
+  const {f,call}=setup();
+  globalThis.fetch=async(url)=>{const u=String(url);
+    if(u.includes('generativelanguage'))return Response.json({error:{code:403,status:'PERMISSION_DENIED',message:'API key not valid for this project'}},{status:403});
+    throw Error('unexpected fetch '+u);};
+  const r=await call('POST','/api/car-spec',pajero,CUST);
+  assert.equal(r.json.status,'failed');
+  assert.match(r.json.error,/403: PERMISSION_DENIED · API key not valid/,'the stored reason is the real one, not just a status code');
+  assert.equal(r.json.trace,undefined,'customers never see the internal trail');
+  const live=await call('GET','/api/admin/live',null,BOSS);
+  const ev=live.json.specLog[0];
+  assert.equal(ev.kind,'research');assert.equal(ev.ok,0);assert.match(ev.who,/^u:cust/);
+  const tries=ev.trail.filter(x=>x.step==='search');
+  assert.ok(tries.length>=2&&tries.every(x=>x.st===403&&/API key not valid/.test(x.err)),'each model attempt is listed with its error');
+  assert.equal(ev.trail[0].step,'setup');assert.equal(ev.trail[0].keyFrom,'GEMINI_KEY');
+  assert.ok(Array.isArray(live.json.spec.models)&&live.json.spec.models.length);
+  /* เปิดซ้ำภายใน 2 นาที = บอกเหตุผลว่าทำไมไม่ค้นใหม่ */
+  await call('POST','/api/car-spec',pajero,CUST);
+  const again=(await call('GET','/api/admin/live',null,BOSS)).json.specLog[0];
+  assert.equal(again.kind,'failed-recent');assert.match(again.err,/API key not valid/);
+  assert.equal((await call('GET','/api/admin/live',null,CUST)).status,403,'the log is staff-only');
+  void f;
+});
+
+test('car spec log: cache hits, guest limits and admin test runs are recorded; admin gets the trail back',async()=>{
+  const {call}=setup();
+  assert.equal((await call('POST','/api/car-spec',{...pajero,force:true},CUST)).json.trace,undefined,'force is ignored for customers');
+  const out=await call('POST','/api/car-spec',{...pajero,force:true},BOSS);
+  assert.equal(out.json.status,'ready');assert.ok(out.json.trace.some(x=>x.step==='search'&&x.ok&&x.json==='ok'&&x.src===1));
+  await call('POST','/api/car-spec',pajero);
+  for(const y of ['2001','2002','2003','2004'])await call('POST','/api/car-spec',{...pajero,year:y});
+  const log=(await call('GET','/api/admin/live',null,BOSS)).json.specLog;
+  assert.equal(log[0].kind,'limited');assert.match(log[0].err,/ไม่ได้ล็อกอิน/);assert.match(log[0].who,/^ip:203\.0…/,'guest IPs are shortened');
+  assert.ok(log.some(x=>x.kind==='cache'&&x.ok));assert.ok(log.some(x=>x.kind==='redo'&&x.ok));
+});
