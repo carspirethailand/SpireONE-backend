@@ -204,8 +204,11 @@ async function gemini(env, ai, { prompt, json = true, search = false, maxTokens 
     /* ค้นเว็บใช้คู่กับบังคับ JSON ไม่ได้ */
     if (search && !json) body.tools = [{ google_search: {} }];
     try {
-      const r = await fetch(`${base}/v1beta/models/${model}:generateContent`, {
+      const send = () => fetch(`${base}/v1beta/models/${model}:generateContent`, {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': ai.key }, body: JSON.stringify(body) });
+      let r = await send();
+      /* บางรุ่นไม่รับค่าการคิดที่ตั้งไป (ตอบ 400) — ลองอีกครั้งแบบไม่ตั้ง */
+      if (r.status === 400 && gen.thinkingConfig) { delete gen.thinkingConfig; r = await send(); }
       if (!r.ok) { last = new Error(`${model} ตอบ ${r.status}`); continue; }
       const j = await r.json();
       const parts = (j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || [];

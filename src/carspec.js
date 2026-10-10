@@ -39,29 +39,35 @@ export function specAI(env) {
   const key = env.GEMINI_SPEC_KEY || env.GEMINI_NEWS_KEY || env.GEMINI_KEY || '';
   const own = !!(env.GEMINI_SPEC_KEY || env.GEMINI_NEWS_KEY);
   const chatMain = own ? [] : chatModels(env).slice(0, 2);
-  const models = [env.GEMINI_SPEC_MODEL, ...SPEC_MODELS.filter((m) => !chatMain.includes(m))]
+  /* รุ่นที่แชตไม่ได้ใช้ตอบเป็นหลักก่อน → แล้วค่อยถอยไปรุ่นของแชตเป็นทางสุดท้าย
+     สเปกรถค้นครั้งเดียวต่อรุ่นรถตลอดไป การค้นสำเร็จสำคัญกว่าการหลบโควตาแชตทุกครั้ง */
+  const models = [env.GEMINI_SPEC_MODEL, ...SPEC_MODELS.filter((m) => !chatMain.includes(m)), ...chatMain]
     .map((m) => norm(m)).filter(Boolean);
-  const repair = ['gemini-3.5-flash-lite', 'gemini-2.5-flash-lite', 'gemini-3.1-flash-lite'].filter((m) => !chatMain.includes(m));
+  const repair = ['gemini-3.5-flash-lite', 'gemini-2.5-flash-lite', 'gemini-3.1-flash-lite', ...chatMain];
   return { key, own, models: [...new Set(models)], repair };
 }
 
 /* โมเดลที่คิดนานกินโทเคนคำตอบไปกับการคิด (นับรวมใน maxOutputTokens) จน JSON โดนตัดกลางทาง
    และใช้เวลานานเกิน — ตั้งให้คิดน้อยพอให้ค้นเว็บแล้วสรุปได้ */
-const thinking = (model, json) => /gemini-3|gemini-[4-9]/.test(model) ? { thinkingLevel: json ? 'minimal' : 'low' }
+const thinking = (model, json) => /gemini-3|gemini-[4-9]/.test(model) ? { thinkingLevel: 'low' }
   : /2\.5/.test(model) ? { thinkingBudget: json ? 0 : 512 } : undefined;
+export const CALL_MS = 40000;
 async function searchCall(env, ai, model, prompt) {
   const base = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
-  const ac = new AbortController(), t = setTimeout(() => ac.abort(), 20000);
+  const ac = new AbortController(), t = setTimeout(() => ac.abort(), CALL_MS);
   try {
-    const r = await fetch(`${base}/v1beta/models/${model}:generateContent`, {
+    const send = (think) => fetch(`${base}/v1beta/models/${model}:generateContent`, {
       method: 'POST', signal: ac.signal,
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': ai.key },
       body: JSON.stringify({
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
         tools: [{ google_search: {} }],                 /* ค้นเว็บใช้คู่กับบังคับ JSON ไม่ได้ — ให้ตอบ JSON ในข้อความ */
-        generationConfig: { temperature: 0.1, maxOutputTokens: 8192, ...(thinking(model, false) ? { thinkingConfig: thinking(model, false) } : {}) },
+        generationConfig: { temperature: 0.1, maxOutputTokens: 8192, ...(think ? { thinkingConfig: think } : {}) },
       }),
     });
+    let r = await send(thinking(model, false));
+    /* บางรุ่นไม่รับค่าการคิดที่ตั้งไป (ตอบ 400) — ลองอีกครั้งแบบไม่ตั้ง */
+    if (r.status === 400 && thinking(model, false)) r = await send(undefined);
     if (!r.ok) throw new Error(`${model} ตอบ ${r.status}`);
     const j = await r.json();
     const c = (j.candidates && j.candidates[0]) || {};
@@ -72,7 +78,7 @@ async function searchCall(env, ai, model, prompt) {
       .map((w) => ({ title: norm(w.title).slice(0, 120), url: String(w.uri).slice(0, 1000) }));
     return { text, sources, model };
   } catch (e) {
-    throw e && e.name === 'AbortError' ? new Error(model + ' ค้นนานเกิน 20 วินาที') : e;
+    throw e && e.name === 'AbortError' ? new Error(model + ' ค้นนานเกิน ' + CALL_MS / 1000 + ' วินาที') : e;
   } finally { clearTimeout(t); }
 }
 
@@ -138,8 +144,8 @@ ${SHAPE}`;
 
 /* ลองรุ่นโมเดลตามลำดับจนได้ JSON ที่อ่านได้ (เริ่มคนละตัวในสองรอบ = สองความเห็นที่ไม่ลอกกัน) */
 async function lookup(env, ai, prompt, start) {
-  /* ไม่เกิน 2 รุ่นต่อรอบ — ทั้งงานต้องเสร็จในเวลาที่ผู้ใช้รอไหว */
-  const order = [...ai.models.slice(start), ...ai.models.slice(0, start)].slice(0, 2);
+  /* ไม่เกิน 3 รุ่นต่อรอบ — รุ่นที่ใช้ไม่ได้ (404/400/429) ตอบกลับเร็ว ส่วนที่ช้าคือการค้นเว็บจริง */
+  const order = [...ai.models.slice(start), ...ai.models.slice(0, start)].slice(0, 3);
   let last = null;
   for (const m of order) {
     try {
@@ -232,7 +238,7 @@ export async function research(env, q) {
   const ai = specAI(env);
   if (!ai.key) throw new Error('ยังไม่ได้ตั้งคีย์ Gemini');
   /* สองรอบพร้อมกัน เริ่มจากรุ่นโมเดลคนละตัว */
-  const cap = (p) => Promise.race([p, new Promise((_, no) => setTimeout(() => no(new Error('ค้นนานเกินกำหนด')), 45000))]);
+  const cap = (p) => Promise.race([p, new Promise((_, no) => setTimeout(() => no(new Error('ค้นนานเกินกำหนด')), 80000))]);
   const [a, b] = await Promise.allSettled([cap(lookup(env, ai, promptA(q), 0)), cap(lookup(env, ai, promptB(q), Math.min(1, ai.models.length - 1)))]);
   const A = a.status === 'fulfilled' ? a.value : null, B = b.status === 'fulfilled' ? b.value : null;
   if (!A && !B) throw (a.reason || b.reason || new Error('ค้นข้อมูลไม่สำเร็จ'));
@@ -268,7 +274,7 @@ async function spend(env, who, limit) {
 
 /* ขอข้อมูลรุ่นนี้: มีในคลัง → ส่งเลย · ยังไม่มี → ค้นครั้งเดียวแล้วเก็บ
    who: 'u:<uid>' หรือ 'ip:<ip>' · staff: ข้ามโควตา · force: ค้นใหม่ทับ (แอดมิน) */
-export async function ensureSpec(env, q, { who = 'ip:unknown', user = false, staff = false, force = false, defer = null, waitMs = 22000 } = {}) {
+export async function ensureSpec(env, q, { who = 'ip:unknown', user = false, staff = false, force = false, retry = false, defer = null, waitMs = 85000 } = {}) {
   const v = validQuery(q);
   if (!v) throw Object.assign(new Error('ชื่อรถหรือปีไม่ถูกต้อง'), { status: 400 });
   const k = specKey(v.make, v.model, v.year), now = Date.now();
@@ -278,8 +284,9 @@ export async function ensureSpec(env, q, { who = 'ip:unknown', user = false, sta
       await env.DB.prepare('UPDATE car_specs SET hits = hits + 1 WHERE k = ?').bind(k).run();
       return row2out(have);
     }
-    if (have.status === 'pending' && now - have.updated_at < 90000) return row2out(have);
-    if (have.status === 'failed' && now - have.updated_at < 2 * 60000) return row2out(have);
+    if (have.status === 'pending' && now - have.updated_at < 180000) return row2out(have);
+    /* ค้นไม่สำเร็จ: ผู้ใช้กด "ลองใหม่" = ค้นใหม่ทันที (นับโควตา) · เปิดเฉย ๆ = รอ 2 นาทีก่อนลองเอง */
+    if (have.status === 'failed' && !retry && now - have.updated_at < 2 * 60000) return row2out(have);
   }
   if (have && have.status === 'verified' && force && !staff) return row2out(have);
   if (!staff) {

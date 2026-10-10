@@ -4925,7 +4925,7 @@ ${convo}`;
           }
           if (url.pathname === '/api/car-spec' && request.method === 'POST') {
             const b = await readBody();
-            return json(await ensureSpec(env, b || {}, { who, user: !!actor, staff: !!actor && rank(actor.role) >= rank('admin'), defer: (p) => ctx.waitUntil(p) }));
+            return json(await ensureSpec(env, b || {}, { who, user: !!actor, staff: !!actor && rank(actor.role) >= rank('admin'), retry: !!(b && b.retry), defer: (p) => ctx.waitUntil(p) }));
           }
           if (url.pathname === '/api/car-spec/report' && request.method === 'POST') {
             const b = await readBody() || {};

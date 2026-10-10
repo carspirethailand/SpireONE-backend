@@ -165,3 +165,24 @@ test('car spec: a slow lookup answers "pending" quickly and finishes in the back
   const {listSpecs}=await import('../src/carspec.js');
   assert.match((await listSpecs(f.env)).find(x=>x.model==='Zzz').error,/ตอบ 404/);
 });
+
+test('car spec: "try again" really searches again; unavailable models fall back (chat models last); a model that rejects the thinking setting is retried without it',async()=>{
+  const {f,ai,call}=setup({fail:true});
+  assert.equal((await call('POST','/api/car-spec',pajero,CUST)).json.status,'failed');
+  const n=ai.length;
+  assert.equal((await call('POST','/api/car-spec',pajero,CUST)).json.status,'failed');assert.equal(ai.length,n,'just opening again within 2 minutes reuses the result');
+  /* ตอนนี้ AI กลับมาใช้ได้ แต่รุ่นที่ไม่ใช่ของแชตใช้ไม่ได้ทั้งหมด และบางรุ่นไม่รับค่าการคิด */
+  const real=globalThis.fetch,main=chatModels(f.env).slice(0,2),seen=[];
+  globalThis.fetch=async(url,init={})=>{const u=String(url);
+    if(u.includes('generativelanguage')){const m=u.split('/models/')[1].split(':')[0],body=JSON.parse(init.body);seen.push({m,think:!!body.generationConfig.thinkingConfig});
+      if(!main.includes(m))return new Response('model not found',{status:404});
+      if(body.generationConfig.thinkingConfig)return new Response('thinking not supported',{status:400});
+      const second=/ตรวจสอบข้อมูลจำเพาะ/.test(body.contents[0].parts[0].text);
+      return Response.json({candidates:[{finishReason:'STOP',content:{parts:[{text:JSON.stringify(PAJERO)}]},groundingMetadata:{groundingChunks:[{web:{uri:'https://g/'+(second?'b':'a'),title:second?'b.com':'a.com'}}]}}]});}
+    return real(url,init);};
+  const r=await call('POST','/api/car-spec',{...pajero,retry:true},CUST);
+  assert.equal(r.json.status,'ready','pressing try again searches again right away');
+  assert.ok(seen.some(x=>main.includes(x.m)&&!x.think),'fell back to a model that works, without the thinking setting');
+  const firstChat=seen.findIndex(x=>main.includes(x.m));assert.ok(firstChat>0&&seen.slice(0,firstChat).every(x=>!main.includes(x.m)),'models chat answers with are tried last');
+  globalThis.fetch=real;
+});
