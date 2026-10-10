@@ -206,7 +206,7 @@ async function who(request, env, required = true, verifyToken = verifyFirebaseTo
   try {
     const u = await env.DB.prepare('SELECT role, banned FROM users WHERE uid = ?').bind(uid).first();
     if (u && u.banned) fail(403, 'บัญชีนี้ถูกระงับ');
-    if (u && (u.role === 'admin' || u.role === 'owner')) admin = staff = true;
+    if (u && (u.role === 'admin' || u.role === 'owner' && emailVerified && owners(env).includes(email))) admin = staff = true;
     if (u && u.role === 'moderator') staff = true;
   } catch (e) { if (e instanceof HttpError) throw e; }
   return { uid, email, admin, staff };

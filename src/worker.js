@@ -1,4 +1,6 @@
 import { verifyFirebaseToken } from './auth.js';
+import { EMAIL_AUTH_SQL, handleEmailAuth } from './email-auth.js';
+import { ONBOARDING_SQL, handleOnboarding, onboardingName, sanitizeSetupState } from './onboarding.js';
 import { buildFeatureRequest } from './features-ai.mjs';
 import { handleTech } from './techs.js';
 import { richMenuStatus, setupRichMenu, lineStatus, lineFixWebhook } from './line-menu.js';
@@ -36,7 +38,7 @@ function corsHeaders(env, request) {
   }
   return {
     'Access-Control-Allow-Origin': origin,
-    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Access-Control-Max-Age': '86400',
     'X-Content-Type-Options': 'nosniff',
@@ -55,7 +57,7 @@ async function getAuthenticatedUser(request, env) {
   /* ทดสอบในเครื่องเท่านั้น (DEV_AUTH ไม่มีในเซิร์ฟเวอร์จริง) — ใช้แบบเดียวกับ techs.js */
   if (env.DEV_AUTH === '1' && token.startsWith('dev:')) {
     const [, sub, email] = token.split(':');
-    return { sub, email, name: email.split('@')[0] };
+    return { sub, email, email_verified: true, name: email.split('@')[0] };
   }
   return await verifyFirebaseToken(token, projectId);
 }
@@ -64,14 +66,14 @@ async function getAuthenticatedUser(request, env) {
 async function getActor(request, env) {
   const payload = await getAuthenticatedUser(request, env);
   const email = (payload.email || '').toLowerCase();
-  if (owners(env).includes(email)) {
+  if (payload.email_verified === true && owners(env).includes(email)) {
     return { payload, email, role: 'owner', banned: false };
   }
   const row = await env.DB.prepare('SELECT role, banned FROM users WHERE uid = ?')
     .bind(payload.sub).first();
   return {
     payload, email,
-    role: (row && ROLE_RANK[row.role]) ? row.role : 'user',
+    role: (row && row.role !== 'owner' && ROLE_RANK[row.role]) ? row.role : 'user',
     banned: !!(row && row.banned),
   };
 }
@@ -94,7 +96,7 @@ function rank(role) { return ROLE_RANK[role] || 0; }
    ยกเว้น ALTER TABLE สองบรรทัดที่ต้องดักข้อผิดพลาด "มีคอลัมน์นี้แล้ว" ทิ้ง
    ══════════════════════════════════════════════════════════════════ */
 
-const SCHEMA_VERSION = 19;
+const SCHEMA_VERSION = 21;
 
 /* ประเภทตัวถังที่แอปมีภาพรถให้ (ตรงกับ BODY_TYPES ในหน้าการาจ) */
 const CAR_BODIES = ['sedan', 'hatchback', 'suv', 'pickup', 'mpv', 'van', 'coupe', 'ev'];
@@ -483,6 +485,10 @@ async function ensureSchema(env) {
          ซึ่งแย่กว่าการข้ามคำสั่งเดียวที่มีปัญหา */
     }
   }
+
+  /* Authentication tables and the one-time legacy onboarding snapshot must all
+     succeed before any route can upload state or mark this schema as ready. */
+  await env.DB.batch([...EMAIL_AUTH_SQL, ...ONBOARDING_SQL].map(sql => env.DB.prepare(sql)));
 
   try {
     await env.DB.prepare(
@@ -3506,8 +3512,18 @@ export default {
 
     if (!env.DB) return deny('Database is not configured', 500);
 
+    /* Do not run account migrations for unauthenticated private requests. */
+    if ((url.pathname === '/api/features/analyze' || /^\/api\/onboarding(?:\/|$)/.test(url.pathname))
+        && !/^Bearer \S+/.test(request.headers.get('Authorization') || '')) {
+      return deny('Invalid authentication token', 401);
+    }
+
     /* สร้าง/อัปเดตตารางเองถ้ายังไม่ครบ — เจ้าของแอปไม่ต้องรัน migration ด้วยมือ */
-    await ensureSchema(env);
+    try { await ensureSchema(env); }
+    catch (e) { return deny('Account services are temporarily unavailable', 503); }
+
+    const emailAuth = await handleEmailAuth(request, env);
+    if (emailAuth) return emailAuth;
 
     /* ระบบช่าง (Cendon Care) อยู่ในไฟล์ techs.js ทั้งหมด */
     if (/^\/api\/tech(\/|$)/.test(url.pathname)) return handleTech(request, env, cors, { ctx });
@@ -3526,6 +3542,15 @@ export default {
     const readBody = async () => { try { return await request.json(); } catch { return null; } };
 
     try {
+
+      if (['/api/onboarding', '/api/onboarding/tutorial', '/api/onboarding/preferences'].includes(url.pathname)) {
+        return await guarded('user', async actor => {
+          const result = await handleOnboarding(request, env, actor);
+          const headers = new Headers(result.headers);
+          Object.entries(cors).forEach(([k, v]) => headers.set(k, v));
+          return new Response(result.body, {status: result.status, headers});
+        })();
+      }
 
       /* ===== PUBLIC: site config (announcement / maintenance) ===== */
       if (url.pathname === '/api/config' && request.method === 'GET') {
@@ -3548,9 +3573,10 @@ export default {
         const bodyData = (await readBody()) || {};
         const uid = payload.sub;
         const email = (payload.email || '').toLowerCase();
-        const name = String(bodyData.name || payload.name || email.split('@')[0]).slice(0, 120);
+        const chosenName = await onboardingName(env, uid);
+        const name = chosenName || String(bodyData.name || payload.name || email.split('@')[0]).slice(0, 120);
         const photo = String(bodyData.photo || payload.picture || '').slice(0, 500);
-        const isOwner = owners(env).includes(email);
+        const isOwner = payload.email_verified === true && owners(env).includes(email);
         const now = Date.now();
 
         // Preserve assigned role/banned/created_at on re-login; owners are always owner.
@@ -3562,13 +3588,13 @@ export default {
             email = excluded.email,
             photo = excluded.photo,
             last_login = excluded.last_login,
-            role = CASE WHEN excluded.role = 'owner' THEN 'owner' ELSE users.role END,
+            role = CASE WHEN excluded.role = 'owner' THEN 'owner' WHEN users.role = 'owner' THEN 'user' ELSE users.role END,
             created_at = COALESCE(users.created_at, excluded.created_at)
         `).bind(uid, name, email, photo, isOwner ? 'owner' : 'user', now, now).run();
 
         const row = await env.DB.prepare('SELECT role, banned FROM users WHERE uid = ?').bind(uid).first();
         if (row && row.banned && !isOwner) return deny('Account suspended', 403);
-        const role = isOwner ? 'owner' : ((row && row.role) || 'user');
+        const role = isOwner ? 'owner' : ((row && row.role !== 'owner' && row.role) || 'user');
 
         return json({ uid, name, email, photo, role, last_login: now });
       }
@@ -3898,13 +3924,14 @@ export default {
           const rs = await env.DB.prepare(sql).bind(...args).all();
           const deleted = await carDeletions(env, actor.payload.sub);
           const state = {};
-          (rs.results || []).forEach((r) => {
-            if (r.k.startsWith(CAR_DELETED_PREFIX)) return;
+          for (const r of rs.results || []) {
+            if (r.k.startsWith(CAR_DELETED_PREFIX)) continue;
             let v = null;
             try { v = JSON.parse(r.v); } catch (e) { v = r.v; }
+            if (r.k === 'setup') v = await sanitizeSetupState(env, actor.payload.sub, v);
             v = withoutDeletedCars(r.k, v, deleted);
             state[r.k] = { v, t: (r.k === 'garage' || r.k === 'selCar') ? Math.max(Number(r.t) || 0, deleted.t) : r.t };
-          });
+          }
           return json({ state, now: Date.now() });
         })();
       }
@@ -3922,7 +3949,8 @@ export default {
           for (const k of Object.keys(items).slice(0, 40)) {
             if (k.startsWith(CAR_DELETED_PREFIX) || !/^[A-Za-z0-9_:.-]{1,64}$/.test(k)) { skipped.push(k); continue; }
             const item = items[k] || {};
-            const value = withoutDeletedCars(k, item.v === undefined ? null : item.v, deleted);
+            let value = withoutDeletedCars(k, item.v === undefined ? null : item.v, deleted);
+            if (k === 'setup') value = await sanitizeSetupState(env, uid, value);
             const raw = JSON.stringify(value);
             /* กันคนยัดข้อมูลก้อนใหญ่จนฐานข้อมูลบวม 256KB ต่อคีย์พอสำหรับบทสนทนาเป็นร้อย */
             if (raw.length > 256 * 1024) { skipped.push(k); continue; }
@@ -4342,7 +4370,7 @@ export default {
           const uid = actor.payload.sub;
           // ลบทีละตาราง ไม่ใช้ transaction เพราะ D1 ยังไม่รองรับข้าม statement
           // ถ้าตารางไหนพลาด ตัวที่ลบไปแล้วยังถือว่าลบจริง จึงรายงานเป็นรายตาราง
-          const tables = ['cars', 'usage', 'usage_win', 'user_state', 'user_memory', 'push_subs', 'push_jobs', 'chat_prefs'];
+          const tables = ['user_onboarding', 'cars', 'usage', 'usage_win', 'user_state', 'user_memory', 'push_subs', 'push_jobs', 'chat_prefs'];
           const removed = {};
           for (const t of tables) {
             try {
