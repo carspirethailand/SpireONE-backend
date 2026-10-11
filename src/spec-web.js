@@ -49,7 +49,7 @@ async function mayRead(url,signal){const u=new URL(url),cached=robotCache.get(u.
 }
 async function publisherLinks(q,log,signal){
   const results=await Promise.all(SEARCH_SITES.map(async origin=>{try{
-    const url=origin+'/wp-json/wp/v2/posts?'+new URLSearchParams({search:q.model+' '+q.year,per_page:'15',orderby:'relevance',_fields:'link,title,date'});
+    const url=origin+'/wp-json/wp/v2/posts?'+new URLSearchParams({search:q.model+' '+q.year,per_page:'15',orderby:'relevance',_fields:'link,title,date',after:(Number(q.year)-1)+'-01-01T00:00:00',before:(Number(q.year)+1)+'-01-01T00:00:00'});
     if(!await mayRead(url,signal))return [];
     const {r,text}=await request(url,4000,signal);if(!r.ok)return [];
     const rows=JSON.parse(text);if(!Array.isArray(rows))return [];
@@ -58,6 +58,14 @@ async function publisherLinks(q,log,signal){
   const links=results.flat();log.push({step:'publisher-discovery',ok:!!links.length,links:links.length});return links;
 }
 function relevant(text,q){const n=normal(text);return n.includes(normal(q.make))&&n.includes(normal(q.model))}
+export function documentRank(url,q,meta={}){
+  const u=new URL(url),title=textOf(meta.title||''),context=u.pathname+' '+title;
+  let score=(under(u.hostname,OEM)?20:0)+(normal(context).includes(normal(q.model))?10:0)+(context.includes(q.year)?15:0);
+  if(String(meta.published||'').startsWith(q.year+'-'))score+=10;
+  if(/official[- ]price|technical[- ]data|specification|full[- ]review|thai[- ]spec|ราคาอย่างเป็นทางการ|ข้อมูลทั้งหมด|สเปค|สเปก|ทดลองขับ/i.test(context))score+=35;
+  if(/spy[- ]?shot|teaser|rumo[u]?r|rendering|one[- ]off|anniversary|ข่าวลือ|ภาพหลุด|คาดว่า/i.test(context))score-=60;
+  return score;
+}
 export function excerpt(text,q){
   // An archive URL containing ...2020... is not model-year evidence. Prefer
   // the applicable generation's production block, otherwise an exact year.
@@ -95,7 +103,8 @@ export async function collectSpecDocuments(q,log=[],signal){
   const page=await wiki({action:'parse',pageid:String(chosen.pageid),prop:'wikitext|externallinks'},signal,deadline-Date.now()),html=page.parse?.wikitext?.['*']||page.parse?.text?.['*']||'',plain=textOf(html);
   let published=[];try{published=await localLinks}catch(e){active(signal)}
   const candidates=[...published.map(x=>x.url),...(page.parse?.externallinks||[])].filter(allowedSource).filter(u=>!/^https:\/\/en\.wikipedia/.test(u));
-  candidates.sort((a,b)=>{const score=u=>(under(new URL(u).hostname,OEM)?20:0)+(normal(u).includes(normal(q.model))?10:0)+(u.includes(q.year)?15:0);return score(b)-score(a)});
+  const metadata=new Map(published.map(x=>[x.url,x]));
+  candidates.sort((a,b)=>documentRank(b,q,metadata.get(b))-documentRank(a,q,metadata.get(a)));
   const hostCounts=new Map(),unique=new Set(),urls=[];for(const u of candidates){const host=new URL(u).hostname.replace(/^www\./,'');if(unique.has(u)||(hostCounts.get(host)||0)>=2||/\.pdf(?:\?|$)/i.test(u))continue;unique.add(u);hostCounts.set(host,(hostCounts.get(host)||0)+1);urls.push(u);if(urls.length===10)break}
   const docs=[];if(relevant(plain,q)&&plain.length>250){docs.push({url:'https://en.wikipedia.org/wiki/'+encodeURIComponent(chosen.title.replace(/ /g,'_')),title:chosen.title,text:excerpt(plain,q),primary:false,license:'CC BY-SA'});log.push({step:'document',ok:true,url:docs[0].url,title:chosen.title,chars:plain.length})}
   // Four simultaneous requests at most; no payment keys and no access-barrier

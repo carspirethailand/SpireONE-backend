@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {allowedSource,robotsAllow,textOf,timebox,collectSpecDocuments,cleanDocumentExtraction,excerpt} from '../src/spec-web.js';
+import {allowedSource,robotsAllow,textOf,timebox,collectSpecDocuments,cleanDocumentExtraction,excerpt,documentRank} from '../src/spec-web.js';
 import {research,merge,specFailure} from '../src/carspec.js';
 const q={make:'Mitsubishi',model:'Pajero Sport',year:'2020'};
 // All documents and Gemini responses in this file are synthetic test data.
@@ -45,6 +45,12 @@ test('reader: scripts and hidden layout are not sent to the extraction model',()
 test('reader: archive URL digits cannot select the wrong generation for a model year',()=>{
   const text='web/20131202035457 archive\nproduction = 1996–present\nOLD GENERATION\n'+'Old information. '.repeat(700)+'\nproduction = 2015–present\nCURRENT GENERATION\n2020 market';
   const s=excerpt(text,q);assert.match(s,/production = 2015–present/);assert.doesNotMatch(s,/OLD GENERATION/);
+});
+test('reader: official Thai specification articles rank above spyshots before per-site candidate limits',()=>{
+  const query={make:'Porsche',model:'Cayenne',year:'2018'};
+  const official=documentRank('https://www.headlightmag.com/official-price-porsche-cayenne-e-hybrid-2018/',query,{title:'ราคาอย่างเป็นทางการ Porsche Cayenne E-Hybrid',published:'2018-09-18'});
+  const spy=documentRank('https://www.headlightmag.com/news-spyshot-2018-porsche-cayenne/',query,{title:'Spyshot: 2018 Porsche Cayenne',published:'2017-02-11'});
+  assert.ok(official>spy);assert.ok(official>documentRank('https://newsroom.porsche.com/en/2022/products/porsche-cayenne-anniversary.html',query));
 });
 test('reader: actual readable documents count, wrong-year title and unreadable links do not',async()=>{
   const calls=installWeb(),trail=[],result=await collectSpecDocuments(q,trail);assert.equal(result.length,2);
