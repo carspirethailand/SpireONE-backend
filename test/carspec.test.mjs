@@ -275,3 +275,21 @@ test('car spec: seats/doors are exact and equal engines cannot merge different t
   const m=merge(PAJERO,{...PAJERO,seats:8,doors:4,variants:[{...PAJERO.variants[0],name:'2.4 Basic 2WD'},{...PAJERO.variants[1],gearbox:'ธรรมดา 6 สปีด'}]});
   assert.equal(m.facts.seats.ok,false);assert.equal(m.facts.doors.ok,false);assert.equal(m.variants.length,4);
 });
+test('car spec: unusable specifications refund lookup allowance but retain non-refundable safety attempts',async()=>{
+  const {f,call,ai}=setup();globalThis.fetch=async()=>{ai.push({});return Response.json({candidates:[{content:{parts:[{text:'{"found":true}'}]},groundingMetadata:{groundingChunks:[{web:{uri:'https://official.example.test/spec',title:'test'}}]}}]})};
+  for(let i=0;i<9;i++)assert.equal((await call('POST','/api/car-spec',{make:'Fixture',model:'Empty '+i,year:'2020'})).json.code,'unconfirmed');
+  assert.equal(f.sqlite.prepare("SELECT n FROM spec_quota WHERE who='ip:203.0.113.9'").get().n,0);assert.equal(f.sqlite.prepare("SELECT n FROM spec_quota WHERE who='*'").get().n,0);
+  assert.equal(f.sqlite.prepare("SELECT n FROM spec_quota WHERE who='attempt:ip:203.0.113.9'").get().n,9);
+  const n=ai.length;assert.equal((await call('POST','/api/car-spec',{make:'Fixture',model:'Extra',year:'2020'})).json.code,'attempt_limit');assert.equal(ai.length,n);
+});
+test('car spec: daily limit responses identify account scope rather than an ambiguous Gemini quota',async()=>{
+  let {f,call}=setup();for(const m of ['G1','G2','G3'])await call('POST','/api/car-spec',{make:'Fixture',model:m,year:'2020'});
+  let r=await call('POST','/api/car-spec',{make:'Fixture',model:'G4',year:'2020'});assert.equal(r.json.code,'guest_limit');assert.equal(r.json.scope,'guest');assert.equal(r.json.signedIn,false);
+  ({f,call}=setup());const day=new Date().toISOString().slice(0,10);f.sqlite.prepare('INSERT INTO spec_quota(who,day,n) VALUES(?,?,?)').run('u:cust',day,10);
+  r=await call('POST','/api/car-spec',pajero,CUST);assert.equal(r.json.code,'user_limit');assert.equal(r.json.signedIn,true);
+  ({f,call}=setup());f.sqlite.prepare('INSERT INTO spec_quota(who,day,n) VALUES(?,?,?)').run('*',day,150);
+  r=await call('POST','/api/car-spec',pajero,CUST);assert.equal(r.json.code,'system_limit');assert.equal(f.sqlite.prepare("SELECT n FROM spec_quota WHERE who='u:cust'").get().n,0);
+});
+test('car spec: invalid bearer tokens cannot silently downgrade to guest or consume any lookup budget',async()=>{
+  const {f,call,ai}=setup();const r=await call('POST','/api/car-spec',pajero,'invalid-fixture-token');assert.equal(r.status,401);assert.equal(r.json.code,'auth_required');assert.equal(ai.length,0);assert.equal(f.sqlite.prepare('SELECT COUNT(*) n FROM spec_quota').get().n,0);
+});

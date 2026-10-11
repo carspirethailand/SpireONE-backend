@@ -397,13 +397,14 @@ export async function ensureSpec(env, q, { who = 'ip:unknown', user = false, sta
     // must not turn an outage into unlimited free provider traffic.
     const attempt=await spend(env,'attempt:'+who,(user?LIMIT.user:LIMIT.guest)*3,day);
     const allAttempts=attempt&&await spend(env,'attempt:*',LIMIT.all*3,day);
-    if(!allAttempts){await note('limited',false,'limited','เกินจำนวนครั้งที่อนุญาตให้ลองค้นในวันนี้');return {status:'limited',code:'attempt_limit',key:k,make:v.make,model:v.model,year:v.year}}
+    if(!allAttempts){await note('limited',false,'limited','เกินจำนวนครั้งที่อนุญาตให้ลองค้นในวันนี้');return {status:'limited',code:'attempt_limit',scope:attempt?'system':user?'user':'guest',key:k,make:v.make,model:v.model,year:v.year}}
     const personal=await spend(env, who, user ? LIMIT.user : LIMIT.guest,day);
     const global=personal&&await spend(env, '*', LIMIT.all,day);
     if (!global) {
       if(personal)await refund(env,who,day);
-      await note('limited', false, 'limited', user ? `ผู้ใช้คนนี้ค้นครบ ${LIMIT.user} รุ่นวันนี้ หรือทั้งระบบครบ ${LIMIT.all}` : `ไม่ได้ล็อกอิน (นับตาม IP) ค้นครบ ${LIMIT.guest} รุ่นวันนี้ หรือทั้งระบบครบ ${LIMIT.all}`);
-      return { status: 'limited', key: k, make: v.make, model: v.model, year: v.year };
+      const code=personal?'system_limit':user?'user_limit':'guest_limit';
+      await note('limited', false, 'limited', personal?`ทั้งระบบค้นครบ ${LIMIT.all} รุ่นวันนี้`:user?`ผู้ใช้คนนี้ค้นครบ ${LIMIT.user} รุ่นวันนี้`:`ไม่ได้ล็อกอิน (นับตาม IP) ค้นครบ ${LIMIT.guest} รุ่นวันนี้`);
+      return { status: 'limited', code, scope:personal?'system':user?'user':'guest', signedIn:user, key: k, make: v.make, model: v.model, year: v.year };
     }
   }
   const claim=await env.DB.prepare(`INSERT INTO car_specs (k, make, model, year, status, created_at, updated_at, by_uid)
@@ -418,7 +419,9 @@ export async function ensureSpec(env, q, { who = 'ip:unknown', user = false, sta
     try { res = await research(env, v, trail); }
     catch (e) {
       const msg = String((e && e.message) || e).slice(0, 300);
-      if(!staff&&['provider_quota','provider_auth','provider_model'].includes(specFailure(msg).code)){await refund(env,who,day);await refund(env,'*',day)}
+      // No usable specification was returned. Refund the lookup allowance,
+      // while the separate, non-refundable attempt caps still stop abuse.
+      if(!staff){await refund(env,who,day);await refund(env,'*',day)}
       await env.DB.prepare("UPDATE car_specs SET status = 'failed', error = ?, updated_at = ? WHERE k = ? AND status='pending' AND updated_at=?")
         .bind(msg, Date.now(), k,now).run();
       await logSpec(env, { k, who, kind: force ? 'redo' : retry ? 'retry' : 'research', ok: false, status: 'failed', err: msg, trail, ms: Date.now() - now });

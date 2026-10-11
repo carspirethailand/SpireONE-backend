@@ -4940,8 +4940,8 @@ ${convo}`;
        * ไม่ต้องล็อกอินก็ดึงได้ (คนเพิ่มรถได้โดยไม่ล็อกอิน) — การค้นรุ่นใหม่ด้วย AI มีโควตาต่อคน/ต่อ IP */
       if (url.pathname === '/api/car-spec' || url.pathname === '/api/car-spec/report' || url.pathname.startsWith('/api/vin/')) {
         let actor = null;
-        if ((request.headers.get('Authorization') || '').startsWith('Bearer ')) {
-          try { actor = await getActor(request, env); } catch (e) { /* ใช้แบบไม่ล็อกอิน */ }
+        if (request.headers.get('Authorization')) {
+          try { actor = await getActor(request, env); } catch (e) { return json({error:'Could not confirm your signed-in session',code:'auth_required'},401); }
         }
         if (actor && actor.banned) return deny('Account suspended', 403);
         const who = actor ? 'u:' + actor.payload.sub : 'ip:' + (request.headers.get('CF-Connecting-IP') || 'unknown');
