@@ -7,6 +7,7 @@ const OEM=['mitsubishi-motors.com','mitsubishi-motors.co.th','mitsubishi-motors.
 const PRESS=['headlightmag.com','autospinn.com','grandprix.co.th','autodeft.com','motortrivia.com','autostation.com','car250.com','caranddriver.com','edmunds.com','motortrend.com','autocar.co.uk','autoexpress.co.uk','topgear.com','carsguide.com.au','carexpert.com.au','paultan.org','roadandtrack.com','thedrive.com','carfolio.com','ultimatespecs.com'];
 const HOSTS=[...OEM,...PRESS,'en.wikipedia.org'];
 const robotCache=new Map();
+const SEARCH_SITES=['https://www.headlightmag.com','https://www.autodeft.com','https://www.motortrivia.com'];
 export function active(signal){if(signal?.aborted)throw Object.assign(new Error('ค้นนานเกินกำหนด'),{name:'AbortError'})}
 /* The race also bounds stalled response bodies and fetch mocks that ignore
  * abort. All nested requests inherit cancellation; no fallback survives it. */
@@ -22,15 +23,15 @@ export function textOf(html){return String(html||'').replace(/<!--[^]*?-->/g,' '
   .replace(/<\/(?:p|tr|li|h[1-6]|div|section|table)>/gi,'\n').replace(/<[^>]+>/g,' ').replace(/&#x([0-9a-f]+);/gi,(_,n)=>String.fromCodePoint(Math.min(parseInt(n,16),0x10ffff)))
   .replace(/&#(\d+);/g,(_,n)=>String.fromCodePoint(Math.min(Number(n),0x10ffff))).replace(/&nbsp;/g,' ').replace(/&amp;/g,'&').replace(/&quot;/g,'"').replace(/&#39;|&apos;/g,"'").replace(/[ \t]+/g,' ').replace(/\n\s*\n/g,'\n').trim();}
 export function robotsAllow(text,path){
-  let agents=[],rules=[],groups=[];
-  for(const line of String(text||'').split(/\r?\n/)){const m=line.replace(/#.*$/,'').match(/^\s*(user-agent|allow|disallow)\s*:\s*(.*?)\s*$/i);if(!m)continue;const k=m[1].toLowerCase();
-    if(k==='user-agent'){if(rules.length){groups.push({agents,rules});agents=[];rules=[]}agents.push(m[2].toLowerCase())}else if(agents.length&&m[2])rules.push({allow:k==='allow',path:m[2]});
-  }groups.push({agents,rules});
+  let agents=[],rules=[],signals='',groups=[];
+  for(const line of String(text||'').split(/\r?\n/)){const m=line.replace(/#.*$/,'').match(/^\s*(user-agent|allow|disallow|content-signal)\s*:\s*(.*?)\s*$/i);if(!m)continue;const k=m[1].toLowerCase();
+    if(k==='user-agent'){if(rules.length||signals){groups.push({agents,rules,signals});agents=[];rules=[];signals=''}agents.push(m[2].toLowerCase())}else if(k==='content-signal'){signals+=' '+m[2]}else if(agents.length&&m[2])rules.push({allow:k==='allow',path:m[2]});
+  }groups.push({agents,rules,signals});
   // Also respect the publisher's Google-Extended restriction: free Gemini API
   // content may be used for model improvement, so do not circumvent that rule.
   const specific=groups.filter(g=>g.agents.some(a=>a!=='*'&&a!=='google-extended'&&UA.toLowerCase().includes(a)));
   const selected=specific.length?specific:groups.filter(g=>g.agents.includes('*'));
-  const permitted=gs=>{let best=null;for(const g of gs)for(const r of g.rules){const escaped=r.path.replace(/[.+?^{}()|[\]\\]/g,'\\$&').replace(/\*/g,'.*');if(new RegExp('^'+escaped).test(path)&&(!best||r.path.length>best.path.length||r.path.length===best.path.length&&r.allow))best=r}return !best||best.allow};
+  const permitted=gs=>{if(gs.some(g=>/ai-(?:input|train)\s*=\s*no/i.test(g.signals)))return false;let best=null;for(const g of gs)for(const r of g.rules){const escaped=r.path.replace(/[.+?^{}()|[\]\\]/g,'\\$&').replace(/\*/g,'.*');if(new RegExp('^'+escaped).test(path)&&(!best||r.path.length>best.path.length||r.path.length===best.path.length&&r.allow))best=r}return !best||best.allow};
   // Google-Extended restrictions are an additional gate, not rules that a
   // longer wildcard Allow can override.
   return permitted(selected)&&permitted(groups.filter(g=>g.agents.includes('google-extended')));
@@ -45,6 +46,16 @@ async function wiki(params,signal,ms=7000){const {r,text}=await request(WIKI+'?'
 async function mayRead(url,signal){const u=new URL(url),cached=robotCache.get(u.origin);let rules=cached?.until>Date.now()?cached.rules:null;
   if(rules==null){try{const {r,text}=await request(u.origin+'/robots.txt',3500,signal);if(r.status===404)rules='';else if(r.ok)rules=text;else return false;robotCache.set(u.origin,{rules,until:Date.now()+600000});if(robotCache.size>60)robotCache.delete(robotCache.keys().next().value)}catch(e){active(signal);return false}}
   return robotsAllow(rules,u.pathname+u.search);
+}
+async function publisherLinks(q,log,signal){
+  const results=await Promise.all(SEARCH_SITES.map(async origin=>{try{
+    const url=origin+'/wp-json/wp/v2/posts?'+new URLSearchParams({search:q.model+' '+q.year,per_page:'15',orderby:'relevance',_fields:'link,title,date'});
+    if(!await mayRead(url,signal))return [];
+    const {r,text}=await request(url,4000,signal);if(!r.ok)return [];
+    const rows=JSON.parse(text);if(!Array.isArray(rows))return [];
+    return rows.filter(x=>allowedSource(x.link)&&normal(textOf(x.title?.rendered)).includes(normal(q.model))).map(x=>({url:x.link,title:textOf(x.title?.rendered),published:x.date}));
+  }catch(e){active(signal);return []}}));
+  const links=results.flat();log.push({step:'publisher-discovery',ok:!!links.length,links:links.length});return links;
 }
 function relevant(text,q){const n=normal(text);return n.includes(normal(q.make))&&n.includes(normal(q.model))}
 function excerpt(text,q){
@@ -67,20 +78,26 @@ async function readPage(raw,q,log,signal){
 }
 export async function collectSpecDocuments(q,log=[],signal){
   const deadline=Date.now()+12000;
+  // Public publisher search APIs are read-only. These provide local-market
+  // articles beyond Wikipedia's reference list; no search-service key needed.
+  const localLinks=publisherLinks(q,log,signal);
+  // Observe rejection even if required discovery exits before using links.
+  localLinks.catch(()=>{});
   const found=await wiki({action:'query',list:'search',srsearch:q.make+' '+q.model,srlimit:'3'},signal,deadline-Date.now());
   const rows=found.query?.search||[],exact=rows.find(x=>normal(x.title)===normal(q.make+' '+q.model)),chosen=exact||rows.find(x=>relevant(textOf(x.title+' '+x.snippet),q));
   if(!chosen?.pageid)throw Error('ไม่พบเอกสารอ้างอิงของรุ่นนี้จากแหล่งค้นข้อมูลเปิด');
   // Wikitext avoids downloading hundreds of KB of generated table/layout HTML
   // and retains the specification table. It is still untrusted document data.
   const page=await wiki({action:'parse',pageid:String(chosen.pageid),prop:'wikitext|externallinks'},signal,deadline-Date.now()),html=page.parse?.wikitext?.['*']||page.parse?.text?.['*']||'',plain=textOf(html);
-  const candidates=(page.parse?.externallinks||[]).filter(allowedSource).filter(u=>!/^https:\/\/en\.wikipedia/.test(u));
+  let published=[];try{published=await localLinks}catch(e){active(signal)}
+  const candidates=[...published.map(x=>x.url),...(page.parse?.externallinks||[])].filter(allowedSource).filter(u=>!/^https:\/\/en\.wikipedia/.test(u));
   candidates.sort((a,b)=>{const score=u=>(under(new URL(u).hostname,OEM)?20:0)+(normal(u).includes(normal(q.model))?10:0)+(u.includes(q.year)?15:0);return score(b)-score(a)});
-  const hosts=new Set(),urls=[];for(const u of candidates){const host=new URL(u).hostname.replace(/^www\./,'');if(hosts.has(host)||/\.pdf(?:\?|$)/i.test(u))continue;hosts.add(host);urls.push(u);if(urls.length===8)break}
+  const hostCounts=new Map(),unique=new Set(),urls=[];for(const u of candidates){const host=new URL(u).hostname.replace(/^www\./,'');if(unique.has(u)||(hostCounts.get(host)||0)>=2||/\.pdf(?:\?|$)/i.test(u))continue;unique.add(u);hostCounts.set(host,(hostCounts.get(host)||0)+1);urls.push(u);if(urls.length===10)break}
   const docs=[];if(relevant(plain,q)&&plain.length>250){docs.push({url:'https://en.wikipedia.org/wiki/'+encodeURIComponent(chosen.title.replace(/ /g,'_')),title:chosen.title,text:excerpt(plain,q),primary:false,license:'CC BY-SA'});log.push({step:'document',ok:true,url:docs[0].url,title:chosen.title,chars:plain.length})}
   // Four simultaneous requests at most; no payment keys and no access-barrier
   // workarounds. Five distinct readable sites are the target, not fabricated.
-  for(let i=0;i<urls.length&&docs.length<5&&Date.now()<deadline;i+=4){active(signal);
-    try{await timebox(own=>Promise.all(urls.slice(i,i+4).map(async u=>{const d=await readPage(u,q,log,own);active(own);if(d&&docs.length<5)docs.push(d)})),Math.min(7000,deadline-Date.now()),signal)}
+  for(let i=0;i<urls.length&&docs.length<6&&Date.now()<deadline;i+=4){active(signal);
+    try{await timebox(own=>Promise.all(urls.slice(i,i+4).map(async u=>{const d=await readPage(u,q,log,own);active(own);if(d&&docs.length<6)docs.push(d)})),Math.min(7000,deadline-Date.now()),signal)}
     catch(e){active(signal);log.push({step:'documents-partial',ok:false,err:'บางเอกสารอ่านไม่ทัน ใช้เฉพาะเอกสารที่อ่านเสร็จแล้ว'})}
   }
   if(!docs.length)throw Error('ไม่พบหน้าเอกสารที่เปิดอ่านและใช้อ้างอิงได้');return docs.map((d,id)=>({...d,id}));

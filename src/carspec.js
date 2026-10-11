@@ -44,7 +44,7 @@ export function specAI(env) {
   /* รุ่นที่แชตไม่ได้ใช้ตอบเป็นหลักก่อน → แล้วค่อยถอยไปรุ่นของแชตเป็นทางสุดท้าย
      สเปกรถค้นครั้งเดียวต่อรุ่นรถตลอดไป การค้นสำเร็จสำคัญกว่าการหลบโควตาแชตทุกครั้ง */
   const defaults=env.GEMINI_SPEC_MODE==='grounded'?SPEC_MODELS:['gemini-3.1-flash-lite','gemini-3.5-flash-lite','gemini-3.6-flash','gemini-3.8-flash'];
-  const models = [env.GEMINI_SPEC_MODEL, ...defaults.filter((m) => !chatMain.includes(m)), ...chatMain.filter(m=>!/^gemini-2/.test(m))]
+  const models = [env.GEMINI_SPEC_MODEL, ...defaults.filter((m) => env.GEMINI_SPEC_MODE!=='grounded'||!chatMain.includes(m)), ...chatMain.filter(m=>!/^gemini-2/.test(m))]
     .map((m) => norm(m)).filter(Boolean);
   const repair = ['gemini-3.5-flash-lite', 'gemini-2.5-flash-lite', 'gemini-3.1-flash-lite', ...chatMain];
   return { key, own, models: [...new Set(models)], repair };
@@ -187,7 +187,7 @@ async function lookup(env, ai, prompt, start, log = [], pass = 'A',docs=null,q=n
       const o = direct || (!docs&&r.text.trim() ? await repairJson(env, ai, r.text, log, pass,signal) : null);
       step.ms = Date.now() - t0; step.ok = !!o; step.json = direct ? 'ok' : o ? 'ซ่อมแล้ว' : r.text.trim() ? 'อ่านไม่ได้' : 'ว่าง';
       if (!o) step.head = r.text.slice(0, 160);
-      if (o) return { ...r, data: docs?cleanDocumentExtraction(o,docs,q):o };
+      if (o) return { ...r, data: docs?(o.found===false?{found:false}:cleanDocumentExtraction(o,docs,q)):o };
       last = new Error(m + (r.text.trim() ? ' ตอบไม่เป็น JSON' : ' ตอบว่าง'));
       step.err = last.message;
     } catch (e) {
@@ -304,7 +304,7 @@ async function researchWithin(env,q,log,signal){
   const A = a.status === 'fulfilled' ? a.value : null, B = b.status === 'fulfilled' ? b.value : null;
   if (!A && !B) throw (a.reason || b.reason || new Error('ค้นข้อมูลไม่สำเร็จ'));
   const first = A || B, second = A ? B : null;
-  if (first.data.found === false && second && second.data.found === false&&first.sources.length&&second.sources.length) {
+  if (!docs&&first.data.found === false && second && second.data.found === false&&first.sources.length&&second.sources.length) {
     return { status: 'notfound', data: null, sources: [], models: [first.model, second && second.model].filter(Boolean) };
   }
   const positive=[A,B].filter(r=>r&&r.data.found===true&&r.sources.length);
@@ -322,7 +322,8 @@ async function researchWithin(env,q,log,signal){
   if(docs){const used=new Set([...Object.values(data.facts).flatMap(f=>f?.sourceIds||[]),...data.bodySourceIds,...data.variants.flatMap(v=>[...v.sourceIds,...v.fuelSourceIds,...['engine','gearbox','drive',...VNUM].flatMap(k=>v[k]?.sourceIds||[])])]);
     for(let i=sources.length-1;i>=0;i--)if(!used.has(sources[i].docId))sources.splice(i,1);
   }
-  data.coverage={targetSources:5,sourceCount:sources.length,readCount:docs?.length||sources.length,passes:positive.length};
+  const countHosts=xs=>new Set(xs.map(x=>new URL(x.url).hostname.replace(/^www\./,''))).size;
+  data.coverage={targetSources:5,sourceCount:sources.length,siteCount:countHosts(sources),readCount:docs?.length||sources.length,readSiteCount:countHosts(docs||sources),passes:positive.length};
   return { status: 'ready', data, sources: sources.slice(0, 16), models: positive.map(r=>r.model), passes:positive.length };
 }
 

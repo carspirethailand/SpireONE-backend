@@ -36,6 +36,8 @@ test('reader: publisher bot restrictions cannot be undone by a wildcard allow',(
   assert.equal(robotsAllow('User-agent: *\nAllow: /\nUser-agent: CendonSpecs\nDisallow: /private','/private'),false);
   assert.equal(robotsAllow('User-agent: *\nDisallow: /\nAllow: /public','/public/a'),true);
   assert.equal(robotsAllow('User-agent: *\nDisallow: /x$','/xyz'),true);
+  assert.equal(robotsAllow('User-agent: *\nAllow: /\nContent-Signal: search=yes,ai-input=no','/public'),false);
+  assert.equal(robotsAllow('User-agent: *\nAllow: /\nContent-Signal: search=yes,ai-train=no','/public'),false);
 });
 test('reader: scripts and hidden layout are not sent to the extraction model',()=>{
   const s=textOf('<script>secret</script><nav>menu</nav><p>Seats: 7 &amp; 5 doors.</p>');assert.equal(s,'Seats: 7 & 5 doors.');
@@ -89,5 +91,8 @@ test('free pipeline: real document input, no Google Search tool, only validated 
 test('free pipeline: total budget includes discovery and forbids late Gemini calls after cancellation',async()=>{
   const calls=[];globalThis.fetch=async(url,init)=>{calls.push({url,init});return new Promise(()=>{})};
   await assert.rejects(research({GEMINI_KEY:'test-only-key'},q,[],{budgetMs:20}),e=>e.name==='AbortError');
-  await new Promise(r=>setTimeout(r,30));assert.equal(calls.length,1);assert.equal(calls[0].init.signal.aborted,true);
+  const n=calls.length;await new Promise(r=>setTimeout(r,30));assert.equal(calls.length,n);assert.ok(!calls.some(c=>String(c.url).includes('generativelanguage')));assert.ok(calls.every(c=>c.init.signal.aborted));
+});
+test('free pipeline: two honest negative extractions stop after two calls and are not proof that the model never existed',async()=>{
+  const calls=installWeb({aiResponse:{found:false}});await assert.rejects(research({GEMINI_KEY:'test-only-key'},q),/ยืนยัน/);assert.equal(calls.filter(c=>c.url.includes('generativelanguage')).length,2);
 });
