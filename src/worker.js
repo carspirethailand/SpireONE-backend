@@ -4949,7 +4949,7 @@ ${convo}`;
           if (url.pathname === '/api/car-spec' && request.method === 'GET') {
             const v = validQuery(Object.fromEntries(url.searchParams));
             if (!v) return deny('ชื่อรถหรือปีไม่ถูกต้อง', 400);
-            return json((await getSpec(env, specKey(v.make, v.model, v.year))) || { status: 'none' });
+            return json((await getSpec(env, specKey(v.make, v.model, v.year,v.market))) || { status: 'none' });
           }
           if (url.pathname === '/api/car-spec' && request.method === 'POST') {
             const b = await readBody();
@@ -4981,7 +4981,7 @@ ${convo}`;
           const r = await getSpec(env, String(b.key || ''));
           if (!r) return deny('ไม่พบรุ่นนี้ในคลัง', 404);
           /* ค้นใหม่ทับ แล้วล้างรายงานเดิม (รายงานเป็นของข้อมูลชุดเก่า) */
-          const out = await ensureSpec(env, { make: r.make || make, model: r.model || model, year: r.year || year },
+          const out = await ensureSpec(env, { make: r.make || make, model: r.model || model, year: r.year || year,market:r.data?.query?.market||r.key.split('|')[3]?.toUpperCase()||'TH' },
             { who: 'u:' + actor.payload.sub, staff: true, force: true });
           await env.DB.batch([
             env.DB.prepare('DELETE FROM car_spec_reports WHERE k = ?').bind(r.key),
@@ -4994,7 +4994,7 @@ ${convo}`;
       if (url.pathname === '/api/admin/car-specs/verify' && request.method === 'POST') {
         return await guarded('admin', async (actor) => {
           const b = await readBody() || {};
-          const out = await verifySpec(env, b.key, b.on !== false);
+          let out;try{out=await verifySpec(env, b.key, b.on !== false)}catch(e){if(e.status===400)return deny(e.message,400);throw e}
           await logAudit(env, actor.email || actor.payload.sub, b.on !== false ? 'spec_verify' : 'spec_unverify', String(b.key || ''), '');
           return json(out);
         })();

@@ -55,7 +55,7 @@ export async function vpic(vin) {
 }
 
 /* ข้อมูลเพิ่มเติมที่เจ้าของรถกรอกเอง (ไม่บังคับทุกช่อง) — รับเฉพาะคีย์ที่รู้จัก ตัดความยาว */
-const INFO = { vin: 17, trim: 60, engine: 60, gear: 20, fuel: 20, plate: 20, province: 40, tax_due: 10, ins_due: 10, ins_co: 60, tire: 30, note: 300 };
+const INFO = { vin: 17, trim: 60, engine: 60, engine_code:40, model_year:4, market:40, drive:20, gear: 20, fuel: 20, plate: 20, province: 40, tax_due: 10, ins_due: 10, ins_co: 60, tire: 30, note: 300 };
 export function cleanInfo(o) {
   if (!o || typeof o !== 'object' || Array.isArray(o)) return null;
   const out = {};
@@ -64,6 +64,7 @@ export function cleanInfo(o) {
     let s = String(o[k]).normalize('NFC').replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, n);
     if (!s) continue;
     if (k === 'vin') { s = s.toUpperCase().replace(/[\s-]/g, ''); if (!VIN_RE.test(s)) continue; }
+    if (k === 'model_year' && (!/^\d{4}$/.test(s)||Number(s)<1950||Number(s)>new Date().getUTCFullYear()+1))continue;
     if ((k === 'tax_due' || k === 'ins_due') && !/^\d{4}-\d{2}-\d{2}$/.test(s)) continue;
     out[k] = s;
   }

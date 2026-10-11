@@ -14,7 +14,7 @@ const PAJERO={found:true,body:'suv',generation:'Gen 3 (2015–2024)',market:'ไ
   safety:['ถุงลมนิรภัย 7 ตำแหน่ง','ABS','ASC'],comfort:['กุญแจอัจฉริยะ'],notes:null};
 
 function setup({passA=PAJERO,passB=PAJERO,fail=false}={}){
-  const f=fixture({DEV_AUTH:'1',FIREBASE_PROJECT_ID:'unit-test',GEMINI_KEY:'test-only-key'});
+  const f=fixture({DEV_AUTH:'1',FIREBASE_PROJECT_ID:'unit-test',GEMINI_KEY:'test-only-key',GEMINI_SPEC_MODE:'grounded'});
   f.sqlite.exec(`CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT); INSERT INTO config VALUES ('schema_version','999');
     CREATE TABLE audit (id INTEGER PRIMARY KEY AUTOINCREMENT, t INTEGER, actor TEXT, action TEXT, target TEXT, detail TEXT);
     CREATE TABLE car_specs (k TEXT PRIMARY KEY, make TEXT NOT NULL, model TEXT NOT NULL, year TEXT NOT NULL, status TEXT NOT NULL, body TEXT, data TEXT,
@@ -48,16 +48,16 @@ test('car spec: only real-looking car names and years are researched',()=>{
 });
 
 test('car spec: two independent lookups are compared field by field',()=>{
-  assert.deepEqual(field(181,180),{v:181,ok:true},'within 4% is the same number');
+  assert.deepEqual(field(181,180),{v:181,ok:true},'one-unit rounding is tolerated, not a generic four-percent difference');
   assert.deepEqual(field(181,150),{v:181,ok:false,alt:150},'different numbers keep both');
   assert.deepEqual(field(null,68),{v:68,ok:null},'one source only');
   const m=merge(PAJERO,{...PAJERO,body:'suv',kerb_kg:1990,variants:[{...PAJERO.variants[1],hp:178},{...PAJERO.variants[0]}]});
   assert.equal(m.body,'suv');assert.equal(m.body_ok,true);
   assert.equal(m.variants.length,2);assert.equal(m.variants[1].drive.v,'4WD','variants are matched by engine and drive, not by order');
-  assert.equal(m.variants[1].hp.ok,true);assert.equal(m.facts.kerb_kg.ok,true,'1990 vs 2045 is within 3%');
+  assert.equal(m.variants[1].hp.ok,false);assert.equal(m.facts.kerb_kg.ok,false,'different actual specifications must not be collapsed into a 3% tolerance');
   const bad=merge(PAJERO,{...PAJERO,body:'mpv',tank_l:80});
   assert.equal(bad.body,null,'body types that disagree are not trusted');assert.equal(bad.facts.tank_l.ok,false);assert.equal(bad.facts.tank_l.alt,80);
-  assert.ok(m.score.confirmed>10&&m.score.conflicts===0);
+  assert.ok(m.score.confirmed>10&&m.score.conflicts===2);
 });
 
 test('car spec: the first person to pick a model triggers AI once; everyone after gets the same data instantly',async()=>{
@@ -221,4 +221,57 @@ test('car spec log: cache hits, guest limits and admin test runs are recorded; a
   const log=(await call('GET','/api/admin/live',null,BOSS)).json.specLog;
   assert.equal(log[0].kind,'limited');assert.match(log[0].err,/ไม่ได้ล็อกอิน/);assert.match(log[0].who,/^ip:203\.0…/,'guest IPs are shortened');
   assert.ok(log.some(x=>x.kind==='cache'&&x.ok));assert.ok(log.some(x=>x.kind==='redo'&&x.ok));
+});
+
+test('car spec: notfound in one lookup cannot compare the other positive lookup with itself',async()=>{
+  const {call}=setup({passA:{found:false},passB:PAJERO});
+  const r=await call('POST','/api/car-spec',pajero,CUST);assert.equal(r.json.status,'ready');assert.equal(r.json.data.score.confirmed,0);
+  assert.equal(r.json.data.body_ok,false);assert.equal(r.json.data.variants[0].hp.ok,null);assert.equal(r.json.data.coverage.passes,1);
+});
+test('car spec: source-free or empty model output is never published as a real ready specification',async()=>{
+  for(const empty of [false,true]){const {call}=setup();globalThis.fetch=async()=>Response.json({candidates:[{content:{parts:[{text:JSON.stringify(empty?{found:true}:PAJERO)}]},groundingMetadata:{groundingChunks:empty?[{web:{uri:'https://official.example.test',title:'official'}}]:[]}}]});
+    const r=await call('POST','/api/car-spec',pajero,CUST);assert.equal(r.json.status,'failed');assert.equal(r.json.data,null);assert.equal(r.json.code,'unconfirmed');}
+});
+test('car spec: an unsuccessful negative lookup is not remembered as permanent notfound',async()=>{
+  const {f}=setup();let count=0;globalThis.fetch=async(url,init)=>{const second=/ตรวจสอบข้อมูลจำเพาะ/.test(JSON.parse(init.body).contents[0].parts[0].text);count++;if(second)return new Response('quota',{status:429});return Response.json({candidates:[{content:{parts:[{text:'{"found":false}'}]},groundingMetadata:{groundingChunks:[{web:{uri:'https://official.example.test',title:'official'}}]}}]})};
+  const {ensureSpec}=await import('../src/carspec.js');const r=await ensureSpec(f.env,pajero,{who:'u:cust',user:true});assert.equal(r.status,'failed');assert.ok(count>1);assert.notEqual(r.status,'notfound');
+});
+test('car spec: same model/year in different markets uses different shared cache records and never sends a VIN',async()=>{
+  const {f,call,ai}=setup();const a=await call('POST','/api/car-spec',pajero,CUST),b=await call('POST','/api/car-spec',{...pajero,market:'JP',vin:'PRIVATE-FIXTURE-VIN'},CUST);
+  assert.notEqual(a.json.key,b.json.key);assert.equal(b.json.data.query.market,'JP');assert.equal(f.sqlite.prepare('SELECT count(*) n FROM car_specs').get().n,2);
+  assert.ok(ai.slice(2).every(x=>x.body.contents[0].parts[0].text.includes('ญี่ปุ่น')&&!JSON.stringify(x.body).includes('PRIVATE-FIXTURE-VIN')));
+  assert.equal((await call('GET','/api/car-spec?make=Mitsubishi&model=Pajero%20Sport&year=2020&market=JP')).json.key,b.json.key);
+});
+test('car spec: simultaneous first requests reserve one lookup and refund the duplicate reservation',async()=>{
+  const {f,ai}=setup(),base=globalThis.fetch;let release;const gate=new Promise(resolve=>{release=resolve});globalThis.fetch=async(...args)=>{await gate;return base(...args)};
+  const {ensureSpec,getSpec}=await import('../src/carspec.js');const jobs=[];
+  const results=await Promise.all([ensureSpec(f.env,pajero,{who:'u:cust',user:true,waitMs:10,defer:p=>jobs.push(p)}),ensureSpec(f.env,pajero,{who:'u:other',user:true,waitMs:10,defer:p=>jobs.push(p)})]);
+  assert.ok(results.every(x=>x.status==='pending'));assert.equal(jobs.length,1);release();await Promise.all(jobs);assert.equal(ai.length,2);
+  assert.equal((await getSpec(f.env,results[0].key)).status,'ready');assert.equal(f.sqlite.prepare("SELECT n FROM spec_quota WHERE who='*'").get().n,1);
+});
+test('car spec: provider quota failure is explicit and does not consume the user lookup allowance',async()=>{
+  const {f,call}=setup({fail:true});const r=await call('POST','/api/car-spec',pajero,CUST);
+  assert.equal(r.json.code,'provider_quota');assert.equal(r.json.retryable,false);assert.equal(f.sqlite.prepare("SELECT n FROM spec_quota WHERE who='u:cust'").get().n,0);
+});
+test('car spec: different numeric specs, drivetrains and impossible values cannot be called matching facts',()=>{
+  const x=merge({...PAJERO,seats:1000,tank_l:-1},{...PAJERO,variants:[{...PAJERO.variants[0],drive:'AWD'}]});
+  assert.equal(x.facts.seats.ok,null);assert.equal(x.facts.tank_l.ok,null);assert.equal(x.variants[0].drive.ok,null);
+  assert.deepEqual(field(7.9,8.3),{v:7.9,ok:false,alt:8.3});assert.equal(merge({...PAJERO,seats:1000},{...PAJERO,seats:1000}).facts.seats,null);
+});
+test('car info: extra optional model context is private and invalid model years are discarded',()=>{
+  assert.deepEqual(cleanInfo({engine_code:'4N15',model_year:'2020',market:'JP',drive:'4WD',unexpected:'x'}),{engine_code:'4N15',model_year:'2020',market:'JP',drive:'4WD'});
+  assert.equal(cleanInfo({model_year:'9999'}),null);
+});
+test('car spec: admin verification cannot make a legacy unsourced record look trustworthy',async()=>{
+  const {f,call}=setup();f.sqlite.prepare("INSERT INTO car_specs(k,make,model,year,status,data,sources,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)").run('fake|model|2020','Fake','Model','2020','ready','{"facts":{"seats":{"v":5}}}','[]',1,1);
+  const r=await call('POST','/api/admin/car-specs/verify',{key:'fake|model|2020'},BOSS);assert.equal(r.status,400);
+  assert.equal((await call('GET','/api/car-spec?make=Fake&model=Model&year=2020')).json.status,'unconfirmed');
+});
+test('car spec: provider refunds cannot enable unlimited lookup attempts by rotating car models',async()=>{
+  const {call,ai}=setup({fail:true});for(let i=0;i<9;i++)assert.equal((await call('POST','/api/car-spec',{make:'Honda',model:'Fixture '+i,year:'2020'})).json.code,'provider_quota');
+  const n=ai.length,r=await call('POST','/api/car-spec',{make:'Honda',model:'Fixture blocked',year:'2020'});assert.equal(r.json.status,'limited');assert.equal(r.json.code,'attempt_limit');assert.equal(ai.length,n);
+});
+test('car spec: seats/doors are exact and equal engines cannot merge different trims or gearboxes',()=>{
+  const m=merge(PAJERO,{...PAJERO,seats:8,doors:4,variants:[{...PAJERO.variants[0],name:'2.4 Basic 2WD'},{...PAJERO.variants[1],gearbox:'ธรรมดา 6 สปีด'}]});
+  assert.equal(m.facts.seats.ok,false);assert.equal(m.facts.doors.ok,false);assert.equal(m.variants.length,4);
 });
