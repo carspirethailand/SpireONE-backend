@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {allowedSource,robotsAllow,textOf,timebox,collectSpecDocuments,cleanDocumentExtraction} from '../src/spec-web.js';
+import {allowedSource,robotsAllow,textOf,timebox,collectSpecDocuments,cleanDocumentExtraction,excerpt} from '../src/spec-web.js';
 import {research,merge,specFailure} from '../src/carspec.js';
 const q={make:'Mitsubishi',model:'Pajero Sport',year:'2020'};
 // All documents and Gemini responses in this file are synthetic test data.
@@ -42,6 +42,10 @@ test('reader: publisher bot restrictions cannot be undone by a wildcard allow',(
 test('reader: scripts and hidden layout are not sent to the extraction model',()=>{
   const s=textOf('<script>secret</script><nav>menu</nav><p>Seats: 7 &amp; 5 doors.</p>');assert.equal(s,'Seats: 7 & 5 doors.');
 });
+test('reader: archive URL digits cannot select the wrong generation for a model year',()=>{
+  const text='web/20131202035457 archive\nproduction = 1996–present\nOLD GENERATION\n'+'Old information. '.repeat(700)+'\nproduction = 2015–present\nCURRENT GENERATION\n2020 market';
+  const s=excerpt(text,q);assert.match(s,/production = 2015–present/);assert.doesNotMatch(s,/OLD GENERATION/);
+});
 test('reader: actual readable documents count, wrong-year title and unreadable links do not',async()=>{
   const calls=installWeb(),trail=[],result=await collectSpecDocuments(q,trail);assert.equal(result.length,2);
   assert.equal(result[0].license,'CC BY-SA');assert.equal(result[1].primary,true);assert.equal(result[1].url,docs[0].url);
@@ -67,6 +71,10 @@ test('extraction: wrong year, missing year scope and wrong market cannot become 
   raw.scope=[];assert.equal(cleanDocumentExtraction(raw,docs,q).seats,null);
   const usDocs=docs.map(d=>({...d,url:'https://www.caranddriver.com/test-pajero-sport'}));assert.equal(cleanDocumentExtraction(extraction(),usDocs,q).seats,null,'a US publisher needs explicit Thai market evidence');
   raw.scope=[{source:0,year_quote:'Mitsubishi Pajero Sport 2020 Thailand specification.',market_quote:'2020 Thailand specification.'}];assert.equal(cleanDocumentExtraction(raw,usDocs,q).seats,7);
+});
+test('extraction: nested facts keep their proof requirement and manufacturing country is not a sales-market proof',()=>{
+  const raw=extraction();raw.facts={seats:raw.seats};delete raw.seats;assert.equal(cleanDocumentExtraction(raw,docs,q).seats,7);
+  const d={...docs[0],url:'https://porsche.com/a',text:paragraph+' Assembly: Thailand.'};raw.scope[0].market_quote='Assembly: Thailand.';assert.equal(cleanDocumentExtraction(raw,[d],q).seats,null);
 });
 test('extraction: an unrelated generation far from the year context is rejected',()=>{
   const d={...docs[0],title:'Mitsubishi Pajero Sport',text:'2020 Thailand specification. '+ 'Other unrelated section. '.repeat(110)+ 'Seats: 7.'};

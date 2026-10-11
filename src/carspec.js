@@ -187,7 +187,7 @@ async function lookup(env, ai, prompt, start, log = [], pass = 'A',docs=null,q=n
       const o = direct || (!docs&&r.text.trim() ? await repairJson(env, ai, r.text, log, pass,signal) : null);
       step.ms = Date.now() - t0; step.ok = !!o; step.json = direct ? 'ok' : o ? 'ซ่อมแล้ว' : r.text.trim() ? 'อ่านไม่ได้' : 'ว่าง';
       if (!o) step.head = r.text.slice(0, 160);
-      if (o) return { ...r, data: docs?(o.found===false?{found:false}:cleanDocumentExtraction(o,docs,q)):o };
+      if (o){const data=docs?(o.found===false?{found:false}:cleanDocumentExtraction(o,docs,q)):o;if(data.diagnostic)step.evidence=data.diagnostic;return {...r,data}}
       last = new Error(m + (r.text.trim() ? ' ตอบไม่เป็น JSON' : ' ตอบว่าง'));
       step.err = last.message;
     } catch (e) {

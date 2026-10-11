@@ -58,8 +58,12 @@ async function publisherLinks(q,log,signal){
   const links=results.flat();log.push({step:'publisher-discovery',ok:!!links.length,links:links.length});return links;
 }
 function relevant(text,q){const n=normal(text);return n.includes(normal(q.make))&&n.includes(normal(q.model))}
-function excerpt(text,q){
-  const needle=String(q.year),at=text.indexOf(needle),start=Math.max(0,at<0?0:at-1800);
+export function excerpt(text,q){
+  // An archive URL containing ...2020... is not model-year evidence. Prefer
+  // the applicable generation's production block, otherwise an exact year.
+  const production=[...text.matchAll(/\b(?:production|model_years)\s*=\s*[^\n]{1,180}/gi)].filter(m=>coversYear(m[0],q.year)).sort((a,b)=>Number((b[0].match(/(?:19|20)\d{2}/)||[])[0]||0)-Number((a[0].match(/(?:19|20)\d{2}/)||[])[0]||0))[0];
+  const exact=text.match(new RegExp('(?<!\\d)'+String(q.year)+'(?!\\d)'));
+  const at=production?.index??exact?.index??-1,start=Math.max(0,at<0?0:at-(production?350:1800));
   return text.slice(start,start+9000);
 }
 async function readPage(raw,q,log,signal){
@@ -122,22 +126,24 @@ function supports(k,value,quote){const s=squash(quote);if(value==null)return fal
  * links only, not reproductions of article paragraphs or user information. */
 export function cleanDocumentExtraction(raw,docs,q){
   if(!raw||typeof raw!=='object'||raw.found!==true)throw Error('เอกสารยังไม่ยืนยันข้อมูลของปี/รุ่นนี้');
-  const proof=raw.evidence&&typeof raw.evidence==='object'?raw.evidence:{},evidence={},positions={};
+  const proof=raw.evidence&&typeof raw.evidence==='object'?raw.evidence:{},evidence={},positions={},diagnostic={scopeReceived:Array.isArray(raw.scope)?raw.scope.length:0,scopedDocuments:0,proofPaths:Object.keys(proof).length,acceptedFields:0,rejected:{},nestedFacts:!!raw.facts};
   const texts=new Map(docs.map(d=>[d.id,squash(d.text)])),scopes=new Map();
   const quoteAt=(id,s)=>typeof s==='string'&&s.length>=4&&s.length<=260?(texts.get(id)||'').indexOf(squash(s)):-1;
   for(const s of Array.isArray(raw.scope)?raw.scope:[]){const id=Number(s.source),d=docs.find(x=>x.id===id),at=quoteAt(id,s.year_quote);if(!d||at<0||!coversYear(s.year_quote,q?.year))continue;
     const market=q?.market||'TH',country=COUNTRY[market]||[],host=new URL(d.url).hostname;
     const directTH=market==='TH'&&/\.co\.th$/.test(host);
-    if(market!=='GLOBAL'&&!directTH&&!(quoteAt(id,s.market_quote)>=0&&country.some(x=>squash(s.market_quote).includes(x))))continue;
+    if(market!=='GLOBAL'&&!directTH&&!(quoteAt(id,s.market_quote)>=0&&country.some(x=>squash(s.market_quote).includes(x))&&!/\b(?:assembly|assembled|manufactur|export)\w*|ผลิต|ประกอบ/i.test(s.market_quote)))continue;
     const points=scopes.get(id)||[];points.push(at);scopes.set(id,points);
   }
-  function value(path,k,v,anchors){const entries=Array.isArray(proof[path])?proof[path]:[];const good=entries.filter(e=>{const id=Number(e.source),at=quoteAt(id,e.quote),d=docs.find(x=>x.id===id);if(!d||at<0||!scopes.has(id)||!supports(k,v,e.quote))return false;
+  diagnostic.scopedDocuments=scopes.size;
+  const reject=reason=>{diagnostic.rejected[reason]=(diagnostic.rejected[reason]||0)+1;return false};
+  function value(path,k,v,anchors){const entries=Array.isArray(proof[path])?proof[path]:[];const good=entries.filter(e=>{const id=Number(e.source),at=quoteAt(id,e.quote),d=docs.find(x=>x.id===id);if(!d||at<0)return reject('quote_missing');if(!scopes.has(id))return reject('scope_missing');if(!supports(k,v,e.quote))return reject('value_not_supported');
       const inYear=(d.title.match(/\b(?:19|20)\d{2}\b/g)||[]).includes(String(q.year))||scopes.get(id).some(p=>Math.abs(p-at)<=1200);
-      return inYear&&(!anchors||anchors.some(a=>a.id===id&&Math.abs(a.at-at)<=900));});
-    if(!good.length)return null;evidence[path]=[...new Set(good.map(e=>Number(e.source)))];positions[path]=good.map(e=>({id:Number(e.source),at:quoteAt(Number(e.source),e.quote)}));return v;
+      if(!inYear)return reject('outside_year_context');return !anchors||anchors.some(a=>a.id===id&&Math.abs(a.at-at)<=900)||reject('outside_variant_context');});
+    if(!good.length)return null;diagnostic.acceptedFields++;evidence[path]=[...new Set(good.map(e=>Number(e.source)))];positions[path]=good.map(e=>({id:Number(e.source),at:quoteAt(Number(e.source),e.quote)}));return v;
   }
   const out={found:true,variants:[],evidence};
-  for(const k of ['body','generation','market','seats','doors','length_mm','width_mm','height_mm','wheelbase_mm','kerb_kg','tank_l','tire'])out[k]=value('facts.'+k,k,raw[k]);
+  for(const k of ['body','generation','market','seats','doors','length_mm','width_mm','height_mm','wheelbase_mm','kerb_kg','tank_l','tire'])out[k]=value('facts.'+k,k,raw[k]??raw.facts?.[k]);
   for(const [i,v] of (Array.isArray(raw.variants)?raw.variants:[]).slice(0,12).entries()){
     const next={},base='variants.'+i+'.';for(const k of ['name','engine'])next[k]=value(base+k,k,v?.[k]);
     const anchors=[...(positions[base+'name']||[]),...(positions[base+'engine']||[])];
@@ -146,5 +152,5 @@ export function cleanDocumentExtraction(raw,docs,q){
     next._sources={};for(const k of Object.keys(next)){const refs=evidence[base+k];if(refs)next._sources[k]=refs}
     out.variants.push(next);
   }
-  out.safety=[];out.comfort=[];out.notes=null;return out;
+  out.safety=[];out.comfort=[];out.notes=null;out.diagnostic=diagnostic;return out;
 }
