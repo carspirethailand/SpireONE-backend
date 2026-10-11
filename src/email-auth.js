@@ -329,7 +329,7 @@ export async function handleEmailAuth(request, env) {
     const method = path === '/api/auth/config' ? 'GET' : 'POST';
     if (request.method !== method) return response({ error: 'Method not allowed.', code: 'auth/method-not-allowed' }, 405, request, env, { Allow: method });
     const config = await configuration(env);
-    if (path === '/api/auth/config') {const policy=onboardingPolicy(env);return response({ emailOtpReady: !!config, otpLength: 6, onboardingReady:policy.enabled,privacyUrl:policy.privacyUrl }, 200, request, env);}
+    if (path === '/api/auth/config') {const policy=onboardingPolicy(env);return response({ emailOtpReady: !!config, appleAuthReady:env.AUTH_APPLE_ENABLED==='1', otpLength: 6, onboardingReady:policy.enabled,privacyUrl:policy.privacyUrl }, 200, request, env);}
     if (!config) throw unavailable();
     const deadline = Date.now() + REQUEST_BUDGET;
     return path.endsWith('/request') ? await requestCode(request, env, config, deadline) : await verifyCode(request, env, config, deadline);

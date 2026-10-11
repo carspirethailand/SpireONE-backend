@@ -105,7 +105,7 @@ test('email auth: unrelated routes are untouched, route methods and cache header
   assert.equal((await f.call('/api/auth/email/request')).status, 405);
   assert.equal((await f.call('/api/auth/config', {})).status, 405);
   const config = await f.call('/api/auth/config');
-  assert.deepEqual(config.body, { emailOtpReady: true, otpLength: 6, onboardingReady:false,privacyUrl:null });
+  assert.deepEqual(config.body, { emailOtpReady: true, appleAuthReady:false, otpLength: 6, onboardingReady:false,privacyUrl:null });
   assert.equal(config.headers.get('Cache-Control'), 'no-store');
   assert.equal(config.headers.get('Access-Control-Allow-Origin'), 'https://cendon.unit.test');
   const forbidden = await f.call('/api/auth/email/request', { email: 'person@unit.test' }, { headers: { Origin: 'https://untrusted.unit.test' } });

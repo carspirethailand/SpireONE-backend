@@ -22,6 +22,7 @@
   "vars": {
     "FIREBASE_PROJECT_ID": "sp1p-82396",
     "ONBOARDING_PRIVACY_URL": "https://carspirethailand.github.io/Phasmion.ai/privacy.html",
+    "AUTH_APPLE_ENABLED": "0",
     // ชื่อบัญชี LINE OA ที่ผู้ใช้เห็น (ไม่ใช่ความลับ) — secret และ token ของ LINE ใส่ด้วย wrangler secret put
     "LINE_OA_ID": "@988omovg",
     "GEMINI_MODEL": "gemini-3.5-flash-lite",
