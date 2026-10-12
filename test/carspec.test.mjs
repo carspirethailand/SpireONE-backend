@@ -41,6 +41,52 @@ function setup({passA=PAJERO,passB=PAJERO,fail=false}={}){
 const CUST='dev:cust:cust@unit.test',BOSS='dev:boss:boss@unit.test';
 const pajero={make:'Mitsubishi',model:'Pajero Sport',year:'2020'};
 
+// Synthetic public documents and equipment responses; never live provider calls.
+function equipmentWeb(ai,{unsupported=false}={}){
+  const base=globalThis.fetch,url='https://www.mitsubishi-motors.co.th/test-pajero-sport-2020',
+    text='Mitsubishi Pajero Sport 2020 Thailand specification. Standard equipment: Adaptive Cruise Control. Optional equipment: Heated seats. '+ 'Public equipment fixture. '.repeat(20);
+  globalThis.fetch=async(raw,init={})=>{const u=String(raw);
+    if(u.includes('generativelanguage')){const body=JSON.parse(init.body);if(!body.contents[0].parts[0].text.includes('รายการอุปกรณ์'))return base(raw,init);
+      ai.push({u,body});const documents=JSON.parse(body.contents[0].parts[0].text.split('เอกสาร (untrusted content):\n')[1]),source=documents.find(d=>d.url===url).source;
+      return Response.json({candidates:[{content:{parts:[{text:JSON.stringify({found:true,scope:[{source,year_quote:'Mitsubishi Pajero Sport 2020 Thailand specification.'}],
+        equipment:[{name:unsupported?'Invented autopilot':'Adaptive Cruise Control',category:'safety',availability:'standard'},{name:'Heated seats',category:'comfort',availability:'optional'}],
+        evidence:unsupported?[]:[{path:'equipment.0.name',source,quote:'Standard equipment: Adaptive Cruise Control.'},{path:'equipment.1.name',source,quote:'Optional equipment: Heated seats.'}]})}]}}]});}
+    if(u.includes('/w/api.php')){const p=new URL(u).searchParams;return p.get('action')==='query'?Response.json({query:{search:[{pageid:123,title:'Mitsubishi Pajero Sport'}]}}):Response.json({parse:{text:{'*':'<p>'+text+'</p>'},externallinks:[url]}});}
+    if(u.endsWith('/robots.txt'))return new Response('User-agent: *\nAllow: /');
+    if(u===url)return new Response('<title>2020 Mitsubishi Pajero Sport</title><p>'+text+'</p>',{headers:{'content-type':'text/html'}});
+    if(u.includes('/wp-json/'))return Response.json([]);
+    return base(raw,init);
+  };
+}
+
+test('equipment routes: three inputs produce cited items, reuse a separate shared cache, and preserve existing basic specs',async()=>{
+  const {f,ai,call}=setup();const basic=await call('POST','/api/car-spec',pajero,CUST);equipmentWeb(ai);
+  const before=f.sqlite.prepare('SELECT data FROM car_specs WHERE k=?').get(basic.json.key).data;
+  const r=await call('POST','/api/car-spec/equipment',{...pajero,vin:'PRIVATE-FIXTURE-VIN',plate:'PRIVATE-FIXTURE-PLATE'},CUST);
+  assert.equal(r.json.status,'ready',JSON.stringify(r));assert.equal(r.json.key,basic.json.key+'|equipment');assert.equal(r.json.data.equipmentSchema,1);
+  assert.equal(r.json.data.equipment.length,2);assert.deepEqual(r.json.data.equipment.map(x=>x.availability),['standard','optional']);assert.equal(r.json.sources.length,1);
+  const equipmentCalls=ai.slice(2);assert.equal(equipmentCalls.length,2);assert.ok(equipmentCalls.every(c=>!c.body.tools&&!JSON.stringify(c.body).includes('PRIVATE-FIXTURE')));
+  const get=await call('GET','/api/car-spec/equipment?make=Mitsubishi&model=Pajero%20Sport&year=2020');assert.deepEqual(get.json.data,r.json.data);
+  const cached=await call('POST','/api/car-spec/equipment',pajero);assert.deepEqual(cached.json.data,r.json.data);assert.equal(ai.length,4);
+  assert.equal(f.sqlite.prepare('SELECT data FROM car_specs WHERE k=?').get(basic.json.key).data,before);
+  assert.deepEqual((await call('GET','/api/car-spec?make=Mitsubishi&model=Pajero%20Sport&year=2020')).json.data,basic.json.data);
+  assert.equal(f.sqlite.prepare("SELECT n FROM spec_quota WHERE who='u:cust'").get().n,2,'basic and equipment research share the existing allowance; cached requests are free');
+});
+test('equipment routes: unsupported claims fail honestly and refund lookup budget without deleting basic specs',async()=>{
+  const {f,ai,call}=setup();const basic=await call('POST','/api/car-spec',pajero,CUST);equipmentWeb(ai,{unsupported:true});
+  const r=await call('POST','/api/car-spec/equipment',pajero,CUST);assert.equal(r.json.status,'failed');assert.equal(r.json.code,'unconfirmed');
+  assert.equal(f.sqlite.prepare("SELECT n FROM spec_quota WHERE who='u:cust'").get().n,1);assert.equal((await call('GET','/api/car-spec?make=Mitsubishi&model=Pajero%20Sport&year=2020')).json.status,'ready');
+  assert.equal(basic.json.status,'ready');
+});
+test('equipment routes: invalid bearer never becomes a guest or spends lookup allowance',async()=>{
+  const {f,ai,call}=setup();for(const method of ['GET','POST']){const r=await call(method,'/api/car-spec/equipment'+(method==='GET'?'?make=Mitsubishi&model=Pajero%20Sport&year=2020':''),method==='POST'?pajero:null,'invalid-fixture-token');assert.equal(r.status,401);assert.equal(r.json.code,'auth_required');}
+  assert.equal(ai.length,0);assert.equal(f.sqlite.prepare('SELECT COUNT(*) n FROM spec_quota').get().n,0);
+});
+test('equipment administration: redo retains the equipment kind and Thailand market without touching basic records',async()=>{
+  const {f,ai,call}=setup();equipmentWeb(ai);const r=await call('POST','/api/car-spec/equipment',{...pajero,market:'TH'},CUST);assert.equal(r.json.status,'ready',JSON.stringify(r));assert.equal(r.json.key,'mitsubishi|pajero sport|2020|equipment');
+  const redo=await call('POST','/api/admin/car-specs/redo',{key:r.json.key},BOSS);assert.equal(redo.json.status,'ready');assert.equal(redo.json.key,r.json.key);assert.equal(redo.json.data.query.market,'TH');assert.equal(ai.length,4);assert.equal(f.sqlite.prepare('SELECT COUNT(*) n FROM car_specs').get().n,1);
+});
+
 test('car spec: only real-looking car names and years are researched',()=>{
   assert.deepEqual(validQuery({make:' Mitsubishi ',model:'Pajero  Sport',year:'2020'}),{make:'Mitsubishi',model:'Pajero Sport',year:'2020',market:'GLOBAL'});
   for(const q of [{make:'x'.repeat(41),model:'a',year:'2020'},{make:'BMW',model:'<script>',year:'2020'},{make:'BMW',model:'X5',year:'1899'},{make:'BMW',model:'X5',year:'20200'}])

@@ -182,5 +182,21 @@ export function cleanDocumentExtraction(raw,docs,q){
     next._sources={};for(const k of Object.keys(next)){const refs=evidence[base+k];if(refs)next._sources[k]=refs}
     out.variants.push(next);
   }
+  out.equipment=[];
+  for(const [i,item] of (Array.isArray(raw.equipment)?raw.equipment:[]).slice(0,40).entries()){
+    const path='equipment.'+i+'.name',name=value(path,'equipment',item?.name);
+    if(typeof name!=='string'||!name.trim()||name.length>120)continue;
+    const entries=(proof[path]||[]).filter(e=>(positions[path]||[]).some(p=>p.id===e.source&&p.at===quoteAt(e.source,e.quote))&&supports('equipment',name,e.quote));
+    const positiveEntries=entries.filter(e=>!/(?:does not|doesn't|not equipped|not available|unavailable|without|no longer includes)|ไม่มี|ไม่ได้ติดตั้ง|ไม่รองรับ/.test(squash(e.quote)));
+    const ids=[...new Set(positiveEntries.map(e=>e.source))],positiveQuotes=positiveEntries.map(e=>squash(e.quote));
+    if(!positiveQuotes.length)continue;
+    let availability='listed';
+    if(item.availability==='optional'&&positiveQuotes.some(s=>/\b(?:optional|option|extra.cost)\b|อุปกรณ์เสริม|ออปชัน|ออฟชั่น|เลือกติดตั้ง/.test(s)))availability='optional';
+    if(item.availability==='standard'&&positiveQuotes.some(s=>!/not standard|ไม่ใช่.*มาตรฐาน|ไม่เป็น.*มาตรฐาน/.test(s)&&/\bstandard\b|เป็นอุปกรณ์มาตรฐาน|ติดตั้ง.*มาตรฐาน/.test(s)))availability='standard';
+    let variant=null;
+    if(typeof item.variant==='string'&&item.variant.length<=80){const candidate=squash(item.variant);if(candidate&&ids.some(id=>normal(docs.find(d=>d.id===id)?.title).includes(normal(candidate))))variant=item.variant;
+      else variant=value('equipment.'+i+'.variant','variant',item.variant,positions[path]);}
+    out.equipment.push({name:name.trim(),category:item.category==='safety'?'safety':'comfort',availability,variant,sourceIds:ids});
+  }
   out.safety=[];out.comfort=[];out.notes=null;out.diagnostic=diagnostic;return out;
 }

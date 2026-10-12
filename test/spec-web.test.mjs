@@ -136,3 +136,32 @@ test('free pipeline: total budget includes discovery and forbids late Gemini cal
 test('free pipeline: two honest negative extractions stop after two calls and are not proof that the model never existed',async()=>{
   const calls=installWeb({aiResponse:{found:false}});await assert.rejects(research({GEMINI_KEY:'test-only-key'},q),/ยืนยัน/);assert.equal(calls.filter(c=>c.url.includes('generativelanguage')).length,2);
 });
+const equipmentText=' Standard equipment: Adaptive Cruise Control. Optional equipment: Heated seats. Body equipment includes PASM. ';
+function equipmentExtraction(){return {found:true,scope:[{source:1,year_quote:'Mitsubishi Pajero Sport 2020 Thailand specification.'}],equipment:[
+  {name:'Adaptive Cruise Control',category:'safety',availability:'standard',variant:null},
+  {name:'Heated seats',category:'comfort',availability:'optional',variant:null},
+  {name:'PASM',category:'comfort',availability:'standard',variant:null}],evidence:[
+  {path:'equipment.0.name',source:1,quote:'Standard equipment: Adaptive Cruise Control.'},
+  {path:'equipment.1.name',source:1,quote:'Optional equipment: Heated seats.'},
+  {path:'equipment.2.name',source:1,quote:'Body equipment includes PASM.'}]};}
+test('equipment: exact quotations are required and standard/optional labels cannot be invented',()=>{
+  const raw=equipmentExtraction(),d={...docs[0],id:1,text:paragraph+equipmentText};
+  raw.equipment.push({name:'Invented autopilot',category:'safety',availability:'standard'});raw.evidence.push({path:'equipment.3.name',source:1,quote:'Standard equipment: Invented autopilot.'});
+  const out=cleanDocumentExtraction(raw,[d],{...q,market:'GLOBAL'});assert.equal(out.equipment.length,3);assert.deepEqual(out.equipment.map(x=>x.availability),['standard','optional','listed']);assert.deepEqual(out.equipment[0].sourceIds,[1]);
+});
+test('equipment: explicitly absent features are not advertised as present or standard',()=>{
+  const raw=equipmentExtraction(),d={...docs[0],id:1,text:paragraph+' This trim is not equipped with Adaptive Cruise Control. Heated seats are not standard. PASM is unavailable.'};
+  raw.evidence[0].quote='This trim is not equipped with Adaptive Cruise Control.';raw.evidence[1].quote='Heated seats are not standard.';raw.equipment[1].availability='standard';raw.evidence[2].quote='PASM is unavailable.';
+  const out=cleanDocumentExtraction(raw,[d],{...q,market:'GLOBAL'});assert.ok(!out.equipment.some(x=>x.name==='Adaptive Cruise Control'));assert.ok(!out.equipment.some(x=>x.name==='PASM'));assert.equal(out.equipment.find(x=>x.name==='Heated seats').availability,'listed');
+});
+test('equipment: a fabricated extra quotation from the same cited document cannot upgrade availability',()=>{
+  const raw=equipmentExtraction(),d={...docs[0],id:1,text:paragraph+equipmentText};
+  raw.evidence.push({path:'equipment.2.name',source:1,quote:'PASM is standard equipment.'});
+  assert.equal(cleanDocumentExtraction(raw,[d],{...q,market:'GLOBAL'}).equipment.find(x=>x.name==='PASM').availability,'listed');
+});
+test('equipment: real document mode has no search tools and returns only cited items, separate from numerical specs',async()=>{
+  const raw=equipmentExtraction(),calls=installWeb({aiResponse:raw}),base=globalThis.fetch;
+  globalThis.fetch=async(url,opt)=>{const r=await base(url,opt);if(String(url)===docs[0].url)return new Response((await r.text())+'<p>'+equipmentText+'</p>',{headers:{'content-type':'text/html'}});return r};
+  const r=await research({GEMINI_KEY:'test-only-key'},q,[],{kind:'equipment'});assert.equal(r.status,'ready');assert.equal(r.data.kind,'equipment');assert.equal(r.data.equipment.length,3);assert.equal(r.data.equipmentSchema,1);assert.ok(r.data.equipment.every(x=>x.ok===true));assert.equal(r.sources.length,1);assert.deepEqual(r.data.facts,{});
+  for(const c of calls.filter(c=>c.url.includes('generativelanguage'))){const b=JSON.parse(c.init.body);assert.equal(b.tools,undefined);assert.match(b.contents[0].parts[0].text,/รายการอุปกรณ์/);}
+});

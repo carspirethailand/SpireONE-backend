@@ -6,7 +6,7 @@ import { handleTech } from './techs.js';
 import { richMenuStatus, setupRichMenu, lineStatus, lineFixWebhook } from './line-menu.js';
 import { appUrl, card } from './line-notify.js';
 import { refreshNews, newsStatus } from './news.js';
-import { ensureSpec, getSpec, specKey, validQuery, reportSpec, listSpecs, verifySpec, specLogList, specAI } from './carspec.js';
+import { ensureSpec, getSpec, specKey, equipmentKey, validQuery, reportSpec, listSpecs, verifySpec, specLogList, specAI } from './carspec.js';
 import { decodeVin, vpic, cleanInfo } from './vin.js';
 import { LINE_AI, LINE_TALK, LINE_MARK, linePlain, lineChunks, lineCodeIn } from './line-chat.js';
 import { handleVec, kbScores, refreshKb } from './vectors.js';
@@ -4938,7 +4938,7 @@ ${convo}`;
 
       /* ===== คลังสเปกรถ (carspec.js) =====
        * ไม่ต้องล็อกอินก็ดึงได้ (คนเพิ่มรถได้โดยไม่ล็อกอิน) — การค้นรุ่นใหม่ด้วย AI มีโควตาต่อคน/ต่อ IP */
-      if (url.pathname === '/api/car-spec' || url.pathname === '/api/car-spec/report' || url.pathname.startsWith('/api/vin/')) {
+      if (url.pathname === '/api/car-spec' || url.pathname === '/api/car-spec/equipment' || url.pathname === '/api/car-spec/report' || url.pathname.startsWith('/api/vin/')) {
         let actor = null;
         if (request.headers.get('Authorization')) {
           try { actor = await getActor(request, env); } catch (e) { return json({error:'Could not confirm your signed-in session',code:'auth_required'},401); }
@@ -4946,16 +4946,17 @@ ${convo}`;
         if (actor && actor.banned) return deny('Account suspended', 403);
         const who = actor ? 'u:' + actor.payload.sub : 'ip:' + (request.headers.get('CF-Connecting-IP') || 'unknown');
         try {
-          if (url.pathname === '/api/car-spec' && request.method === 'GET') {
+          const equipment=url.pathname==='/api/car-spec/equipment';
+          if ((url.pathname === '/api/car-spec'||equipment) && request.method === 'GET') {
             const v = validQuery(Object.fromEntries(url.searchParams));
             if (!v) return deny('ชื่อรถหรือปีไม่ถูกต้อง', 400);
-            return json((await getSpec(env, specKey(v.make, v.model, v.year,v.market))) || { status: 'none' });
+            return json((await getSpec(env, (equipment?equipmentKey:specKey)(v.make, v.model, v.year,v.market))) || { status: 'none' });
           }
-          if (url.pathname === '/api/car-spec' && request.method === 'POST') {
+          if ((url.pathname === '/api/car-spec'||equipment) && request.method === 'POST') {
             const b = await readBody();
             const staff = !!actor && rank(actor.role) >= rank('admin');
             /* แอดมินกด "ทดสอบค้นสเปก" จากแผงลอย = ค้นใหม่ทับ (force) และได้ขั้นตอนทั้งหมดกลับไปดู */
-            return json(await ensureSpec(env, b || {}, { who, user: !!actor, staff, retry: !!(b && b.retry), force: staff && !!(b && b.force), defer: (p) => ctx.waitUntil(p) }));
+            return json(await ensureSpec(env, b || {}, { who, user: !!actor, staff, retry: !!(b && b.retry), force: staff && !!(b && b.force), defer: (p) => ctx.waitUntil(p),kind:equipment?'equipment':'spec' }));
           }
           if (url.pathname === '/api/car-spec/report' && request.method === 'POST') {
             const b = await readBody() || {};
@@ -4981,8 +4982,9 @@ ${convo}`;
           const r = await getSpec(env, String(b.key || ''));
           if (!r) return deny('ไม่พบรุ่นนี้ในคลัง', 404);
           /* ค้นใหม่ทับ แล้วล้างรายงานเดิม (รายงานเป็นของข้อมูลชุดเก่า) */
-          const out = await ensureSpec(env, { make: r.make || make, model: r.model || model, year: r.year || year,market:r.data?.query?.market||r.key.split('|')[3]?.toUpperCase()||'TH' },
-            { who: 'u:' + actor.payload.sub, staff: true, force: true });
+          const marketPart=r.key.split('|')[3]?.toUpperCase(),market=r.data?.query?.market||(marketPart&&marketPart!=='EQUIPMENT'?marketPart:'TH');
+          const out = await ensureSpec(env, { make: r.make || make, model: r.model || model, year: r.year || year,market },
+            { who: 'u:' + actor.payload.sub, staff: true, force: true,kind:r.key.endsWith('|equipment')?'equipment':'spec' });
           await env.DB.batch([
             env.DB.prepare('DELETE FROM car_spec_reports WHERE k = ?').bind(r.key),
             env.DB.prepare('UPDATE car_specs SET reports = 0 WHERE k = ?').bind(r.key),
