@@ -165,3 +165,12 @@ test('equipment: real document mode has no search tools and returns only cited i
   const r=await research({GEMINI_KEY:'test-only-key'},q,[],{kind:'equipment'});assert.equal(r.status,'ready');assert.equal(r.data.kind,'equipment');assert.equal(r.data.equipment.length,3);assert.equal(r.data.equipmentSchema,1);assert.ok(r.data.equipment.every(x=>x.ok===true));assert.equal(r.sources.length,1);assert.deepEqual(r.data.facts,{});
   for(const c of calls.filter(c=>c.url.includes('generativelanguage'))){const b=JSON.parse(c.init.body);assert.equal(b.tools,undefined);assert.match(b.contents[0].parts[0].text,/รายการอุปกรณ์/);}
 });
+test('equipment: one stalled extraction cannot discard a successful sourced pass, and its requests are cancelled',async()=>{
+  const raw=equipmentExtraction(),calls=installWeb({aiResponse:raw}),base=globalThis.fetch,stalled=[];
+  globalThis.fetch=async(url,opt)=>{
+    if(String(url).includes('generativelanguage')&&!JSON.parse(opt.body).contents[0].parts[0].text.startsWith('ตรวจอย่างระมัดระวัง')){stalled.push(opt.signal);return new Promise(()=>{})}
+    const r=await base(url,opt);if(String(url)===docs[0].url)return new Response((await r.text())+'<p>'+equipmentText+'</p>',{headers:{'content-type':'text/html'}});return r;
+  };
+  const log=[],r=await research({GEMINI_KEY:'test-only-key'},q,log,{kind:'equipment',budgetMs:200});
+  assert.equal(r.status,'ready');assert.equal(r.passes,1);assert.equal(r.data.equipment.length,3);assert.ok(r.data.equipment.every(x=>x.ok===null));assert.equal(r.data.score.confirmed,0);assert.equal(r.sources.length,1);assert.equal(stalled.length,1);assert.ok(stalled.every(s=>s.aborted));assert.ok(log.some(s=>s.step==='extraction-deadline'));assert.equal(calls.filter(c=>c.url.includes('generativelanguage')).length,1);
+});
