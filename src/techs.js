@@ -15,6 +15,7 @@ import { verifyFirebaseToken } from './auth.js';
 import { screenApplication, screeningSnapshot } from './tech-screen.js';
 import { applicantErrors, imageInfo, approvalError } from './tech-vetting.js';
 import { notify, jobCard, card, once, appUrl } from './line-notify.js';
+import { MEDIA_SQL, MediaError, putMedia, getMedia, deleteMedia, claimMedia, mediaLabel } from './media.js';
 const CATS = ['body', 'ev', 'tyre', 'air', 'eng'];
 const CAT_TH = { body: 'ตัวถัง & สี', ev: 'ไฟฟ้า & EV', tyre: 'ยาง & ช่วงล่าง', air: 'แอร์รถยนต์', eng: 'เครื่องยนต์' };
 /* ด่านที่ทีมงานต้องตรวจเองก่อนอนุมัติ — ชื่อต้องตรงกับหน้าเว็บ (tech.html) */
@@ -24,7 +25,7 @@ const CHECKS = ['identity', 'phone', 'work', 'skills', 'shop', 'terms'];
    ใบรับรองฝีมือไม่บังคับ — ช่างเก่งจำนวนมากไม่มีใบ ทีมงานสัมภาษณ์ทักษะแทนได้ */
 const DOCS = [['id', 1, 1], ['selfie', 1, 1], ['shop', 1, 3], ['work', 3, 6], ['cert', 0, 2]];
 const PRIVATE_DOCS = ['id', 'selfie', 'cert'];
-const API_VERSION = 8;
+const API_VERSION = 9;
 const PHONE = /^0\d{8,9}$/;
 const now = () => Date.now();
 
@@ -111,6 +112,8 @@ const TECH_SQL = [
 ];
 /* คอลัมน์ที่เพิ่มทีหลัง — ALTER ซ้ำจะ error ว่ามีอยู่แล้ว ซึ่งเป็นเรื่องปกติ ข้ามไปได้ */
 const TECH_ALTER = [
+  /* ไฟล์แนบในข้อความ (รูป/วิดีโอ/เสียง) — JSON [{id, kind, mime, size}] ไฟล์จริงอยู่ในตาราง media */
+  `ALTER TABLE tech_messages ADD COLUMN media TEXT`,
   /* รหัสเริ่มงาน (ลูกค้าบอกช่างเมื่อพบกันจริง) และงานเพิ่มที่ลูกค้าต้องกดยอมรับ */
   `ALTER TABLE tech_jobs ADD COLUMN start_code TEXT`,
   `ALTER TABLE tech_jobs ADD COLUMN start_exp INTEGER`,
@@ -154,7 +157,7 @@ const TECH_ALTER = [
 const techReady = new WeakMap();
 async function ensureTech(env) {
   if (!techReady.has(env.DB)) {
-    const task=(async()=>{for(const sql of TECH_SQL)await env.DB.prepare(sql).run();
+    const task=(async()=>{for(const sql of [...TECH_SQL,...MEDIA_SQL])await env.DB.prepare(sql).run();
       for(const sql of TECH_ALTER)try{await env.DB.prepare(sql).run()}catch(e){if(!/duplicate column|already exists/i.test(e.message||''))throw e;}})();
     techReady.set(env.DB,task);task.catch(()=>techReady.delete(env.DB));
   }
@@ -181,7 +184,7 @@ function cors(env, request) {
   }
   return {
     'Access-Control-Allow-Origin': origin,
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Access-Control-Max-Age': '86400',
     'Vary': 'Origin',
@@ -594,6 +597,25 @@ async function appDocs(env, me, uid) {
 
 /* รูปอู่/ผลงานบนการ์ดช่าง — เปิดสาธารณะเฉพาะของช่างที่ผ่านการตรวจแล้ว
    บัตรประชาชนกับเซลฟี่ไม่มีทางออกทางนี้ไม่ว่ากรณีใด */
+/* ── ไฟล์แนบ (รูป/วิดีโอ/เสียง) ── รายละเอียดอยู่ใน media.js
+   ใครเปิดไฟล์ในห้องคุยได้บ้าง = คนที่เปิดห้องทักช่าง/ใบงานนั้นได้ (ลูกค้า ช่างเจ้าของร้าน ทีมงาน) */
+async function mediaRoute(env, request, id, h, verifyToken) {
+  const me = await who(request, env, true, verifyToken);
+  const inScope = async scope => {
+    const [k, sid] = scope.split(':');
+    try {
+      if (k === 'thread') { await threadCtx(env, me, sid); return true; }
+      if (k === 'job') { await loadJob(env, me, sid); return true; }
+    } catch (e) { if (!(e instanceof HttpError)) throw e; }
+    return false;
+  };
+  const m = request.method;
+  if (m === 'PUT' || m === 'POST') return json(await putMedia(env, me, id, request, limit), 200, h);
+  if (m === 'GET') return await getMedia(env, me, id, inScope, h);
+  if (m === 'DELETE') return json(await deleteMedia(env, me, id), 200, h);
+  fail(405, 'ไม่รองรับคำขอนี้');
+}
+
 async function image(env, request, id) {
   const d = await env.DB.prepare(
     `SELECT d.mime, d.data, p.verified, p.test FROM tech_docs d JOIN tech_profiles p ON p.uid = d.uid
@@ -744,9 +766,9 @@ function jobOut(j, t, role, messages) {
 
 async function messagesOf(env, jobId, after) {
   const { results } = await env.DB.prepare(
-    'SELECT id, role, text, at FROM tech_messages WHERE job_id = ? AND id > ? ORDER BY id ASC LIMIT 500')
+    'SELECT id, role, text, at, media FROM tech_messages WHERE job_id = ? AND id > ? ORDER BY id ASC LIMIT 500')
     .bind(jobId, after || 0).all();
-  return results;
+  return results.map(({ media, ...m }) => { const l = parse(media); return l && l.length ? { ...m, media: l } : m; });
 }
 async function markRead(env, jobId, uid, last) {
   if (!last) return;
@@ -805,7 +827,7 @@ async function threadsOut(env, me, rows, myTechId) {
   const ids = rows.map(r => r.id);
   const [techs, last, unread, users, gigs] = await Promise.all([
     inAll(env, 'SELECT id, data FROM tech_profiles WHERE id IN ({IN})', [...new Set(rows.map(r => r.tech_id))]),
-    inAll(env, 'SELECT job_id, role, text, at FROM tech_messages WHERE id IN (SELECT MAX(id) FROM tech_messages WHERE job_id IN ({IN}) GROUP BY job_id)', ids),
+    inAll(env, 'SELECT job_id, role, text, at, media FROM tech_messages WHERE id IN (SELECT MAX(id) FROM tech_messages WHERE job_id IN ({IN}) GROUP BY job_id)', ids),
     inAll(env, `SELECT m.job_id, COUNT(*) AS n FROM tech_messages m
       LEFT JOIN tech_reads r ON r.job_id = m.job_id AND r.uid = ?
       WHERE m.job_id IN ({IN}) AND m.uid != ? AND m.id > COALESCE(r.last, 0) GROUP BY m.job_id`, ids, [me.uid], [me.uid]),
@@ -823,7 +845,7 @@ async function threadsOut(env, me, rows, myTechId) {
     return { id: th.id, techId: th.tech_id, techName: tn[th.tech_id] || 'ช่าง', customerName: cn[th.customer_uid] || '',
       role: cust ? 'customer' : tech ? 'technician' : 'admin', test: !!th.test,
       gig: th.gig_id ? { id: th.gig_id, title: gn[th.gig_id] || '' } : null,
-      last: l ? { role: l.role, text: l.text.slice(0, 140), at: l.at } : null, unread: un[th.id] || 0,
+      last: l ? { role: l.role, text: (l.text || mediaLabel(parse(l.media))).slice(0, 140), at: l.at } : null, unread: un[th.id] || 0,
       createdAt: th.created_at, updatedAt: th.updated_at };
   });
 }
@@ -843,22 +865,26 @@ async function myThreads(env, me, url) {
 }
 async function threadText(env, me, ctx, b) {
   await limit(env, 'msg', me.uid, 300);
-  return mask(str(b.text ?? b.message, 'ข้อความ', 1, 2000));
+  /* ส่งแต่ไฟล์แนบได้ ไม่ต้องพิมพ์ข้อความ (ตรวจไฟล์จริงตอนบันทึก) */
+  const files = Array.isArray(b.media) && b.media.length > 0;
+  return mask(str(b.text ?? b.message, 'ข้อความ', files ? 0 : 1, 2000));
 }
-async function postToThread(env, me, ctx, text) {
+async function postToThread(env, me, ctx, text, files) {
   const { th, t, role } = ctx;
   if (role === 'admin') fail(403, 'ผู้ดูแลอ่านได้อย่างเดียว');
+  const media = await claimMedia(env, me, files, 'thread:' + th.id);
+  if (!text && !media.length) fail(400, 'ข้อความ: ต้องมีอย่างน้อย 1 ตัวอักษร');
   const ts = now();
-  const r = await env.DB.prepare('INSERT INTO tech_messages (job_id, uid, role, text, at) VALUES (?,?,?,?,?) RETURNING id')
-    .bind(th.id, me.uid, role, text, ts).first();
+  const r = await env.DB.prepare('INSERT INTO tech_messages (job_id, uid, role, text, at, media) VALUES (?,?,?,?,?,?) RETURNING id')
+    .bind(th.id, me.uid, role, text, ts, media.length ? JSON.stringify(media) : null).first();
   await env.DB.prepare('UPDATE tech_threads SET updated_at = ? WHERE id = ?').bind(ts, th.id).run();
   await markRead(env, th.id, me.uid, r.id);
   /* แจ้งอีกฝ่ายทาง LINE ไม่เกิน 1 ครั้ง / 30 นาที / ห้อง */
   const to = role === 'technician' ? th.customer_uid : (t && t.uid);
   if (to && to !== me.uid) tell(env, to, async () => (await once(env, 'line-thread:' + th.id, to, 1800000))
     ? card({ tag: role === 'technician' ? 'ช่างตอบแล้ว' : 'ลูกค้าทักมา', title: role === 'technician' ? shopOf(t) : 'มีลูกค้าทักถาม (ยังไม่ใช่ใบงาน)',
-        lines: [text], url: appUrl(env, '/messages/' + th.id), label: 'ตอบกลับ' }) : null);
-  return { id: r.id, role, text, at: ts };
+        lines: [text || mediaLabel(media)], url: appUrl(env, '/messages/' + th.id), label: 'ตอบกลับ' }) : null);
+  return { id: r.id, role, text, at: ts, ...(media.length ? { media } : {}) };
 }
 /* ทักร้าน: มีห้องอยู่แล้วคุยต่อ · ยังไม่มีเปิดห้องใหม่ (วันละไม่เกิน 20 ร้านใหม่ กันสแปม) */
 async function startThread(env, me, b) {
@@ -885,7 +911,7 @@ async function startThread(env, me, b) {
     await env.DB.prepare('UPDATE tech_threads SET gig_id = ? WHERE id = ?').bind(gig.id, th.id).run();
     th.gig_id = gig.id;
   }
-  const message = await postToThread(env, me, { th, t, role: 'customer' }, text);
+  const message = await postToThread(env, me, { th, t, role: 'customer' }, text, b.media);
   await bumpView(env, t.id, 'msg');
   const [thread] = await threadsOut(env, me, [{ ...th, updated_at: message.at }], null);
   return { thread, message };
@@ -901,7 +927,7 @@ async function openThread(env, me, id, after) {
 async function replyThread(env, me, id, b) {
   const ctx = await threadCtx(env, me, id);
   const text = await threadText(env, me, ctx, b);
-  return { message: await postToThread(env, me, ctx, text) };
+  return { message: await postToThread(env, me, ctx, text, b.media) };
 }
 
 /* ══ รูปแนบกับคำขอ (เช่น รูปรถที่จอด รูปอาการ) ══
@@ -1028,22 +1054,24 @@ async function sendMessage(env, me, ctx, b) {
   if (['completed', 'cancelled'].includes(j.status)) fail(409, 'ใบงานปิดแล้ว ส่งข้อความไม่ได้');
   /* กันส่งข้อความรัว/สแปม — คนคุยงานจริงไม่ถึง 300 ข้อความต่อวัน */
   await limit(env, 'msg', me.uid, 300);
-  let text = str(b.message ?? b.text, 'ข้อความ', 1, 2000);
+  /* ส่งแต่รูป/วิดีโอ/เสียงได้ ไม่ต้องพิมพ์ข้อความ */
+  const media = await claimMedia(env, me, b.media, 'job:' + j.id);
+  let text = str(b.message ?? b.text, 'ข้อความ', media.length ? 0 : 1, 2000);
   if (!j.accepted_at) text = mask(text);
   /* งานทดสอบที่ผู้ดูแลเป็นทั้งลูกค้าและช่าง ให้เลือกได้ว่าพิมพ์ในบทไหน
      ไม่งั้นทดสอบแชตสองฝั่งด้วยบัญชีเดียวไม่ได้ */
   const as = role === 'both' ? (b.as === 'technician' ? 'technician' : 'customer')
     : isCustomer ? 'customer' : 'technician';
   const ts = now();
-  const r = await env.DB.prepare('INSERT INTO tech_messages (job_id, uid, role, text, at) VALUES (?,?,?,?,?)')
-    .bind(j.id, me.uid, as, text, ts).run();
+  const r = await env.DB.prepare('INSERT INTO tech_messages (job_id, uid, role, text, at, media) VALUES (?,?,?,?,?,?) RETURNING id')
+    .bind(j.id, me.uid, as, text, ts, media.length ? JSON.stringify(media) : null).first();
   await env.DB.prepare('UPDATE tech_jobs SET updated_at = ? WHERE id = ?').bind(ts, j.id).run();
-  await markRead(env, j.id, me.uid, r.meta.last_row_id);
+  await markRead(env, j.id, me.uid, r.id);
   /* แจ้งข้อความใหม่ทาง LINE ไม่เกิน 1 ครั้ง / 30 นาที / ใบงาน — คุยกันรัว ๆ ไม่ให้ LINE เด้งทุกข้อความ */
   const to = as === 'technician' ? j.customer_uid : (ctx.t && ctx.t.uid);
   if (to && to !== me.uid) tell(env, to, async () => (await once(env, 'line-msg:' + j.id, to, 1800000))
-    ? jobCard(env, 'message', j, shopOf(ctx.t), { from: as === 'technician' ? shopOf(ctx.t) : 'ลูกค้า', text }) : null);
-  return { ok: true, message: { id: r.meta.last_row_id, role: as, text, at: ts } };
+    ? jobCard(env, 'message', j, shopOf(ctx.t), { from: as === 'technician' ? shopOf(ctx.t) : 'ลูกค้า', text: text || mediaLabel(media) }) : null);
+  return { ok: true, message: { id: r.id, role: as, text, at: ts, ...(media.length ? { media } : {}) } };
 }
 
 async function updateJob(env, me, id, b) {
@@ -1810,9 +1838,11 @@ export async function handleTech(request, env, corsHeaders, options={}) {
     await ensureTech(env);
     const img = new URL(request.url).pathname.match(/^\/api\/tech\/img\/(\d+)$/);
     if (img) return await image(env, request, Number(img[1]));
+    const md = new URL(request.url).pathname.match(/^\/api\/tech\/media\/([^/]+)$/);
+    if (md) return await mediaRoute(env, request, md[1], h, options.verifyToken);
     return json(await route(request, env,options.verifyToken), 200, h);
   } catch (e) {
-    if (e instanceof HttpError) return json({ error: e.message }, e.status, h);
+    if (e instanceof HttpError || e instanceof MediaError) return json({ error: e.message }, e.status, h);
     console.error(e);
     return json({ error: 'ระบบขัดข้องชั่วคราว กรุณาลองใหม่' }, 500, h);
   }
