@@ -24,7 +24,7 @@ const CHECKS = ['identity', 'phone', 'work', 'skills', 'shop', 'terms'];
    ใบรับรองฝีมือไม่บังคับ — ช่างเก่งจำนวนมากไม่มีใบ ทีมงานสัมภาษณ์ทักษะแทนได้ */
 const DOCS = [['id', 1, 1], ['selfie', 1, 1], ['shop', 1, 3], ['work', 3, 6], ['cert', 0, 2]];
 const PRIVATE_DOCS = ['id', 'selfie', 'cert'];
-const API_VERSION = 7;
+const API_VERSION = 8;
 const PHONE = /^0\d{8,9}$/;
 const now = () => Date.now();
 
@@ -144,6 +144,12 @@ const TECH_ALTER = [
   `CREATE TABLE IF NOT EXISTS tech_shares (token TEXT PRIMARY KEY, job_id TEXT NOT NULL, uid TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0)`,
   /* ยอดเข้าชมรายวันของร้าน (Studio → สถิติ): kind = shop | gig | call | book */
   `CREATE TABLE IF NOT EXISTS tech_views (tech_id TEXT NOT NULL, day INTEGER NOT NULL, kind TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tech_id, day, kind))`,
+  /* ทักช่าง (คุยก่อนจ้าง): ห้องคุยหนึ่งห้องต่อ ลูกค้า × ร้าน — ไม่ใช่ใบงาน ไม่ต้องกรอกที่อยู่/รถ/เวลา
+     ข้อความเก็บในตาราง tech_messages เดียวกับใบงาน (job_id = รหัสห้อง) ใช้ tech_reads นับยังไม่อ่านเหมือนกัน */
+  `CREATE TABLE IF NOT EXISTS tech_threads (id TEXT PRIMARY KEY, tech_id TEXT NOT NULL, customer_uid TEXT NOT NULL, gig_id INTEGER,
+    test INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE (tech_id, customer_uid))`,
+  `CREATE INDEX IF NOT EXISTS tech_threads_customer ON tech_threads(customer_uid, updated_at)`,
+  `CREATE INDEX IF NOT EXISTS tech_threads_tech ON tech_threads(tech_id, updated_at)`,
 ];
 const techReady = new WeakMap();
 async function ensureTech(env) {
@@ -390,14 +396,17 @@ async function meInfo(env, me) {
      ใช้ขึ้นตัวเลขบนปุ่ม "งานของฉัน" ช่างจะได้ไม่พลาดคำขอราคา
      เพราะเรายังไม่มีการแจ้งเตือนทาง SMS */
   const jobs = await myJobs(env, me, t);
-  const attention = jobs.filter(j => j.needsMe || j.unread > 0).length;
+  /* ห้องทักช่างที่มีข้อความยังไม่อ่าน นับรวมด้วย — ช่างไม่พลาดลูกค้าที่ทักมาถาม */
+  let msgs = 0;
+  try { msgs = (await myThreads(env, me, new URL('https://x/'))).threads.filter(x => x.unread > 0).length; } catch (e) {}
+  const attention = jobs.filter(j => j.needsMe || j.unread > 0).length + msgs;
   return {
     uid: me.uid, email: me.email, admin: me.admin, staff: me.staff, version: API_VERSION,
     application: appOut(a),
     technician: t ? { ...publicTech((await withPhotos(env, [t]))[0]), suspended: !!t.suspended,
       /* ค่าตั้งของร้านที่เห็นเฉพาะเจ้าของ (Studio → ตั้งค่า) */
       ...(() => { const d = parse(t.data) || {}; return { autoReply: d.autoReply || null, minPrice: d.minPrice || 0, vacationRaw: d.vacation || null }; })() } : null,
-    attention,
+    attention, unreadThreads: msgs,
   };
 }
 
@@ -775,6 +784,124 @@ async function myJobs(env, me, myTech, all) {
       side: cust && tech ? 'both' : cust ? 'customer' : tech ? 'technician' : 'admin',
       needsMe, unread: un[j.id] || 0 };
   });
+}
+
+/* ══ ทักช่าง (คุยก่อนจ้าง) ══
+   ลูกค้าถามช่างได้เลยโดยไม่ต้องสร้างใบขอราคา — ไม่มีราคา ไม่มีนัด ไม่ผูกมัดใคร
+   พร้อมจ้างเมื่อไรค่อยกดขอราคา/จอง ซึ่งเป็นใบงานตามขั้นตอนเดิม
+   เบอร์/ไลน์ในข้อความถูกซ่อนเหมือนใบงานที่ยังไม่ยืนยันราคา (คุยนอกระบบแล้วลูกค้าไม่ได้รับการคุ้มครอง) */
+const shortName = (n) => String(n || '').trim().split(/\s+/)[0].slice(0, 24);
+async function threadCtx(env, me, id) {
+  if (!/^[0-9a-f-]{36}$/i.test(String(id || ''))) fail(404, 'ไม่พบบทสนทนา');
+  const th = await env.DB.prepare('SELECT * FROM tech_threads WHERE id = ?').bind(id).first();
+  if (!th) fail(404, 'ไม่พบบทสนทนา');
+  const t = await techById(env, th.tech_id);
+  const isCustomer = th.customer_uid === me.uid, isTech = !!t && t.uid === me.uid;
+  if (!isCustomer && !isTech && !me.staff) fail(403, 'ไม่มีสิทธิ์ดูบทสนทนานี้');
+  return { th, t, role: isCustomer ? 'customer' : isTech ? 'technician' : 'admin' };
+}
+async function threadsOut(env, me, rows, myTechId) {
+  if (!rows.length) return [];
+  const ids = rows.map(r => r.id);
+  const [techs, last, unread, users, gigs] = await Promise.all([
+    inAll(env, 'SELECT id, data FROM tech_profiles WHERE id IN ({IN})', [...new Set(rows.map(r => r.tech_id))]),
+    inAll(env, 'SELECT job_id, role, text, at FROM tech_messages WHERE id IN (SELECT MAX(id) FROM tech_messages WHERE job_id IN ({IN}) GROUP BY job_id)', ids),
+    inAll(env, `SELECT m.job_id, COUNT(*) AS n FROM tech_messages m
+      LEFT JOIN tech_reads r ON r.job_id = m.job_id AND r.uid = ?
+      WHERE m.job_id IN ({IN}) AND m.uid != ? AND m.id > COALESCE(r.last, 0) GROUP BY m.job_id`, ids, [me.uid], [me.uid]),
+    inAll(env, 'SELECT uid, name FROM users WHERE uid IN ({IN})', [...new Set(rows.map(r => r.customer_uid))]).catch(() => []),
+    inAll(env, 'SELECT id, title FROM tech_gigs WHERE id IN ({IN})', [...new Set(rows.map(r => r.gig_id).filter(Boolean))]),
+  ]);
+  const tn = Object.fromEntries(techs.map(r => { const d = parse(r.data) || {}; return [r.id, d.shop || d.name || 'ช่าง']; }));
+  const ls = Object.fromEntries(last.map(r => [r.job_id, r]));
+  const un = Object.fromEntries(unread.map(r => [r.job_id, r.n]));
+  const cn = Object.fromEntries(users.map(r => [r.uid, shortName(r.name)]));
+  const gn = Object.fromEntries(gigs.map(r => [r.id, r.title]));
+  return rows.map(th => {
+    const cust = th.customer_uid === me.uid, tech = !!myTechId && th.tech_id === myTechId;
+    const l = ls[th.id];
+    return { id: th.id, techId: th.tech_id, techName: tn[th.tech_id] || 'ช่าง', customerName: cn[th.customer_uid] || '',
+      role: cust ? 'customer' : tech ? 'technician' : 'admin', test: !!th.test,
+      gig: th.gig_id ? { id: th.gig_id, title: gn[th.gig_id] || '' } : null,
+      last: l ? { role: l.role, text: l.text.slice(0, 140), at: l.at } : null, unread: un[th.id] || 0,
+      createdAt: th.created_at, updatedAt: th.updated_at };
+  });
+}
+async function myThreads(env, me, url) {
+  const myTech = await env.DB.prepare('SELECT id FROM tech_profiles WHERE uid = ?').bind(me.uid).first();
+  const techId = String(url.searchParams.get('tech') || '');
+  let rows;
+  if (techId) {
+    /* หน้าร้าน: มีห้องคุยกับร้านนี้อยู่แล้วไหม (ลูกค้าเปิดคุยต่อจากเดิม ไม่เปิดห้องใหม่) */
+    rows = (await env.DB.prepare('SELECT * FROM tech_threads WHERE tech_id = ? AND customer_uid = ?').bind(techId, me.uid).all()).results;
+  } else if (myTech) {
+    rows = (await env.DB.prepare('SELECT * FROM tech_threads WHERE customer_uid = ? OR tech_id = ? ORDER BY updated_at DESC LIMIT 100').bind(me.uid, myTech.id).all()).results;
+  } else {
+    rows = (await env.DB.prepare('SELECT * FROM tech_threads WHERE customer_uid = ? ORDER BY updated_at DESC LIMIT 100').bind(me.uid).all()).results;
+  }
+  return { threads: await threadsOut(env, me, rows, myTech && myTech.id) };
+}
+async function threadText(env, me, ctx, b) {
+  await limit(env, 'msg', me.uid, 300);
+  return mask(str(b.text ?? b.message, 'ข้อความ', 1, 2000));
+}
+async function postToThread(env, me, ctx, text) {
+  const { th, t, role } = ctx;
+  if (role === 'admin') fail(403, 'ผู้ดูแลอ่านได้อย่างเดียว');
+  const ts = now();
+  const r = await env.DB.prepare('INSERT INTO tech_messages (job_id, uid, role, text, at) VALUES (?,?,?,?,?) RETURNING id')
+    .bind(th.id, me.uid, role, text, ts).first();
+  await env.DB.prepare('UPDATE tech_threads SET updated_at = ? WHERE id = ?').bind(ts, th.id).run();
+  await markRead(env, th.id, me.uid, r.id);
+  /* แจ้งอีกฝ่ายทาง LINE ไม่เกิน 1 ครั้ง / 30 นาที / ห้อง */
+  const to = role === 'technician' ? th.customer_uid : (t && t.uid);
+  if (to && to !== me.uid) tell(env, to, async () => (await once(env, 'line-thread:' + th.id, to, 1800000))
+    ? card({ tag: role === 'technician' ? 'ช่างตอบแล้ว' : 'ลูกค้าทักมา', title: role === 'technician' ? shopOf(t) : 'มีลูกค้าทักถาม (ยังไม่ใช่ใบงาน)',
+        lines: [text], url: appUrl(env, '/messages/' + th.id), label: 'ตอบกลับ' }) : null);
+  return { id: r.id, role, text, at: ts };
+}
+/* ทักร้าน: มีห้องอยู่แล้วคุยต่อ · ยังไม่มีเปิดห้องใหม่ (วันละไม่เกิน 20 ร้านใหม่ กันสแปม) */
+async function startThread(env, me, b) {
+  const t = await techById(env, String(b.techId || ''));
+  if (!t || t.suspended) fail(404, 'ไม่พบช่าง หรือช่างงดรับงานชั่วคราว');
+  if (t.test && !me.staff) fail(404, 'ไม่พบช่าง');
+  if (!t.test && !t.verified) fail(404, 'ช่างยังไม่ผ่านการตรวจ');
+  if (t.uid === me.uid) fail(400, 'ทักร้านตัวเองไม่ได้');
+  let gig = null;
+  if (b.gigId != null && b.gigId !== '') {
+    gig = await env.DB.prepare('SELECT id, tech_id FROM tech_gigs WHERE id = ? AND active = 1').bind(Number(b.gigId) || 0).first();
+    if (!gig || gig.tech_id !== t.id) gig = null;
+  }
+  let th = await env.DB.prepare('SELECT * FROM tech_threads WHERE tech_id = ? AND customer_uid = ?').bind(t.id, me.uid).first();
+  const text = await threadText(env, me, null, b);
+  if (!th) {
+    await limit(env, 'thread', me.uid, 20);
+    const ts = now(), id = crypto.randomUUID();
+    await env.DB.prepare('INSERT INTO tech_threads (id, tech_id, customer_uid, gig_id, test, created_at, updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(tech_id, customer_uid) DO NOTHING')
+      .bind(id, t.id, me.uid, gig ? gig.id : null, t.test ? 1 : 0, ts, ts).run();
+    th = await env.DB.prepare('SELECT * FROM tech_threads WHERE tech_id = ? AND customer_uid = ?').bind(t.id, me.uid).first();
+  } else if (gig && gig.id !== th.gig_id) {
+    /* ถามเรื่องบริการใหม่ในห้องเดิม — จำบริการล่าสุดที่คุยถึง */
+    await env.DB.prepare('UPDATE tech_threads SET gig_id = ? WHERE id = ?').bind(gig.id, th.id).run();
+    th.gig_id = gig.id;
+  }
+  const message = await postToThread(env, me, { th, t, role: 'customer' }, text);
+  await bumpView(env, t.id, 'msg');
+  const [thread] = await threadsOut(env, me, [{ ...th, updated_at: message.at }], null);
+  return { thread, message };
+}
+async function openThread(env, me, id, after) {
+  const ctx = await threadCtx(env, me, id);
+  const messages = await messagesOf(env, id, after);
+  if (ctx.role !== 'admin' && messages.length) await markRead(env, id, me.uid, messages[messages.length - 1].id);
+  const myTech = ctx.role === 'technician' ? ctx.t.id : null;
+  const [thread] = await threadsOut(env, me, [ctx.th], myTech);
+  return { thread, messages };
+}
+async function replyThread(env, me, id, b) {
+  const ctx = await threadCtx(env, me, id);
+  const text = await threadText(env, me, ctx, b);
+  return { message: await postToThread(env, me, ctx, text) };
 }
 
 /* ══ รูปแนบกับคำขอ (เช่น รูปรถที่จอด รูปอาการ) ══
@@ -1643,6 +1770,11 @@ async function route(request, env, verifyToken) {
     return { jobs };
   }
   if (p === '/api/tech/jobs' && m === 'POST') return createJob(env, me, await body());
+  if (p === '/api/tech/threads' && m === 'GET') return myThreads(env, me, url);
+  if (p === '/api/tech/threads' && m === 'POST') return startThread(env, me, await body());
+  const thm = p.match(/^\/api\/tech\/threads\/([0-9a-f-]{36})$/i);
+  if (thm && m === 'GET') return openThread(env, me, thm[1], Number(url.searchParams.get('after')) || 0);
+  if (thm && m === 'POST') return replyThread(env, me, thm[1], await body());
   if (p === '/api/tech/posts' && m === 'POST') return createPost(env, me, await body());
   if (p === '/api/tech/posts' && m === 'GET') return myPosts(env, me);
   if (p === '/api/tech/posts/near' && m === 'GET') return nearPosts(env, me);
