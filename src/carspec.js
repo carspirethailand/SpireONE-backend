@@ -173,7 +173,7 @@ ${SHAPE}`;
 
 /* ลองรุ่นโมเดลตามลำดับจนได้ JSON ที่อ่านได้ (เริ่มคนละตัวในสองรอบ = สองความเห็นที่ไม่ลอกกัน) */
 /* log: ทุกครั้งที่เรียกโมเดล บันทึก รอบ · รุ่น · เวลา · สถานะ HTTP · ความยาวคำตอบ · จำนวนแหล่ง · อ่าน JSON ได้ไหม · ข้อผิดพลาดจริง */
-async function lookup(env, ai, prompt, start, log = [], pass = 'A',docs=null,q=null,signal) {
+async function lookup(env, ai, prompt, start, log = [], pass = 'A',docs=null,q=null,signal,kind='spec') {
   /* ไม่เกิน 3 รุ่นต่อรอบ — รุ่นที่ใช้ไม่ได้ (404/400/429) ตอบกลับเร็ว ส่วนที่ช้าคือการค้นเว็บจริง */
   const order = [...ai.models.slice(start), ...ai.models.slice(0, start)].slice(0, 3);
   let last = null;
@@ -188,7 +188,7 @@ async function lookup(env, ai, prompt, start, log = [], pass = 'A',docs=null,q=n
       const o = direct || (!docs&&r.text.trim() ? await repairJson(env, ai, r.text, log, pass,signal) : null);
       step.ms = Date.now() - t0; step.ok = !!o; step.json = direct ? 'ok' : o ? 'ซ่อมแล้ว' : r.text.trim() ? 'อ่านไม่ได้' : 'ว่าง';
       if (!o) step.head = r.text.slice(0, 160);
-      if (o){const data=docs?(o.found===false?{found:false}:cleanDocumentExtraction(o,docs,q)):o;if(data.diagnostic)step.evidence=data.diagnostic;return {...r,data}}
+      if (o){const data=docs?(o.found===false?{found:false}:cleanDocumentExtraction(o,docs,q,{kind})):o;if(data.diagnostic)step.evidence=data.diagnostic;return {...r,data}}
       last = new Error(m + (r.text.trim() ? ' ตอบไม่เป็น JSON' : ' ตอบว่าง'));
       step.err = last.message;
     } catch (e) {
@@ -312,7 +312,7 @@ async function researchWithin(env,q,log,signal,kind,deadline,reserveMs){
   // with exact document proofs. Reserve time to merge/store a one-pass result.
   const run=(text,start,pass)=>{if(kind!=='equipment')return lookup(env,ai,text,start,log,pass,docs,q,signal);
     const ms=Math.max(1,Math.min(14000,deadline-Date.now()-reserveMs));
-    return timebox(own=>lookup(env,ai,text,start,log,pass,docs,q,own),ms,signal).catch(e=>{active(signal);log.push({p:pass,step:'extraction-deadline',ok:false,ms,err:String(e.message).slice(0,160)});throw e});};
+    return timebox(own=>lookup(env,ai,text,start,log,pass,docs,q,own,kind),ms,signal).catch(e=>{active(signal);log.push({p:pass,step:'extraction-deadline',ok:false,ms,err:String(e.message).slice(0,160)});throw e});};
   const [a, b] = await Promise.allSettled([run(docs?prompt:promptA(q),0,'A'),run(docs?(kind==='equipment'?'ตรวจอย่างระมัดระวัง ไม่เดารุ่นย่อยหรืออุปกรณ์มาตรฐาน\n':'ตรวจอย่างระมัดระวัง แยกแต่ละรุ่นย่อยและปฏิเสธค่าที่เอกสารไม่ระบุ\n')+prompt:promptB(q),Math.min(1,ai.models.length-1),'B')]);
   active(signal);
   const A = a.status === 'fulfilled' ? a.value : null, B = b.status === 'fulfilled' ? b.value : null;

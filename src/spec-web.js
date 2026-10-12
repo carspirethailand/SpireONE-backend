@@ -141,7 +141,7 @@ function supports(k,value,quote){const s=squash(quote);if(value==null)return fal
 }
 /* Quotes are validated in RAM and discarded. Public evidence keeps source
  * links only, not reproductions of article paragraphs or user information. */
-export function cleanDocumentExtraction(raw,docs,q){
+export function cleanDocumentExtraction(raw,docs,q,{kind='spec'}={}){
   if(!raw||typeof raw!=='object'||raw.found!==true)throw Error('เอกสารยังไม่ยืนยันข้อมูลของปี/รุ่นนี้');
   const inputProof=raw.evidence&&typeof raw.evidence==='object'?raw.evidence:{},proof=Object.create(null);
   const idOf=s=>{if(typeof s==='number')return Number.isInteger(s)&&s>=0?s:NaN;const m=String(s??'').match(/^(?:doc(?:ument)?[-_ ]?)?(\d+)$/i);return m?Number(m[1]):NaN};
@@ -182,6 +182,16 @@ export function cleanDocumentExtraction(raw,docs,q){
     next._sources={};for(const k of Object.keys(next)){const refs=evidence[base+k];if(refs)next._sources[k]=refs}
     out.variants.push(next);
   }
+  // A model-specific, exact-year specification/price article supplies its own
+  // reference context. Do not rely on the model inventing a year quotation.
+  // This is equipment-only: general encyclopedia pages, spyshots and dated
+  // unrelated pages do not qualify, and numerical specs keep the strict scope.
+  if(kind==='equipment')for(const d of docs){const u=new URL(d.url),context=d.title+' '+u.pathname,market=q?.market||'GLOBAL';
+    const exactYear=new RegExp('(?<!\\d)'+q.year+'(?!\\d)').test(context),modelTitle=normal(d.title).includes(normal(q.make))&&normal(d.title).includes(normal(q.model));
+    const specArticle=/official[- ]price|new[- ]price|technical[- ]data|specification|spec[- ]sheet|full[- ]review|ราคาอย่างเป็นทางการ|สเปค|สเปก|ข้อมูลทั้งหมด/i.test(context)&&!/spy[- ]?shot|rumo[u]?r|anniversary|ภาพหลุด|ข่าวลือ/i.test(context);
+    if(exactYear&&modelTitle&&specArticle&&market==='GLOBAL')scopes.set(d.id,scopes.get(d.id)||[0]);
+  }
+  diagnostic.scopedDocuments=scopes.size;
   out.equipment=[];
   for(const [i,item] of (Array.isArray(raw.equipment)?raw.equipment:[]).slice(0,40).entries()){
     const path='equipment.'+i+'.name',name=value(path,'equipment',item?.name);

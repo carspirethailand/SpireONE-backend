@@ -159,6 +159,13 @@ test('equipment: a fabricated extra quotation from the same cited document canno
   raw.evidence.push({path:'equipment.2.name',source:1,quote:'PASM is standard equipment.'});
   assert.equal(cleanDocumentExtraction(raw,[d],{...q,market:'GLOBAL'}).equipment.find(x=>x.name==='PASM').availability,'listed');
 });
+test('equipment: exact-year model specification article supplies reference context without fabricated year quotes; numerical specs remain strict',()=>{
+  const raw=equipmentExtraction();raw.scope=[];raw.seats=7;raw.evidence.push({path:'facts.seats',source:1,quote:'Seats: 7.'});
+  const d={...docs[0],id:1,url:'https://www.headlightmag.com/official-price-mitsubishi-pajero-sport-2020/',title:'ราคาอย่างเป็นทางการ Mitsubishi Pajero Sport',text:paragraph+equipmentText};
+  const out=cleanDocumentExtraction(raw,[d],{...q,market:'GLOBAL'},{kind:'equipment'});assert.equal(out.equipment.length,3);assert.equal(out.seats,null);assert.deepEqual(out.equipment[0].sourceIds,[1]);
+  for(const bad of [{...d,url:d.url.replace('2020','2021')},{...d,title:'Spyshot Mitsubishi Pajero Sport 2020'},{...d,title:'Toyota Hilux 2020 specification'},{...d,url:'https://en.wikipedia.org/wiki/Mitsubishi_Pajero_Sport',title:'Mitsubishi Pajero Sport'}])assert.equal(cleanDocumentExtraction(raw,[bad],{...q,market:'GLOBAL'},{kind:'equipment'}).equipment.length,0);
+  assert.equal(cleanDocumentExtraction(raw,[d],{...q,market:'JP'},{kind:'equipment'}).equipment.length,0,'an exact-year Thai article is not evidence of Japanese equipment');
+});
 test('equipment: real document mode has no search tools and returns only cited items, separate from numerical specs',async()=>{
   const raw=equipmentExtraction(),calls=installWeb({aiResponse:raw}),base=globalThis.fetch;
   globalThis.fetch=async(url,opt)=>{const r=await base(url,opt);if(String(url)===docs[0].url)return new Response((await r.text())+'<p>'+equipmentText+'</p>',{headers:{'content-type':'text/html'}});return r};
