@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {allowedSource,robotsAllow,textOf,timebox,collectSpecDocuments,cleanDocumentExtraction,excerpt,documentRank} from '../src/spec-web.js';
+import {allowedSource,robotsAllow,textOf,timebox,collectSpecDocuments,cleanDocumentExtraction,excerpt,documentRank,wikiPlain} from '../src/spec-web.js';
 import {research,merge,specFailure} from '../src/carspec.js';
-const q={make:'Mitsubishi',model:'Pajero Sport',year:'2020'};
+const q={make:'Mitsubishi',model:'Pajero Sport',year:'2020',market:'TH'};
 // All documents and Gemini responses in this file are synthetic test data.
 const paragraph='Mitsubishi Pajero Sport 2020 Thailand specification. 2.4 GT diesel engine. Seats: 7. Displacement: 2442 cc. Power: 181 hp. Torque: 430 Nm. Drive: RWD. '+ 'Public fixture descriptive text. '.repeat(10);
 const docs=[{id:0,url:'https://www.mitsubishi-motors.co.th/test-pajero-sport-2020',title:'2020 Mitsubishi Pajero Sport',text:paragraph,primary:true}];
@@ -72,6 +72,32 @@ test('extraction: every value needs an exact verified quotation; invented quotes
   const out=cleanDocumentExtraction(raw,docs,q);assert.equal(out.seats,7);assert.equal(out.length_mm,null);assert.equal(out.tank_l,null);assert.equal(out.variants[0].hp,null);assert.equal(out.variants[0].cc,2442);assert.equal(out.body,null);
   assert.deepEqual(out.evidence['facts.seats'],[0]);assert.ok(!JSON.stringify(out).includes('Power:'));
 });
+test('extraction: evidence maps, single objects, nested properties and flat arrays retain the same exact-quote validation',()=>{
+  for(const shape of ['object','nested','array']){const raw=extraction();
+    if(shape==='object')raw.evidence=Object.fromEntries(Object.entries(raw.evidence).map(([k,v])=>[k.replace(/^facts\./,''),v[0]]));
+    if(shape==='nested'){const original=raw.evidence;raw.evidence={facts:{seats:original['facts.seats'][0]},variants:[{}]};for(const [k,v] of Object.entries(original))if(k.startsWith('variants.0.'))raw.evidence.variants[0][k.split('.').pop()]=v[0]}
+    if(shape==='array')raw.evidence=Object.entries(raw.evidence).flatMap(([path,a])=>a.map(e=>({...e,path:path.replace('variants.0.','variants[0].')})));
+    raw.variants[0].cc={value:'2,442'};const out=cleanDocumentExtraction(raw,docs,q);assert.equal(out.seats,7,shape);assert.equal(out.variants[0].cc,2442,shape);assert.deepEqual(out.evidence['facts.seats'],[0]);
+  }
+});
+test('extraction: omitted optional market permits basic references, explicit market still requires matching country evidence',()=>{
+  const raw=extraction(),source={...docs[0],url:'https://porsche.com/test-2020',text:paragraph.replace('Thailand','Germany')};raw.scope[0].year_quote='Mitsubishi Pajero Sport 2020 Germany specification.';
+  assert.equal(cleanDocumentExtraction(raw,[source],{make:q.make,model:q.model,year:q.year}).seats,7);
+  assert.equal(cleanDocumentExtraction(raw,[source],{...q,market:'TH'}).seats,null);
+});
+test('extraction: missing, boolean or fabricated source IDs never implicitly mean source zero',()=>{
+  for(const source of [null,false,'','unknown',99]){const raw=extraction();raw.evidence['facts.seats']={source,quote:'Seats: 7.'};assert.equal(cleanDocumentExtraction(raw,docs,q).seats,null,String(source));}
+});
+test('reader: wiki formatting becomes readable without inventing conversions, and archived references do not replace production dates',()=>{
+  const s=wikiPlain("| production = 2017–2023\n| length = {{convert|4918|mm|in|abbr=on}}\n| engine = [[Example engine|V6 engine]]<ref>web/20181231</ref>");assert.match(s,/4918 mm/);assert.match(s,/V6 engine/);assert.doesNotMatch(s,/convert|20181231|\[\[/);
+  assert.match(wikiPlain('{{convert|4918|-|4930|mm}}'),/4918\|-\|4930/,'ranges must not silently become one number');
+});
+test('free pipeline: sourced body-only basic information is useful, without manufacturing missing numerical specs',async()=>{
+  const raw={found:true,body:'suv',variants:[],scope:[{source:1,year_quote:'Mitsubishi Pajero Sport 2020 Thailand specification.'}],evidence:{body:{source:1,quote:'Pajero Sport'}}};
+  const calls=installWeb({aiResponse:raw}),base=globalThis.fetch;
+  globalThis.fetch=async(url,opt)=>{const r=await base(url,opt);if(String(url)===docs[0].url){const s=await r.text();return new Response(s+'<p>Body: SUV.</p>',{headers:{'content-type':'text/html'}})}return r};
+  raw.evidence.body.quote='Body: SUV.';const r=await research({GEMINI_KEY:'test-only-key'},{make:q.make,model:q.model,year:q.year});assert.equal(r.status,'ready');assert.equal(r.data.body,'suv');assert.ok(r.data.score.cells>0);assert.equal(r.data.facts.seats,null);assert.equal(r.sources.length,1);assert.equal(calls.filter(c=>c.url.includes('generativelanguage')).length,2);
+});
 test('extraction: wrong year, missing year scope and wrong market cannot become Thailand specifications',()=>{
   const raw=extraction();for(const query of [{...q,year:'2021'},{...q,market:'JP'}]){const out=cleanDocumentExtraction(raw,docs,query);assert.equal(out.seats,null);assert.equal(out.variants.length,0);}
   raw.scope=[];assert.equal(cleanDocumentExtraction(raw,docs,q).seats,null);
@@ -83,7 +109,7 @@ test('extraction: nested facts keep their proof requirement and manufacturing co
   const d={...docs[0],url:'https://porsche.com/a',text:paragraph+' Assembly: Thailand.'};raw.scope[0].market_quote='Assembly: Thailand.';assert.equal(cleanDocumentExtraction(raw,[d],q).seats,null);
 });
 test('extraction: an unrelated generation far from the year context is rejected',()=>{
-  const d={...docs[0],title:'Mitsubishi Pajero Sport',text:'2020 Thailand specification. '+ 'Other unrelated section. '.repeat(110)+ 'Seats: 7.'};
+  const d={...docs[0],url:'https://www.mitsubishi-motors.co.th/pajero-sport-history',title:'Mitsubishi Pajero Sport',text:'2020 Thailand specification. '+ 'Other unrelated section. '.repeat(110)+ 'Seats: 7.'};
   const raw=extraction();raw.scope=[{source:0,year_quote:'2020 Thailand specification.'}];assert.equal(cleanDocumentExtraction(raw,[d],q).seats,null);
 });
 test('extraction: source IDs follow their variant when an unsupported variant is removed',()=>{

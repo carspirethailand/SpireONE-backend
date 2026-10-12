@@ -22,6 +22,14 @@ export function allowedSource(raw){try{const u=new URL(raw);return u.protocol===
 export function textOf(html){return String(html||'').replace(/<!--[^]*?-->/g,' ').replace(/<(script|style|noscript|svg|nav|footer|header|aside|form)\b[^>]*>[\s\S]*?<\/\1>/gi,' ')
   .replace(/<\/(?:p|tr|li|h[1-6]|div|section|table)>/gi,'\n').replace(/<[^>]+>/g,' ').replace(/&#x([0-9a-f]+);/gi,(_,n)=>String.fromCodePoint(Math.min(parseInt(n,16),0x10ffff)))
   .replace(/&#(\d+);/g,(_,n)=>String.fromCodePoint(Math.min(Number(n),0x10ffff))).replace(/&nbsp;/g,' ').replace(/&amp;/g,'&').replace(/&quot;/g,'"').replace(/&#39;|&apos;/g,"'").replace(/[ \t]+/g,' ').replace(/\n\s*\n/g,'\n').trim();}
+export function wikiPlain(raw){
+  const s=String(raw||'').replace(/<ref\b[^>]*>[\s\S]*?<\/ref>|<ref\b[^>]*\/>/gi,' ')
+    .replace(/\{\{convert\|([\d,.]+)\|([a-zA-Z³²]+)(?:\|[^{}]*)?\}\}/g,'$1 $2')
+    .replace(/\{\{val\|([\d,.]+)\|u=([^|{}]+)(?:\|[^{}]*)?\}\}/g,'$1 $2')
+    .replace(/\[\[([^\]\n]+)\]\]/g,(_,link)=>link.split('|').pop())
+    .replace(/'{2,5}/g,'');
+  return textOf(s);
+}
 export function robotsAllow(text,path){
   let agents=[],rules=[],signals='',groups=[];
   for(const line of String(text||'').split(/\r?\n/)){const m=line.replace(/#.*$/,'').match(/^\s*(user-agent|allow|disallow|content-signal)\s*:\s*(.*?)\s*$/i);if(!m)continue;const k=m[1].toLowerCase();
@@ -100,7 +108,7 @@ export async function collectSpecDocuments(q,log=[],signal){
   if(!chosen?.pageid)throw Error('ไม่พบเอกสารอ้างอิงของรุ่นนี้จากแหล่งค้นข้อมูลเปิด');
   // Wikitext avoids downloading hundreds of KB of generated table/layout HTML
   // and retains the specification table. It is still untrusted document data.
-  const page=await wiki({action:'parse',pageid:String(chosen.pageid),prop:'wikitext|externallinks'},signal,deadline-Date.now()),html=page.parse?.wikitext?.['*']||page.parse?.text?.['*']||'',plain=textOf(html);
+  const page=await wiki({action:'parse',pageid:String(chosen.pageid),prop:'wikitext|externallinks'},signal,deadline-Date.now()),rawWiki=page.parse?.wikitext?.['*'],plain=rawWiki?wikiPlain(rawWiki):textOf(page.parse?.text?.['*']||'');
   let published=[];try{published=await localLinks}catch(e){active(signal)}
   const candidates=[...published.map(x=>x.url),...(page.parse?.externallinks||[])].filter(allowedSource).filter(u=>!/^https:\/\/en\.wikipedia/.test(u));
   const metadata=new Map(published.map(x=>[x.url,x]));
@@ -117,7 +125,7 @@ export async function collectSpecDocuments(q,log=[],signal){
 }
 const WORDS={seats:['seats','seating','passenger','ที่นั่ง'],doors:['doors','ประตู'],length_mm:['length','ยาว'],width_mm:['width','กว้าง'],height_mm:['height','สูง'],wheelbase_mm:['wheelbase','ฐานล้อ'],kerb_kg:['weight','kerb','curb','น้ำหนัก'],tank_l:['tank','fuel capacity','ถัง'],cc:['cc','displacement','cubic','ความจุ','ซีซี'],hp:['hp','bhp','horsepower','แรงม้า'],torque_nm:['torque','nm','แรงบิด'],l_per_100km:['l/100','litres per 100','ลิตร/100'],battery_kwh:['kwh','battery','แบตเตอรี่'],range_km:['range','driving distance','ระยะทาง']};
 const ENUM={coupe:['coupe','coupé','sports car','คูเป้','รถสปอร์ต'],sedan:['sedan','saloon','ซีดาน'],suv:['suv','sport utility','เอสยูวี'],hatchback:['hatchback','แฮทช์แบ็ก'],pickup:['pickup','pick-up','กระบะ'],mpv:['mpv','minivan','เอ็มพีวี'],van:['van','รถตู้'],ev:['electric','battery electric','ไฟฟ้า'],petrol:['petrol','gasoline','เบนซิน'],diesel:['diesel','ดีเซล'],hybrid:['hybrid','ไฮบริด'],phev:['plug-in','phev','ปลั๊กอิน'],lpg:['lpg','แก๊ส'],FWD:['fwd','front-wheel','front wheel','ขับหน้า'],RWD:['rwd','rear-wheel','rear wheel','ขับหลัง'],AWD:['awd','all-wheel','all wheel','ขับสี่'], '4WD':['4wd','four-wheel','4x4','ขับสี่']};
-const squash=s=>String(s||'').normalize('NFC').replace(/\s+/g,' ').trim().toLowerCase();
+const squash=s=>String(s||'').normalize('NFC').replace(/[–—−]/g,'-').replace(/[“”]/g,'"').replace(/[‘’]/g,"'").replace(/\s+/g,' ').trim().toLowerCase();
 const COUNTRY={TH:['thailand','thai market','ประเทศไทย','ตลาดไทย'],JP:['japan','japanese market','ญี่ปุ่น'],US:['united states','u.s. market','us market','สหรัฐ'],UK:['united kingdom','uk market','british market','สหราชอาณาจักร'],DE:['germany','german market','เยอรมนี'],AU:['australia','australian market','ออสเตรเลีย'],EU:['europe','european market','ยุโรป']};
 function coversYear(quote,year){
   const s=squash(quote),y=Number(year);
@@ -135,19 +143,32 @@ function supports(k,value,quote){const s=squash(quote);if(value==null)return fal
  * links only, not reproductions of article paragraphs or user information. */
 export function cleanDocumentExtraction(raw,docs,q){
   if(!raw||typeof raw!=='object'||raw.found!==true)throw Error('เอกสารยังไม่ยืนยันข้อมูลของปี/รุ่นนี้');
-  const proof=raw.evidence&&typeof raw.evidence==='object'?raw.evidence:{},evidence={},positions={},diagnostic={scopeReceived:Array.isArray(raw.scope)?raw.scope.length:0,scopedDocuments:0,proofPaths:Object.keys(proof).length,acceptedFields:0,rejected:{},nestedFacts:!!raw.facts};
+  const inputProof=raw.evidence&&typeof raw.evidence==='object'?raw.evidence:{},proof=Object.create(null);
+  const idOf=s=>{if(typeof s==='number')return Number.isInteger(s)&&s>=0?s:NaN;const m=String(s??'').match(/^(?:doc(?:ument)?[-_ ]?)?(\d+)$/i);return m?Number(m[1]):NaN};
+  const addProof=(path,value,depth=0)=>{if(depth>8||!value||typeof value!=='object')return;
+    if((value.source!==undefined||value.source_id!==undefined)&&typeof(value.quote??value.text)==='string'){
+      const p=String(value.path||value.field||path||'').replace(/\[(\d+)\]/g,'.$1');if(p)proof[p]=[...(proof[p]||[]),{source:idOf(value.source??value.source_id),quote:value.quote??value.text}];return;
+    }
+    if(Array.isArray(value)){value.forEach((v,i)=>addProof(v?.path||v?.field||((v?.source!==undefined||v?.source_id!==undefined)?path:path+'.'+i),v,depth+1));return}
+    for(const [k,v] of Object.entries(value))addProof(path?path+'.'+k:k,v,depth+1);
+  };addProof('',inputProof);
+  const evidence=Object.create(null),positions=Object.create(null),scopesInput=Array.isArray(raw.scope)?raw.scope:raw.scope&&typeof raw.scope==='object'?[raw.scope]:[],diagnostic={scopeReceived:scopesInput.length,scopedDocuments:0,proofPaths:Object.keys(proof).length,acceptedFields:0,rejected:{},nestedFacts:!!raw.facts};
   const texts=new Map(docs.map(d=>[d.id,squash(d.text)])),scopes=new Map();
   const quoteAt=(id,s)=>typeof s==='string'&&s.length>=4&&s.length<=260?(texts.get(id)||'').indexOf(squash(s)):-1;
-  for(const s of Array.isArray(raw.scope)?raw.scope:[]){const id=Number(s.source),d=docs.find(x=>x.id===id),at=quoteAt(id,s.year_quote);if(!d||at<0||!coversYear(s.year_quote,q?.year))continue;
-    const market=q?.market||'TH',country=COUNTRY[market]||[],host=new URL(d.url).hostname;
+  for(const s of scopesInput){const id=idOf(s.source??s.source_id),d=docs.find(x=>x.id===id),at=quoteAt(id,s.year_quote);if(!d||at<0||!coversYear(s.year_quote,q?.year))continue;
+    const market=q?.market||'GLOBAL',country=COUNTRY[market]||[],host=new URL(d.url).hostname;
     const directTH=market==='TH'&&/\.co\.th$/.test(host);
     if(market!=='GLOBAL'&&!directTH&&!(quoteAt(id,s.market_quote)>=0&&country.some(x=>squash(s.market_quote).includes(x))&&!/\b(?:assembly|assembled|manufactur|export)\w*|ผลิต|ประกอบ/i.test(s.market_quote)))continue;
     const points=scopes.get(id)||[];points.push(at);scopes.set(id,points);
   }
   diagnostic.scopedDocuments=scopes.size;
   const reject=reason=>{diagnostic.rejected[reason]=(diagnostic.rejected[reason]||0)+1;return false};
-  function value(path,k,v,anchors){const entries=Array.isArray(proof[path])?proof[path]:[];const good=entries.filter(e=>{const id=Number(e.source),at=quoteAt(id,e.quote),d=docs.find(x=>x.id===id);if(!d||at<0)return reject('quote_missing');if(!scopes.has(id))return reject('scope_missing');if(!supports(k,v,e.quote))return reject('value_not_supported');
-      const inYear=(d.title.match(/\b(?:19|20)\d{2}\b/g)||[]).includes(String(q.year))||scopes.get(id).some(p=>Math.abs(p-at)<=1200);
+  function value(path,k,v,anchors){if(v&&typeof v==='object'&&!Array.isArray(v))v=v.value??v.v;
+    if(WORDS[k]&&typeof v==='string'){const n=v.replace(/,/g,'');v=/^\d+(?:\.\d+)?$/.test(n)?Number(n):null}
+    if(WORDS[k]&&typeof v!=='number')v=null;
+    const aliases=[...new Set(path.startsWith('facts.')?[path,path.slice(6),'facts.'+k]:[path,path.replace(/\.(\d+)\./,'[$1].')])];const entries=aliases.flatMap(p=>proof[p]||[]);const good=entries.filter(e=>{const id=Number(e.source),at=quoteAt(id,e.quote),d=docs.find(x=>x.id===id);if(!d||at<0)return reject('quote_missing');if(!scopes.has(id))return reject('scope_missing');if(!supports(k,v,e.quote))return reject('value_not_supported');
+      const identifiedYear=(d.title+' '+new URL(d.url).pathname).match(/(?<!\d)(?:19|20)\d{2}(?!\d)/g)||[];
+      const inYear=identifiedYear.includes(String(q.year))||scopes.get(id).some(p=>Math.abs(p-at)<=1200);
       if(!inYear)return reject('outside_year_context');return !anchors||anchors.some(a=>a.id===id&&Math.abs(a.at-at)<=900)||reject('outside_variant_context');});
     if(!good.length)return null;diagnostic.acceptedFields++;evidence[path]=[...new Set(good.map(e=>Number(e.source)))];positions[path]=good.map(e=>({id:Number(e.source),at:quoteAt(Number(e.source),e.quote)}));return v;
   }

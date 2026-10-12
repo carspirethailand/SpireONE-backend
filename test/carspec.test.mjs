@@ -42,7 +42,7 @@ const CUST='dev:cust:cust@unit.test',BOSS='dev:boss:boss@unit.test';
 const pajero={make:'Mitsubishi',model:'Pajero Sport',year:'2020'};
 
 test('car spec: only real-looking car names and years are researched',()=>{
-  assert.deepEqual(validQuery({make:' Mitsubishi ',model:'Pajero  Sport',year:'2020'}),{make:'Mitsubishi',model:'Pajero Sport',year:'2020'});
+  assert.deepEqual(validQuery({make:' Mitsubishi ',model:'Pajero  Sport',year:'2020'}),{make:'Mitsubishi',model:'Pajero Sport',year:'2020',market:'GLOBAL'});
   for(const q of [{make:'x'.repeat(41),model:'a',year:'2020'},{make:'BMW',model:'<script>',year:'2020'},{make:'BMW',model:'X5',year:'1899'},{make:'BMW',model:'X5',year:'20200'}])
     assert.equal(validQuery(q),null,JSON.stringify(q));
 });
@@ -265,7 +265,7 @@ test('car info: extra optional model context is private and invalid model years 
 test('car spec: admin verification cannot make a legacy unsourced record look trustworthy',async()=>{
   const {f,call}=setup();f.sqlite.prepare("INSERT INTO car_specs(k,make,model,year,status,data,sources,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)").run('fake|model|2020','Fake','Model','2020','ready','{"facts":{"seats":{"v":5}}}','[]',1,1);
   const r=await call('POST','/api/admin/car-specs/verify',{key:'fake|model|2020'},BOSS);assert.equal(r.status,400);
-  assert.equal((await call('GET','/api/car-spec?make=Fake&model=Model&year=2020')).json.status,'unconfirmed');
+  assert.equal((await call('GET','/api/car-spec?make=Fake&model=Model&year=2020&market=TH')).json.status,'unconfirmed');
 });
 test('car spec: provider refunds cannot enable unlimited lookup attempts by rotating car models',async()=>{
   const {call,ai}=setup({fail:true});for(let i=0;i<9;i++)assert.equal((await call('POST','/api/car-spec',{make:'Honda',model:'Fixture '+i,year:'2020'})).json.code,'provider_quota');
@@ -292,4 +292,8 @@ test('car spec: daily limit responses identify account scope rather than an ambi
 });
 test('car spec: invalid bearer tokens cannot silently downgrade to guest or consume any lookup budget',async()=>{
   const {f,call,ai}=setup();const r=await call('POST','/api/car-spec',pajero,'invalid-fixture-token');assert.equal(r.status,401);assert.equal(r.json.code,'auth_required');assert.equal(ai.length,0);assert.equal(f.sqlite.prepare('SELECT COUNT(*) n FROM spec_quota').get().n,0);
+});
+test('car spec: three required fields are sufficient and explicit Thai requests keep their legacy library key separate',async()=>{
+  const {call}=setup();const general=await call('POST','/api/car-spec',pajero,CUST),thai=await call('POST','/api/car-spec',{...pajero,market:'TH'},CUST);
+  assert.equal(general.json.status,'ready');assert.equal(general.json.key,'mitsubishi|pajero sport|2020|global');assert.equal(general.json.data.query.market,'GLOBAL');assert.equal(thai.json.key,'mitsubishi|pajero sport|2020');assert.notEqual(thai.json.key,general.json.key);
 });
