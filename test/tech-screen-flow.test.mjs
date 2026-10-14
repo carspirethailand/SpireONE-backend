@@ -92,10 +92,10 @@ test('Didit mode: no ID photos or number stored; consent to Didit required; appr
   fakeVision();const f=fixture(DIDIT);
   assert.equal((await f.call(USER,'/api/tech/apply',D({diditConsent:false}))).status,400);
   fakeVision();const r=await diditApp(f,{docs:form().docs,idNo:'1101700203450'});
-  assert.deepEqual(r.identity,{mode:'didit',status:'none'});
+  assert.deepEqual(r.identity,{mode:'didit',status:'not_started'});
   assert.equal(f.sqlite.prepare("SELECT COUNT(*) n FROM tech_docs WHERE kind IN ('id','selfie')").get().n,0,'old clients sending ID photos: dropped, never stored');
   assert.ok(!f.sqlite.prepare('SELECT data FROM tech_applications').get().data.includes('1101700203450'),'ID number not kept');
-  const a=await staffView(f);assert.equal(a.ai.verdict,'pass');assert.equal(a.identity.status,'none');
+  const a=await staffView(f);assert.equal(a.ai.verdict,'pass');assert.equal(a.identity.status,'not_started');
   const ap=await f.call(ADMIN,'/api/tech/review',review(a,{evidence:didEv()}));assert.equal(ap.status,400);assert.match(ap.error,/Didit/);
 });
 test('Didit session → signed webhook → decision re-fetched → approval works; personal card data trimmed after approval',async()=>{

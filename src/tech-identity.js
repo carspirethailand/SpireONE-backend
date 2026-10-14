@@ -16,12 +16,17 @@ export async function hmacHex(key,msg){
 export function sameHex(a,b){a=String(a||'').toLowerCase();b=String(b||'').toLowerCase();if(!a||a.length!==b.length)return false;let x=0;for(let i=0;i<a.length;i++)x|=a.charCodeAt(i)^b.charCodeAt(i);return x===0;}
 const canonical=v=>Array.isArray(v)?v.map(canonical):v&&typeof v==='object'?Object.fromEntries(Object.keys(v).sort().map(k=>[k,canonical(v[k])])):v;
 export const canonicalJson=v=>JSON.stringify(canonical(v));
-/* ลายเซ็น webhook: X-Signature = HMAC(ข้อความดิบ) หรือ X-Signature-V2 = HMAC(JSON เรียงคีย์) · เวลาต้องห่างไม่เกิน 5 นาที */
+/* Didit v3 signs the exact raw UTF-8 body in X-Signature-V2. Keep the
+   timestamped legacy signature during the Console migration. */
 export async function verifyDidit(secret,raw,headers,nowMs=Date.now()){
-  const ts=Number(headers.get('x-timestamp'));
-  if(!secret||!Number.isFinite(ts)||ts<=0||Math.abs(nowMs/1000-ts)>300)return false;
+  if(!secret)return false;
   const sig=headers.get('x-signature'),v2=headers.get('x-signature-v2');
+  if(v2&&sameHex(v2,await hmacHex(secret,raw)))return true;
+  const ts=Number(headers.get('x-timestamp'));
+  if(!Number.isFinite(ts)||ts<=0||Math.abs(nowMs/1000-ts)>300)return false;
   if(sig&&sameHex(sig,await hmacHex(secret,raw)))return true;
+  /* Temporary compatibility with destinations created before v3's raw-body
+     signature. A timestamp is mandatory on this legacy canonical form. */
   if(v2){let b;try{b=JSON.parse(raw)}catch{return false;}if(sameHex(v2,await hmacHex(secret,canonicalJson(b))))return true;}
   return false;
 }

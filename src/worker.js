@@ -2,7 +2,7 @@ import { verifyFirebaseToken } from './auth.js';
 import { EMAIL_AUTH_SQL, handleEmailAuth } from './email-auth.js';
 import { ONBOARDING_SQL, handleOnboarding, onboardingName, sanitizeSetupState } from './onboarding.js';
 import { buildFeatureRequest } from './features-ai.mjs';
-import { handleTech } from './techs.js';
+import { handleTech, reconcileDiditIdentities } from './techs.js';
 import { richMenuStatus, setupRichMenu, lineStatus, lineFixWebhook } from './line-menu.js';
 import { appUrl, card } from './line-notify.js';
 import { refreshNews, newsStatus } from './news.js';
@@ -5890,6 +5890,9 @@ ${convo}`;
     ctx.waitUntil(runDueJobs(env));
     /* นิตยสาร: เช็กทุกชั่วโมง อัปเดตจริงทุก 5 ชั่วโมง (รอบของตัวเอง ไม่พ่วงงานหนักรายวัน) */
     if (event.cron === NEWS_CRON) { ctx.waitUntil(refreshNews(env)); return; }
+    /* Didit retries only briefly; reconcile incomplete identity sessions on the
+       existing hourly schedule so a missed webhook cannot strand an applicant. */
+    ctx.waitUntil(reconcileDiditIdentities(env).catch(() => {}));
     if (event.cron !== '*/10 * * * *') {
       ctx.waitUntil(runPushRound(env));
       ctx.waitUntil(runOdoRound(env));

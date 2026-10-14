@@ -38,6 +38,9 @@ const TECH_SQL = [
   /* ผลยืนยันตัวตนกับ Didit ต่อบัญชี — data = {url, vendor, name, birth, last3, flags} ชื่อ/วันเกิดถูกลบหลังทีมงานตรวจใบสมัครเสร็จ */
   `CREATE TABLE IF NOT EXISTS tech_identity (uid TEXT PRIMARY KEY, session_id TEXT, status TEXT NOT NULL DEFAULT 'none', id_hash TEXT, data TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
   `CREATE INDEX IF NOT EXISTS tech_identity_session ON tech_identity(session_id)`,
+  /* Receipt ledger only: never retain Didit's raw webhook payload or document data. */
+  `CREATE TABLE IF NOT EXISTS tech_identity_events (event_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, event_type TEXT NOT NULL, status TEXT, received_at INTEGER NOT NULL)`,
+  `CREATE INDEX IF NOT EXISTS tech_identity_events_session ON tech_identity_events(session_id, received_at)`,
   `CREATE TABLE IF NOT EXISTS tech_applications (
   uid        TEXT PRIMARY KEY,
   email      TEXT,
@@ -419,7 +422,7 @@ function appOut(a, staff = false, ident = null) {
 function identityOut(d, row, staff) {
   if (d.idMode !== 'didit') return { mode: 'manual' };
   const v = identityView(row, d);
-  const out = { mode: 'didit', status: v.status, updatedAt: row ? row.updated_at : null };
+  const out = { mode: 'didit', status: v.status === 'none' ? 'not_started' : v.status, updatedAt: row ? row.updated_at : null };
   return staff ? { ...out, name: v.name, birth: v.birth, last3: v.last3, flags: v.flags } : out;
 }
 /* ข้อสงสัยคิดใหม่ทุกครั้งจากข้อมูลบัตร × ใบสมัครปัจจุบัน (ผู้สมัครแก้ชื่อแล้วส่งใหม่ ผลต้องตามทัน) */
@@ -449,6 +452,7 @@ async function meInfo(env, me) {
     uid: me.uid, email: me.email, admin: me.admin, staff: me.staff, version: API_VERSION,
     application: appOut(a, false, ident),
     technician: t ? { ...publicTech((await withPhotos(env, [t]))[0]), suspended: !!t.suspended,
+      identityHold: !!(!t.test && t.suspended && ident && ident.status !== 'approved'),
       /* ค่าตั้งของร้านที่เห็นเฉพาะเจ้าของ (Studio → ตั้งค่า) */
       ...(() => { const d = parse(t.data) || {}; return { autoReply: d.autoReply || null, minPrice: d.minPrice || 0, vacationRaw: d.vacation || null }; })() } : null,
     attention, unreadThreads: msgs,
@@ -605,7 +609,7 @@ async function apply(env, me, b) {
     return {ok:true,status:'rejected',result:'rejected',reasons};
   }
   return {ok:true,status:'pending',result:'pending',screening:ai?{status:ai.status,verdict:ai.verdict}:null,
-    identity:didit?{mode:'didit',status:ident?ident.status:'none'}:{mode:'manual'}};
+    identity:didit?{mode:'didit',status:ident?ident.status:'not_started'}:{mode:'manual'}};
 }
 
 /* รัน AI คัดกรองแล้วเก็บผลไว้ในใบสมัคร (ทีมงานเห็นเท่านั้น ผู้สมัครไม่เห็น) */
@@ -674,7 +678,6 @@ async function syncIdentity(env, uid) {
   if (!cur || !cur.session_id) return null;
   const dec = await diditFetch(env, '/v3/session/' + encodeURIComponent(cur.session_id) + '/decision/');
   const f = diditFacts(dec), x = parse(cur.data) || {}, t = now();
-  if (cur.status === 'approved' && f.status !== 'approved' && f.status !== 'declined') return cur;   /* ผ่านแล้วไม่ถอยกลับเพราะผลค้าง */
   const next = { url: f.status === 'pending' ? x.url : undefined, vendor: x.vendor };
   let idHash = cur.id_hash;
   if (f.status === 'approved') {
@@ -691,6 +694,11 @@ async function syncIdentity(env, uid) {
     env.DB.prepare('INSERT INTO tech_identity_claims(id_hash,uid) VALUES (?,?) ON CONFLICT(uid) DO UPDATE SET id_hash=excluded.id_hash').bind(idHash, uid),
     env.DB.prepare("UPDATE tech_applications SET id_hash=? WHERE uid=? AND status='pending'").bind(idHash, uid));
   await env.DB.batch(stmts);
+  /* A later Didit review hides the public profile and prevents new work.
+     A subsequent approved decision restores a profile held for this reason. */
+  const hold = f.status !== 'approved';
+  await env.DB.prepare('UPDATE tech_profiles SET suspended=?,online=CASE WHEN ? THEN 0 ELSE online END,updated_at=? WHERE uid=? AND test=0')
+    .bind(hold ? 1 : 0, hold ? 1 : 0, t, uid).run();
   return { ...cur, status: f.status, id_hash: idHash, data: JSON.stringify(next), updated_at: t };
 }
 async function refreshIdentity(env, me) {
@@ -698,7 +706,18 @@ async function refreshIdentity(env, me) {
   await limit(env, 'didit_check', me.uid, 30);
   let row;
   try { row = await syncIdentity(env, me.uid); } catch (e) { if (e instanceof HttpError) throw e; console.error('didit decision', e && e.message); fail(502, 'ยังดึงผลจาก Didit ไม่ได้ ลองใหม่อีกครั้ง'); }
-  return { ok: true, identity: { mode: 'didit', status: row ? row.status : 'none' } };
+  return { ok: true, identity: { mode: 'didit', status: row ? row.status : 'not_started' } };
+}
+/* Webhooks are the fast path. This bounded sweep is the recovery path when a
+   delivery was lost while our Worker was unavailable; it never touches a
+   terminal decision and is safe to call from the existing hourly cron. */
+export async function reconcileDiditIdentities(env, max = 50) {
+  if(!diditReady(env)) return { checked: 0 };
+  await ensureTech(env);
+  const {results}=await env.DB.prepare("SELECT uid FROM tech_identity WHERE status IN ('pending','review') ORDER BY updated_at ASC LIMIT ?").bind(Math.max(1,Math.min(100,max))).all();
+  let checked=0;
+  for(const row of results){ try { await syncIdentity(env,row.uid); checked++; } catch(e) { console.error('didit reconcile',e&&e.message); } }
+  return { checked };
 }
 /* webhook จาก Didit — ไม่ต้องล็อกอิน แต่ต้องมีลายเซ็นถูกต้อง · ตอบเหมือนกันทุกกรณีที่ลายเซ็นถูก ไม่บอกว่ามี session นี้ไหม */
 async function diditWebhook(env, request) {
@@ -708,6 +727,11 @@ async function diditWebhook(env, request) {
   if (!await verifyDidit(env.DIDIT_WEBHOOK_SECRET, raw, request.headers)) fail(401, 'invalid signature');
   let b; try { b = JSON.parse(raw); } catch { fail(400, 'ข้อมูลไม่ถูกต้อง'); }
   const sid = String(b && b.session_id || '');
+  const eventId = String(b && (b.event_id || b.id) || `${sid}:${b && (b.webhook_type || b.type) || 'status.updated'}:${b && b.status || ''}`);
+  if(!sid || eventId.length>200)return { ok:true };
+  const receipt=await env.DB.prepare('INSERT INTO tech_identity_events(event_id,session_id,event_type,status,received_at) VALUES (?,?,?,?,?) ON CONFLICT(event_id) DO NOTHING RETURNING event_id')
+    .bind(eventId,sid,String(b && (b.webhook_type || b.type) || 'status.updated').slice(0,80),String(b && b.status || '').slice(0,80),now()).first();
+  if(!receipt)return { ok:true,duplicate:true };
   const row = /^[\w-]{8,80}$/.test(sid) && await env.DB.prepare('SELECT uid FROM tech_identity WHERE session_id=?').bind(sid).first();
   if (row) await syncIdentity(env, row.uid);
   return { ok: true };
@@ -782,6 +806,13 @@ async function review(env, me, b) {
   if (decision === 'approve' && !CHECKS.every(k => checks[k])) fail(400, 'อนุมัติได้เมื่อตรวจครบทุกข้อเท่านั้น');
   let evidence={},resolutions={};
   if(decision==='approve'){
+    /* Reviewer screens can be open for a long time; never approve from a
+       stale provider result. */
+    const appData=parse(a.data)||{};
+    if(appData.idMode==='didit'){
+      if(!diditReady(env)) fail(503,'ระบบยืนยันตัวตน Didit ยังไม่พร้อม');
+      try { await syncIdentity(env,a.uid); } catch(e) { console.error('didit approval refresh',e&&e.message); fail(502,'ยังตรวจผล Didit ล่าสุดไม่ได้ กรุณาลองใหม่'); }
+    }
     const {results:docs}=await env.DB.prepare('SELECT kind,mime,data,hash FROM tech_docs WHERE uid=? ORDER BY id').bind(a.uid).all();
     const ident=identityView(await identityRow(env,a.uid),parse(a.data)||{});
     const ai=parse(a.ai),error=approvalError({app:a,ai,snapshot:await screeningSnapshot(a,docs),evidence:b.evidence,resolutions:b.resolutions,identity:ident});if(error)fail(400,error);
@@ -1260,6 +1291,7 @@ async function updateJob(env, me, id, b) {
   const ok = who_ === 'tech' ? isTech : who_ === 'customer' ? isCustomer
     : who_ === 'either' ? (isTech || isCustomer) : me.staff;
   if (!ok) fail(403, 'คุณทำขั้นตอนนี้ในใบงานนี้ไม่ได้');
+  if (isTech && t && t.suspended) fail(403, 'บัญชีช่างอยู่ระหว่างตรวจสอบ จึงรับหรือดำเนินงานใหม่ชั่วคราวไม่ได้');
   if (!from.includes(j.status)) fail(409, 'สถานะใบงานเปลี่ยนไปแล้ว กรุณารีเฟรช');
   if (Number(b.revision) !== j.revision) fail(409, 'ใบงานเพิ่งถูกอัปเดต กรุณารีเฟรชแล้วลองอีกครั้ง');
   if (action === 'enroute' && j.mode !== 'mobile') fail(400, 'งานนี้ลูกค้านำรถไปที่อู่');
@@ -1621,6 +1653,7 @@ async function myShop(env, me) {
 }
 async function setOnline(env, me, b) {
   const t = await myShop(env, me);
+  if(t.suspended && b.online) fail(403,'บัญชีช่างอยู่ระหว่างตรวจสอบ จึงเปิดรับงานไม่ได้ชั่วคราว');
   await env.DB.prepare('UPDATE tech_profiles SET online = ?, last_seen = ? WHERE id = ?').bind(b.online ? 1 : 0, now(), t.id).run();
   return { ok: true, online: !!b.online };
 }
@@ -1988,7 +2021,7 @@ async function route(request, env, verifyToken) {
     return listReviews(env, me, url);
   }
   /* หน้าเว็บใช้เช็กว่าเซิร์ฟเวอร์มีระบบช่างรุ่นนี้แล้ว — ถ้าไม่มี แสดงให้ทีมงานรู้ว่ายังไม่ได้ deploy */
-  if (p === '/api/tech/ping') return { ok: true, version: API_VERSION, identity: diditReady(env) ? 'didit' : 'manual', consentVer: CONSENT_VER, photoAI: visionReady(env) };
+  if (p === '/api/tech/ping') return { ok: true, version: API_VERSION, identity: diditReady(env) ? 'didit' : 'manual', identityRequired: diditReady(env), consentVer: CONSENT_VER, photoAI: visionReady(env) };
   if (p === '/api/tech/didit/webhook' && m === 'POST') return diditWebhook(env, request);
 
   const me = await who(request, env,true,verifyToken);
