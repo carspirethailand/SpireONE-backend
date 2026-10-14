@@ -40,7 +40,7 @@ test('LINE status: a rejected token, a wrong OA name, and an unset or switched-o
   let r=await setup(SECRETS,{info:401}).call('/api/admin/line/status');
   assert.ok(r.problems.some(p=>/ไม่รับ LINE_CHANNEL_TOKEN/.test(p)));
   r=await setup(SECRETS,{basicId:'@other'}).call('/api/admin/line/status');
-  assert.equal(r.bot.basicId,'@other');assert.ok(r.problems.some(p=>/ไม่ตรงกับบัญชีจริง/.test(p)));
+  assert.equal(r.bot.basicId,'@other');assert.ok(r.problems.some(p=>/LINE_OA_ID.*ไม่ตรงกับบัญชี/.test(p)));
   assert.ok(r.problems.some(p=>/Webhook URL/.test(p)));assert.ok(r.problems.some(p=>/Use webhook/.test(p)));
   r=await setup(SECRETS,{endpoint:'https://api.unit.test/api/line/webhook',active:true}).call('/api/admin/line/status');
   assert.deepEqual(r.problems,[],'all good');
