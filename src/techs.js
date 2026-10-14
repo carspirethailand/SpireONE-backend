@@ -25,7 +25,7 @@ const CHECKS = ['identity', 'phone', 'work', 'skills', 'shop', 'terms'];
    ใบรับรองฝีมือไม่บังคับ — ช่างเก่งจำนวนมากไม่มีใบ ทีมงานสัมภาษณ์ทักษะแทนได้ */
 const DOCS = [['id', 1, 1], ['selfie', 1, 1], ['shop', 1, 3], ['work', 3, 6], ['cert', 0, 2]];
 const PRIVATE_DOCS = ['id', 'selfie', 'cert'];
-const API_VERSION = 9;
+const API_VERSION = 10;
 const PHONE = /^0\d{8,9}$/;
 const now = () => Date.now();
 
@@ -141,6 +141,12 @@ const TECH_ALTER = [
     title TEXT NOT NULL, body TEXT, price INTEGER, cats TEXT, brands TEXT, photos TEXT, active INTEGER NOT NULL DEFAULT 1,
     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
   `CREATE INDEX IF NOT EXISTS tech_gigs_active ON tech_gigs(active, created_at)`,
+  /* สปอนเซอร์บริการ: ร้านดันบริการของตัวเองให้ขึ้นก่อน (มีป้ายบอกลูกค้าเสมอ) · หนึ่งแถว = ซื้อ/ต่อเวลาหนึ่งครั้ง
+     price/paid เตรียมไว้ตอนเริ่มเก็บเงิน — ช่วงทดลอง price = 0 · cancelled_at = เจ้าของหยุดเอง หรือบริการถูกลบ */
+  `CREATE TABLE IF NOT EXISTS tech_sponsors (id INTEGER PRIMARY KEY AUTOINCREMENT, gig_id INTEGER NOT NULL, tech_id TEXT NOT NULL, uid TEXT NOT NULL,
+    days INTEGER NOT NULL, price INTEGER NOT NULL DEFAULT 0, paid INTEGER NOT NULL DEFAULT 0, starts_at INTEGER NOT NULL, ends_at INTEGER NOT NULL,
+    cancelled_at INTEGER, created_at INTEGER NOT NULL)`,
+  `CREATE INDEX IF NOT EXISTS tech_sponsors_gig ON tech_sponsors(gig_id, ends_at)`,
   /* บันทึกการกระทำของทีมงาน (ใครดูเอกสาร อนุมัติ ตีกลับ ระงับ) — ไม่เก็บเลขบัตรเต็มหรือ key */
   `CREATE TABLE IF NOT EXISTS tech_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT, detail TEXT)`,
   /* ลิงก์แชร์ใบงานให้คนที่ไว้ใจ — หมดอายุ ยกเลิกได้ ไม่มีที่อยู่/เบอร์ */
@@ -1538,9 +1544,48 @@ async function editShop(env, me, b) {
    ร้านละไม่เกิน 2 รายการ — ให้หน้าแรกเป็นที่หาช่าง ไม่ใช่ฟีดโซเชียล
    (โพสต์ "ผลงาน" แบบเก่าเลิกใช้แล้ว ความน่าเชื่อถือมาจากรีวิวลูกค้าแทน) */
 const GIG_MAX = 2;
-function gigOut(g, t) {
-  return { id: g.id, kind: g.kind, title: g.title, body: g.body || '', price: g.price || 0, cats: parse(g.cats) || [],
+function gigOut(g, t, sp, owner) {
+  const o = { id: g.id, kind: g.kind, title: g.title, body: g.body || '', price: g.price || 0, cats: parse(g.cats) || [],
     brands: parse(g.brands) || [], photos: parse(g.photos) || [], createdAt: g.created_at, tech: t ? publicTech(t) : null };
+  /* ลูกค้ารู้แค่ว่าเป็นสปอนเซอร์ (ต้องติดป้าย) · เจ้าของเห็นวันหมดด้วย */
+  if (sp) { o.sponsored = true; if (owner) o.sponsor = { since: sp.s, until: sp.e }; }
+  return o;
+}
+/* ── สปอนเซอร์บริการ ── ช่วงทดลองฟรี · ต่อเวลาได้ แต่รวมแล้วไม่เกิน 30 วันข้างหน้า */
+const SPONSOR_DAYS = [3, 7, 14], SPONSOR_AHEAD = 30 * 86400000;
+async function sponsorMap(env, ids) {
+  if (!ids.length) return {};
+  const t = now();
+  const rows = await inAll(env, 'SELECT gig_id, MIN(starts_at) AS s, MAX(ends_at) AS e FROM tech_sponsors WHERE gig_id IN ({IN}) AND cancelled_at IS NULL AND ends_at > ? GROUP BY gig_id', ids, [], [t]);
+  return Object.fromEntries(rows.filter(r => r.s <= t).map(r => [r.gig_id, r]));
+}
+async function ownGig(env, me, id) {
+  const g = await env.DB.prepare('SELECT * FROM tech_gigs WHERE id = ?').bind(Number(id) || 0).first();
+  if (!g || g.uid !== me.uid || !g.active) fail(404, 'ไม่พบบริการ');
+  const t = await env.DB.prepare('SELECT * FROM tech_profiles WHERE id = ?').bind(g.tech_id).first();
+  if (!t || t.suspended) fail(403, 'ร้านถูกระงับชั่วคราว');
+  return { g, t };
+}
+async function sponsorGig(env, me, b) {
+  const { g, t } = await ownGig(env, me, b.id);
+  /* ร้านที่ยังไม่ผ่านการตรวจ ลูกค้ามองไม่เห็นอยู่แล้ว — ดันไปก็ไม่มีใครเห็น (ร้านทดสอบของทีมงานยกเว้น) */
+  if (!t.verified && !t.test) fail(403, 'ร้านต้องผ่านการตรวจก่อน จึงสปอนเซอร์บริการได้');
+  const days = Number(b.days);
+  if (!SPONSOR_DAYS.includes(days)) fail(400, 'เลือกระยะเวลา 3, 7 หรือ 14 วัน');
+  await limit(env, 'sponsor', me.uid, 20);
+  const at = now(), cur = (await sponsorMap(env, [g.id]))[g.id];
+  const start = cur ? cur.e : at, end = start + days * 86400000;
+  if (end - at > SPONSOR_AHEAD) fail(400, 'ต่อเวลาได้รวมไม่เกิน 30 วันข้างหน้า');
+  /* ช่วงทดลอง: ไม่เก็บเงิน — เมื่อมีระบบจ่ายเงิน ตรงนี้จะสร้างรายการรอจ่ายแทน (paid = 0) */
+  await env.DB.prepare('INSERT INTO tech_sponsors (gig_id, tech_id, uid, days, price, paid, starts_at, ends_at, created_at) VALUES (?,?,?,?,0,1,?,?,?)')
+    .bind(g.id, g.tech_id, me.uid, days, start, end, at).run();
+  return { ok: true, free: true, sponsor: { since: cur ? cur.s : at, until: end } };
+}
+async function unsponsorGig(env, me, b) {
+  const { g } = await ownGig(env, me, b.id);
+  const at = now();
+  await env.DB.prepare('UPDATE tech_sponsors SET cancelled_at = ? WHERE gig_id = ? AND cancelled_at IS NULL AND ends_at > ?').bind(at, g.id, at).run();
+  return { ok: true };
 }
 async function listGigs(env, me, url) {
   const mine = url.searchParams.get('mine') === '1';
@@ -1559,7 +1604,8 @@ async function listGigs(env, me, url) {
   const techs = await inAll(env, 'SELECT * FROM tech_profiles WHERE id IN ({IN}) AND suspended = 0', ids);
   const by = Object.fromEntries((await withPhotos(env, techs)).map(t => [t.id, t]));
   const ok = t => t && (t.verified || (t.test && me && me.staff) || (mine && t.uid === me.uid));
-  return { gigs: rows.filter(r => ok(by[r.tech_id])).map(r => gigOut(r, by[r.tech_id])) };
+  const sp = await sponsorMap(env, rows.map(r => r.id));
+  return { gigs: rows.filter(r => ok(by[r.tech_id])).map(r => gigOut(r, by[r.tech_id], sp[r.id], me && r.uid === me.uid)) };
 }
 /* หมวดบริการ (ชุดเดียวกับแถวหมวดหน้าแรก) → หมวดหลักที่ทีมงานตรวจทักษะ */
 const GIG_BASE = { air: 'air', 'air-clean': 'air', eng: 'eng', oil: 'eng', service: 'eng', gear: 'eng', cool: 'eng', exhaust: 'eng',
@@ -1613,7 +1659,8 @@ async function saveGig(env, me, b) {
 async function delGig(env, me, b) {
   const g = await env.DB.prepare('SELECT uid FROM tech_gigs WHERE id = ?').bind(+b.id).first();
   if (!g || (g.uid !== me.uid && !me.staff)) fail(404, 'ไม่พบโพสต์');
-  await env.DB.prepare('UPDATE tech_gigs SET active = 0, updated_at = ? WHERE id = ?').bind(now(), +b.id).run();
+  await env.DB.batch([env.DB.prepare('UPDATE tech_gigs SET active = 0, updated_at = ? WHERE id = ?').bind(now(), +b.id),
+    env.DB.prepare('UPDATE tech_sponsors SET cancelled_at = ? WHERE gig_id = ? AND cancelled_at IS NULL AND ends_at > ?').bind(now(), +b.id, now())]);
   return { ok: true };
 }
 
@@ -1759,7 +1806,7 @@ async function route(request, env, verifyToken) {
   }
   if (p === '/api/tech/gigs' && m === 'GET') {
     let me = null;
-    try { me = await who(request, env, false); } catch (e) {}
+    try { me = await who(request, env, false, verifyToken); } catch (e) {}
     return listGigs(env, me, url);
   }
   /* นับยอดเข้าชม (ไม่ต้องล็อกอิน) — นับเฉพาะร้านที่มีอยู่จริง */
@@ -1810,6 +1857,8 @@ async function route(request, env, verifyToken) {
   if (p === '/api/tech/shop' && m === 'POST') return editShop(env, me, await body());
   if (p === '/api/tech/gig' && m === 'POST') return saveGig(env, me, await body());
   if (p === '/api/tech/gig/delete' && m === 'POST') return delGig(env, me, await body());
+  if (p === '/api/tech/gig/sponsor' && m === 'POST') return sponsorGig(env, me, await body());
+  if (p === '/api/tech/gig/unsponsor' && m === 'POST') return unsponsorGig(env, me, await body());
   if (p === '/api/tech/stats' && m === 'GET') return stats(env, me);
   if (p === '/api/tech/advice' && m === 'GET') return advice(env, me);
   const pd = p.match(/^\/api\/tech\/posts\/([0-9a-f-]{36})$/i);
