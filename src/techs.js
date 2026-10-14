@@ -136,6 +136,8 @@ const TECH_ALTER = [
   `ALTER TABLE tech_jobs ADD COLUMN group_id TEXT`,
   `ALTER TABLE tech_profiles ADD COLUMN online INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE tech_profiles ADD COLUMN last_seen INTEGER`,
+  /* 1 = ร้านถูกพักเพราะผลยืนยันตัวตนกับ Didit ยังไม่ผ่าน (ปลดเองเมื่อ Didit ผ่าน) · 0 = ถ้า suspended=1 คือทีมงานระงับ ปลดได้เฉพาะทีมงาน */
+  `ALTER TABLE tech_profiles ADD COLUMN id_hold INTEGER NOT NULL DEFAULT 0`,
   `CREATE TABLE IF NOT EXISTS tech_posts (
   id TEXT PRIMARY KEY, customer_uid TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', test INTEGER NOT NULL DEFAULT 0,
   car TEXT NOT NULL, symptom TEXT NOT NULL, cat TEXT, lat REAL NOT NULL, lng REAL NOT NULL, area TEXT NOT NULL,
@@ -175,7 +177,10 @@ const techReady = new WeakMap();
 async function ensureTech(env) {
   if (!techReady.has(env.DB)) {
     const task=(async()=>{for(const sql of [...TECH_SQL,...MEDIA_SQL])await env.DB.prepare(sql).run();
-      for(const sql of TECH_ALTER)try{await env.DB.prepare(sql).run()}catch(e){if(!/duplicate column|already exists/i.test(e.message||''))throw e;}
+      let holdAdded=false;
+      for(const sql of TECH_ALTER)try{await env.DB.prepare(sql).run();if(/ADD COLUMN id_hold/.test(sql))holdAdded=true}catch(e){if(!/duplicate column|already exists/i.test(e.message||''))throw e;}
+      /* เพิ่งเพิ่มคอลัมน์ครั้งแรก: ร้านที่ถูกพักอยู่และตัวตนยังไม่ผ่าน = ถูกพักเพราะตัวตน (พฤติกรรมเดิมก่อนแยกสถานะ) */
+      if(holdAdded)await env.DB.prepare("UPDATE tech_profiles SET id_hold=1 WHERE test=0 AND suspended=1 AND uid IN (SELECT uid FROM tech_identity WHERE status!='approved')").run();
       if(env.ID_HASH_KEY)await upgradeIdHashes(env);})();
     techReady.set(env.DB,task);task.catch(()=>techReady.delete(env.DB));
   }
@@ -452,7 +457,7 @@ async function meInfo(env, me) {
     uid: me.uid, email: me.email, admin: me.admin, staff: me.staff, version: API_VERSION,
     application: appOut(a, false, ident),
     technician: t ? { ...publicTech((await withPhotos(env, [t]))[0]), suspended: !!t.suspended,
-      identityHold: !!(!t.test && t.suspended && ident && ident.status !== 'approved'),
+      identityHold: !!(!t.test && t.suspended && t.id_hold),
       /* ค่าตั้งของร้านที่เห็นเฉพาะเจ้าของ (Studio → ตั้งค่า) */
       ...(() => { const d = parse(t.data) || {}; return { autoReply: d.autoReply || null, minPrice: d.minPrice || 0, vacationRaw: d.vacation || null }; })() } : null,
     attention, unreadThreads: msgs,
@@ -694,18 +699,19 @@ async function syncIdentity(env, uid) {
     env.DB.prepare('INSERT INTO tech_identity_claims(id_hash,uid) VALUES (?,?) ON CONFLICT(uid) DO UPDATE SET id_hash=excluded.id_hash').bind(idHash, uid),
     env.DB.prepare("UPDATE tech_applications SET id_hash=? WHERE uid=? AND status='pending'").bind(idHash, uid));
   await env.DB.batch(stmts);
-  /* A later Didit review hides the public profile and prevents new work.
-     A subsequent approved decision restores a profile held for this reason. */
-  const hold = f.status !== 'approved';
-  await env.DB.prepare('UPDATE tech_profiles SET suspended=?,online=CASE WHEN ? THEN 0 ELSE online END,updated_at=? WHERE uid=? AND test=0')
-    .bind(hold ? 1 : 0, hold ? 1 : 0, t, uid).run();
+  /* A later Didit review hides the public profile and prevents new work (id_hold=1).
+     A subsequent approved decision restores only a profile held for this reason;
+     a suspension made by staff (suspended=1, id_hold=0) is never lifted by Didit. */
+  if (f.status !== 'approved') await env.DB.prepare('UPDATE tech_profiles SET id_hold=CASE WHEN suspended=0 OR id_hold=1 THEN 1 ELSE 0 END,suspended=1,online=0,updated_at=? WHERE uid=? AND test=0')
+    .bind(t, uid).run();
+  else await env.DB.prepare('UPDATE tech_profiles SET suspended=0,id_hold=0,updated_at=? WHERE uid=? AND test=0 AND id_hold=1').bind(t, uid).run();
   return { ...cur, status: f.status, id_hash: idHash, data: JSON.stringify(next), updated_at: t };
 }
 async function refreshIdentity(env, me) {
   if (!diditReady(env)) fail(409, 'ระบบยืนยันตัวตนออนไลน์ยังไม่เปิด');
   await limit(env, 'didit_check', me.uid, 30);
   let row;
-  try { row = await syncIdentity(env, me.uid); } catch (e) { if (e instanceof HttpError) throw e; console.error('didit decision', e && e.message); fail(502, 'ยังดึงผลจาก Didit ไม่ได้ ลองใหม่อีกครั้ง'); }
+  try { row = await syncIdentity(env, me.uid); } catch (e) { if (e instanceof HttpError) throw e; console.error('didit decision', e && e.message); return { ok: true, identity: { mode: 'didit', status: 'service_unavailable' } }; }
   return { ok: true, identity: { mode: 'didit', status: row ? row.status : 'not_started' } };
 }
 /* Webhooks are the fast path. This bounded sweep is the recovery path when a
@@ -864,7 +870,7 @@ async function review(env, me, b) {
 
 async function moderate(env, me, b) {
   adminOnly(me);
-  const r = await env.DB.prepare('UPDATE tech_profiles SET suspended=?, updated_at=? WHERE id=?')
+  const r = await env.DB.prepare('UPDATE tech_profiles SET suspended=?, id_hold=0, updated_at=? WHERE id=?')
     .bind(b.suspend === false ? 0 : 1, now(), String(b.id || '')).run();
   if (!r.meta.changes) fail(404, 'ไม่พบช่าง');
   await audit(env, me, b.suspend === false ? 'unsuspend' : 'suspend', b.id);
@@ -2021,7 +2027,7 @@ async function route(request, env, verifyToken) {
     return listReviews(env, me, url);
   }
   /* หน้าเว็บใช้เช็กว่าเซิร์ฟเวอร์มีระบบช่างรุ่นนี้แล้ว — ถ้าไม่มี แสดงให้ทีมงานรู้ว่ายังไม่ได้ deploy */
-  if (p === '/api/tech/ping') return { ok: true, version: API_VERSION, identity: diditReady(env) ? 'didit' : 'manual', identityRequired: diditReady(env), consentVer: CONSENT_VER, photoAI: visionReady(env) };
+  if (p === '/api/tech/ping') return { ok: true, version: API_VERSION, identity: diditReady(env) ? 'didit' : 'manual', consentVer: CONSENT_VER, photoAI: visionReady(env) };
   if (p === '/api/tech/didit/webhook' && m === 'POST') return diditWebhook(env, request);
 
   const me = await who(request, env,true,verifyToken);

@@ -5937,11 +5937,11 @@ ${convo}`;
     ctx.waitUntil(ensureSchema(env));
     // รอบถี่ทำเฉพาะงานที่นัดเวลาไว้ ส่วนงานหนักปล่อยให้รอบวันละครั้งทำ
     ctx.waitUntil(runDueJobs(env));
+    /* Didit retries only briefly; reconcile incomplete identity sessions on the
+       hourly schedule (before the early return below) so a missed webhook cannot strand an applicant. */
+    ctx.waitUntil(reconcileDiditIdentities(env).catch(() => {}));
     /* นิตยสาร: เช็กทุกชั่วโมง อัปเดตจริงทุก 5 ชั่วโมง (รอบของตัวเอง ไม่พ่วงงานหนักรายวัน) */
     if (event.cron === NEWS_CRON) { ctx.waitUntil(refreshNews(env)); return; }
-    /* Didit retries only briefly; reconcile incomplete identity sessions on the
-       existing hourly schedule so a missed webhook cannot strand an applicant. */
-    ctx.waitUntil(reconcileDiditIdentities(env).catch(() => {}));
     if (event.cron !== '*/10 * * * *') {
       ctx.waitUntil(runPushRound(env));
       ctx.waitUntil(runOdoRound(env));

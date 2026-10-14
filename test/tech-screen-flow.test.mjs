@@ -163,3 +163,36 @@ test('staff rescreen also pulls the latest Didit result when the webhook never a
   const ds=fakeDidit(approvedDecision());const r=await f.call(ADMIN,'/api/tech/rescreen',{uid:'applicant'});
   assert.equal(r.status,200);assert.equal(r.identity.status,'approved');assert.equal(r.identity.name,'สมชาย ใจดี');assert.equal(ds.decisions,1);
 });
+test('Didit hold: a later non-approved result pauses the shop and a later approval restores it — a staff suspension is never lifted by Didit',async()=>{
+  fakeVision();const f=fixture(DIDIT);await diditApp(f);const seen=fakeDidit();
+  const sid=(await f.call(USER,'/api/tech/apply/identity',{})).url.split('/').pop();
+  assert.equal((await diditHook(f,sid)).status,200);
+  const a=await staffView(f);assert.equal((await f.call(ADMIN,'/api/tech/review',review(a,{evidence:didEv()}))).status,200);
+  const shop=()=>f.sqlite.prepare('SELECT id,suspended,id_hold FROM tech_profiles').get();
+  assert.deepEqual({s:shop().suspended,h:shop().id_hold},{s:0,h:0});
+  seen.decision=({...approvedDecision(),status:'In Review'});await diditHook(f,sid,{status:'In Review'});
+  assert.deepEqual({s:shop().suspended,h:shop().id_hold},{s:1,h:1},'held because of identity');
+  assert.equal((await f.call(USER,'/api/tech/me')).technician.identityHold,true);
+  seen.decision=approvedDecision();assert.equal((await f.call(USER,'/api/tech/apply/identity/refresh',{})).identity.status,'approved');
+  assert.deepEqual({s:shop().suspended,h:shop().id_hold},{s:0,h:0},'identity approved again → restored');
+  assert.equal((await f.call(USER,'/api/tech/me')).technician.identityHold,false);
+  assert.equal((await f.call(ADMIN,'/api/tech/moderate',{id:shop().id,suspend:true})).status,200);
+  assert.deepEqual({s:shop().suspended,h:shop().id_hold},{s:1,h:0},'staff suspension');
+  assert.equal((await f.call(USER,'/api/tech/apply/identity/refresh',{})).identity.status,'approved');
+  assert.equal(shop().suspended,1,'Didit approval does not lift a staff suspension');
+  seen.decision=({...approvedDecision(),status:'In Review'});await f.call(USER,'/api/tech/apply/identity/refresh',{});
+  assert.deepEqual({s:shop().suspended,h:shop().id_hold},{s:1,h:0},'a staff suspension stays staff-owned when Didit also pauses');
+  seen.decision=approvedDecision();await f.call(USER,'/api/tech/apply/identity/refresh',{});
+  assert.equal(shop().suspended,1,'still suspended until staff lift it');
+  assert.equal((await f.call(ADMIN,'/api/tech/moderate',{id:shop().id,suspend:false})).status,200);assert.equal(shop().suspended,0);
+});
+test('Didit unreachable on "check result": answers service_unavailable and changes nothing',async()=>{
+  fakeVision();const f=fixture(DIDIT);await diditApp(f);fakeDidit({status:'In Progress'});
+  await f.call(USER,'/api/tech/apply/identity',{});
+  const before=JSON.stringify(f.sqlite.prepare('SELECT * FROM tech_identity').get());
+  globalThis.fetch=async()=>{throw Error('network down');};
+  const r=await f.call(USER,'/api/tech/apply/identity/refresh',{});
+  assert.equal(r.status,200);assert.deepEqual(r.identity,{mode:'didit',status:'service_unavailable'});
+  assert.equal(JSON.stringify(f.sqlite.prepare('SELECT * FROM tech_identity').get()),before);
+  assert.equal((await f.call('','/api/tech/ping')).identityRequired,undefined);
+});
