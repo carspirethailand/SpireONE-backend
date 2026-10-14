@@ -1,6 +1,8 @@
 import {DatabaseSync} from 'node:sqlite';
 import {deflateSync} from 'node:zlib';
 import {handleTech} from '../src/techs.js';
+import {CONSENT_VER} from '../src/tech-vetting.js';
+import {hmacHex} from '../src/tech-identity.js';
 export function png(seed=1,w=400,h=300){
   const crc=b=>{let c=0xffffffff;for(const n of b){c^=n;for(let i=0;i<8;i++)c=(c>>>1)^((c&1)?0xedb88320:0);}return (c^0xffffffff)>>>0;};
   const chunk=(kind,data)=>{const type=Buffer.from(kind),b=Buffer.alloc(data.length+12);b.writeUInt32BE(data.length);type.copy(b,4);data.copy(b,8);b.writeUInt32BE(crc(Buffer.concat([type,data])),b.length-4);return b;};
@@ -9,39 +11,51 @@ export function png(seed=1,w=400,h=300){
   return Buffer.concat([Buffer.from([137,80,78,71,13,10,26,10]),chunk('IHDR',head),chunk('IDAT',deflateSync(raw)),chunk('IEND',Buffer.alloc(0))]);
 }
 export const pic=(kind,n)=>({kind,data:'data:image/png;base64,'+png(n).toString('base64')});
-export const form=(over={})=>({title:'นาย',name:'สมชาย ใจดี',phone:'0812345678',area:'บางนา กรุงเทพ',age:30,birth:'1996-05-01',years:5,from:500,warranty:30,radius:10,lat:13.7,lng:100.6,cats:['eng'],consent:true,aiConsent:true,idConsent:true,idNo:'1101700203450',about:'ซ่อมเครื่องยนต์และระบบแอร์ มีเครื่องตรวจและเครื่องมือประจำอู่',docs:[pic('id',1),pic('selfie',2),pic('shop',3),pic('work',4),pic('work',5),pic('work',6)],...over});
+export const form=(over={})=>({title:'นาย',name:'สมชาย ใจดี',phone:'0812345678',area:'บางนา กรุงเทพ',age:30,birth:'1996-05-01',years:5,from:500,warranty:30,radius:10,lat:13.7,lng:100.6,cats:['eng'],consent:true,aiConsent:true,consentVer:CONSENT_VER,idConsent:true,idNo:'1101700203450',about:'ซ่อมเครื่องยนต์และระบบแอร์ มีเครื่องตรวจและเครื่องมือประจำอู่',docs:[pic('id',1),pic('selfie',2),pic('shop',3),pic('work',4),pic('work',5),pic('work',6)],...over});
 export const evidence=()=>Object.fromEntries(Object.entries({identity:'document_review',phone:'live_call',work:'portfolio_review',skills:'interview',shop:'video_call',terms:'written_agreement'}).map(([key,method])=>[key,{method,note:'Test-only human review record; not a real applicant verification.'}]));
-export function fakeGemini(transform=out=>out){
-  const seen={calls:0,requests:[]};globalThis.fetch=async(url,init)=>{seen.calls++;const body=JSON.parse(init.body);seen.requests.push(body);
-    const images=body.contents[0].parts.filter(p=>p.text).map(p=>{try{return JSON.parse(p.text)}catch{return null}}).filter(x=>x?.imageId).map(x=>({...x,relevance:'relevant',concern:false,note:'Test-only mocked image analysis'}));
-    const out=transform({images,descriptionRelevant:'yes',summary:'Mocked response for unit tests only'});
-    return Response.json({candidates:[{finishReason:'STOP',content:{parts:[{text:JSON.stringify(out)}]}}]});};return seen;
+/* Workers AI ปลอม: ตอบครบทุกรูปที่ส่งมาในคำขอนั้น · transform(out, ลำดับคำขอ) ใช้จำลองคำตอบเสีย/ไม่ครบ
+   ห่อคำตอบใน ```json``` เหมือนโมเดลจริงบางรุ่น เพื่อทดสอบการอ่านแบบยืดหยุ่น */
+let vision=null;
+export const AI={run:(model,input)=>{if(!vision)throw Error('AI mock not set');return vision(model,input);}};
+export function fakeVision(transform=out=>out){
+  const seen={calls:0,requests:[],models:[]};
+  vision=async(model,input)=>{const n=seen.calls++;seen.requests.push(input);seen.models.push(model);
+    const head=JSON.parse(input.messages.find(m=>m.role==='user').content[0].text);
+    const images=head.images.map(x=>({...x,relevance:'relevant',concern:false,note:'Test-only mocked image analysis'}));
+    const out=transform({images,descriptionRelevant:'yes',summary:'Mocked response for unit tests only'},n);
+    return {response:'```json\n'+JSON.stringify(out)+'\n```'};};
+  return seen;
+}
+export function failVision(msg='quota exceeded: private provider details'){const seen={calls:0};vision=async()=>{seen.calls++;throw Error(msg);};return seen;}
+/* Didit ปลอม: เปิด session / ส่งผล · decision = ผลที่จะตอบเมื่อถูกดึง (เปลี่ยนได้ระหว่างเทสต์) */
+export const DIDIT={DIDIT_API_KEY:'test-mock-only',DIDIT_WORKFLOW_ID:'wf-test',DIDIT_WEBHOOK_SECRET:'whsec-test-only'};
+export const approvedDecision=(over={})=>({session_id:'sess-0001-test',status:'Approved',id_verifications:[{status:'Approved',first_name:'สมชาย',last_name:'ใจดี',date_of_birth:'1996-05-01',document_number:'1101700203450',personal_number:'1101700203450',expiration_date:'2031-01-01',document_type:'Identity Card',issuing_state:'THA',front_image:'https://didit.example/private.jpg',...over}]});
+export function fakeDidit(decision=approvedDecision()){
+  const seen={sessions:[],decisions:0,other:0,decision,next:1};
+  globalThis.fetch=async(url,init={})=>{const u=new URL(url);
+    if(u.pathname==='/v3/session/'&&init.method==='POST'){const body=JSON.parse(init.body);seen.sessions.push({body,headers:init.headers});const id='sess-'+String(seen.next++).padStart(4,'0')+'-test';
+      return Response.json({session_id:id,url:'https://verify.didit.me/session/'+id,status:'Not Started',vendor_data:body.vendor_data});}
+    const m=u.pathname.match(/^\/v3\/session\/([\w-]+)\/decision\/$/);
+    if(m){seen.decisions++;const d=typeof seen.decision==='function'?seen.decision(m[1]):seen.decision;return Response.json({...d,session_id:m[1]});}
+    seen.other++;return Response.json({});};
+  return seen;
+}
+/* webhook ที่เซ็นด้วยกุญแจทดสอบ (หรือกุญแจผิด) */
+export async function diditHook(f,sessionId,{secret=DIDIT.DIDIT_WEBHOOK_SECRET,ts=Math.floor(Date.now()/1000),status='Approved'}={}){
+  const raw=JSON.stringify({session_id:sessionId,status,webhook_type:'status.updated',vendor_data:'x'});
+  const r=await handleTech(new Request('https://unit.test/api/tech/didit/webhook',{method:'POST',headers:{'Content-Type':'application/json','X-Timestamp':String(ts),'X-Signature':await hmacHex(secret,raw)},body:raw}),f.env,undefined,{});
+  return {...await r.json(),status:r.status};
 }
 export function fixture(extra={}){
   const sqlite=new DatabaseSync(':memory:');sqlite.exec('CREATE TABLE users(uid TEXT PRIMARY KEY,role TEXT,banned INTEGER)');let queue=Promise.resolve();
   const DB={prepare(sql){let values=[];return {bind(...v){values=v;return this;},async first(){return sqlite.prepare(sql).get(...values)||null;},async all(){return {results:sqlite.prepare(sql).all(...values)};},async run(){const r=sqlite.prepare(sql).run(...values);return {meta:{changes:Number(r.changes)}};}};},batch(list){const task=queue.then(async()=>{sqlite.exec('BEGIN');try{const out=[];for(const st of list)out.push(await st.run());sqlite.exec('COMMIT');return out;}catch(e){sqlite.exec('ROLLBACK');throw e;}});queue=task.catch(()=>{});return task;}};
-  const env={DB,GEMINI_KEY:'test-mock-only',OWNERS:'boss@unit.test',...extra};
+  const env={DB,AI,OWNERS:'boss@unit.test',...extra};
   const verifyToken=async token=>{const [uid,email,verified]=token.split('|');if(!uid)throw Error('invalid');return {sub:uid,email,email_verified:verified!=='unverified'};};
   const call=async(token,path,body)=>{const r=await handleTech(new Request('https://unit.test'+path,{method:body?'POST':'GET',headers:token?{Authorization:'Bearer '+token}:{},body:body?JSON.stringify(body):undefined}),env,undefined,{verifyToken});return {...await r.json(),status:r.status};};
   return {call,sqlite,env};
 }
 export const USER='applicant|person@unit.test',ADMIN='boss|boss@unit.test';
 export async function pending(f,over={}){const r=await f.call(USER,'/api/tech/apply',form(over));if(r.status!==200)throw Error(JSON.stringify(r));return (await f.call(ADMIN,'/api/tech/applications')).applications[0];}
-/* ข้อสงสัยด่านบัตร (เช่น "เทียบเลขบัตรเอง" ตอน AI ตรวจบัตรปิดอยู่) ต้องมีบันทึกของทีมงาน — เติมให้เฉพาะด่านบัตร ด่านรูปผลงานยังให้แต่ละเทสต์กำหนดเอง */
-export const idNotes=a=>Object.fromEntries((a.ai?.flags||[]).filter(f=>f.source==='identity'&&f.level!=='low'&&!f.block).map(f=>[f.code,{outcome:'false_positive',note:'Test-only: compared the ID number digit by digit with the form.'}]));
+/* ข้อสงสัยด่านบัตร (ทีมงานเทียบเลขบัตรเอง / ข้อสงสัยจาก Didit) ต้องมีบันทึกของทีมงาน — เติมให้เฉพาะด่านบัตร ด่านรูปผลงานยังให้แต่ละเทสต์กำหนดเอง */
+export const idNotes=a=>Object.fromEntries([...(a.ai?.flags||[]),...(a.identity?.flags||[])].filter(f=>f.source==='identity'&&f.level!=='low'&&!f.block).map(f=>[f.code,{outcome:'false_positive',note:'Test-only: compared the ID number digit by digit with the form.'}]));
 export const review=(a,over={})=>({uid:a.uid,revision:a.revision,decision:'approve',checks:Object.fromEntries(['identity','phone','work','skills','shop','terms'].map(k=>[k,true])),evidence:evidence(),note:'Test-only completed human review with evidence.',...over,resolutions:{...idNotes(a),...(over.resolutions||{})}});
-
-/* Gemini ปลอมที่แยกตอบตามชนิดคำขอ: ตรวจรูปผลงาน / อ่านบัตร / อ่านเลขรอบสอง / เทียบใบหน้า
-   card/ocr/face = ค่าที่จะตอบ (ฟังก์ชันได้ รับลำดับครั้งที่เรียก) · บันทึกคำขอแต่ละชนิดไว้ตรวจ */
-export function fakeGeminiAll({card={},ocr={idNumber:'',clear:false},face={personHoldingCard:true,samePerson:'yes',cardNumberInSelfie:''},transform=out=>out}={}){
-  const seen={calls:0,work:[],card:[],ocr:[],face:[]};
-  const goodCard={isThaiIdCard:true,photoOfScreenOrCopy:false,editedSuspected:false,idNumber:'1101700203450',expiry:'2031-01-01',nameOnCard:'สมชาย ใจดี',birthOnCard:'1996-05-01'};
-  globalThis.fetch=async(url,init)=>{seen.calls++;const body=JSON.parse(init.body),sys=body.systemInstruction?.parts?.[0]?.text||'';let out;
-    if(/Thai national ID card photo/.test(sys)){seen.card.push(body);out={...goodCard,...(typeof card==='function'?card(seen.card.length):card)};}
-    else if(/Read ONLY the 13-digit/.test(sys)){seen.ocr.push(body);out=typeof ocr==='function'?ocr(seen.ocr.length):ocr;}
-    else if(/explicitly consented to this face comparison/.test(sys)){seen.face.push(body);out=face;}
-    else{seen.work.push(body);const images=body.contents[0].parts.filter(p=>p.text).map(p=>{try{return JSON.parse(p.text)}catch{return null}}).filter(x=>x?.imageId).map(x=>({...x,relevance:'relevant',concern:false,note:'Test-only mocked image analysis'}));
-      out=transform({images,descriptionRelevant:'yes',summary:'Mocked response for unit tests only'});}
-    return Response.json({candidates:[{finishReason:'STOP',content:{parts:[{text:JSON.stringify(out)}]}}]});};
-  return seen;
-}

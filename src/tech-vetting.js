@@ -1,6 +1,9 @@
 /* Server-owned rules, not proof of identity or professional competence. */
-/* 3 = เพิ่มด่านตรวจบัตรประชาชน (ผลตรวจรุ่นเก่าต้องตรวจใหม่ก่อนอนุมัติ) */
-export const VETTING_VERSION=3;
+/* 4 = AI ตรวจเฉพาะรูปอู่/ผลงาน (Cloudflare Workers AI · ผู้สมัครเลือกเอง) · บัตร/ชื่อ/อายุตรวจผ่าน Didit หรือทีมงาน
+   ผลตรวจรุ่นเก่าต้องตรวจใหม่ก่อนอนุมัติ */
+export const VETTING_VERSION=4;
+/* รุ่นข้อความยินยอมในฟอร์มสมัคร — ใบสมัครที่ยินยอมกับข้อความรุ่นเก่า (Gemini) จะไม่ถูกส่งรูปให้ผู้ให้บริการรายใหม่ */
+export const CONSENT_VER='2026-10-cf';
 export function fullNameError(value){
   if(typeof value!=='string')return 'กรอกชื่อและนามสกุลตามเอกสาร';
   const n=value.normalize('NFKC').trim();
@@ -45,11 +48,17 @@ export function imageInfo(mime,data){
   }else throw Error('ชนิดรูปไม่รองรับ');
   if(Math.min(w,h)<240||Math.max(w,h)<320||w>8192||h>8192||w*h>32000000)throw Error('รูปต้องชัดอย่างน้อย 320×240 และไม่ใหญ่เกิน 32 ล้านพิกเซล');return {width:w,height:h};
 }
-export const EVIDENCE_METHODS={identity:['document_review'],phone:['live_call'],work:['portfolio_review'],skills:['interview','certificate_review'],shop:['site_visit','video_call','document_review'],terms:['written_agreement']};
-export function approvalError({app,ai,snapshot,evidence,resolutions}){
+export const EVIDENCE_METHODS={identity:['document_review','didit'],phone:['live_call'],work:['portfolio_review'],skills:['interview','certificate_review'],shop:['site_visit','video_call','document_review'],terms:['written_agreement']};
+/* identity = ผลยืนยันตัวตนปัจจุบัน (Didit) แยกจากผล AI เพราะมาทีหลังทาง webhook
+   ใบสมัครโหมด Didit อนุมัติได้เมื่อ Didit ผ่านแล้วเท่านั้น · ข้อสงสัยจาก Didit ต้องมีบันทึกของทีมงานเหมือนข้อสงสัยของ AI */
+export function approvalError({app,ai,snapshot,evidence,resolutions,identity}){
   if(app.test)return 'โปรไฟล์ทดสอบไม่สามารถรับรองเป็นร้านจริง';
-  if(!ai||ai.status!=='complete'||ai.policyVersion!==VETTING_VERSION||ai.revision!==app.revision||ai.snapshot!==snapshot)return 'ต้องตรวจ AI สำเร็จด้วยข้อมูลและรูปชุดล่าสุดก่อนอนุมัติ';
-  for(const f of ai.flags||[]){if(f.block)return 'อนุมัติไม่ได้: '+f.msg;if(f.source==='rules'&&f.level==='high')return 'ข้อมูลไม่ผ่านกฎพื้นฐาน ต้องให้ผู้สมัครแก้ไขก่อน';if(f.level==='low')continue;const r=resolutions?.[f.code];
-    if(r?.outcome!=='false_positive'||typeof r.note!=='string'||r.note.trim().length<30||r.note.length>1000)return 'ต้องตรวจและบันทึกหลักฐานตอบข้อสงสัยของ AI ทุกข้อ หรือส่งกลับให้แก้ไข';}
-  for(const [key,methods] of Object.entries(EVIDENCE_METHODS)){const i=evidence?.[key];if(!methods.includes(i?.method)||typeof i.note!=='string'||i.note.trim().length<20||i.note.length>1000)return 'ต้องบันทึกวิธีและหลักฐานการตรวจครบทั้ง 6 ข้อ ไม่ใช่ติ๊กอย่างเดียว';}return '';
+  if(!ai||!['complete','skipped'].includes(ai.status)||ai.policyVersion!==VETTING_VERSION||ai.revision!==app.revision||ai.snapshot!==snapshot)return 'ต้องตรวจ AI สำเร็จด้วยข้อมูลและรูปชุดล่าสุดก่อนอนุมัติ';
+  const d=typeof app.data==='string'?JSON.parse(app.data||'{}'):(app.data||{});
+  if(d.idMode==='didit'&&identity?.status!=='approved')return 'ผู้สมัครยังยืนยันตัวตนกับ Didit ไม่ผ่าน — รอผลก่อนอนุมัติ';
+  const flags=[...(ai.flags||[]),...(d.idMode==='didit'?identity?.flags||[]:[])];
+  for(const f of flags){if(f.block)return 'อนุมัติไม่ได้: '+f.msg;if(f.source==='rules'&&f.level==='high')return 'ข้อมูลไม่ผ่านกฎพื้นฐาน ต้องให้ผู้สมัครแก้ไขก่อน';if(f.level==='low')continue;const r=resolutions?.[f.code];
+    if(r?.outcome!=='false_positive'||typeof r.note!=='string'||r.note.trim().length<30||r.note.length>1000)return 'ต้องตรวจและบันทึกหลักฐานตอบข้อสงสัยทุกข้อ หรือส่งกลับให้แก้ไข';}
+  for(const [key,methods] of Object.entries(EVIDENCE_METHODS)){const i=evidence?.[key];if(!methods.includes(i?.method)||typeof i.note!=='string'||i.note.trim().length<20||i.note.length>1000)return 'ต้องบันทึกวิธีและหลักฐานการตรวจครบทั้ง 6 ข้อ ไม่ใช่ติ๊กอย่างเดียว';}
+  if(evidence.identity.method==='didit'&&d.idMode!=='didit')return 'ใบสมัครนี้ไม่ได้ยืนยันตัวตนผ่าน Didit — ทีมงานต้องตรวจเอกสารเอง';return '';
 }

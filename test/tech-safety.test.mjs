@@ -1,7 +1,7 @@
 /* ความปลอดภัยของลูกค้าเมื่อพาช่าง (คนแปลกหน้า) ไปพบลูกค้าและรถ */
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {fixture,USER,ADMIN,fakeGemini,pending,review} from './tech-fixtures.mjs';
+import {fixture,USER,ADMIN,fakeVision,pending,review} from './tech-fixtures.mjs';
 
 export const MECH='mech|mech@unit.test';
 /* ช่างที่ผ่านการตรวจแล้ว (ใส่ตรงในฐานข้อมูล — การอนุมัติจริงมีเทสต์ของมันเองแล้ว) */
@@ -39,7 +39,7 @@ test('a mechanic can only post services in categories that were skill-checked',a
 });
 
 test('approval publishes separate, dated vetting facts — not a blanket "safe" badge, and no reviewer notes',async()=>{
-  fakeGemini();const f=fixture(),a=await pending(f);assert.equal((await f.call(ADMIN,'/api/tech/review',review(a))).status,200);
+  fakeVision();const f=fixture(),a=await pending(f);assert.equal((await f.call(ADMIN,'/api/tech/review',review(a))).status,200);
   const t=(await f.call('','/api/tech')).techs[0];
   assert.deepEqual({identity:t.vetting.identity,phone:t.vetting.phone,shop:t.vetting.shop,skills:t.vetting.skills,cats:t.vetting.cats},{identity:true,phone:true,shop:'video_call',skills:'interview',cats:['eng']});
   assert.ok(t.vetting.at>0);assert.ok(!JSON.stringify(t).includes('Test-only human review'),'reviewer evidence notes stay private');
@@ -117,7 +117,7 @@ test('uploads lose embedded GPS/EXIF and text metadata; plain images pass unchan
   assert.equal(stripMeta('image/jpeg','bm90IGFuIGltYWdl'),'bm90IGFuIGltYWdl','unparseable input returned as-is for the validator');
 });
 test('staff actions are written to an audit log without full ID numbers; only admins can read it',async()=>{
-  const {fakeGemini,pending,review,ADMIN}=await import('./tech-fixtures.mjs');fakeGemini();
+  const {fakeVision,pending,review,ADMIN}=await import('./tech-fixtures.mjs');fakeVision();
   const f=fixture(),a=await pending(f);await f.call(ADMIN,'/api/tech/docs?uid='+a.uid);await f.call(ADMIN,'/api/tech/review',review(a));
   const log=(await f.call(ADMIN,'/api/tech/audit')).log;assert.deepEqual(log.map(x=>x.action).sort(),['approve','view_docs']);
   assert.ok(!JSON.stringify(log).includes('1101700203450'));assert.equal((await f.call(USER,'/api/tech/audit')).status,403);

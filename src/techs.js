@@ -12,8 +12,9 @@
  *   - เบอร์กับที่อยู่ลูกค้าเปิดให้ช่างเห็นหลังลูกค้ายืนยันราคาแล้วเท่านั้น
  */
 import { verifyFirebaseToken } from './auth.js';
-import { screenApplication, screeningSnapshot } from './tech-screen.js';
-import { applicantErrors, imageInfo, approvalError } from './tech-vetting.js';
+import { screenApplication, screeningSnapshot, aiConsented, visionReady } from './tech-screen.js';
+import { applicantErrors, imageInfo, approvalError, CONSENT_VER } from './tech-vetting.js';
+import { diditReady, verifyDidit, diditFacts, identityFlags, diditFetch, idHashOf, upgradeHash } from './tech-identity.js';
 import { notify, jobCard, card, once, appUrl } from './line-notify.js';
 import { MEDIA_SQL, MediaError, putMedia, getMedia, deleteMedia, claimMedia, mediaLabel } from './media.js';
 const CATS = ['body', 'ev', 'tyre', 'air', 'eng'];
@@ -25,7 +26,7 @@ const CHECKS = ['identity', 'phone', 'work', 'skills', 'shop', 'terms'];
    ใบรับรองฝีมือไม่บังคับ — ช่างเก่งจำนวนมากไม่มีใบ ทีมงานสัมภาษณ์ทักษะแทนได้ */
 const DOCS = [['id', 1, 1], ['selfie', 1, 1], ['shop', 1, 3], ['work', 3, 6], ['cert', 0, 2]];
 const PRIVATE_DOCS = ['id', 'selfie', 'cert'];
-const API_VERSION = 11;
+const API_VERSION = 12;
 const PHONE = /^0\d{8,9}$/;
 const now = () => Date.now();
 
@@ -34,6 +35,9 @@ const now = () => Date.now();
 const TECH_SQL = [
   `CREATE TABLE IF NOT EXISTS tech_limits (scope TEXT, uid TEXT, bucket INTEGER, n INTEGER NOT NULL, PRIMARY KEY(scope,uid,bucket))`,
   `CREATE TABLE IF NOT EXISTS tech_identity_claims (id_hash TEXT PRIMARY KEY, uid TEXT NOT NULL UNIQUE)`,
+  /* ผลยืนยันตัวตนกับ Didit ต่อบัญชี — data = {url, vendor, name, birth, last3, flags} ชื่อ/วันเกิดถูกลบหลังทีมงานตรวจใบสมัครเสร็จ */
+  `CREATE TABLE IF NOT EXISTS tech_identity (uid TEXT PRIMARY KEY, session_id TEXT, status TEXT NOT NULL DEFAULT 'none', id_hash TEXT, data TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+  `CREATE INDEX IF NOT EXISTS tech_identity_session ON tech_identity(session_id)`,
   `CREATE TABLE IF NOT EXISTS tech_applications (
   uid        TEXT PRIMARY KEY,
   email      TEXT,
@@ -168,10 +172,21 @@ const techReady = new WeakMap();
 async function ensureTech(env) {
   if (!techReady.has(env.DB)) {
     const task=(async()=>{for(const sql of [...TECH_SQL,...MEDIA_SQL])await env.DB.prepare(sql).run();
-      for(const sql of TECH_ALTER)try{await env.DB.prepare(sql).run()}catch(e){if(!/duplicate column|already exists/i.test(e.message||''))throw e;}})();
+      for(const sql of TECH_ALTER)try{await env.DB.prepare(sql).run()}catch(e){if(!/duplicate column|already exists/i.test(e.message||''))throw e;}
+      if(env.ID_HASH_KEY)await upgradeIdHashes(env);})();
     techReady.set(env.DB,task);task.catch(()=>techReady.delete(env.DB));
   }
   await techReady.get(env.DB);
+}
+/* เปิด ID_HASH_KEY ครั้งแรก: แปลงแฮชเลขบัตรแบบเก่า (SHA ไม่มีกุญแจ) ทุกแถวเป็น HMAC ทันที ก่อนมีการเทียบซ้ำ */
+async function upgradeIdHashes(env){
+  const old=r=>r.id_hash&&!String(r.id_hash).startsWith('h2:');
+  const stmts=[];
+  for(const [table,key] of [['tech_applications','uid'],['tech_identity_claims','uid'],['tech_identity','uid']]){
+    const {results}=await env.DB.prepare(`SELECT ${key} AS k, id_hash FROM ${table} WHERE id_hash IS NOT NULL AND id_hash NOT LIKE 'h2:%'`).all();
+    for(const r of results.filter(old))stmts.push(env.DB.prepare(`UPDATE ${table} SET id_hash=? WHERE ${key}=? AND id_hash=?`).bind(await upgradeHash(env,r.id_hash),r.k,r.id_hash));
+  }
+  if(stmts.length)await env.DB.batch(stmts);
 }
 async function limit(env,scope,uid,max){
   const bucket=Math.floor(now()/86400000);
@@ -393,17 +408,34 @@ async function listTechs(env, me, url) {
 }
 
 /* staff = ทีมงานเห็นผล AI ครบ · ผู้สมัครเห็นแค่สถานะ (ไม่เห็นจุดสงสัย กันการลองหาทางหลบระบบ) */
-function appOut(a, staff = false) {
+function appOut(a, staff = false, ident = null) {
   if (!a) return null;
   const d = parse(a.data) || {}, ai = parse(a.ai);
   return { ...d, uid: a.uid, email: a.email, status: a.status, test: !!a.test,
-    review: parse(a.review), revision: a.revision, createdAt: a.created_at, ai: staff ? ai : ai ? { status: ai.status } : null };
+    review: parse(a.review), revision: a.revision, createdAt: a.created_at, ai: staff ? ai : ai ? { status: ai.status } : null,
+    identity: identityOut(d, ident, staff) };
 }
+/* สถานะยืนยันตัวตน · ผู้สมัครเห็นแค่สถานะ · ทีมงานเห็นชื่อ/วันเกิดตามบัตร เลข 3 หลักท้าย และข้อสงสัย */
+function identityOut(d, row, staff) {
+  if (d.idMode !== 'didit') return { mode: 'manual' };
+  const v = identityView(row, d);
+  const out = { mode: 'didit', status: v.status, updatedAt: row ? row.updated_at : null };
+  return staff ? { ...out, name: v.name, birth: v.birth, last3: v.last3, flags: v.flags } : out;
+}
+/* ข้อสงสัยคิดใหม่ทุกครั้งจากข้อมูลบัตร × ใบสมัครปัจจุบัน (ผู้สมัครแก้ชื่อแล้วส่งใหม่ ผลต้องตามทัน) */
+function identityView(row, d) {
+  const x = parse(row && row.data) || {}, status = row ? row.status : 'none';
+  const flags = identityFlags({ status, name: x.name || '', birth: x.birth || '', idKey: row && row.id_hash ? 'yes' : '' }, d);
+  if (x.dup) flags.push({ code: 'duplicate_id', level: 'high', block: true, source: 'identity', msg: 'บัตรนี้ใช้ยืนยันตัวตนกับบัญชีอื่นแล้ว — ติดต่อผู้สมัครก่อน' });
+  return { status, name: x.name || '', birth: x.birth || '', last3: x.last3 || '', flags };
+}
+const identityRow = (env, uid) => env.DB.prepare('SELECT * FROM tech_identity WHERE uid = ?').bind(uid).first();
 
 async function meInfo(env, me) {
-  const [a, t] = await Promise.all([
+  const [a, t, ident] = await Promise.all([
     env.DB.prepare('SELECT * FROM tech_applications WHERE uid = ?').bind(me.uid).first(),
     env.DB.prepare('SELECT * FROM tech_profiles WHERE uid = ?').bind(me.uid).first(),
+    identityRow(env, me.uid),
   ]);
   /* งานที่รอเราทำอะไรสักอย่าง + ข้อความที่ยังไม่ได้อ่าน
      ใช้ขึ้นตัวเลขบนปุ่ม "งานของฉัน" ช่างจะได้ไม่พลาดคำขอราคา
@@ -415,7 +447,7 @@ async function meInfo(env, me) {
   const attention = jobs.filter(j => j.needsMe || j.unread > 0).length + msgs;
   return {
     uid: me.uid, email: me.email, admin: me.admin, staff: me.staff, version: API_VERSION,
-    application: appOut(a),
+    application: appOut(a, false, ident),
     technician: t ? { ...publicTech((await withPhotos(env, [t]))[0]), suspended: !!t.suspended,
       /* ค่าตั้งของร้านที่เห็นเฉพาะเจ้าของ (Studio → ตั้งค่า) */
       ...(() => { const d = parse(t.data) || {}; return { autoReply: d.autoReply || null, minPrice: d.minPrice || 0, vacationRaw: d.vacation || null }; })() } : null,
@@ -441,8 +473,9 @@ function coord(b) {
 }
 
 /* รูปเอกสาร — หน้าเว็บย่อเป็น JPEG ก่อนส่งแล้ว ที่นี่ตรวจชนิดและขนาดซ้ำ */
-function docList(b) {
-  const docs = Array.isArray(b.docs) ? b.docs : [];
+function docList(b, didit = false) {
+  /* โหมด Didit: บัตร/เซลฟี่ไปที่ Didit โดยตรง ไม่รับเก็บไว้ที่เรา (หน้าเว็บรุ่นเก่าที่ยังส่งมา = ทิ้งไป) */
+  const docs = (Array.isArray(b.docs) ? b.docs : []).filter(d => !(didit && d && ['id', 'selfie'].includes(d.kind)));
   if (docs.length > 14) fail(400, 'แนบรูปได้ไม่เกิน 14 รูป');
   const out = [];
   for (const d of docs) {
@@ -455,6 +488,7 @@ function docList(b) {
   }
   const label = { id: 'บัตรประชาชน', selfie: 'รูปถ่ายคู่บัตร', shop: 'รูปอู่หรือเครื่องมือ', work: 'รูปผลงาน', cert: 'ใบรับรอง' };
   for (const [k, min, max] of DOCS) {
+    if (didit && (k === 'id' || k === 'selfie')) continue;
     const n = out.filter(d => d.kind === k).length;
     if (n < min) fail(400, `${label[k]}: ต้องแนบอย่างน้อย ${min} รูป`);
     if (n > max) fail(400, `${label[k]}: แนบได้ไม่เกิน ${max} รูป`);
@@ -507,11 +541,14 @@ async function apply(env, me, b) {
 
   const cats = [...new Set((Array.isArray(b.cats) ? b.cats : []).filter(c => CATS.includes(c)))];
   if (!cats.length) fail(400, 'เลือกงานที่รับอย่างน้อย 1 อย่าง');
-  if (b.consent !== true || b.aiConsent !== true) fail(400, 'ต้องยินยอมให้ตรวจใบสมัครและให้ Gemini ตรวจรูปอู่/ผลงานก่อนส่ง');
-  /* เลขบัตรที่กรอกต้องตรงกับรูปบัตร — ต้องยินยอมให้ระบบตรวจบัตร · การเทียบใบหน้าเป็นความยินยอมแยก ไม่บังคับ (ข้อมูลอ่อนไหว) */
-  if (b.idConsent !== true) fail(400, 'ต้องยินยอมให้ระบบตรวจเลขบนรูปบัตรประชาชนก่อนส่ง');
-  const idNo = String(b.idNo || '').replace(/\D/g, '');
-  if (!thaiId(idNo)) fail(400, 'เลขประจำตัวประชาชนไม่ถูกต้อง');
+  if (b.consent !== true) fail(400, 'ต้องยืนยันว่าข้อมูลเป็นความจริง และยินยอมให้ทีมงานตรวจใบสมัครก่อนส่ง');
+  /* ตัวตน: Didit (ถ้าเปิด) ตรวจบัตร+ใบหน้าเอง เราไม่รับรูปบัตร · ไม่เปิด = ทีมงานดูรูปบัตรเองแล้วลบทิ้งหลังตรวจ
+     AI ดูรูปอู่/ผลงานเป็นทางเลือก นับเฉพาะคนที่ติ๊กยินยอมกับข้อความรุ่นปัจจุบัน (CONSENT_VER) */
+  const didit = diditReady(env);
+  if (didit && b.diditConsent !== true) fail(400, 'ต้องยินยอมให้ Didit ตรวจบัตรประชาชนและใบหน้าก่อนส่ง');
+  if (!didit && b.idConsent !== true) fail(400, 'ต้องยินยอมให้ทีมงานตรวจรูปบัตรประชาชนก่อนส่ง');
+  const idNo = didit ? '' : String(b.idNo || '').replace(/\D/g, '');
+  if (!didit && !thaiId(idNo)) fail(400, 'เลขประจำตัวประชาชนไม่ถูกต้อง');
   const c = coord(b);
   const d = {
     name: str(b.name, 'ชื่อ-นามสกุล (ตรงบัตร)', 4, 100), shop: String(b.shop || '').trim().slice(0, 120),
@@ -521,17 +558,21 @@ async function apply(env, me, b) {
     from: num(b.from, 'ราคาเริ่มต้น', 1, 1000000), warranty: num(b.warranty, 'รับประกัน', 7, 365),
     radius: num(b.radius, 'รัศมีบริการ', 0, 200), lat: c.lat, lng: c.lng,
     cats, mobile: !!b.mobile, urgent: !!b.urgent, hasCert: false, consentAt: t,
-    title: ['นาย', 'นาง', 'นางสาว'].includes(b.title) ? b.title : '', idNo,
-    birth: /^\d{4}-\d{2}-\d{2}$/.test(String(b.birth || '')) ? b.birth : '', aiConsent:true, idConsent:true, faceConsent:b.faceConsent===true,
+    title: ['นาย', 'นาง', 'นางสาว'].includes(b.title) ? b.title : '', ...(didit ? {} : { idNo }),
+    birth: /^\d{4}-\d{2}-\d{2}$/.test(String(b.birth || '')) ? b.birth : '',
+    idMode: didit ? 'didit' : 'manual', consentVer: b.consentVer === CONSENT_VER ? CONSENT_VER : '',
+    aiConsent: b.aiConsent === true && b.consentVer === CONSENT_VER, ...(didit ? { diditConsent: true } : { idConsent: true }),
     appNo: 'CP-' + (await sha(me.uid)).slice(0, 6).toUpperCase(), submittedAt: t,
   };
   if(typeof b.age==='boolean'||typeof b.years==='boolean')fail(400,'อายุและประสบการณ์ต้องเป็นตัวเลข');
   const invalid=applicantErrors(d,t);if(invalid.length)fail(400,invalid.map(x=>x.msg).join(' · '));
-  const docs = docList(b);
+  const docs = docList(b, didit);
   for (const x of docs) x.hash = await sha(x.data);
   if(new Set(docs.map(x=>x.hash)).size!==docs.length)fail(400,'ต้องใช้รูปต่างกัน ไม่ใช้รูปเดียวซ้ำหลายช่อง');
-  const idHash = await sha('cendon-id:' + idNo);
-  const duplicate=await env.DB.prepare("SELECT uid FROM tech_applications WHERE id_hash=? AND uid!=? AND test=0 AND status!='rejected'").bind(idHash,me.uid).first();
+  /* โหมด Didit: ได้แฮชเลขบัตรตอน Didit ผ่าน — เคยผ่านแล้ว (ส่งใหม่หลังถูกตีกลับ) ใช้ของเดิม ไม่ต้องยืนยันซ้ำ */
+  const ident = didit ? await identityRow(env, me.uid) : null;
+  const idHash = didit ? (ident && ident.status === 'approved' ? ident.id_hash : null) : await idHashOf(env, idNo);
+  const duplicate=idHash&&await env.DB.prepare("SELECT uid FROM tech_applications WHERE id_hash=? AND uid!=? AND test=0 AND status!='rejected'").bind(idHash,me.uid).first();
   if(duplicate)fail(409,'ข้อมูลตัวตนนี้มีใบสมัครอยู่แล้ว กรุณาติดต่อทีมงาน');
   await limit(env,'apply',me.uid,4);
   d.hasCert = docs.some(x => x.kind === 'cert');
@@ -543,7 +584,7 @@ async function apply(env, me, b) {
       ON CONFLICT(uid) DO UPDATE SET data=excluded.data,status='pending',test=0,review=NULL,ai=NULL,revision=revision+1,updated_at=excluded.updated_at
       WHERE tech_applications.status='rejected' OR tech_applications.test=1`)
       .bind(me.uid,me.email,packed,t,t),
-    env.DB.prepare('INSERT INTO tech_identity_claims(id_hash,uid) SELECT ?,? FROM tech_applications WHERE uid=? AND data=? ON CONFLICT(uid) DO UPDATE SET id_hash=excluded.id_hash').bind(idHash,me.uid,me.uid,packed),
+    ...(idHash?[env.DB.prepare('INSERT INTO tech_identity_claims(id_hash,uid) SELECT ?,? FROM tech_applications WHERE uid=? AND data=? ON CONFLICT(uid) DO UPDATE SET id_hash=excluded.id_hash').bind(idHash,me.uid,me.uid,packed)]:[]),
     env.DB.prepare('DELETE FROM tech_docs WHERE uid=? AND EXISTS(SELECT 1 FROM tech_applications WHERE uid=? AND data=?)').bind(me.uid,me.uid,packed),
     ...docs.map(x=>env.DB.prepare('INSERT INTO tech_docs(uid,kind,mime,data,created_at,hash) SELECT ?,?,?,?,?,? FROM tech_applications WHERE uid=? AND data=?').bind(me.uid,x.kind,x.mime,x.data,t,x.hash,me.uid,packed)),
     env.DB.prepare('UPDATE tech_applications SET id_hash=? WHERE uid=? AND data=?').bind(idHash,me.uid,packed),
@@ -563,7 +604,8 @@ async function apply(env, me, b) {
     ]);
     return {ok:true,status:'rejected',result:'rejected',reasons};
   }
-  return {ok:true,status:'pending',result:'pending',screening:ai?{status:ai.status,verdict:ai.verdict}:null};
+  return {ok:true,status:'pending',result:'pending',screening:ai?{status:ai.status,verdict:ai.verdict}:null,
+    identity:didit?{mode:'didit',status:ident?ident.status:'none'}:{mode:'manual'}};
 }
 
 /* รัน AI คัดกรองแล้วเก็บผลไว้ในใบสมัคร (ทีมงานเห็นเท่านั้น ผู้สมัครไม่เห็น) */
@@ -595,6 +637,75 @@ async function rescreen(env, me, b) {
   if (!a) fail(404, 'ไม่พบใบสมัคร');
   if (a.status !== 'pending') fail(409, 'ตรวจได้เฉพาะใบที่รอตรวจ (เอกสารของใบที่ตรวจแล้วถูกลบไปแล้ว)');
   return { ok: true, ai: await runScreen(env, uid) };
+}
+
+/* ── ยืนยันตัวตนกับ Didit ──
+   ส่งใบสมัครแล้ว → ขอลิงก์ Didit → ผู้สมัครถ่ายบัตร+หน้ากับ Didit → กลับมาที่ /join
+   ผลมาทาง webhook (ตรวจลายเซ็น) หรือผู้สมัครกด "ตรวจผล" — ทั้งสองทางดึงผลจริงจาก Didit ใหม่เสมอ */
+async function startIdentity(env, me) {
+  if (!diditReady(env)) fail(409, 'ระบบยืนยันตัวตนออนไลน์ยังไม่เปิด ทีมงานจะตรวจจากรูปบัตรแทน');
+  const a = await env.DB.prepare('SELECT status,data,test FROM tech_applications WHERE uid=?').bind(me.uid).first();
+  if (!a || a.test || a.status !== 'pending' || (parse(a.data) || {}).idMode !== 'didit') fail(409, 'ส่งใบสมัครก่อน แล้วจึงยืนยันตัวตน');
+  const cur = await identityRow(env, me.uid), x = parse(cur && cur.data) || {};
+  if (cur && (cur.status === 'approved' || cur.status === 'review')) return { ok: true, identity: { mode: 'didit', status: cur.status } };
+  /* ลิงก์เดิมยังใช้ได้ (ยังไม่เริ่ม/ทำค้าง ไม่เกิน 20 ชม.) — ใช้ซ้ำ ไม่เปิด session ใหม่ให้เสียค่าตรวจ */
+  if (cur && cur.status === 'pending' && x.url && now() - cur.updated_at < 20 * 3600000) return { ok: true, url: x.url, identity: { mode: 'didit', status: 'pending' } };
+  await limit(env, 'didit', me.uid, 3); await limit(env, 'didit_all', 'all', 300);
+  const vendor = 'cendon-' + (await sha('didit:' + me.uid)).slice(0, 20);
+  let s;
+  try { s = await diditFetch(env, '/v3/session/', { workflow_id: env.DIDIT_WORKFLOW_ID, vendor_data: vendor, callback: String(env.APP_URL || 'https://cendon-beta.pages.dev').replace(/\/+$/, '') + '/join', language: 'th' }); }
+  catch (e) { console.error('didit session', e && e.message); fail(502, 'เปิดหน้ายืนยันตัวตนไม่สำเร็จ กรุณาลองใหม่'); }
+  const sid = String(s && s.session_id || ''), url = String(s && s.url || '');
+  if (!/^[\w-]{8,80}$/.test(sid) || !/^https:\/\//.test(url)) fail(502, 'เปิดหน้ายืนยันตัวตนไม่สำเร็จ กรุณาลองใหม่');
+  const t = now();
+  await env.DB.prepare(`INSERT INTO tech_identity (uid,session_id,status,id_hash,data,created_at,updated_at) VALUES (?,?,'pending',NULL,?,?,?)
+    ON CONFLICT(uid) DO UPDATE SET session_id=excluded.session_id,status='pending',data=excluded.data,updated_at=excluded.updated_at`)
+    .bind(me.uid, sid, JSON.stringify({ url, vendor }), t, t).run();
+  return { ok: true, url, identity: { mode: 'didit', status: 'pending' } };
+}
+/* ดึงผลจาก Didit แล้วบันทึก — ผ่านแล้วผูกแฮชเลขบัตรกับบัญชี (บัตรเดียวใช้ได้บัญชีเดียว) */
+async function syncIdentity(env, uid) {
+  const cur = await identityRow(env, uid);
+  if (!cur || !cur.session_id) return null;
+  const dec = await diditFetch(env, '/v3/session/' + encodeURIComponent(cur.session_id) + '/decision/');
+  const f = diditFacts(dec), x = parse(cur.data) || {}, t = now();
+  if (cur.status === 'approved' && f.status !== 'approved' && f.status !== 'declined') return cur;   /* ผ่านแล้วไม่ถอยกลับเพราะผลค้าง */
+  const next = { url: f.status === 'pending' ? x.url : undefined, vendor: x.vendor };
+  let idHash = cur.id_hash;
+  if (f.status === 'approved') {
+    Object.assign(next, { name: f.name, birth: f.birth, last3: f.last3 });
+    if (f.idKey) {
+      idHash = await idHashOf(env, f.idKey);
+      const other = await env.DB.prepare('SELECT uid FROM tech_identity_claims WHERE id_hash=? AND uid!=?').bind(idHash, uid).first()
+        || await env.DB.prepare("SELECT uid FROM tech_applications WHERE id_hash=? AND uid!=? AND test=0 AND status!='rejected'").bind(idHash, uid).first();
+      if (other) next.dup = true;
+    }
+  }
+  const stmts = [env.DB.prepare('UPDATE tech_identity SET status=?,id_hash=?,data=?,updated_at=? WHERE uid=? AND session_id=?').bind(f.status, idHash, JSON.stringify(next), t, uid, cur.session_id)];
+  if (f.status === 'approved' && idHash && !next.dup) stmts.push(
+    env.DB.prepare('INSERT INTO tech_identity_claims(id_hash,uid) VALUES (?,?) ON CONFLICT(uid) DO UPDATE SET id_hash=excluded.id_hash').bind(idHash, uid),
+    env.DB.prepare("UPDATE tech_applications SET id_hash=? WHERE uid=? AND status='pending'").bind(idHash, uid));
+  await env.DB.batch(stmts);
+  return { ...cur, status: f.status, id_hash: idHash, data: JSON.stringify(next), updated_at: t };
+}
+async function refreshIdentity(env, me) {
+  if (!diditReady(env)) fail(409, 'ระบบยืนยันตัวตนออนไลน์ยังไม่เปิด');
+  await limit(env, 'didit_check', me.uid, 30);
+  let row;
+  try { row = await syncIdentity(env, me.uid); } catch (e) { if (e instanceof HttpError) throw e; console.error('didit decision', e && e.message); fail(502, 'ยังดึงผลจาก Didit ไม่ได้ ลองใหม่อีกครั้ง'); }
+  return { ok: true, identity: { mode: 'didit', status: row ? row.status : 'none' } };
+}
+/* webhook จาก Didit — ไม่ต้องล็อกอิน แต่ต้องมีลายเซ็นถูกต้อง · ตอบเหมือนกันทุกกรณีที่ลายเซ็นถูก ไม่บอกว่ามี session นี้ไหม */
+async function diditWebhook(env, request) {
+  if (!env.DIDIT_WEBHOOK_SECRET || !diditReady(env)) fail(404, 'ไม่พบปลายทาง');
+  const raw = await request.text();
+  if (raw.length > 512000) fail(413, 'ข้อมูลใหญ่เกินไป');
+  if (!await verifyDidit(env.DIDIT_WEBHOOK_SECRET, raw, request.headers)) fail(401, 'invalid signature');
+  let b; try { b = JSON.parse(raw); } catch { fail(400, 'ข้อมูลไม่ถูกต้อง'); }
+  const sid = String(b && b.session_id || '');
+  const row = /^[\w-]{8,80}$/.test(sid) && await env.DB.prepare('SELECT uid FROM tech_identity WHERE session_id=?').bind(sid).first();
+  if (row) await syncIdentity(env, row.uid);
+  return { ok: true };
 }
 
 /* เอกสารของผู้สมัคร — ทีมงานเท่านั้น */
@@ -642,7 +753,9 @@ async function pendingApps(env, me) {
   adminOnly(me);
   const { results } = await env.DB.prepare(
     "SELECT * FROM tech_applications WHERE status = 'pending' ORDER BY created_at ASC").all();
-  return { applications: results.map(a => appOut(a, true)) };
+  const { results: ids } = await env.DB.prepare("SELECT i.* FROM tech_identity i JOIN tech_applications a ON a.uid = i.uid WHERE a.status = 'pending'").all();
+  const byUid = new Map(ids.map(r => [r.uid, r]));
+  return { applications: results.map(a => appOut(a, true, byUid.get(a.uid) || null)) };
 }
 
 /* ── ด่านคัดเลือกช่าง ──
@@ -665,11 +778,13 @@ async function review(env, me, b) {
   let evidence={},resolutions={};
   if(decision==='approve'){
     const {results:docs}=await env.DB.prepare('SELECT kind,mime,data,hash FROM tech_docs WHERE uid=? ORDER BY id').bind(a.uid).all();
-    const ai=parse(a.ai),error=approvalError({app:a,ai,snapshot:await screeningSnapshot(a,docs),evidence:b.evidence,resolutions:b.resolutions});if(error)fail(400,error);
+    const ident=identityView(await identityRow(env,a.uid),parse(a.data)||{});
+    const ai=parse(a.ai),error=approvalError({app:a,ai,snapshot:await screeningSnapshot(a,docs),evidence:b.evidence,resolutions:b.resolutions,identity:ident});if(error)fail(400,error);
     const duplicate=await env.DB.prepare("SELECT uid FROM tech_applications WHERE id_hash=? AND uid!=? AND test=0 AND status!='rejected'").bind(a.id_hash,a.uid).first();
     if(duplicate)fail(409,'พบข้อมูลตัวตนซ้ำ ต้องตรวจและแก้ไขก่อน');
     evidence=Object.fromEntries(CHECKS.map(k=>[k,{method:b.evidence[k].method,note:b.evidence[k].note.trim()}]));
-    resolutions=Object.fromEntries((ai.flags||[]).filter(f=>f.level!=='low'&&f.source!=='rules').map(f=>[f.code,{outcome:b.resolutions[f.code].outcome,note:b.resolutions[f.code].note.trim()}]));
+    const idFlags=(parse(a.data)||{}).idMode==='didit'?ident.flags:[];
+    resolutions=Object.fromEntries([...(ai.flags||[]),...idFlags].filter(f=>f.level!=='low'&&f.source!=='rules').map(f=>[f.code,{outcome:b.resolutions[f.code].outcome,note:b.resolutions[f.code].note.trim()}]));
   }
   const t = now();
   const rv = JSON.stringify({id:crypto.randomUUID(),by:me.email,note,checks,evidence,resolutions,decision,at:t,screeningSnapshot:parse(a.ai)?.snapshot||null});
@@ -690,7 +805,9 @@ async function review(env, me, b) {
       lat: d.lat, lng: d.lng, cert: !!d.hasCert };
     /* ป้ายบนหน้าร้านมาจากสิ่งที่ทีมงานตรวจจริง แยกเป็นเรื่อง ๆ (ตัวตน / เบอร์ / สถานที่ / ทักษะรายหมวด) พร้อมวันที่
        ไม่มีป้าย "ปลอดภัย" เหมารวม — ยืนยันตัวตน ≠ รับรองฝีมือ ≠ รับประกันทุกเหตุการณ์ */
-    const vetting = { at: t, identity: true, phone: true, shop: evidence.shop.method, skills: evidence.skills.method, cats: d.cats || [], mobile: !!d.mobile };
+    const vetting = { at: t, identity: true, idMethod: evidence.identity.method, phone: true, shop: evidence.shop.method, skills: evidence.skills.method, cats: d.cats || [], mobile: !!d.mobile };
+    /* ผ่านแล้ว: ไม่ต้องเก็บชื่อ/วันเกิดตามบัตรจาก Didit อีก เหลือสถานะ เลข 3 หลักท้าย และแฮชกันสมัครซ้ำ */
+    stmts.push(env.DB.prepare("UPDATE tech_identity SET data=json_remove(COALESCE(data,'{}'),'$.name','$.birth','$.url') WHERE uid=? AND EXISTS(SELECT 1 FROM tech_applications WHERE uid=? AND review=?)").bind(a.uid,a.uid,rv));
     profile.vetting = vetting;
     stmts.push(env.DB.prepare(`INSERT INTO tech_profiles (id,uid,phone,data,verified,test,suspended,created_at,updated_at)
       SELECT ?,?,?,?,1,0,0,?,? FROM tech_applications WHERE uid=? AND status='approved' AND review=?
@@ -1866,11 +1983,14 @@ async function route(request, env, verifyToken) {
     return listReviews(env, me, url);
   }
   /* หน้าเว็บใช้เช็กว่าเซิร์ฟเวอร์มีระบบช่างรุ่นนี้แล้ว — ถ้าไม่มี แสดงให้ทีมงานรู้ว่ายังไม่ได้ deploy */
-  if (p === '/api/tech/ping') return { ok: true, version: API_VERSION };
+  if (p === '/api/tech/ping') return { ok: true, version: API_VERSION, identity: diditReady(env) ? 'didit' : 'manual', consentVer: CONSENT_VER, photoAI: visionReady(env) };
+  if (p === '/api/tech/didit/webhook' && m === 'POST') return diditWebhook(env, request);
 
   const me = await who(request, env,true,verifyToken);
   if (p === '/api/tech/me' && m === 'GET') return meInfo(env, me);
   if (p === '/api/tech/apply' && m === 'POST') return apply(env, me, await body());
+  if (p === '/api/tech/apply/identity' && m === 'POST') return startIdentity(env, me);
+  if (p === '/api/tech/apply/identity/refresh' && m === 'POST') return refreshIdentity(env, me);
   if (p === '/api/tech/applications' && m === 'GET') return pendingApps(env, me);
   if (p === '/api/tech/audit' && m === 'GET') return auditLog(env, me);
   if (p === '/api/tech/docs' && m === 'GET') return appDocs(env, me, String(url.searchParams.get('uid') || ''));
