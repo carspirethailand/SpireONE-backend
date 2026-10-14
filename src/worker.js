@@ -5352,6 +5352,9 @@ ${convo}`;
             schema,
             env: {
               aiConfigured: !!env.GEMINI_KEY,
+              /* สมัครช่าง: ตั้งแล้วหรือยัง (ไม่ส่งค่าจริงออกไป) */
+              diditKey: !!env.DIDIT_API_KEY, diditWorkflow: !!env.DIDIT_WORKFLOW_ID, diditWebhook: !!env.DIDIT_WEBHOOK_SECRET,
+              idHashKey: !!env.ID_HASH_KEY, privacyUrl: env.ONBOARDING_PRIVACY_URL || '', appUrl: env.APP_URL || '',
               model: env.GEMINI_MODEL || 'gemini-3.5-flash-lite',
               searchModel: env.GEMINI_SEARCH_MODEL || '',
               fallbackModel: env.GEMINI_FALLBACK_MODEL || '',

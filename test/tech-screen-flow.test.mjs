@@ -157,3 +157,9 @@ test('ID_HASH_KEY: new hashes are keyed, old rows are upgraded on first request,
   for(const t of ['tech_applications','tech_identity_claims'])assert.match(f.sqlite.prepare(`SELECT id_hash FROM ${t}`).get().id_hash,/^h2:[0-9a-f]{64}$/,t);
   assert.ok(!JSON.stringify(f.sqlite.prepare('SELECT * FROM tech_applications').all()).includes(legacy),'no unkeyed hash left behind');
 });
+test('staff rescreen also pulls the latest Didit result when the webhook never arrived',async()=>{
+  fakeVision();const f=fixture(DIDIT);await diditApp(f);const seen=fakeDidit({status:'In Progress'});
+  await f.call(USER,'/api/tech/apply/identity',{});seen.decision=approvedDecision();fakeVision();
+  const ds=fakeDidit(approvedDecision());const r=await f.call(ADMIN,'/api/tech/rescreen',{uid:'applicant'});
+  assert.equal(r.status,200);assert.equal(r.identity.status,'approved');assert.equal(r.identity.name,'สมชาย ใจดี');assert.equal(ds.decisions,1);
+});

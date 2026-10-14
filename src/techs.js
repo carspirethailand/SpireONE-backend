@@ -636,7 +636,12 @@ async function rescreen(env, me, b) {
   const a = await env.DB.prepare('SELECT status FROM tech_applications WHERE uid = ?').bind(uid).first();
   if (!a) fail(404, 'ไม่พบใบสมัคร');
   if (a.status !== 'pending') fail(409, 'ตรวจได้เฉพาะใบที่รอตรวจ (เอกสารของใบที่ตรวจแล้วถูกลบไปแล้ว)');
-  return { ok: true, ai: await runScreen(env, uid) };
+  const ai = await runScreen(env, uid);
+  /* โหมด Didit: ดึงผลยืนยันตัวตนล่าสุดด้วย (เผื่อ webhook ไม่มา) */
+  const app = await env.DB.prepare('SELECT data FROM tech_applications WHERE uid=?').bind(uid).first(), d = parse(app && app.data) || {};
+  let row = await identityRow(env, uid);
+  if (d.idMode === 'didit' && diditReady(env) && row) { try { row = await syncIdentity(env, uid) || row; } catch (e) { console.error('didit decision', e && e.message); } }
+  return { ok: true, ai, identity: identityOut(d, row, true) };
 }
 
 /* ── ยืนยันตัวตนกับ Didit ──
