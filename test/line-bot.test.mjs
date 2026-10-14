@@ -95,3 +95,12 @@ test('LINE bot: people who have not linked get a daily limit; slow AI gets a pol
 test('LINE reply text: markdown left by the model becomes readable plain text',()=>{
   assert.equal(linePlain('| อะไหล่ | ราคา |\n|---|---|\n| ผ้าเบรก | 900 |'),'อะไหล่ · ราคา\n\nผ้าเบรก · 900'.replace('\n\n','\n\n'));
 });
+
+test('LINE bot: shows the "typing…" dots as soon as a message arrives, before the answer is sent',async()=>{
+  const {say,calls}=setup();const inner=globalThis.fetch,bodies=[];
+  globalThis.fetch=async(u,init={})=>{if(String(u).endsWith('/chat/loading/start'))bodies.push(JSON.parse(init.body));return inner(u,init);};
+  const n=calls.length;await say('สวัสดีครับ');
+  assert.equal(bodies.length,1);assert.equal(bodies[0].chatId,'Uline1');assert.ok(bodies[0].loadingSeconds%5===0&&bodies[0].loadingSeconds>=5&&bodies[0].loadingSeconds<=60,'LINE needs 5–60 s in steps of 5');
+  const seen=calls.slice(n),load=seen.indexOf('https://api.line.me/v2/bot/chat/loading/start'),reply=seen.indexOf('https://api.line.me/v2/bot/message/reply');
+  assert.ok(load>=0,'typing animation started');assert.ok(reply>load,'the answer goes out after the dots, which then disappear by themselves');
+});

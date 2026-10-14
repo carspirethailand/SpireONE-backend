@@ -3170,8 +3170,7 @@ async function lineMileage(env, link) {
    ยังไม่เชื่อม = ถามได้วันละ anonDaily ข้อความต่อ LINE หนึ่งคน */
 async function lineAsk(env, ev, link, text) {
   const lineUid = ev.source.userId, now = Date.now(), day = new Date(now).toISOString().slice(0, 10);
-  /* จุด "กำลังพิมพ์…" ในแชตระหว่างรอ AI (ฟรี) */
-  lineCall(env, '/chat/loading/start', { chatId: lineUid, loadingSeconds: 30 }).catch(() => {});
+  /* จุด "กำลังพิมพ์…" เริ่มไปแล้วตั้งแต่รับข้อความ (lineWebhook → lineTyping) */
 
   let mem = null;
   try { mem = await env.DB.prepare('SELECT * FROM line_chat WHERE line_uid = ?').bind(lineUid).first(); } catch (e) {}
@@ -3286,6 +3285,15 @@ const LINE_HELP = 'ผมช่วยอะไรได้บ้าง\n\n'
   + '• พิมพ์ "หยุด" พักเตือนดูแลรถ 90 วัน · "เปิดเตือน" เปิดกลับ\n\n'
   + 'งานช่าง ราคา และข้อความในใบงานจะแจ้งที่นี่อัตโนมัติ';
 
+/* จุดสามจุด "กำลังพิมพ์…" ในห้องแชต LINE (loading animation API) — ขึ้นทันทีที่ได้รับข้อความ
+   หายเองเมื่อบอทตอบกลับ หรือครบเวลาที่ตั้ง · LINE รองรับเฉพาะแชตเดี่ยว และเวลาต้องเป็นทวีคูณของ 5 วินาที (5–60)
+   ไม่สำเร็จก็ไม่เป็นไร (เช่นผู้ใช้ไม่ได้เปิดห้องแชตอยู่) — แค่ไม่เห็นจุด ไม่กระทบคำตอบ */
+async function lineTyping(env, ev, seconds) {
+  if (!ev.source || ev.source.type !== 'user' || !ev.source.userId) return;
+  const s = Math.min(60, Math.max(5, Math.ceil(seconds / 5) * 5));
+  try { await lineCall(env, '/chat/loading/start', { chatId: ev.source.userId, loadingSeconds: s }); } catch (e) {}
+}
+
 async function lineWebhook(env, ev) {
   if (!ev || !ev.source || !ev.source.userId) return;
   const lineUid = ev.source.userId;
@@ -3309,6 +3317,9 @@ async function lineWebhook(env, ev) {
   }
   if (ev.type !== 'message' || !ev.replyToken) return;
 
+  /* เริ่มจุดพิมพ์พร้อมกับเริ่มคิดคำตอบ — รอให้ LINE รับคำสั่งก่อนส่งคำตอบ ไม่งั้นจุดอาจโผล่หลังคำตอบ
+     รูปใบเสร็จอ่านนานกว่า · ข้อความรอได้นานเท่าเวลาที่ให้ AI ตอบ */
+  const typing = lineTyping(env, ev, ev.message && ev.message.type === 'image' ? 45 : LINE_AI.timeoutMs / 1000 + 5);
   let msg;
   try {
     if (ev.message.type === 'image') {
@@ -3322,6 +3333,7 @@ async function lineWebhook(env, ev) {
   } catch (e) {
     msg = txt('ระบบขัดข้องชั่วคราวครับ ลองใหม่อีกครั้ง');
   }
+  await typing;
   if (!msg) return;
   const r = await lineReply(env, ev.replyToken, (Array.isArray(msg) ? msg : [msg]).slice(0, 5));
   if (r && !r.ok) {
