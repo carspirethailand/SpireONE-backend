@@ -2873,6 +2873,33 @@ const linePush = (env, to, msgs) =>
 
 const txt = (s) => ({ type: 'text', text: String(s).slice(0, 4900) });
 
+/* ชื่อบัญชี LINE OA ที่ใช้ทำปุ่ม "เปิด LINE" ในแอป — ถามจาก LINE ตรง ๆ ด้วย token ที่ตั้งไว้
+   (ชื่อพิเศษ @cendon ก่อน ถ้าไม่มีใช้ basic ID) · ไม่ต้องพึ่ง LINE_OA_ID ที่อาจพิมพ์ผิดหรือเป็นของ OA เก่า
+   ถามไม่ได้ค่อยใช้ LINE_OA_ID · จำไว้ 1 ชม. ต่อ isolate */
+let lineOaCache = { v: '', at: 0, token: '' };
+async function lineOaId(env) {
+  if (!env.LINE_CHANNEL_TOKEN) return '';
+  if (lineOaCache.v && lineOaCache.token === env.LINE_CHANNEL_TOKEN && Date.now() - lineOaCache.at < 3600000) return lineOaCache.v;
+  try {
+    const r = await fetch(LINE_API + '/info', { headers: { Authorization: 'Bearer ' + env.LINE_CHANNEL_TOKEN } });
+    if (r.ok) {
+      const j = await r.json();
+      const id = String(j.premiumId || j.basicId || '').trim();
+      if (id) { lineOaCache = { v: id.startsWith('@') ? id : '@' + id, at: Date.now(), token: env.LINE_CHANNEL_TOKEN }; return lineOaCache.v; }
+    }
+  } catch (e) {}
+  return env.LINE_OA_ID || '';
+}
+const lineAddUrl = (oa) => 'https://line.me/R/ti/p/' + encodeURIComponent(oa);
+/* LINE ส่งแจ้งเตือน (push) ถึงได้เฉพาะคนที่เป็นเพื่อนกับ OA — ดูโปรไฟล์ได้ = เป็นเพื่อน · 404 = ยังไม่เพิ่มเพื่อนหรือบล็อกไว้
+   ถามไม่ได้ (เน็ต/LINE ล่ม) ถือว่าเป็นเพื่อน ไม่ปิดแจ้งเตือนเพราะเดา */
+async function lineIsFriend(env, lineUid) {
+  try {
+    const r = await fetch(LINE_API + '/profile/' + encodeURIComponent(lineUid), { headers: { Authorization: 'Bearer ' + env.LINE_CHANNEL_TOKEN } });
+    return r.status !== 404;
+  } catch (e) { return true; }
+}
+
 /* ─────────── ผูกบัญชี ───────────
    ผู้ใช้เห็นรหัส 6 ตัวในแอป แล้วพิมพ์ทักบอทครั้งเดียว จบตลอดไป
    ไม่ใช้ LINE Login เพราะนั่นต้องเด้งออกไปหน้าเว็บแล้วกลับมา
@@ -2980,6 +3007,16 @@ async function lineLinkReply(env, lineUid, code) {
   let name = '';
   try { const u = await env.DB.prepare('SELECT name FROM users WHERE uid = ?').bind(r.uid).first(); name = (u && u.name) || ''; } catch (e) {}
   const who = name ? `บัญชี ${name}` : 'บัญชี Cendon ของคุณ';
+  /* เชื่อมแล้วแต่ยังไม่ได้เพิ่มเพื่อน = LINE ไม่ให้ส่งแจ้งเตือนหา · พักไว้ (active=2) เพิ่มเพื่อนเมื่อไรเปิดเองทันที (ดู follow) */
+  if (!(await lineIsFriend(env, lineUid))) {
+    await env.DB.prepare('UPDATE line_link SET active = 2 WHERE line_uid = ? AND active = 1').bind(lineUid).run();
+    const oa = await lineOaId(env);
+    return card({
+      tag: 'อีกขั้นเดียว', title: 'เพิ่ม Cendon เป็นเพื่อนก่อนนะครับ',
+      url: oa ? lineAddUrl(oa) : appUrl(env, '/profile'), label: oa ? 'เพิ่มเพื่อน' : 'เปิด Cendon',
+      lines: [`เชื่อมกับ${who} แล้ว`, 'แต่ LINE ส่งแจ้งเตือนได้เฉพาะคนที่เพิ่มเพื่อนกับ Cendon', 'กดเพิ่มเพื่อน แล้วการแจ้งเตือนจะเปิดเองทันที'],
+    });
+  }
   if (r.already) return txt(`LINE นี้เชื่อมกับ${who} อยู่แล้วครับ ✓ ไม่ต้องทำอะไรเพิ่ม`);
   return card({
     tag: 'เชื่อมบัญชีสำเร็จ', title: `เชื่อม LINE กับ${who} แล้ว ✓`,
@@ -3166,13 +3203,18 @@ async function lineWebhook(env, ev) {
   const link = await lineUidFor(env, lineUid);
 
   if (ev.type === 'follow') {
-    return await lineReply(env, ev.replyToken, [txt(link
-      ? `ยินดีต้อนรับกลับครับ LINE นี้เชื่อมกับบัญชี ${BRAND.ai} อยู่แล้ว\n\n`
+    /* เพิ่มเพื่อน/เลิกบล็อก: บัญชีที่เคยเชื่อมแล้วพักไว้ (active=2) กลับมารับแจ้งเตือนเองทันที ไม่ต้องขอรหัสใหม่ */
+    const back = await env.DB.prepare('UPDATE line_link SET active = 1 WHERE line_uid = ? AND active = 2').bind(lineUid).run();
+    const on = link || (back.meta && back.meta.changes ? await lineUidFor(env, lineUid) : null);
+    return await lineReply(env, ev.replyToken, [txt(on
+      ? (link ? `ยินดีต้อนรับกลับครับ LINE นี้เชื่อมกับบัญชี ${BRAND.ai} อยู่แล้ว\n\n` : `เชื่อมเสร็จสมบูรณ์ครับ ✓\n\n`)
         + 'งานช่าง ราคา และข้อความจะแจ้งเข้าที่นี่ · กดเมนูด้านล่างเพื่อเปิดแอปได้เลย'
       : LINE_HOWTO)]);
   }
   if (ev.type === 'unfollow') {
-    await env.DB.prepare('UPDATE line_link SET active = 0 WHERE line_uid = ?')
+    /* บล็อก/ลบเพื่อน: พักการส่ง (active=2) แต่จำการเชื่อมไว้ — กลับมาเพิ่มเพื่อนเมื่อไรใช้ต่อได้เลย
+       (กดยกเลิกการเชื่อมในแอป = active 0 ซึ่งจะไม่กลับมาเอง) */
+    await env.DB.prepare('UPDATE line_link SET active = 2 WHERE line_uid = ? AND active = 1')
       .bind(lineUid).run();
     return;
   }
@@ -3369,11 +3411,13 @@ async function runOdoRound(env) {
       try {
         const r = await linePush(env, line.line_uid,
           [txt(`${title}\n\n${body}${link ? '\n\n' + link : ''}`)]);
-        if (r && r.ok) anySent = true;
-        /* 403 = ผู้ใช้บล็อกบอทไปแล้ว เลิกส่งช่องทางนี้ */
-        else if (r && r.status === 403) {
-          await env.DB.prepare('UPDATE line_link SET active = 0 WHERE line_uid = ?')
-            .bind(line.line_uid).run();
+        if (r && r.ok) { anySent = true; await lineNote(env, 'line_last_push_ok', {}); }
+        /* ส่งไม่ผ่าน: บันทึกให้หน้าแอดมินเห็น (เช่น 429 = โควตาเดือนนี้หมด)
+           ไม่ปิดการเชื่อมของผู้ใช้เอง — การบล็อกจริงรู้จาก unfollow อยู่แล้ว และ 403 อาจเป็นปัญหาสิทธิ์ของ OA ทั้งบัญชี */
+        else if (r) {
+          let detail = '';
+          try { detail = String((await r.json()).message || '').slice(0, 200); } catch (e) {}
+          await lineNote(env, 'line_last_push_error', { status: r.status, detail });
         }
       } catch (e) {}
     }
@@ -3669,7 +3713,7 @@ export default {
           await env.DB.prepare(
             'INSERT INTO line_code (code, uid, expires_at, used) VALUES (?, ?, ?, 0)'
           ).bind(code, uid, exp).run();
-          return json({ code, expiresAt: exp, oa: env.LINE_OA_ID || '' });
+          return json({ code, expiresAt: exp, oa: await lineOaId(env) });
         })();
       }
 
@@ -3677,10 +3721,12 @@ export default {
       if (url.pathname === '/api/line/link' && request.method === 'GET') {
         return await guarded('user', async (actor) => {
           const r = await env.DB.prepare(
-            'SELECT line_uid, linked_at, active FROM line_link WHERE uid = ? AND active = 1'
+            'SELECT line_uid, linked_at, active FROM line_link WHERE uid = ? AND active IN (1, 2) ORDER BY active ASC, linked_at DESC'
           ).bind(actor.payload.sub).first();
-          /* oa = ชื่อบัญชี LINE OA (เช่น @cendon) — ว่าง = ยังไม่ได้ตั้ง LINE หน้าแอปจะไม่โชว์ปุ่มเชื่อม */
-          return json({ linked: !!r, linkedAt: r ? r.linked_at : null, oa: env.LINE_CHANNEL_TOKEN ? (env.LINE_OA_ID || '') : '' });
+          /* oa = ชื่อบัญชี LINE OA (เช่น @cendon) — ว่าง = ยังไม่ได้ตั้ง LINE หน้าแอปจะไม่โชว์ปุ่มเชื่อม
+             paused = เชื่อมแล้วแต่ยังไม่ได้เพิ่มเพื่อน/บล็อก Cendon ใน LINE จึงยังส่งแจ้งเตือนไม่ได้ */
+          const on = !!(r && r.active === 1);
+          return json({ linked: on, paused: !!(r && r.active === 2), linkedAt: r ? r.linked_at : null, oa: await lineOaId(env) });
         })();
       }
       if (url.pathname === '/api/line/link' && request.method === 'DELETE') {
@@ -5438,11 +5484,14 @@ ${convo}`;
         return await guarded('admin', async () => {
           const notes = {};
           try {
-            const rows = await env.DB.prepare("SELECT key, value FROM config WHERE key IN ('line_last_event','line_last_bad_sig','line_last_reply_error')").all();
+            const rows = await env.DB.prepare("SELECT key, value FROM config WHERE key IN ('line_last_event','line_last_bad_sig','line_last_reply_error','line_last_push_error','line_last_push_ok')").all();
             for (const r of rows.results || []) {
               const v = JSON.parse(r.value);
-              notes[{ line_last_event: 'event', line_last_bad_sig: 'badSig', line_last_reply_error: 'replyErr' }[r.key]] = v;
+              notes[{ line_last_event: 'event', line_last_bad_sig: 'badSig', line_last_reply_error: 'replyErr', line_last_push_error: 'pushErr', line_last_push_ok: 'pushOk' }[r.key]] = v;
             }
+            /* จำนวนคนที่เชื่อมแล้ว / เชื่อมแต่ยังไม่เป็นเพื่อน (ส่งไม่ถึง) */
+            const c = await env.DB.prepare('SELECT SUM(active = 1) AS on_, SUM(active = 2) AS paused FROM line_link').first();
+            notes.linked = { on: Number(c && c.on_) || 0, paused: Number(c && c.paused) || 0 };
           } catch (e) {}
           return json(await lineStatus(env, url.origin, notes));
         })();

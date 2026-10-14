@@ -46,14 +46,24 @@ export async function notify(env, uid, msg) {
     link = await env.DB.prepare('SELECT line_uid FROM line_link WHERE uid = ? AND active = 1').bind(uid).first();
   } catch (e) { return false; }          /* ยังไม่มีตาราง line_link = ระบบหลักยังไม่เปิด LINE */
   if (!link) return false;
+  let r = null, detail = '';
   try {
-    const r = await fetch(PUSH, {
+    r = await fetch(PUSH, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + env.LINE_CHANNEL_TOKEN },
       body: JSON.stringify({ to: link.line_uid, messages: [msg] }),
     });
-    return r.ok;
-  } catch (e) { return false; }
+    if (!r.ok) try { detail = String((await r.json()).message || '').slice(0, 200); } catch (e) {}
+  } catch (e) { detail = 'เชื่อมต่อ LINE ไม่ได้'; }
+  /* บันทึกผลล่าสุดให้หน้าแอดมินตรวจการเชื่อม LINE เห็น (เช่น 429 = โควตาข้อความเดือนนี้หมด) */
+  await pushNote(env, r && r.ok, r ? r.status : 0, detail);
+  return !!(r && r.ok);
+}
+export async function pushNote(env, ok, status, detail) {
+  try {
+    await env.DB.prepare('INSERT INTO config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+      .bind(ok ? 'line_last_push_ok' : 'line_last_push_error', JSON.stringify(ok ? { at: Date.now() } : { at: Date.now(), status, detail })).run();
+  } catch (e) {}
 }
 
 /* ได้สิทธิ์ส่งครั้งเดียวต่อช่วงเวลา (เช่น แจ้งแชตใหม่ 1 ครั้ง / 30 นาที / ใบงาน / ผู้รับ) */

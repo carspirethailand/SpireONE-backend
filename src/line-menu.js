@@ -111,12 +111,26 @@ export async function lineStatus(env, origin, notes = {}) {
   const H = auth(env);
   try {
     const r = await fetch(BOT + '/info', { headers: H });
-    if (r.ok) { const j = await r.json(); out.bot = { name: j.displayName || '', basicId: j.basicId || '', chatMode: j.chatMode || '', pictureUrl: j.pictureUrl || '' }; }
+    if (r.ok) { const j = await r.json(); out.bot = { name: j.displayName || '', basicId: j.basicId || '', premiumId: j.premiumId || '', chatMode: j.chatMode || '', pictureUrl: j.pictureUrl || '' }; }
     else out.tokenStatus = r.status;
   } catch (e) { out.tokenStatus = 0; }
   if (!out.bot) { P('LINE ไม่รับ LINE_CHANNEL_TOKEN (ตอบ ' + (out.tokenStatus || 'ไม่ได้') + ') — ก๊อป Channel access token (long-lived) ใหม่จากแท็บ Messaging API แล้วใส่ใหม่'); return out; }
-  if (out.oa && out.bot.basicId && out.oa.toLowerCase() !== out.bot.basicId.toLowerCase())
-    P(`LINE_OA_ID (${out.oa}) ไม่ตรงกับบัญชีจริง (${out.bot.basicId}) — ปุ่มเชื่อมในแอปจะเปิดผิดห้อง`);
+  /* ปุ่มในแอปใช้ชื่อจริงจาก LINE เองแล้ว (worker.js lineOaId) — LINE_OA_ID ที่ไม่ตรงไม่ทำให้เชื่อมผิดห้องอีก แต่ควรแก้ให้ตรงไว้ */
+  const real = [out.bot.basicId, out.bot.premiumId].filter(Boolean).map((x) => x.toLowerCase());
+  if (out.oa && real.length && !real.includes(out.oa.toLowerCase()))
+    P(`LINE_OA_ID ในไฟล์ตั้งค่า (${out.oa}) ไม่ตรงกับบัญชีที่ token นี้เป็นเจ้าของ (${out.bot.basicId}) — แอปใช้ ${out.bot.premiumId || out.bot.basicId} ให้อัตโนมัติแล้ว แต่ควรแก้ LINE_OA_ID ใน wrangler.jsonc ให้ตรง`);
+  if (out.bot.chatMode && out.bot.chatMode !== 'bot')
+    P('LINE OA ตั้งเป็นโหมดแชตด้วยคน (Chat) อยู่ — บอทจะไม่ตอบรหัสเชื่อม ไปที่ LINE Official Account Manager → ตั้งค่า → การตอบกลับ → เปิด Webhook และปิดข้อความตอบกลับอัตโนมัติ');
+  /* โควตาข้อความ push ของเดือนนี้ — หมดเมื่อไรแจ้งเตือนหยุดทั้งระบบ */
+  try {
+    const [q, u] = await Promise.all([fetch(BOT + '/message/quota', { headers: H }), fetch(BOT + '/message/quota/consumption', { headers: H })]);
+    if (q.ok && u.ok) {
+      const qj = await q.json(), uj = await u.json();
+      out.quota = { limit: qj.type === 'limited' ? Number(qj.value) : null, used: Number(uj.totalUsage) || 0 };
+      if (out.quota.limit != null && out.quota.used >= out.quota.limit)
+        P(`ข้อความแจ้งเตือนของเดือนนี้หมดโควตาแล้ว (${out.quota.used}/${out.quota.limit}) — แจ้งเตือนจะไม่ถึงใครจนขึ้นเดือนใหม่ หรืออัปเกรดแผน LINE OA`);
+    }
+  } catch (e) {}
   try {
     const r = await fetch(BOT + '/channel/webhook/endpoint', { headers: H });
     if (r.ok) { const j = await r.json(); out.webhook = { endpoint: j.endpoint || '', active: !!j.active }; }
@@ -129,6 +143,9 @@ export async function lineStatus(env, origin, notes = {}) {
     P(`LINE ส่งข้อความมาแล้วแต่ลายเซ็นไม่ผ่าน (${thTime(notes.badSig.at)}) — LINE_CHANNEL_SECRET ไม่ตรงกับช่องนี้ ก๊อป Channel secret จากแท็บ Basic settings มาใส่ใหม่`);
   if (notes.replyErr && (!notes.event || notes.replyErr.at >= notes.event.at))
     P(`ตอบกลับไม่สำเร็จ (${thTime(notes.replyErr.at)}, LINE ตอบ ${notes.replyErr.status}) ${notes.replyErr.detail || ''}`.trim());
+  const pe = notes.pushErr;
+  if (pe && (!notes.pushOk || pe.at > notes.pushOk.at))
+    P(`ส่งแจ้งเตือนครั้งล่าสุดไม่สำเร็จ (${thTime(pe.at)}) — ` + ({ 429: 'โควตาข้อความเดือนนี้หมด', 401: 'LINE_CHANNEL_TOKEN ใช้ไม่ได้แล้ว', 403: 'บัญชี LINE OA นี้ไม่มีสิทธิ์ส่งข้อความ push (ตรวจแผนของ OA)', 400: 'LINE ไม่รับข้อความ' }[pe.status] || `LINE ตอบ ${pe.status || 'ไม่ได้'}`) + (pe.detail ? ` (${pe.detail})` : ''));
   return out;
 }
 
