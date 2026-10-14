@@ -56,3 +56,13 @@ test('quote: reads every line, checks the sums itself, triages for this car and 
   assert.equal(buildFeatureRequest({tool:'listen',...fixtures.listen}).maxTokens,3000);
   assert.match(r.contents[0].parts[0].text,/"mileage":42000/,'car context reaches the model');
 });
+
+test('listen: describes the sound first, ranks causes for this car, judges urgency and never claims a definite diagnosis',()=>{
+  const r=buildFeatureRequest({tool:'listen',attachments:[{mime:'audio/wav',b64:'UklGRg=='},{mime:'image/jpeg',b64:'aGVsbG8='}],
+    question:'เสียงมาจาก: ห้องเครื่อง · ได้ยินตอน: เดินเบา',context:{car:{make:'Honda',model:'City',year:'2019',mileage:'42000'}}});
+  for(const re of [/where the owner hears the sound/,/what you actually hear/,/following road speed/,/most likely causes for this car/,/can be normal/,/stop driving/,/never while driving/,/Never claim a definitive diagnosis from audio/,/how to record again/,/frames from the owner's video/])
+    assert.match(r.system,re);
+  assert.equal(r.contents[0].parts[1].inlineData.mimeType,'audio/wav','WAV from the app reaches the model');
+  assert.equal(r.contents[0].parts[2].inlineData.mimeType,'image/jpeg','video frames go along with the sound');
+  assert.match(r.contents[0].parts[0].text,/ห้องเครื่อง/);
+});
