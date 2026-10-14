@@ -1062,7 +1062,7 @@ const DEFAULT_SKILLS = [
    ═══════════════════════════════════════════════════════════════════ */
 const BRAND = {
   ai: 'Cendon',
-  company: 'Phasmion',
+  company: 'Cendon',
   founderEn: 'Anapat Maliwong',
   founderTh: 'อนพัทย์ มะลิวงศ์',
 };
