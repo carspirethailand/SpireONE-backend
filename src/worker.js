@@ -96,7 +96,7 @@ function rank(role) { return ROLE_RANK[role] || 0; }
    ยกเว้น ALTER TABLE สองบรรทัดที่ต้องดักข้อผิดพลาด "มีคอลัมน์นี้แล้ว" ทิ้ง
    ══════════════════════════════════════════════════════════════════ */
 
-const SCHEMA_VERSION = 21;
+const SCHEMA_VERSION = 22;
 
 /* ประเภทตัวถังที่แอปมีภาพรถให้ (ตรงกับ BODY_TYPES ในหน้าการาจ) */
 const CAR_BODIES = ['sedan', 'hatchback', 'suv', 'pickup', 'mpv', 'van', 'coupe', 'ev'];
@@ -442,6 +442,17 @@ const SCHEMA_SQL = [
   expires_at INTEGER NOT NULL,
   used       INTEGER NOT NULL DEFAULT 0
 )`,
+  /* ลิงก์เชื่อมบัญชีที่บอทส่งให้ (เริ่มจากในแชต LINE) — เก็บแค่แฮชของ token ไม่เก็บ token จริง
+     ใช้ได้ครั้งเดียว อายุ 15 นาที · name/picture = ชื่อและรูปใน LINE ให้หน้าเว็บโชว์ว่ากำลังเชื่อมกับใคร */
+  `CREATE TABLE IF NOT EXISTS line_link_token (
+  hash       TEXT PRIMARY KEY,
+  line_uid   TEXT NOT NULL,
+  name       TEXT,
+  picture    TEXT,
+  expires_at INTEGER NOT NULL,
+  used       INTEGER NOT NULL DEFAULT 0
+)`,
+  `CREATE INDEX IF NOT EXISTS idx_line_link_token_uid ON line_link_token(line_uid)`,
   `CREATE TABLE IF NOT EXISTS obd_device (
   device_id  TEXT PRIMARY KEY,     
   uid        TEXT NOT NULL,
@@ -2984,21 +2995,97 @@ async function lineLinkCode(env, lineUid, code) {
   const claim = await env.DB.prepare('UPDATE line_code SET used = 1 WHERE code = ? AND used = 0 AND expires_at > ?')
     .bind(code, Date.now()).run();
   if (!claim.meta.changes) return { ok: false, reason: 'used' };
+  await lineBind(env, lineUid, row.uid);
+  return { ok: true, uid: row.uid, moved: !!(cur && cur.uid !== row.uid) };
+}
+/* ผูก LINE นี้กับบัญชี uid — บัญชีหนึ่งรับแจ้งเตือนที่ LINE เดียว (LINE เดิมของบัญชีนี้เลิกรับ)
+   LINE นี้เคยผูกกับบัญชีอื่น = ย้ายมาบัญชีนี้ */
+async function lineBind(env, lineUid, uid) {
   await env.DB.batch([
     env.DB.prepare(`INSERT INTO line_link (line_uid, uid, lang, active, linked_at) VALUES (?, ?, 'th', 1, ?)
       ON CONFLICT(line_uid) DO UPDATE SET uid = excluded.uid, active = 1, linked_at = excluded.linked_at`)
-      .bind(lineUid, row.uid, Date.now()),
-    /* บัญชีหนึ่งรับแจ้งเตือนที่ LINE เดียว — LINE เดิมของบัญชีนี้เลิกรับ */
-    env.DB.prepare('UPDATE line_link SET active = 0 WHERE uid = ? AND line_uid <> ?').bind(row.uid, lineUid),
+      .bind(lineUid, uid, Date.now()),
+    env.DB.prepare('UPDATE line_link SET active = 0 WHERE uid = ? AND line_uid <> ?').bind(uid, lineUid),
   ]);
-  return { ok: true, uid: row.uid, moved: !!(cur && cur.uid !== row.uid) };
+}
+
+/* ─────────── เชื่อมบัญชีโดยเริ่มจากในแชต LINE ───────────
+   ผู้ใช้กดเมนู "เชื่อมบัญชี" (ส่งข้อความ "เชื่อมต่อบัญชี") → บอทสร้าง token ผูกกับ LINE user id นี้
+   → ส่งลิงก์หน้าเชื่อมต่อ (/line?t=…) → ผู้ใช้ล็อกอิน Cendon แล้วกดเชื่อมต่อ → หลังบ้านเทียบ token → ผูกบัญชี → push แจ้งว่าสำเร็จ
+   token สุ่ม 256 บิต ใช้ได้ครั้งเดียว 15 นาที เก็บแค่แฮช · หน้าเว็บโชว์ชื่อ/รูป LINE ให้เห็นก่อนกด กันโดนหลอกให้เชื่อมกับ LINE ของคนอื่น */
+const CMD_CONNECT = /^(เชื่อมต่อบัญชี|เชื่อมบัญชี|เชื่อมต่อ|เชื่อม line|เชื่อมไลน์|link account|connect)$/i;
+const LINK_TTL = 15 * 60000;
+const b64url = (b) => btoa(String.fromCharCode(...b)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+async function tokenHash(t) {
+  const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('line-link:' + t));
+  return [...new Uint8Array(d)].map((x) => x.toString(16).padStart(2, '0')).join('');
+}
+async function lineProfile(env, lineUid) {
+  try {
+    const r = await fetch(LINE_API + '/profile/' + encodeURIComponent(lineUid), { headers: { Authorization: 'Bearer ' + env.LINE_CHANNEL_TOKEN } });
+    if (!r.ok) return null;
+    const j = await r.json();
+    return { name: String(j.displayName || '').slice(0, 80), picture: /^https:\/\//.test(j.pictureUrl || '') ? String(j.pictureUrl).slice(0, 500) : '' };
+  } catch (e) { return null; }
+}
+async function lineConnectReply(env, lineUid, link) {
+  const token = b64url(crypto.getRandomValues(new Uint8Array(32))), now = Date.now();
+  const prof = await lineProfile(env, lineUid);
+  /* ลิงก์ใหม่แทนลิงก์เก่าของ LINE นี้ทันที · เก็บกวาดลิงก์ที่หมดอายุเกินวัน */
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM line_link_token WHERE line_uid = ? OR expires_at < ?').bind(lineUid, now - 86400000),
+    env.DB.prepare('INSERT INTO line_link_token (hash, line_uid, name, picture, expires_at, used) VALUES (?, ?, ?, ?, ?, 0)')
+      .bind(await tokenHash(token), lineUid, prof ? prof.name : '', prof ? prof.picture : '', now + LINK_TTL),
+  ]);
+  const url = appUrl(env, '/line?t=' + token);
+  let who = '';
+  if (link) { try { const u = await env.DB.prepare('SELECT name FROM users WHERE uid = ?').bind(link.uid).first(); who = (u && u.name) || ''; } catch (e) {} }
+  return card(link ? {
+    tag: 'เชื่อมบัญชี', title: `LINE นี้เชื่อมกับ${who ? 'บัญชี ' + who : 'บัญชี Cendon'} อยู่แล้ว ✓`, url, label: 'เปลี่ยนบัญชี',
+    lines: ['ถ้าต้องการย้ายไปเชื่อมกับบัญชีอื่น กดปุ่มด้านล่างแล้วล็อกอินบัญชีนั้น', 'ลิงก์ใช้ได้ 15 นาที ครั้งเดียว — อย่าส่งต่อให้คนอื่น'],
+  } : {
+    tag: 'เชื่อมบัญชี', title: 'เชื่อม LINE กับบัญชี Cendon', url, label: 'เชื่อมต่อบัญชี',
+    lines: ['กดปุ่มด้านล่าง ล็อกอิน Cendon (ถ้ายังไม่ได้ล็อกอิน) แล้วกด "เชื่อมต่อ"', 'จากนั้นงานช่าง ราคา ข้อความ และเตือนดูแลรถจะแจ้งที่นี่', 'ลิงก์ใช้ได้ 15 นาที ครั้งเดียว — อย่าส่งต่อให้คนอื่น'],
+  });
+}
+/* หน้าเว็บอ่านข้อมูลลิงก์ (ยังไม่ใช้) — บอกสถานะ และชื่อ/รูป LINE ที่จะเชื่อม */
+async function lineTokenRow(env, t) {
+  if (typeof t !== 'string' || !/^[A-Za-z0-9_-]{30,64}$/.test(t)) return null;
+  return await env.DB.prepare('SELECT * FROM line_link_token WHERE hash = ?').bind(await tokenHash(t)).first();
+}
+const tokenState = (row) => !row ? 'notfound' : row.used ? 'used' : row.expires_at <= Date.now() ? 'expired' : 'ok';
+/* กดเชื่อมต่อ: ใช้ token แบบอะตอม (กดซ้อนสองครั้งได้ผลครั้งเดียว) → ผูกบัญชี → push แจ้งใน LINE */
+async function lineConnect(env, uid, t) {
+  const row = await lineTokenRow(env, t), st = tokenState(row);
+  if (st !== 'ok') return { ok: false, state: st };
+  const claim = await env.DB.prepare('UPDATE line_link_token SET used = 1 WHERE hash = ? AND used = 0 AND expires_at > ?').bind(row.hash, Date.now()).run();
+  if (!claim.meta.changes) return { ok: false, state: 'used' };
+  const before = await lineUidFor(env, row.line_uid);
+  await lineBind(env, row.line_uid, uid);
+  const friend = await lineIsFriend(env, row.line_uid);
+  if (!friend) await env.DB.prepare('UPDATE line_link SET active = 2 WHERE line_uid = ? AND active = 1').bind(row.line_uid).run();
+  else {
+    let name = '';
+    try { const u = await env.DB.prepare('SELECT name FROM users WHERE uid = ?').bind(uid).first(); name = (u && u.name) || ''; } catch (e) {}
+    const r = await linePush(env, row.line_uid, [card({
+      tag: 'เชื่อมบัญชีสำเร็จ', title: `เชื่อม LINE กับ${name ? 'บัญชี ' + name : 'บัญชี Cendon ของคุณ'} แล้ว ✓`,
+      url: appUrl(env, '/profile'), label: 'เปิด Cendon',
+      lines: [before && before.uid !== uid ? 'ย้ายการแจ้งเตือนจากบัญชีเดิมมาที่บัญชีนี้แล้ว' : '',
+        'จากนี้แจ้งที่นี่: งานช่าง ราคา ข้อความในใบงาน และเตือนดูแลรถ',
+        'พิมพ์ถามเรื่องรถได้ตลอด หรือส่งรูปใบเสร็จจากอู่ให้ผมอ่านเลขไมล์เก็บไว้'],
+    })]).catch(() => null);
+    let detail = '';
+    if (r && !r.ok) try { detail = String((await r.json()).message || '').slice(0, 200); } catch (e) {}
+    await lineNote(env, r && r.ok ? 'line_last_push_ok' : 'line_last_push_error', r && r.ok ? {} : { status: r ? r.status : 0, detail });
+  }
+  return { ok: true, name: row.name || '', paused: !friend, oa: await lineOaId(env) };
 }
 
 async function lineLinkReply(env, lineUid, code) {
   let r;
   try { r = await lineLinkCode(env, lineUid, code); }
   catch (e) { return txt('เชื่อมบัญชีไม่สำเร็จครับ ระบบขัดข้องชั่วคราว ลองส่งรหัสเดิมอีกครั้งในอีกสักครู่'); }
-  const again = '\n\nขอรหัสใหม่: เปิดแอป Cendon → ตั้งค่า → บัญชี → เชื่อม LINE';
+  const again = '\n\nเชื่อมแบบง่ายกว่า: กดเมนู "เชื่อมบัญชี" ด้านล่าง หรือพิมพ์ "เชื่อมต่อบัญชี" แล้วกดลิงก์ที่ผมส่งให้';
   if (!r.ok) return txt('เชื่อมบัญชีไม่สำเร็จครับ\n\n' + ({
     expired: `รหัส ${code} หมดอายุแล้ว (รหัสใช้ได้ 20 นาที)`,
     used: `รหัส ${code} ถูกใช้ไปแล้ว`,
@@ -3038,12 +3125,14 @@ const CMD_HELP = /^(เมนู|ช่วยเหลือ|วิธีใช�
 
 async function lineHandleText(env, ev, link) {
   const t = String(ev.message.text || '').trim();
+  if (CMD_CONNECT.test(t)) return await lineConnectReply(env, ev.source.userId, link);
+  /* รหัส 6 ตัวแบบเดิม (ขอจากในแอป) ยังใช้ได้ */
   const code = lineCodeIn(t);
   if (code) return await lineLinkReply(env, ev.source.userId, code);
 
   if (CMD_HELP.test(t)) return txt(link ? LINE_HELP : LINE_HOWTO);
   if (CMD_MUTE.test(t) || CMD_UNMUTE.test(t) || CMD_MILES.test(t)) {
-    if (!link) return txt('ต้องเชื่อมบัญชีก่อนครับ — เปิดแอป Cendon → ตั้งค่า → บัญชี → เชื่อม LINE แล้วกดส่งรหัสมาที่นี่');
+    if (!link) return txt('ต้องเชื่อมบัญชีก่อนครับ — กดเมนู "เชื่อมบัญชี" ด้านล่าง หรือพิมพ์ "เชื่อมต่อบัญชี"');
     if (CMD_MUTE.test(t)) {
       await env.DB.prepare('UPDATE notify_state SET muted_until = ? WHERE uid = ?')
         .bind(Date.now() + 90 * 86400000, link.uid).run();
@@ -3108,7 +3197,7 @@ async function lineAsk(env, ev, link, text) {
     }
   } else {
     const lim = (await getConfig(env, 'limits', {})).anonDaily || parseInt(env.AI_ANON_DAILY_LIMIT || '15', 10);
-    if (usedToday >= lim) return txt(`วันนี้ถามครบ ${lim} ข้อความแล้วครับ\nเชื่อมบัญชี Cendon เพื่อถามต่อได้มากขึ้น และให้ผมรู้จักรถของคุณ: เปิดแอป → ตั้งค่า → บัญชี → เชื่อม LINE`);
+    if (usedToday >= lim) return txt(`วันนี้ถามครบ ${lim} ข้อความแล้วครับ\nเชื่อมบัญชี Cendon เพื่อถามต่อได้มากขึ้น และให้ผมรู้จักรถของคุณ: กดเมนู "เชื่อมบัญชี" ด้านล่าง หรือพิมพ์ "เชื่อมต่อบัญชี"`);
   }
 
   let carInfo = { make: '', model: '', year: '', mileage: '' }, carId = null;
@@ -3187,7 +3276,7 @@ async function lineNote(env, key, data) {
 /* ทักครั้งแรก / คนที่ยังไม่ได้ผูกบัญชี — ผู้ใช้มาจากแอปก่อนเสมอ จึงบอกทางเชื่อมจากในแอป */
 const LINE_HOWTO = `สวัสดีครับ ผมคือ ${BRAND.ai} ผู้ช่วยดูแลรถและหาช่าง\n\n`
   + 'พิมพ์ถามเรื่องรถได้เลยครับ เช่น "แอร์ไม่เย็นเกิดจากอะไร" หรือ "ผ้าเบรกควรเปลี่ยนตอนไหน"\n\n'
-  + 'รับแจ้งเตือนงานช่าง ราคา และข้อความทาง LINE: เปิดแอป → ตั้งค่า → บัญชี → เชื่อม LINE แล้วกดส่งรหัส 6 ตัวมาที่นี่\n\n'
+  + 'รับแจ้งเตือนงานช่าง ราคา และข้อความทาง LINE: กดเมนู "เชื่อมบัญชี" ด้านล่าง หรือพิมพ์ "เชื่อมต่อบัญชี"\n\n'
   + 'กดเมนูด้านล่างเพื่อหาช่าง หรือดูงานของคุณได้เลย';
 /* คนที่เชื่อมแล้วพิมพ์ "เมนู" / "help" */
 const LINE_HELP = 'ผมช่วยอะไรได้บ้าง\n\n'
@@ -3223,7 +3312,7 @@ async function lineWebhook(env, ev) {
   let msg;
   try {
     if (ev.message.type === 'image') {
-      if (!link) msg = txt('เชื่อมบัญชีก่อนนะครับ — เปิดแอป → บัญชี → เชื่อม LINE');
+      if (!link) msg = txt('เชื่อมบัญชีก่อนนะครับ — กดเมนู "เชื่อมบัญชี" ด้านล่าง หรือพิมพ์ "เชื่อมต่อบัญชี"');
       else msg = await lineHandleImage(env, ev, link);
     } else if (ev.message.type === 'text') {
       msg = await lineHandleText(env, ev, link);
@@ -3727,6 +3816,27 @@ export default {
              paused = เชื่อมแล้วแต่ยังไม่ได้เพิ่มเพื่อน/บล็อก Cendon ใน LINE จึงยังส่งแจ้งเตือนไม่ได้ */
           const on = !!(r && r.active === 1);
           return json({ linked: on, paused: !!(r && r.active === 2), linkedAt: r ? r.linked_at : null, oa: await lineOaId(env) });
+        })();
+      }
+      /* หน้าเชื่อมต่อ (/line?t=…) ที่บอทส่งลิงก์ให้ — ต้องล็อกอิน Cendon ก่อน
+         GET = ดูว่าลิงก์ยังใช้ได้ไหม และกำลังจะเชื่อมกับ LINE ชื่ออะไร · POST = กดเชื่อมต่อ */
+      if (url.pathname === '/api/line/connect' && request.method === 'GET') {
+        return await guarded('user', async (actor) => {
+          const row = await lineTokenRow(env, url.searchParams.get('t'));
+          const st = tokenState(row);
+          const cur = await env.DB.prepare('SELECT line_uid FROM line_link WHERE uid = ? AND active IN (1, 2)').bind(actor.payload.sub).first();
+          return json({ state: st, name: row && st === 'ok' ? row.name || '' : '', picture: row && st === 'ok' ? row.picture || '' : '',
+            expiresAt: row ? row.expires_at : null, linked: !!cur, same: !!(cur && row && cur.line_uid === row.line_uid), oa: await lineOaId(env) });
+        })();
+      }
+      if (url.pathname === '/api/line/connect' && request.method === 'POST') {
+        return await guarded('user', async (actor) => {
+          const b = await readBody();
+          const r = await lineConnect(env, actor.payload.sub, b && b.t);
+          if (!r.ok) return json({ error: { notfound: 'ไม่พบลิงก์นี้ — กลับไปที่ LINE แล้วกดเมนู "เชื่อมบัญชี" ใหม่',
+            used: 'ลิงก์นี้ถูกใช้ไปแล้ว — กลับไปที่ LINE แล้วกดเมนู "เชื่อมบัญชี" ใหม่', expired: 'ลิงก์หมดอายุแล้ว (ใช้ได้ 15 นาที) — กลับไปที่ LINE แล้วกดเมนู "เชื่อมบัญชี" ใหม่' }[r.state], state: r.state }, 410);
+          await logAudit(env, actor.email || actor.payload.sub, 'line.connect', '', r.paused ? 'not friend yet' : 'ok').catch(() => {});
+          return json(r);
         })();
       }
       if (url.pathname === '/api/line/link' && request.method === 'DELETE') {

@@ -25,13 +25,15 @@ function setup({failCreate=false}={}){
 }
 const OWNER='dev:boss:boss@unit.test';
 
-test('LINE menu: admin sets six tiles that open the app in the phone browser, then removes only our old menu',async()=>{
+test('LINE menu: admin sets six tiles (five open the app in the phone browser, one starts linking in the chat), then removes only our old menu',async()=>{
   const {call,seen}=setup();
   const r=await call(OWNER,'/api/admin/line/richmenu',{});
   assert.equal(r.status,200,JSON.stringify(r));assert.equal(r.richMenuId,'new1');assert.equal(r.removed,1);
   const made=JSON.parse(seen.find(s=>s.u==='https://api.line.me/v2/bot/richmenu'&&s.m==='POST').init.body);
   assert.deepEqual(made.size,{width:2500,height:1686});assert.equal(made.areas.length,6);assert.ok(made.chatBarText.length<=14);
-  for(const a of made.areas){assert.match(a.action.uri,/^https:\/\/app\.unit\.test\/.*openExternalBrowser=1$/);assert.ok(a.bounds.x+a.bounds.width<=2500&&a.bounds.y+a.bounds.height<=1686);}
+  for(const a of made.areas){if(a.action.type==='uri')assert.match(a.action.uri,/^https:\/\/app\.unit\.test\/.*openExternalBrowser=1$/);assert.ok(a.bounds.x+a.bounds.width<=2500&&a.bounds.y+a.bounds.height<=1686);}
+  assert.equal(made.areas.filter(a=>a.action.type==='uri').length,5);
+  assert.deepEqual(made.areas[5].action,{type:'message',label:'เชื่อมบัญชี',text:'เชื่อมต่อบัญชี'},'bottom-right tile sends the connect message');
   assert.equal(made.areas.reduce((n,a)=>n+a.bounds.width*a.bounds.height,0),2500*1686,'tiles cover the whole image with no gaps');
   const up=seen.find(s=>s.u==='https://api-data.line.me/v2/bot/richmenu/new1/content');assert.equal(up.init.headers['Content-Type'],'image/png');
   assert.ok(seen.some(s=>s.u==='https://api.line.me/v2/bot/user/all/richmenu/new1'&&s.m==='POST'),'set as everyone\'s menu');
@@ -52,5 +54,5 @@ test('LINE bot: a word like CENDON is not taken as a link code (it goes to the A
   const reply=await post({type:'message',replyToken:'rt',source:{userId:'Unew'},message:{type:'text',text:'สวัสดี CENDON'}});
   assert.doesNotMatch(reply,/รหัส|เชื่อมบัญชีไม่สำเร็จ/);assert.deepEqual(asked,['สวัสดี CENDON']);
   const hi=await post({type:'follow',replyToken:'rt2',source:{userId:'Unew'}});
-  assert.match(hi,/พิมพ์ถามเรื่องรถได้เลย/);assert.match(hi,/บัญชี → เชื่อม LINE/);assert.match(hi,/รหัส 6 ตัว/);
+  assert.match(hi,/พิมพ์ถามเรื่องรถได้เลย/);assert.match(hi,/กดเมนู "เชื่อมบัญชี"/);assert.match(hi,/เชื่อมต่อบัญชี/);
 });

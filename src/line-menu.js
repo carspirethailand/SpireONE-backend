@@ -2,7 +2,7 @@
    เมนูในห้องแชต LINE ของ Cendon (rich menu)
 
    6 ช่อง 3×2 บนรูปขนาด 2500×1686 — รูปอยู่ในเว็บ: /img/line-richmenu.png
-   ทุกปุ่มเปิดแอปใน "เบราว์เซอร์ของเครื่อง" (openExternalBrowser=1) เหมือนปุ่มในการ์ดแจ้งเตือน
+   ปุ่มเปิดแอปใน "เบราว์เซอร์ของเครื่อง" (openExternalBrowser=1) เหมือนปุ่มในการ์ดแจ้งเตือน · ยกเว้น "เชื่อมบัญชี" ที่ส่งข้อความในแชต
 
    ตั้งครั้งเดียวจากหน้าแอดมิน → ตั้งค่าเว็บ → เมนูในห้องแชต LINE
    ขั้นตอน: สร้างเมนู → อัปโหลดรูป → ตั้งเป็นเมนูของทุกคน → ลบเมนูรุ่นก่อนของเราทิ้ง
@@ -16,14 +16,15 @@ const BOT_DATA = 'https://api-data.line.me/v2/bot';
 const NAME = 'cendon-main';
 const IMG = '/img/line-richmenu.png';
 
-/* ลำดับเดียวกับรูป: แถวบน ซ้าย→ขวา แล้วแถวล่าง */
+/* ลำดับเดียวกับรูป: แถวบน ซ้าย→ขวา แล้วแถวล่าง
+   ช่องที่เป็น { text } = กดแล้วส่งข้อความนั้นในแชต (ไม่เปิดเว็บ) — "เชื่อมบัญชี" ให้บอทส่งลิงก์หน้าเชื่อมต่อกลับมา */
 export const MENU_TILES = [
   ['หาช่าง', '/'],
   ['ถาม AI', '/chat'],
   ['งานของฉัน', '/?jobs=1'],
   ['รถของฉัน', '/garage'],
   ['สำหรับช่าง', '/?studio=1'],
-  ['บัญชี', '/profile'],
+  ['เชื่อมบัญชี', { text: 'เชื่อมต่อบัญชี' }],
 ];
 
 export function richMenuBody(env) {
@@ -37,7 +38,7 @@ export function richMenuBody(env) {
       const c = i % 3, r = Math.floor(i / 3);
       return {
         bounds: { x: W.slice(0, c).reduce((a, b) => a + b, 0), y: r * H, width: W[c], height: H },
-        action: { type: 'uri', label, uri: appUrl(env, path) },
+        action: typeof path === 'object' ? { type: 'message', label, text: path.text } : { type: 'uri', label, uri: appUrl(env, path) },
       };
     }),
   };

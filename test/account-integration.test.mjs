@@ -49,7 +49,7 @@ test('account integration: anonymous onboarding requests are denied before datab
 test('account integration: canonical setup and preference PATCH operate through the Worker with CORS',async()=>{
   const f=await fixture();f.add('fresh');f.add('second');
   const initial=await f.call();assert.equal(initial.status,200);assert.equal(initial.json.status,'required');
-  assert.equal(f.sqlite.prepare("SELECT value FROM config WHERE key='schema_version'").get().value,'21');
+  assert.equal(f.sqlite.prepare("SELECT value FROM config WHERE key='schema_version'").get().value,'22');
   const done=await f.call('POST','/api/onboarding',form());assert.equal(done.status,200);assert.equal(done.json.completed,true);
   assert.equal(done.headers.get('Access-Control-Allow-Origin'),'https://cendon.unit.test');
   assert.match(done.headers.get('Access-Control-Allow-Methods'),/PATCH/);assert.equal(done.headers.get('Cache-Control'),'private, no-store');
@@ -102,14 +102,14 @@ test('account integration: rollout snapshots existing completion once before pro
   assert.equal(f.batchCalls,1,'schema snapshot does not rerun during later requests');
 });
 
-test('account integration: failed rollout is unavailable, rolls back the snapshot and does not mark schema 21',async()=>{
+test('account integration: failed rollout is unavailable, rolls back the snapshot and does not mark the new schema version',async()=>{
   const f=await fixture({legacy:[{uid:'old',setup:{v:3,level:'basic'}}],failSnapshot:true});f.add('fresh');
   const failed=await f.call();assert.equal(failed.status,503);assert.equal(failed.json.error,'Account services are temporarily unavailable');
   assert.equal(f.sqlite.prepare("SELECT value FROM config WHERE key='schema_version'").get().value,'19');
   assert.equal(f.sqlite.prepare("SELECT COUNT(*) n FROM sqlite_master WHERE name='user_onboarding'").get().n,0);
   assert.equal(f.sqlite.prepare("SELECT COUNT(*) n FROM config WHERE key='onboarding_seed_done'").get().n,0);
   f.clearFailure();assert.equal((await f.call()).status,200);assert.equal((await f.call('GET','/api/onboarding',undefined,'old')).json.ready,true);
-  assert.equal(f.sqlite.prepare("SELECT value FROM config WHERE key='schema_version'").get().value,'21');
+  assert.equal(f.sqlite.prepare("SELECT value FROM config WHERE key='schema_version'").get().value,'22');
 });
 
 test('account integration: verified local-test owners and banned ordinary users follow the Worker guards',async()=>{

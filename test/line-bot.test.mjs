@@ -51,7 +51,7 @@ test('LINE bot: a code that cannot be used says why, and how to get a new one',a
   const {f,say,code}=setup();code('EXP234','suda',{ago:3600000});code('USD234','suda',{used:1});
   for(const [c,why] of [['EXP234',/หมดอายุ/],['USD234',/ถูกใช้ไปแล้ว/],['NXPE23',/ไม่พบรหัส/]]){
     const t=words((await say('รหัสเชื่อมบัญชี '+c))[0]);
-    assert.match(t,/^เชื่อมบัญชีไม่สำเร็จ/);assert.match(t,why);assert.match(t,/ขอรหัสใหม่/);
+    assert.match(t,/^เชื่อมบัญชีไม่สำเร็จ/);assert.match(t,why);assert.match(t,/เชื่อมต่อบัญชี/,'points to the simpler link-from-LINE way');
   }
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) n FROM line_link').get().n,0);
 });
