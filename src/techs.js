@@ -25,7 +25,7 @@ const CHECKS = ['identity', 'phone', 'work', 'skills', 'shop', 'terms'];
    ใบรับรองฝีมือไม่บังคับ — ช่างเก่งจำนวนมากไม่มีใบ ทีมงานสัมภาษณ์ทักษะแทนได้ */
 const DOCS = [['id', 1, 1], ['selfie', 1, 1], ['shop', 1, 3], ['work', 3, 6], ['cert', 0, 2]];
 const PRIVATE_DOCS = ['id', 'selfie', 'cert'];
-const API_VERSION = 10;
+const API_VERSION = 11;
 const PHONE = /^0\d{8,9}$/;
 const now = () => Date.now();
 
@@ -114,6 +114,10 @@ const TECH_SQL = [
 const TECH_ALTER = [
   /* ไฟล์แนบในข้อความ (รูป/วิดีโอ/เสียง) — JSON [{id, kind, mime, size}] ไฟล์จริงอยู่ในตาราง media */
   `ALTER TABLE tech_messages ADD COLUMN media TEXT`,
+  /* แก้/ยกเลิกข้อความ: edited_at = เวลาแก้ล่าสุด (หน้าแชตใช้ดึงข้อความที่เปลี่ยน) · orig_text = ข้อความแรกสุด เก็บไว้ให้ทีมงานดูตอนมีข้อพิพาท */
+  `ALTER TABLE tech_messages ADD COLUMN edited_at INTEGER`,
+  `ALTER TABLE tech_messages ADD COLUMN deleted_at INTEGER`,
+  `ALTER TABLE tech_messages ADD COLUMN orig_text TEXT`,
   /* รหัสเริ่มงาน (ลูกค้าบอกช่างเมื่อพบกันจริง) และงานเพิ่มที่ลูกค้าต้องกดยอมรับ */
   `ALTER TABLE tech_jobs ADD COLUMN start_code TEXT`,
   `ALTER TABLE tech_jobs ADD COLUMN start_exp INTEGER`,
@@ -770,11 +774,48 @@ function jobOut(j, t, role, messages) {
   return out;
 }
 
-async function messagesOf(env, jobId, after) {
-  const { results } = await env.DB.prepare(
-    'SELECT id, role, text, at, media FROM tech_messages WHERE job_id = ? AND id > ? ORDER BY id ASC LIMIT 500')
-    .bind(jobId, after || 0).all();
-  return results.map(({ media, ...m }) => { const l = parse(media); return l && l.length ? { ...m, media: l } : m; });
+/* since = ข้อความที่ถูกแก้/ยกเลิกหลังเวลานี้ส่งมาด้วย (แม้ id เก่ากว่า after) อีกฝ่ายจะเห็นการแก้ภายในรอบดึงถัดไป */
+function msgOut({ media, edited_at, deleted_at, ...m }) {
+  if (deleted_at) return { id: m.id, role: m.role, text: '', at: m.at, deleted: true, editedAt: edited_at || deleted_at };
+  const l = parse(media), o = l && l.length ? { ...m, media: l } : m;
+  return edited_at ? { ...o, editedAt: edited_at } : o;
+}
+async function messagesOf(env, jobId, after, since) {
+  const cols = 'SELECT id, role, text, at, media, edited_at, deleted_at FROM tech_messages WHERE job_id = ?';
+  const { results } = await (since > 0
+    ? env.DB.prepare(cols + ' AND (id > ? OR edited_at >= ?) ORDER BY id ASC LIMIT 500').bind(jobId, after || 0, since)
+    : env.DB.prepare(cols + ' AND id > ? ORDER BY id ASC LIMIT 500').bind(jobId, after || 0)).all();
+  return results.map(msgOut);
+}
+/* แก้/ยกเลิกข้อความของตัวเอง: แก้ได้ภายใน 15 นาที · ยกเลิกได้ภายใน 24 ชั่วโมง (แบบ LINE)
+   ห้องต้องยังเปิดอยู่ · อีกฝ่ายเห็นว่า "แก้ไขแล้ว" / "ยกเลิกข้อความแล้ว" · ข้อความเดิมเก็บไว้ให้ทีมงานดูตอนมีข้อพิพาทเท่านั้น */
+const EDIT_MS = 15 * 60000, UNSEND_MS = 24 * 3600000;
+async function changeMessage(env, me, id, b, action) {
+  const msg = await env.DB.prepare('SELECT * FROM tech_messages WHERE id = ?').bind(Number(id) || 0).first();
+  if (!msg || msg.uid !== me.uid) fail(404, 'ไม่พบข้อความ');
+  if (msg.deleted_at) fail(409, 'ยกเลิกข้อความนี้ไปแล้ว');
+  const th = await env.DB.prepare('SELECT id FROM tech_threads WHERE id = ?').bind(msg.job_id).first();
+  let hide = true;
+  if (th) { if ((await threadCtx(env, me, msg.job_id)).role === 'admin') fail(403, 'ผู้ดูแลอ่านได้อย่างเดียว'); }
+  else {
+    const { j, role } = await loadJob(env, me, msg.job_id);
+    if (role === 'admin') fail(403, 'ผู้ดูแลอ่านได้อย่างเดียว');
+    if (['completed', 'cancelled'].includes(j.status)) fail(409, 'ใบงานปิดแล้ว แก้หรือยกเลิกข้อความไม่ได้');
+    hide = !j.accepted_at;
+  }
+  await limit(env, 'msgedit', me.uid, 100);
+  const age = now() - msg.at, ts = now();
+  if (action === 'edit') {
+    if (age > EDIT_MS) fail(409, 'แก้ข้อความได้ภายใน 15 นาทีหลังส่ง');
+    let text = str(b.text, 'ข้อความ', parse(msg.media) ? 0 : 1, 2000);
+    /* เบอร์/ไลน์ยังถูกซ่อนเหมือนตอนส่ง — แก้ข้อความไม่ใช่ช่องทางเลี่ยง */
+    if (hide) text = mask(text);
+    if (text !== msg.text) await env.DB.prepare('UPDATE tech_messages SET text = ?, edited_at = ?, orig_text = COALESCE(orig_text, text) WHERE id = ?').bind(text, ts, msg.id).run();
+  } else {
+    if (age > UNSEND_MS) fail(409, 'ยกเลิกข้อความได้ภายใน 24 ชั่วโมงหลังส่ง');
+    await env.DB.prepare("UPDATE tech_messages SET deleted_at = ?, edited_at = ?, orig_text = COALESCE(orig_text, text), text = '' WHERE id = ?").bind(ts, ts, msg.id).run();
+  }
+  return { message: msgOut(await env.DB.prepare('SELECT id, role, text, at, media, edited_at, deleted_at FROM tech_messages WHERE id = ?').bind(msg.id).first()) };
 }
 async function markRead(env, jobId, uid, last) {
   if (!last) return;
@@ -833,7 +874,7 @@ async function threadsOut(env, me, rows, myTechId) {
   const ids = rows.map(r => r.id);
   const [techs, last, unread, users, gigs] = await Promise.all([
     inAll(env, 'SELECT id, data FROM tech_profiles WHERE id IN ({IN})', [...new Set(rows.map(r => r.tech_id))]),
-    inAll(env, 'SELECT job_id, role, text, at, media FROM tech_messages WHERE id IN (SELECT MAX(id) FROM tech_messages WHERE job_id IN ({IN}) GROUP BY job_id)', ids),
+    inAll(env, 'SELECT job_id, role, text, at, media, deleted_at FROM tech_messages WHERE id IN (SELECT MAX(id) FROM tech_messages WHERE job_id IN ({IN}) GROUP BY job_id)', ids),
     inAll(env, `SELECT m.job_id, COUNT(*) AS n FROM tech_messages m
       LEFT JOIN tech_reads r ON r.job_id = m.job_id AND r.uid = ?
       WHERE m.job_id IN ({IN}) AND m.uid != ? AND m.id > COALESCE(r.last, 0) GROUP BY m.job_id`, ids, [me.uid], [me.uid]),
@@ -851,7 +892,7 @@ async function threadsOut(env, me, rows, myTechId) {
     return { id: th.id, techId: th.tech_id, techName: tn[th.tech_id] || 'ช่าง', customerName: cn[th.customer_uid] || '',
       role: cust ? 'customer' : tech ? 'technician' : 'admin', test: !!th.test,
       gig: th.gig_id ? { id: th.gig_id, title: gn[th.gig_id] || '' } : null,
-      last: l ? { role: l.role, text: (l.text || mediaLabel(parse(l.media))).slice(0, 140), at: l.at } : null, unread: un[th.id] || 0,
+      last: l ? { role: l.role, text: (l.deleted_at ? 'ยกเลิกข้อความแล้ว' : l.text || mediaLabel(parse(l.media))).slice(0, 140), at: l.at } : null, unread: un[th.id] || 0,
       createdAt: th.created_at, updatedAt: th.updated_at };
   });
 }
@@ -922,9 +963,9 @@ async function startThread(env, me, b) {
   const [thread] = await threadsOut(env, me, [{ ...th, updated_at: message.at }], null);
   return { thread, message };
 }
-async function openThread(env, me, id, after) {
+async function openThread(env, me, id, after, since) {
   const ctx = await threadCtx(env, me, id);
-  const messages = await messagesOf(env, id, after);
+  const messages = await messagesOf(env, id, after, since);
   if (ctx.role !== 'admin' && messages.length) await markRead(env, id, me.uid, messages[messages.length - 1].id);
   const myTech = ctx.role === 'technician' ? ctx.t.id : null;
   const [thread] = await threadsOut(env, me, [ctx.th], myTech);
@@ -1047,9 +1088,9 @@ async function getJob(env, me, id) {
 }
 
 /* ดึงเฉพาะข้อความใหม่ — หน้าแชตเรียกทุกไม่กี่วินาที จึงต้องเบาที่สุด */
-async function pollJob(env, me, id, after) {
+async function pollJob(env, me, id, after, since) {
   const { j, role } = await loadJob(env, me, id);
-  const messages = await messagesOf(env, id, after);
+  const messages = await messagesOf(env, id, after, since);
   if (role !== 'admin' && messages.length) await markRead(env, id, me.uid, messages[messages.length - 1].id);
   return { messages, status: j.status, revision: j.revision };
 }
@@ -1848,7 +1889,7 @@ async function route(request, env, verifyToken) {
   if (p === '/api/tech/threads' && m === 'GET') return myThreads(env, me, url);
   if (p === '/api/tech/threads' && m === 'POST') return startThread(env, me, await body());
   const thm = p.match(/^\/api\/tech\/threads\/([0-9a-f-]{36})$/i);
-  if (thm && m === 'GET') return openThread(env, me, thm[1], Number(url.searchParams.get('after')) || 0);
+  if (thm && m === 'GET') return openThread(env, me, thm[1], Number(url.searchParams.get('after')) || 0, Number(url.searchParams.get('since')) || 0);
   if (thm && m === 'POST') return replyThread(env, me, thm[1], await body());
   if (p === '/api/tech/posts' && m === 'POST') return createPost(env, me, await body());
   if (p === '/api/tech/posts' && m === 'GET') return myPosts(env, me);
@@ -1871,7 +1912,9 @@ async function route(request, env, verifyToken) {
   mm = p.match(/^\/api\/tech\/groups\/([0-9a-f-]{36})$/i);
   if (mm && m === 'GET') return groupOf(env, me, mm[1]);
   mm = p.match(/^\/api\/tech\/jobs\/([0-9a-f-]{36})\/messages$/i);
-  if (mm && m === 'GET') return pollJob(env, me, mm[1], Number(url.searchParams.get('after')) || 0);
+  if (mm && m === 'GET') return pollJob(env, me, mm[1], Number(url.searchParams.get('after')) || 0, Number(url.searchParams.get('since')) || 0);
+  mm = p.match(/^\/api\/tech\/messages\/(\d+)\/(edit|delete)$/);
+  if (mm && m === 'POST') return changeMessage(env, me, mm[1], await body(), mm[2]);
   fail(404, 'ไม่พบปลายทาง');
 }
 

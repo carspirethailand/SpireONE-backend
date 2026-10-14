@@ -47,3 +47,12 @@ test('feature endpoint rejects anonymous access before invoking any model',async
   const response=await worker.fetch(new Request('https://local.test/api/features/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tool:'quote',...fixtures.quote})}),{ALLOWED_ORIGINS:'*',DB},{});
   assert.equal(response.status,401);
 });
+
+test('quote: reads every line, checks the sums itself, triages for this car and never states estimates as fact',()=>{
+  const r=buildFeatureRequest({tool:'quote',...fixtures.quote,context:{car:{make:'Honda',model:'City',year:2019,mileage:42000}}});
+  for(const re of [/every legible line/,/never guess a number/,/arithmetic yourself/,/VAT \(7% in Thailand\)/,/urgent/,/upsells/,/labour charged twice/,/not a reference price/,/questions to ask this garage/,/retake the photo/])
+    assert.match(r.system,re);
+  assert.equal(r.maxTokens,4096,'room for long quotes');
+  assert.equal(buildFeatureRequest({tool:'listen',...fixtures.listen}).maxTokens,3000);
+  assert.match(r.contents[0].parts[0].text,/"mileage":42000/,'car context reaches the model');
+});
