@@ -3,7 +3,7 @@ import { EMAIL_AUTH_SQL, handleEmailAuth, deleteFirebaseUser } from './email-aut
 import { exportAccount, resetAccount, deleteAccount, deleteBlockers } from './account-data.js';
 import { ONBOARDING_SQL, handleOnboarding, onboardingName, sanitizeSetupState } from './onboarding.js';
 import { buildFeatureRequest } from './features-ai.mjs';
-import { handleTech, reconcileDiditIdentities, vaultSweep, expireStaleApplications } from './techs.js';
+import { handleTech, reconcileDiditIdentities, vaultSweep, expireStaleApplications, releaseWrongHolds } from './techs.js';
 import { richMenuStatus, setupRichMenu, lineStatus, lineFixWebhook } from './line-menu.js';
 import { appUrl, card } from './line-notify.js';
 import { refreshNews, newsStatus } from './news.js';
@@ -6185,6 +6185,8 @@ ${convo}`;
     ctx.waitUntil(reconcileDiditIdentities(env).catch(() => {}));
     /* ตู้เซฟใบสมัคร: เข้ารหัสแถวรุ่นเก่าที่ยังอ่านออก / เข้ารหัสใหม่หลังเปลี่ยนกุญแจ (ทีละชุด ทุกชั่วโมง) */
     ctx.waitUntil(vaultSweep(env).catch(e => console.error('vault sweep', e && e.message)));
+    /* ร้านที่ถูกพักผิดเพราะ session Didit ค้าง → เปิดกลับ (ไม่แตะการพักของทีมงาน) */
+    ctx.waitUntil(releaseWrongHolds(env).catch(e => console.error('release holds', e && e.message)));
     /* นิตยสาร: เช็กทุกชั่วโมง อัปเดตจริงทุก 5 ชั่วโมง (รอบของตัวเอง ไม่พ่วงงานหนักรายวัน) */
     if (event.cron === NEWS_CRON) { ctx.waitUntil(refreshNews(env)); return; }
     if (event.cron !== '*/10 * * * *') {

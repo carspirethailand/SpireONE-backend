@@ -84,7 +84,7 @@ export function jobCard(env, kind, j, shop, x = {}) {
   let q = {}; try { q = JSON.parse(j.quote || '{}') || {}; } catch (e) {}
   const car = j.car || 'รถของคุณ';
   switch (kind) {
-    case 'request': return card({ tag: 'คำขอราคาใหม่', title: car, url, label: 'ดูและเสนอราคา', lines: [
+    case 'request': return card({ tag: j.urgent ? 'งานด่วน — รถเสียตอนนี้' : 'คำขอราคาใหม่', title: car, url, label: j.urgent ? 'ดูและตอบด่วน' : 'ดูและเสนอราคา', lines: [
       cut(j.symptom, 90), 'พื้นที่ ' + j.area, 'สะดวก ' + j.requested_time,
       j.mode === 'mobile' ? 'ให้ช่างไปหาถึงที่' : 'ลูกค้านำรถเข้าร้าน'] });
     case 'quote': return card({ tag: 'ได้ราคาแล้ว', title: `${shop} เสนอราคา ฿${money(q.total)}`, url, label: 'ดูใบเสนอราคา', lines: [

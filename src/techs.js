@@ -139,6 +139,8 @@ const TECH_ALTER = [
   `ALTER TABLE tech_profiles ADD COLUMN last_seen INTEGER`,
   /* 1 = ร้านถูกพักเพราะผลยืนยันตัวตนกับ Didit ยังไม่ผ่าน (ปลดเองเมื่อ Didit ผ่าน) · 0 = ถ้า suspended=1 คือทีมงานระงับ ปลดได้เฉพาะทีมงาน */
   `ALTER TABLE tech_profiles ADD COLUMN id_hold INTEGER NOT NULL DEFAULT 0`,
+  /* 1 = งานด่วน (รถเสียตอนนี้) — Studio ขึ้นสีแดงบนสุด · การ์ด LINE บอกว่าด่วน */
+  `ALTER TABLE tech_jobs ADD COLUMN urgent INTEGER NOT NULL DEFAULT 0`,
   `CREATE TABLE IF NOT EXISTS tech_posts (
   id TEXT PRIMARY KEY, customer_uid TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', test INTEGER NOT NULL DEFAULT 0,
   car TEXT NOT NULL, symptom TEXT NOT NULL, cat TEXT, lat REAL NOT NULL, lng REAL NOT NULL, area TEXT NOT NULL,
@@ -738,10 +740,33 @@ async function syncIdentity(env, uid) {
   /* A later Didit review hides the public profile and prevents new work (id_hold=1).
      A subsequent approved decision restores only a profile held for this reason;
      a suspension made by staff (suspended=1, id_hold=0) is never lifted by Didit. */
-  if (f.status !== 'approved') await env.DB.prepare('UPDATE tech_profiles SET id_hold=CASE WHEN suspended=0 OR id_hold=1 THEN 1 ELSE 0 END,suspended=1,online=0,updated_at=? WHERE uid=? AND test=0')
+  /* ร้านที่อนุมัติแบบทีมงานตรวจบัตรเอง ไม่ผูกกับ Didit · ผลค้าง (ยังไม่เริ่ม/ทำไม่เสร็จ/หมดอายุ) ไม่ใช่เหตุพักร้าน
+     เคยพักร้านที่อนุมัติแล้วทุกชั่วโมงเพราะ session ค้าง → ร้านหายจากลูกค้า งานด่วนไม่ถึง */
+  if (await holdable(env, uid, f.status)) await env.DB.prepare('UPDATE tech_profiles SET id_hold=CASE WHEN suspended=0 OR id_hold=1 THEN 1 ELSE 0 END,suspended=1,online=0,updated_at=? WHERE uid=? AND test=0')
     .bind(t, uid).run();
-  else await env.DB.prepare('UPDATE tech_profiles SET suspended=0,id_hold=0,updated_at=? WHERE uid=? AND test=0 AND id_hold=1').bind(t, uid).run();
+  else if (f.status === 'approved') await env.DB.prepare('UPDATE tech_profiles SET suspended=0,id_hold=0,updated_at=? WHERE uid=? AND test=0 AND id_hold=1').bind(t, uid).run();
   return { ...cur, status: f.status, id_hash: idHash, data: JSON.stringify(next), updated_at: t };
+}
+/* ผล Didit นี้ควรพักร้านไหม: ใบสมัครที่อนุมัติแล้วต้องเป็นโหมด Didit และผลใหม่ต้องเป็น "Didit ขอตรวจซ้ำ" หรือ "ไม่ผ่าน" เท่านั้น */
+const HOLD_STATUS = ['review', 'declined'];
+async function holdable(env, uid, status) {
+  if (!HOLD_STATUS.includes(status)) return false;
+  const a = await openApp(env, await env.DB.prepare("SELECT uid,data FROM tech_applications WHERE uid=? AND status='approved'").bind(uid).first());
+  return !!a && (parse(a.data) || {}).idMode === 'didit';
+}
+/* ปลดร้านที่ถูกพักผิด (รอบเก่าพักเพราะ session Didit ค้าง หรือร้านอนุมัติแบบทีมงานตรวจบัตร) — cron ทุกชั่วโมง ไม่แตะการพักของทีมงาน */
+export async function releaseWrongHolds(env) {
+  await ensureTech(env);
+  const { results } = await env.DB.prepare("SELECT p.uid, i.status FROM tech_profiles p LEFT JOIN tech_identity i ON i.uid = p.uid WHERE p.id_hold = 1 AND p.test = 0 LIMIT 50").all();
+  let n = 0;
+  for (const r of results) {
+    try {
+      if (await holdable(env, r.uid, r.status || 'none')) continue;
+      const u = await env.DB.prepare('UPDATE tech_profiles SET suspended=0,id_hold=0,updated_at=? WHERE uid=? AND id_hold=1').bind(now(), r.uid).run();
+      n += u.meta.changes || 0;
+    } catch (e) { console.error('release hold', e && e.message); }
+  }
+  return { released: n };
 }
 async function refreshIdentity(env, me) {
   if (!diditReady(env)) fail(409, 'ระบบยืนยันตัวตนออนไลน์ยังไม่เปิด');
@@ -756,7 +781,7 @@ async function refreshIdentity(env, me) {
 export async function reconcileDiditIdentities(env, max = 50) {
   if(!diditReady(env)) return { checked: 0 };
   await ensureTech(env);
-  const {results}=await env.DB.prepare("SELECT uid FROM tech_identity WHERE status IN ('pending','review') ORDER BY updated_at ASC LIMIT ?").bind(Math.max(1,Math.min(100,max))).all();
+  const {results}=await env.DB.prepare("SELECT i.uid FROM tech_identity i JOIN tech_applications a ON a.uid=i.uid WHERE i.status IN ('pending','review') AND (a.status='pending' OR i.status='review') ORDER BY i.updated_at ASC LIMIT ?").bind(Math.max(1,Math.min(100,max))).all();
   let checked=0;
   for(const row of results){ try { await syncIdentity(env,row.uid); checked++; } catch(e) { console.error('didit reconcile',e&&e.message); } }
   return { checked };
@@ -1039,7 +1064,7 @@ function jobOut(j, t, role, messages) {
   const accepted = !!j.accepted_at;
   const d = parse(t && t.data) || {};
   const out = {
-    id: j.id, status: j.status, test: !!j.test, role, revision: j.revision,
+    id: j.id, status: j.status, test: !!j.test, role, revision: j.revision, urgent: !!j.urgent,
     techId: j.tech_id, techName: d.shop || d.name || 'ช่าง', group: j.group_id || null,
     car: j.car, symptom: j.symptom, area: j.area, requestedTime: j.requested_time, mode: j.mode,
     quote: parse(j.quote), completion: j.completion, dispute: j.dispute, resolution: j.resolution,
@@ -1139,7 +1164,7 @@ async function myJobs(env, me, myTech, all) {
     const q = parse(j.quote);
     return { id: j.id, status: j.status, test: !!j.test, techName: nm[j.tech_id] || 'ช่าง', techId: j.tech_id,
       group: j.group_id || null, total: q ? q.total : null,
-      car: j.car, symptom: j.symptom, createdAt: j.created_at, updatedAt: j.updated_at,
+      car: j.car, symptom: j.symptom, createdAt: j.created_at, updatedAt: j.updated_at, urgent: !!j.urgent,
       side: cust && tech ? 'both' : cust ? 'customer' : tech ? 'technician' : 'admin',
       needsMe, unread: un[j.id] || 0 };
   });
@@ -1326,13 +1351,15 @@ async function createJob(env, me, b) {
   }
   const ts = now();
   const photos = mediaIn(b);
-  await env.DB.prepare(`INSERT INTO tech_jobs (id,tech_id,customer_uid,status,test,car,symptom,area,address,phone,requested_time,mode,history,revision,created_at,updated_at,group_id,note)
-    VALUES (?,?,?,'requested',?,?,?,?,?,?,?,?,?,1,?,?,?,?)`).bind(
+  /* งานด่วน: รถเสียตอนนี้ ลูกค้ากดชิปอาการสั้น ๆ ("แบตหมด") ก็พอ ไม่บังคับเล่ายาว */
+  const urgent = b.urgent ? 1 : 0;
+  await env.DB.prepare(`INSERT INTO tech_jobs (id,tech_id,customer_uid,status,test,car,symptom,area,address,phone,requested_time,mode,history,revision,created_at,updated_at,group_id,note,urgent)
+    VALUES (?,?,?,'requested',?,?,?,?,?,?,?,?,?,1,?,?,?,?,?)`).bind(
     id, t.id, me.uid, t.test ? 1 : 0,
-    str(b.car, 'รถ / รุ่น / ปี', 2, 200), str(b.symptom, 'อาการ', 10, 2000),
+    str(b.car, 'รถ / รุ่น / ปี', 2, 200), str(b.symptom, 'อาการ', urgent ? 3 : 10, 2000),
     str(b.area, 'พื้นที่', 4, 160), str(b.address, 'ที่อยู่', 8, 500), phone(b.phone, 'เบอร์โทร'),
     str(b.requestedTime, 'วันและเวลา', 4, 160), mode,
-    JSON.stringify([{ status: 'requested', at: ts, by: 'customer' }]), ts, ts, group, noteIn(b)).run();
+    JSON.stringify([{ status: 'requested', at: ts, by: 'customer' }]), ts, ts, group, noteIn(b), urgent).run();
   /* ขอหลายร้านพร้อมกัน เก็บรูปชุดเดียวผูกกับชุดคำขอ ไม่ต้องเก็บซ้ำทุกร้าน */
   await saveMedia(env, group || id, me.uid, photos);
   /* ตอบกลับอัตโนมัติของร้าน — ลูกค้ารู้ทันทีว่าร้านได้รับเรื่องแล้ว */
@@ -1754,7 +1781,7 @@ async function nearPosts(env, me) {
     mc.forEach(r => { pc[r.owner] = r.n; });
   }
   const posts = results.map(p => ({ p, dist: km(d.lat, d.lng, p.lat, p.lng) }))
-    .filter(x => x.dist <= radius && (!x.p.cat || (d.cats || []).includes(x.p.cat) || t.test))
+    .filter(x => x.dist <= radius && (!x.p.cat || (d.cats || []).includes(x.p.cat) || t.test || (x.p.urgent && (d.mobile || d.urgent))))
     .sort((a, b) => (b.p.urgent - a.p.urgent) || a.dist - b.dist)
     .map(x => postOut(x.p, { dist: roughKm(x.dist), mine: mine[x.p.id] || null, photos: pc[x.p.id] || 0 }));
   return { posts, radius, center: { lat: d.lat, lng: d.lng } };
@@ -1783,11 +1810,11 @@ async function offer(env, me, postId, b) {
     return { id, updated: true };
   }
   const d = parse(t.data) || {};
-  await env.DB.prepare(`INSERT INTO tech_jobs (id,tech_id,customer_uid,status,test,car,symptom,area,address,phone,requested_time,mode,quote,history,revision,created_at,updated_at,group_id,note)
-    VALUES (?,?,?,'quoted',?,?,?,?,?,?,?,?,?,?,1,?,?,?,?)`).bind(id, t.id, p.customer_uid, p.test || t.test ? 1 : 0,
+  await env.DB.prepare(`INSERT INTO tech_jobs (id,tech_id,customer_uid,status,test,car,symptom,area,address,phone,requested_time,mode,quote,history,revision,created_at,updated_at,group_id,note,urgent)
+    VALUES (?,?,?,'quoted',?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?)`).bind(id, t.id, p.customer_uid, p.test || t.test ? 1 : 0,
     p.car, p.symptom, p.area, p.address + ` · แผนที่ https://maps.google.com/?q=${p.lat},${p.lng}`, p.phone, p.requested_time,
     p.mode === 'mobile' && d.mobile ? 'mobile' : 'shop', quote,
-    JSON.stringify([{ status: 'requested', at: p.created_at, by: 'customer' }, { status: 'quoted', at: ts, by: 'technician' }]), ts, ts, p.id, p.note || '').run();
+    JSON.stringify([{ status: 'requested', at: p.created_at, by: 'customer' }, { status: 'quoted', at: ts, by: 'technician' }]), ts, ts, p.id, p.note || '', p.urgent ? 1 : 0).run();
   await env.DB.prepare('UPDATE tech_posts SET updated_at = ? WHERE id = ?').bind(ts, p.id).run();
   return { id };
 }
