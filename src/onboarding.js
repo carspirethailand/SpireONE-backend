@@ -1,7 +1,9 @@
 /* Account-scoped onboarding. Browser setup flags are preferences, never proof
  * that onboarding or the tutorial was completed. Birthday stays in this private
  * endpoint; do not include this table in public/user-directory projections. */
-export const ONBOARDING_VERSIONS = Object.freeze({terms: '2026-08-01-v1.0', privacy: '2026-08-01-v1.0'});
+/* รุ่นของข้อกำหนด/นโยบายที่ผู้ใช้ใหม่กดยอมรับ — ต้องตรงกับหัวหน้า /terms และ /privacy ของเว็บ (site/content)
+ * เปลี่ยนเนื้อหาสาระสำคัญเมื่อไร เปลี่ยนรุ่นที่นี่ด้วย · ผู้ใช้เดิมเก็บรุ่นที่เคยยอมรับไว้ ไม่ถูกบังคับทำ onboarding ใหม่ */
+export const ONBOARDING_VERSIONS = Object.freeze({terms: '2026-10-15-v1.1', privacy: '2026-10-15-v1.1'});
 export const ONBOARDING_LANGS = Object.freeze(['th','en','zh','ja','ko','id','vi','ms','de','fr','es','pt','ar']);
 export const ONBOARDING_CURRENCIES = Object.freeze(['THB','USD','EUR','GBP','JPY','CNY','SGD','AUD','CAD','CHF','NZD','HKD','MYR','IDR','KRW','VND','INR','TWD','AED']);
 const LEVELS = ['basic','advance','enthusiast'];
