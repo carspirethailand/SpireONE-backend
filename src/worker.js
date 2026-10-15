@@ -108,7 +108,7 @@ async function canTeachAI(env, actor) {
    ยกเว้น ALTER TABLE สองบรรทัดที่ต้องดักข้อผิดพลาด "มีคอลัมน์นี้แล้ว" ทิ้ง
    ══════════════════════════════════════════════════════════════════ */
 
-const SCHEMA_VERSION = 23;
+const SCHEMA_VERSION = 24;
 
 /* ประเภทตัวถังที่แอปมีภาพรถให้ (ตรงกับ BODY_TYPES ในหน้าการาจ) */
 const CAR_BODIES = ['sedan', 'hatchback', 'suv', 'pickup', 'mpv', 'van', 'coupe', 'ev'];
@@ -501,6 +501,10 @@ const SCHEMA_SQL = [
   SELECT id, title, body, keywords, make, model, author, 0, created_at, updated_at FROM kb
   WHERE substr(id, 1, instr(id, '_')) IN ('pos_','nda_','lgl_','vc_','sig_','mt_','msg_','ch_','hb_') OR (length(make) > 4 AND substr(make, 1, 2) = '__' AND substr(make, -2) = '__')`,
   `DELETE FROM kb WHERE id IN (SELECT id FROM ws_store)`,
+  /* schema 24: chat_logs เก็บแค่ตัวเลขโทเคนแล้ว — ลบเนื้อหาบทสนทนาเก่าที่เคยเก็บไว้ทิ้ง (บทสนทนาจริงอยู่ในบัญชีผู้ใช้ที่เดียว) */
+  `UPDATE chat_logs SET prompt = '', response = '' WHERE prompt != '' OR response != ''`,
+  /* คำตอบใช้ซ้ำเก่าที่มีอีเมลหรือเลขยาว (อาจเป็นเบอร์โทร) ติดอยู่ — ลบทิ้ง ไม่เสี่ยงส่งต่อให้คนอื่น */
+  `DELETE FROM qa_cache WHERE question LIKE '%@%' OR answer LIKE '%@%' OR question GLOB '*[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*' OR answer GLOB '*[0-9][0-9][0-9]-[0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]*'`,
 ];
 
 /* จำไว้ในหน่วยความจำของ isolate ว่าตรวจไปแล้ว จะได้ไม่อ่าน config ทุกคำขอ
@@ -1276,7 +1280,10 @@ async function cacheLookup(env, carInfo, question) {
   } catch (e) { console.error('[cacheLookup]', e); return null }
 }
 
-async function cacheSave(env, carInfo, question, answer) {
+/* คำตอบที่เก็บไว้ตอบซ้ำ "ใช้ร่วมกับทุกคนที่ใช้รถรุ่นเดียวกัน" — ห้ามมีอะไรระบุตัวคนถามติดไปเด็ดขาด
+   มีเบอร์ อีเมล เลขบัตร/เลขยาว หรือชื่อ/อีเมลของเจ้าของบัญชี (AI ถูกบอกให้เรียกชื่อผู้ใช้) = ไม่เก็บ */
+const CACHE_PII = /(\+?\d[\d\s-]{7,}\d)|([\w.+-]+@[\w-]+\.[\w.]+)|(line\s*id|ไลน์ไอดี)/i;
+async function cacheSave(env, carInfo, question, answer, uid) {
   const make = String(carInfo.make || '').toLowerCase();
   const model = String(carInfo.model || '').toLowerCase();
   if (!make && !model) return;
@@ -1284,6 +1291,21 @@ async function cacheSave(env, carInfo, question, answer) {
   if (qn.length < 6 || !answer || answer.length < 40) return;
   /* คำตอบที่ยังถามข้อมูลเพิ่มอยู่ ไม่ใช่คำตอบจบ อย่าเก็บไว้ใช้ซ้ำ */
   if (/\[\[ASK\]\]/.test(answer)) return;
+  if (CACHE_PII.test(question) || CACHE_PII.test(answer)) return;
+  if (uid) {
+    try {
+      const [u, st] = await Promise.all([
+        env.DB.prepare('SELECT name, email FROM users WHERE uid = ?').bind(uid).first(),
+        env.DB.prepare("SELECT v FROM user_state WHERE uid = ? AND k = 'setup'").bind(uid).first(),
+      ]);
+      let nick = ''; try { nick = (JSON.parse((st && st.v) || '{}') || {}).name || ''; } catch {}
+      const marks = [u && u.name, u && u.email, u && String(u.email || '').split('@')[0], nick]
+        .flatMap(x => [String(x || '').trim(), ...String(x || '').trim().split(/\s+/)])
+        .filter(x => x.length >= 2).map(x => x.toLowerCase());
+      const hay = (String(question) + '\n' + String(answer)).toLowerCase();
+      if (marks.some(m => hay.includes(m))) return;
+    } catch (e) { return; }   /* ตรวจไม่ได้ = ไม่เสี่ยง ไม่เก็บ */
+  }
   const now = Date.now();
   try {
     await env.DB.prepare(`
@@ -3283,7 +3305,7 @@ async function lineAsk(env, ev, link, text) {
     try {
       await meterTokens(env, link.uid, meter);
       await env.DB.prepare(`INSERT INTO chat_logs (uid, car_id, prompt, response, in_tok, out_tok, total_tok, model, day, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(link.uid, carId, ('[LINE] ' + text).slice(0, 4000), answer.slice(0, 8000),
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(link.uid, carId, '[LINE]', '',
         meter.in, meter.out, meter.in + meter.out, (meter.src && meter.src.join(',')) || 'line', day, now).run();
     } catch (e) {}
   }
@@ -4845,12 +4867,12 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                 const day = new Date().toISOString().slice(0, 10);
                 await Promise.all([
                   (!hasMedia && !(body.skillIds && body.skillIds.length) && !needsFresh(question))
-                    ? cacheSave(env, carInfo, question, text) : null,
+                    ? cacheSave(env, carInfo, question, text, uid) : null,
                   rememberTurn(env, uid, body.carId, question, text),
                   env.DB.prepare(`
                     INSERT INTO chat_logs (uid, car_id, prompt, response, in_tok, out_tok, total_tok, model, day, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                  `).bind(uid, body.carId || null, question.slice(0, 4000), text.slice(0, 8000),
+                  `).bind(uid, body.carId || null, '', '',
                     meter.in, meter.out, meter.in + meter.out,
                     (meter.src && meter.src.join(',')) || 'stream', day, Date.now()).run(),
                 ]);
@@ -5001,7 +5023,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
             /* เก็บไว้ตอบซ้ำครั้งหน้า และจำไว้ว่าเคยคุยเรื่องนี้กัน */
             try {
               if (!hasMedia && !(body.skillIds && body.skillIds.length) && !needsFresh(question))
-                await cacheSave(env, carInfo, question, text);
+                await cacheSave(env, carInfo, question, text, actor.payload.sub);
               await rememberTurn(env, actor.payload.sub, body.carId, question, text);
             } catch (e) { console.error('[learn]', e) }
             
@@ -5012,10 +5034,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
               usage = Object.assign({ cost: meter.in + meter.out,
                                       in: meter.in, out: meter.out, src: meter.src }, q);
 
-              // บันทึกประวัติการแชทพร้อมโทเคนลงในตาราง chat_logs
-              const promptText = (body.contents && body.contents.length > 0 && body.contents[body.contents.length - 1].parts)
-                ? body.contents[body.contents.length - 1].parts.map(p => p.text || '').join(' ')
-                : '';
+              // chat_logs เก็บเฉพาะตัวเลขโทเคน (ดูต้นทุน) — ไม่เก็บข้อความที่ผู้ใช้คุย บทสนทนาอยู่ในบัญชีผู้ใช้ที่เดียว
               const day = new Date().toISOString().slice(0, 10);
               const now = Date.now();
               const modelName = (meter.src && meter.src.join(',')) || 'gpt-oss-20b:free';
@@ -5023,7 +5042,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
               await env.DB.prepare(`
                 INSERT INTO chat_logs (uid, car_id, prompt, response, in_tok, out_tok, total_tok, model, day, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-              `).bind(actor.payload.sub, body.carId || null, promptText.slice(0, 4000), text.slice(0, 8000), meter.in, meter.out, (meter.in + meter.out), modelName, day, now).run();
+              `).bind(actor.payload.sub, body.carId || null, '', '', meter.in, meter.out, (meter.in + meter.out), modelName, day, now).run();
             } catch (e) { console.error('[meter/chat_logs] write failed', e); }
             return json({ text, reasoning, usage });
           } catch (err) {

@@ -13,8 +13,10 @@
    ══════════════════════════════════════════════════════════════════ */
 
 /* ตารางที่ไม่มีข้อมูลรายคน (ใช้ร่วมกันทั้งแอป) — เทสต์ใช้ยืนยันว่าทุกตารางถูกจัดกลุ่มแล้ว */
+/* qa_cache = คำตอบใช้ซ้ำตามรุ่นรถ (ไม่มี uid · cacheSave ไม่เก็บคำถามที่มีชื่อ/อีเมล/เบอร์ของคนถาม)
+   part_prices / part_price_runs = ราคาอะไหล่ตามรุ่นรถ (ตารางรุ่นเก่าจาก migrations) */
 export const SHARED_TABLES = ['config', 'kb', 'qa_cache', 'magazine', 'shop', 'car_specs', 'vec_store', 'tech_views', 'tech_identity_events',
-  'auth_otp', 'auth_rate', 'media_parts', 'audit', 'tech_audit', 'spec_log', 'ws_store'];
+  'auth_otp', 'auth_rate', 'media_parts', 'audit', 'tech_audit', 'spec_log', 'ws_store', 'part_prices', 'part_price_runs'];
 
 const MINE = 'uid = ?';
 const MY_SHOP = 'tech_id IN (SELECT id FROM tech_profiles WHERE uid = ?)';
@@ -35,6 +37,10 @@ export const TABLES = [
   ['usage', MINE, []],
   ['usage_win', MINE, []],
   ['ai_events', MINE, []],
+  /* ตัวเลขโทเคนต่อครั้งที่ใช้ AI (ตั้งแต่ schema 24 ไม่เก็บข้อความ) */
+  ['chat_logs', MINE, []],
+  /* ตารางช่างรุ่นเก่า (migrations 0014) — อาจยังมีในฐานข้อมูลที่เคยรัน migration นั้น */
+  ['technicians', MINE, []],
   ['push_subs', MINE, ['endpoint', 'p256dh', 'auth']],
   ['push_jobs', MINE, []],
   ['feedback', MINE, []],
@@ -100,7 +106,7 @@ export async function exportAccount(env, uid, { email = '' } = {}) {
 
 /* ล้างข้อมูลการใช้งาน แต่คงบัญชี ร้านช่าง และการเชื่อม LINE ไว้ (ปุ่ม "รีเซ็ตบัญชี") */
 export const RESET_TABLES = ['user_onboarding', 'cars', 'usage', 'usage_win', 'user_state', 'user_memory', 'push_subs', 'push_jobs', 'chat_prefs',
-  'odo_anchor', 'odo_state', 'maint_item', 'notify_state', 'obd_device', 'spares_cache', 'ai_events'];
+  'odo_anchor', 'odo_state', 'maint_item', 'notify_state', 'obd_device', 'spares_cache', 'ai_events', 'chat_logs'];
 export async function resetAccount(env, uid) {
   const removed = {};
   for (const t of RESET_TABLES) {
@@ -176,7 +182,7 @@ export async function deleteAccount(env, uid, { email = '' } = {}) {
   add('tech_identity_claims', keepClaim
     ? await run(env, "UPDATE tech_identity_claims SET uid = 'deleted:' || id_hash WHERE uid = ?", uid)
     : await run(env, 'DELETE FROM tech_identity_claims WHERE uid = ?', uid));
-  for (const t of ['tech_applications', 'tech_identity', 'tech_docs', 'tech_media', 'tech_shares', 'tech_limits'])
+  for (const t of ['tech_applications', 'tech_identity', 'tech_docs', 'tech_media', 'tech_shares', 'tech_limits', 'technicians'])
     add(t, await run(env, `DELETE FROM ${t} WHERE uid = ?`, uid));
 
   /* LINE: ลบการเชื่อม ประวัติคุยกับบอท และลิงก์เชื่อมที่ค้าง */

@@ -61,9 +61,10 @@ const count=(db,sql,...a)=>{try{return db.prepare(sql).get(...a).n}catch(e){if(/
 
 test('PDPA: ทุกตารางในโค้ดต้องถูกจัดกลุ่ม (ข้อมูลรายคน หรือ ใช้ร่วมกัน) — เพิ่มตารางใหม่แล้วลืมใส่ = ฟ้อง',()=>{
   const names=new Set();
-  for(const f of readdirSync(new URL('../src/',import.meta.url))){
-    if(!/\.(m?js)$/.test(f))continue;
-    for(const m of readFileSync(new URL('../src/'+f,import.meta.url),'utf8').matchAll(/CREATE TABLE IF NOT EXISTS ([a-z_]+)/g))names.add(m[1]);
+  /* ทั้งโค้ดปัจจุบันและ migrations รุ่นเก่า — ตารางเก่าที่ยังค้างในฐานข้อมูลจริงก็ต้องลบได้ */
+  for(const dir of ['../src/','../migrations/'])for(const f of readdirSync(new URL(dir,import.meta.url))){
+    if(!/\.(m?js|sql)$/.test(f))continue;
+    for(const m of readFileSync(new URL(dir+f,import.meta.url),'utf8').matchAll(/CREATE TABLE (?:IF NOT EXISTS )?([a-z_]+)/gi))names.add(m[1].toLowerCase());
   }
   const known=new Set([...TABLES.map(t=>t[0]),...SHARED_TABLES]);
   const missing=[...names].filter(n=>!known.has(n));
@@ -149,4 +150,14 @@ test('PDPA: เจ้าของระบบลบบัญชีตัวเ�
   assert.equal(count(f.sqlite,"SELECT COUNT(*) n FROM media WHERE uid='me' AND scope='ai'"),0);
   assert.equal(count(f.sqlite,"SELECT COUNT(*) n FROM media WHERE uid='me' AND scope='thread:x'"),1,'ไฟล์ที่ส่งให้ช่างแล้วไม่ลบตอนรีเซ็ต');
   for(const t of ['users','line_link','tech_profiles'])assert.equal(count(f.sqlite,`SELECT COUNT(*) n FROM ${t} WHERE uid='me'`),1,t);
+});
+
+test('PDPA: chat_logs ไม่เก็บข้อความแชต · คำตอบใช้ซ้ำไม่เก็บถ้ามีชื่อ/อีเมล/เบอร์ของคนถาม',async()=>{
+  const src=readFileSync(new URL('../src/worker.js',import.meta.url),'utf8');
+  for(const m of src.matchAll(/INSERT INTO chat_logs[\s\S]{0,400}?\.bind\(([^)]*)/g)){
+    const args=m[1].split(',').map(x=>x.trim());
+    assert.ok(/^'[^']*'$/.test(args[2])&&args[3]==="''",'chat_logs ต้องไม่เก็บ prompt/response: '+args.slice(0,4).join(', '));
+  }
+  assert.match(src,/async function cacheSave\(env, carInfo, question, answer, uid\)/);
+  assert.match(src,/CACHE_PII\.test\(question\) \|\| CACHE_PII\.test\(answer\)/);
 });
