@@ -613,6 +613,13 @@ async function apply(env, me, b) {
     ]);
     return {ok:true,status:'rejected',result:'rejected',reasons};
   }
+  /* แจ้งทีมงานทาง LINE: มีใบสมัครรอตรวจ (รวบเป็นการ์ดเดียวต่อ 10 นาที) */
+  tellStaff(env, 'staff:apply', 600000, async () => {
+    const n = await env.DB.prepare("SELECT COUNT(*) AS n FROM tech_applications WHERE status = 'pending' AND test = 0").first();
+    return card({ tag: 'ทีมงาน', title: 'มีใบสมัครช่างใหม่รอตรวจ', label: 'เปิดหน้าตรวจใบสมัคร', url: appUrl(env, '/staff/review'),
+      lines: [`รอตรวจทั้งหมด ${(n && n.n) || 1} ใบ`, ai ? (ai.verdict === 'pass' ? 'AI คัดกรองเบื้องต้น: ไม่พบจุดสงสัย' : 'AI คัดกรอง: มีจุดที่ต้องดูเพิ่ม') : 'AI ยังคัดกรองไม่เสร็จ',
+        didit ? 'ตัวตน: ยืนยันผ่าน Didit' : 'ตัวตน: ทีมงานตรวจบัตรเอง'] });
+  });
   return {ok:true,status:'pending',result:'pending',screening:ai?{status:ai.status,verdict:ai.verdict}:null,
     identity:didit?{mode:'didit',status:ident?ident.status:'not_started'}:{mode:'manual'}};
 }
@@ -1223,6 +1230,26 @@ function tell(env, uid, make) {
 }
 const shopOf = (t) => { const d = parse(t && t.data) || {}; return d.shop || d.name || 'ร้านช่าง'; };
 
+/* แจ้งทีมงาน (OWNERS / admin / moderator ที่ผูก LINE แล้ว) ว่ามีงานรอ: ใบสมัครช่างใหม่ · ข้อพิพาท
+   key + ms = กันถี่ต่อคน (ใบสมัครหลายใบติดกันได้การ์ดเดียว ดูรวมในแอป) · การ์ดไม่มีชื่อ เบอร์ ที่อยู่ หรือเลขบัตร */
+async function staffUids(env) {
+  const own = owners(env);
+  const { results = [] } = await env.DB.prepare(`SELECT DISTINCT u.uid FROM users u JOIN line_link l ON l.uid = u.uid AND l.active = 1
+    WHERE COALESCE(u.banned, 0) = 0 AND (u.role IN ('admin', 'moderator') OR lower(u.email) IN (${own.map(() => '?').join(',') || "''"})) LIMIT 30`).bind(...own).all();
+  return results.map(r => r.uid);
+}
+function tellStaff(env, key, ms, make) {
+  if (!env.LINE_CHANNEL_TOKEN) return;
+  const p = (async () => {
+    const uids = await staffUids(env);
+    if (!uids.length) return;
+    const m = await make();
+    if (!m) return;
+    for (const uid of uids) if (await once(env, key, uid, ms)) await notify(env, uid, m);
+  })().catch(() => {});
+  if (env.bg) env.bg(p);
+}
+
 const DAY = 86400000;
 async function bumpView(env, techId, kind) {
   try {
@@ -1407,6 +1434,10 @@ async function updateJob(env, me, id, b) {
     complete: techUid, review: techUid, cancel: other, dispute: other }[action];
   if (dest && dest !== me.uid) tell(env, dest, () => jobCard(env, action, jj, shop, {
     note: b.note, by, rating: b.rating && Math.round(Number(b.rating)), text: b.note }));
+  /* ข้อพิพาท: ทีมงานต้องเข้าไปช่วยตัดสิน — แจ้งทุกใบ (กันกดซ้ำในใบเดียวกัน 1 ชั่วโมง) · งานทดสอบไม่แจ้ง */
+  if (action === 'dispute' && !j.test) tellStaff(env, 'staff:dispute:' + j.id, 3600000, async () => card({
+    tag: 'ทีมงาน', title: 'มีข้อพิพาทในใบงาน ต้องช่วยตัดสิน', label: 'เปิดใบงาน', url: appUrl(env, '/?job=' + j.id),
+    lines: [`ร้าน: ${shop}`, `รถ: ${j.car}`, `แจ้งโดย: ${by === 'customer' ? 'ลูกค้า' : 'ช่าง'}`] }));
   return { ok: true };
 }
 

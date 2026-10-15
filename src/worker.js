@@ -1,5 +1,6 @@
 import { verifyFirebaseToken } from './auth.js';
-import { EMAIL_AUTH_SQL, handleEmailAuth } from './email-auth.js';
+import { EMAIL_AUTH_SQL, handleEmailAuth, deleteFirebaseUser } from './email-auth.js';
+import { exportAccount, resetAccount, deleteAccount, deleteBlockers } from './account-data.js';
 import { ONBOARDING_SQL, handleOnboarding, onboardingName, sanitizeSetupState } from './onboarding.js';
 import { buildFeatureRequest } from './features-ai.mjs';
 import { handleTech, reconcileDiditIdentities } from './techs.js';
@@ -80,6 +81,17 @@ async function getActor(request, env) {
 
 function rank(role) { return ROLE_RANK[role] || 0; }
 
+/* ใครแก้คลังความรู้ AI ได้: แอดมินขึ้นไป หรือผู้ควบคุมที่แอดมินตั้งตำแหน่งเป็น "หัวหน้าฝ่าย AI" (ระเบียน pos_ ใน ws_store ซึ่งแอดมินเท่านั้นที่เขียนได้)
+   ความรู้ใน kb ถูกหยิบไปตอบผู้ใช้จริง จึงต้องไม่เปิดให้ทีมงานทุกคนเขียน */
+async function canTeachAI(env, actor) {
+  if (rank(actor.role) >= rank('admin')) return true;
+  if (actor.role !== 'moderator') return false;
+  try {
+    const row = await env.DB.prepare('SELECT keywords FROM ws_store WHERE id = ?').bind('pos_' + actor.payload.sub).first();
+    return JSON.parse((row && row.keywords) || '{}').p === 'head_ai';
+  } catch { return false; }
+}
+
 /* ══════════════════════════════════════════════════════════════════
    SCHEMA — ฐานข้อมูลสร้างตัวเองอัตโนมัติ ไม่ต้องรัน migration ด้วยมือ
 
@@ -96,7 +108,7 @@ function rank(role) { return ROLE_RANK[role] || 0; }
    ยกเว้น ALTER TABLE สองบรรทัดที่ต้องดักข้อผิดพลาด "มีคอลัมน์นี้แล้ว" ทิ้ง
    ══════════════════════════════════════════════════════════════════ */
 
-const SCHEMA_VERSION = 22;
+const SCHEMA_VERSION = 23;
 
 /* ประเภทตัวถังที่แอปมีภาพรถให้ (ตรงกับ BODY_TYPES ในหน้าการาจ) */
 const CAR_BODIES = ['sedan', 'hatchback', 'suv', 'pickup', 'mpv', 'van', 'coupe', 'ev'];
@@ -468,6 +480,27 @@ const SCHEMA_SQL = [
 )`,
   `CREATE INDEX IF NOT EXISTS idx_obd_car ON obd_device(car_id)`,
   `CREATE INDEX IF NOT EXISTS idx_obd_uid ON obd_device(uid)`,
+  /* ── ที่ทำงานของทีมงาน (หน้าแอดมิน): ห้องคุย ข้อความ ประชุม สัญญาณโทร ตำแหน่ง/แผนก ลายมือชื่อ NDA คู่มือระบบ ──
+     เดิมฝากไว้ในตาราง kb (คลังความรู้ AI) ทำให้ต้องให้ยศผู้ควบคุมเขียน kb ได้ และข้อความแชตดันความรู้จริงตกจากรายการ
+     แยกมาไว้ที่นี่ รูปแบบคอลัมน์เดียวกับ kb หน้าแอดมินเลยอ่านด้วยโค้ดเดิมได้ · AI ไม่เคยอ่านตารางนี้ */
+  `CREATE TABLE IF NOT EXISTS ws_store (
+  id         TEXT PRIMARY KEY,
+  title      TEXT NOT NULL DEFAULT '',
+  body       TEXT NOT NULL DEFAULT '',
+  keywords   TEXT NOT NULL DEFAULT '',
+  make       TEXT NOT NULL DEFAULT '',
+  model      TEXT NOT NULL DEFAULT '',
+  author     TEXT NOT NULL DEFAULT '',
+  enabled    INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+)`,
+  `CREATE INDEX IF NOT EXISTS idx_ws_updated ON ws_store(updated_at)`,
+  /* ย้ายของที่ทำงานที่เคยอยู่ใน kb มาที่นี่ครั้งเดียว (รหัสขึ้นต้นตามชนิด หรือ make แบบ __ชนิด__) แล้วลบออกจาก kb */
+  `INSERT OR IGNORE INTO ws_store (id, title, body, keywords, make, model, author, enabled, created_at, updated_at)
+  SELECT id, title, body, keywords, make, model, author, 0, created_at, updated_at FROM kb
+  WHERE substr(id, 1, instr(id, '_')) IN ('pos_','nda_','lgl_','vc_','sig_','mt_','msg_','ch_','hb_') OR (length(make) > 4 AND substr(make, 1, 2) = '__' AND substr(make, -2) = '__')`,
+  `DELETE FROM kb WHERE id IN (SELECT id FROM ws_store)`,
 ];
 
 /* จำไว้ในหน่วยความจำของ isolate ว่าตรวจไปแล้ว จะได้ไม่อ่าน config ทุกคำขอ
@@ -4168,6 +4201,54 @@ export default {
       /* ═══════════ คลังความรู้ — สอน AI ═══════════
          เขียนได้เฉพาะผู้ดูแลระบบขึ้นไป ความรู้ที่ใส่จะถูกใช้กับผู้ใช้ทุกคน
          จึงต้องมาจากคนที่รับผิดชอบได้ ไม่เปิดให้ทุกคนแก้ */
+      /* ═══════════ ที่ทำงานของทีมงาน (/api/ws) ═══════════
+         ห้องคุย ข้อความ ประชุม สัญญาณโทร ตำแหน่ง ลายมือชื่อ NDA คู่มือระบบ — แยกจากคลังความรู้ AI แล้ว
+         ยศผู้ควบคุมขึ้นไปอ่าน/เขียนได้ แต่ของที่ให้อำนาจหรือเป็นของคนอื่นถูกจำกัด:
+           pos_ (ตำแหน่ง/แผนก) และ hb_ (คู่มือระบบ) = แอดมินขึ้นไปเท่านั้น
+           nda_ / lgl_ = ลงนามได้เฉพาะชื่อตัวเอง · vc_ (อยู่ในห้องโทร) = ของตัวเองเท่านั้น */
+      if ((url.pathname === '/api/ws' || url.pathname.startsWith('/api/ws/')) && ['GET', 'POST', 'DELETE'].includes(request.method)) {
+        return await guarded('moderator', async (actor) => {
+          const uid = actor.payload.sub, admin = rank(actor.role) >= rank('admin');
+          const KIND = /^(pos|nda|lgl|vc|sig|mt|msg|ch|hb)_[A-Za-z0-9ก-๙:_.-]{1,160}$/;
+          const allowed = id => {
+            if (!KIND.test(id)) return false;
+            if (/^(pos|hb)_/.test(id)) return admin;
+            if (/^(nda|lgl)_/.test(id)) return admin || id.slice(4) === uid;
+            if (/^vc_/.test(id)) return admin || id.endsWith('__' + uid);
+            return true;
+          };
+          if (request.method === 'GET') {
+            const pre = url.searchParams.get('prefix') || '';
+            const rs = /^[a-z]{2,3}_$/.test(pre)
+              ? await env.DB.prepare('SELECT * FROM ws_store WHERE id >= ? AND id < ? ORDER BY updated_at DESC LIMIT 2000').bind(pre, pre.slice(0, -1) + '`').all()
+              : await env.DB.prepare('SELECT * FROM ws_store ORDER BY updated_at DESC LIMIT 2000').all();
+            /* คีย์ kb = รูปแบบเดียวกับ /api/kb หน้าแอดมิน/คู่มือใช้ตัวอ่านเดิมได้ */
+            return json({ kb: rs.results || [] });
+          }
+          if (request.method === 'DELETE') {
+            const id = decodeURIComponent(url.pathname.slice('/api/ws/'.length));
+            /* แอดมินลบได้ทุกแถว (รวมของที่เคยนำเข้าผิดรหัส) · ที่เหลือลบได้ตามสิทธิ์เขียน */
+            if (!admin && !allowed(id)) return deny('Forbidden', 403);
+            await env.DB.prepare('DELETE FROM ws_store WHERE id = ?').bind(id).run();
+            return json({ ok: true });
+          }
+          const b = (await readBody()) || {};
+          const id = String(b.id || '');
+          if (!allowed(id)) return deny('Forbidden', 403);
+          const now = Date.now();
+          await env.DB.prepare(`INSERT INTO ws_store (id, title, body, keywords, make, model, author, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET title = excluded.title, body = excluded.body, keywords = excluded.keywords,
+              make = excluded.make, model = excluded.model, updated_at = excluded.updated_at`)
+            .bind(id, String(b.title || '').slice(0, 200), String(b.body || '').slice(0, 20000), String(b.keywords || '').slice(0, 4000),
+              String(b.make || '').slice(0, 60), String(b.model || '').slice(0, 60), actor.email || '', now, now).run();
+          /* สัญญาณโทร/สถานะในห้องโทรที่ค้างเกินวัน ทิ้งไปเอง ไม่ให้ตารางบวม */
+          if (/^(sig|vc)_/.test(id)) await env.DB.prepare("DELETE FROM ws_store WHERE substr(id, 1, instr(id, '_')) IN ('sig_','vc_') AND updated_at < ?").bind(now - 86400000).run();
+          if (/^(pos|hb|nda|lgl)_/.test(id)) await logAudit(env, actor.email, 'ws.save', id, String(b.title || '').slice(0, 60));
+          return json({ ok: true, id });
+        })();
+      }
+
       if (url.pathname === '/api/kb' && request.method === 'GET') {
         return await guarded('moderator', async () => {
           const q = (url.searchParams.get('q') || '').trim().toLowerCase();
@@ -4182,6 +4263,7 @@ export default {
 
       if (url.pathname === '/api/kb' && request.method === 'POST') {
         return await guarded('moderator', async (actor) => {
+          if (!await canTeachAI(env, actor)) return deny('Forbidden: only admins or the Head of AI can change AI knowledge', 403);
           const b = (await readBody()) || {};
           const title = String(b.title || '').trim();
           const body2 = String(b.body || '').trim();
@@ -4210,6 +4292,7 @@ export default {
          หัวข้อซ้ำจะเขียนทับของเดิม จะได้กดนำเข้าซ้ำได้โดยไม่มีของซ้ำงอก */
       if (url.pathname === '/api/kb/bulk' && request.method === 'POST') {
         return await guarded('moderator', async (actor) => {
+          if (!await canTeachAI(env, actor)) return deny('Forbidden: only admins or the Head of AI can change AI knowledge', 403);
           const b = (await readBody()) || {};
           const items = Array.isArray(b.items) ? b.items : [];
           if (!items.length) return deny('ไม่มีรายการให้นำเข้า', 400);
@@ -4245,6 +4328,7 @@ export default {
 
       if (url.pathname.startsWith('/api/kb/') && request.method === 'DELETE') {
         return await guarded('moderator', async (actor) => {
+          if (!await canTeachAI(env, actor)) return deny('Forbidden: only admins or the Head of AI can change AI knowledge', 403);
           const id = url.pathname.split('/').pop();
           await env.DB.prepare('DELETE FROM kb WHERE id = ?').bind(id).run();
           await logAudit(env, actor.email, 'kb.delete', id, '');
@@ -4537,19 +4621,38 @@ export default {
         return await guarded('user', async (actor) => {
           const uid = actor.payload.sub;
           // ลบทีละตาราง ไม่ใช้ transaction เพราะ D1 ยังไม่รองรับข้าม statement
-          // ถ้าตารางไหนพลาด ตัวที่ลบไปแล้วยังถือว่าลบจริง จึงรายงานเป็นรายตาราง
-          const tables = ['user_onboarding', 'cars', 'usage', 'usage_win', 'user_state', 'user_memory', 'push_subs', 'push_jobs', 'chat_prefs'];
-          const removed = {};
-          for (const t of tables) {
-            try {
-              const r = await env.DB.prepare(`DELETE FROM ${t} WHERE uid = ?`).bind(uid).run();
-              removed[t] = (r.meta && r.meta.changes) || 0;
-            } catch (e) {
-              removed[t] = 'error: ' + String(e.message || e).slice(0, 80);
-            }
-          }
+          // ถ้าตารางไหนพลาด ตัวที่ลบไปแล้วยังถือว่าลบจริง จึงรายงานเป็นรายตาราง (รายการตารางอยู่ใน account-data.js)
+          const removed = await resetAccount(env, uid);
           await logAudit(env, actor.email, 'account.reset', uid, JSON.stringify(removed));
           return json({ ok: true, uid, removed });
+        })();
+      }
+
+      /* ดาวน์โหลดข้อมูลของฉัน (PDPA: สิทธิ์ขอรับสำเนาข้อมูล) — ไฟล์ JSON ทุกตารางที่ผูกกับบัญชี */
+      if (url.pathname === '/api/account/export' && request.method === 'GET') {
+        return await guarded('user', async (actor) => {
+          const uid = actor.payload.sub;
+          const data = await exportAccount(env, uid, { email: actor.email });
+          await logAudit(env, uid, 'account.export', uid, '');
+          return new Response(JSON.stringify(data, null, 2), { headers: { ...cors, 'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': 'private, no-store', 'Content-Disposition': `attachment; filename="cendon-data-${new Date().toISOString().slice(0, 10)}.json"` } });
+        })();
+      }
+
+      /* ลบบัญชีถาวร (PDPA: สิทธิ์ขอให้ลบ) — ต้องพิมพ์ยืนยัน · งานซ่อมที่ค้างต้องจบก่อน · ลบบัญชี Firebase ด้วยถ้าตั้งบัญชีบริการไว้ */
+      if (url.pathname === '/api/account/delete' && request.method === 'POST') {
+        return await guarded('user', async (actor) => {
+          const uid = actor.payload.sub;
+          if (actor.role === 'owner') return deny('Owners cannot delete their own account', 400);
+          const body = (await readBody()) || {};
+          if (body.confirm !== 'DELETE') return deny('Type DELETE to confirm', 400);
+          const busy = await deleteBlockers(env, uid);
+          if (busy.length) return json({ ok: false, error: 'active_jobs', jobs: busy.map(j => ({ id: j.id, status: j.status })) }, 409);
+          const removed = await deleteAccount(env, uid, { email: actor.email });
+          const firebaseDeleted = await deleteFirebaseUser(env, uid);
+          // บันทึกแค่ว่ามีการลบ (ไม่มีอีเมล/ชื่อ) ไว้เป็นหลักฐานว่าทำตามคำขอแล้ว
+          await logAudit(env, 'self', 'account.delete', uid, JSON.stringify({ ...removed, firebase: firebaseDeleted }));
+          return json({ ok: true, removed, firebaseDeleted });
         })();
       }
 

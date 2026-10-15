@@ -122,6 +122,37 @@ async function requestJSON(request) {
   return limited(readJSONBody(request.body, BODY_LIMIT, controller.signal), 5000, () => controller.abort());
 }
 
+/* บัญชีบริการ Firebase (ใช้สร้างผู้ใช้จากอีเมล และลบผู้ใช้ตอนลบบัญชีถาวร) — ตั้งไม่ครบหรือผิดรูป = null */
+async function serviceConfig(env) {
+  try {
+    if (typeof env.FIREBASE_SERVICE_ACCOUNT_JSON !== 'string') return null;
+    const service = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    if (service.type !== 'service_account' || !/^[a-z][a-z0-9-]{4,62}$/.test(env.FIREBASE_PROJECT_ID || '') || service.project_id !== env.FIREBASE_PROJECT_ID ||
+        typeof service.client_email !== 'string' || !/^[a-z0-9._-]+@[a-z0-9.-]+\.iam\.gserviceaccount\.com$/.test(service.client_email) ||
+        !service.client_email.endsWith(`@${env.FIREBASE_PROJECT_ID}.iam.gserviceaccount.com`) ||
+        typeof service.private_key !== 'string' || !service.private_key.includes('-----BEGIN PRIVATE KEY-----')) return null;
+    const signingKey = await importPKCS8(service.private_key, 'RS256');
+    const bits = signingKey.algorithm?.modulusLength || signingKey.asymmetricKeyDetails?.modulusLength;
+    if (!Number.isInteger(bits) || bits < 2048) return null;
+    return { service, signingKey, project: env.FIREBASE_PROJECT_ID };
+  } catch { return null; }
+}
+
+/* ลบผู้ใช้ออกจาก Firebase Authentication ฝั่งเซิร์ฟเวอร์ (ผู้ใช้กดลบบัญชีถาวร)
+   true = ลบแล้วหรือไม่มีอยู่แล้ว · false = ยังไม่ได้ตั้งบัญชีบริการ หรือเรียกไม่สำเร็จ (หน้าเว็บจะลบเองต่อ) */
+export async function deleteFirebaseUser(env, uid) {
+  try {
+    const config = await serviceConfig(env);
+    if (!config || typeof uid !== 'string' || !uid || uid.length > 128) return false;
+    const deadline = Date.now() + 12_000;
+    const access = await googleAccessToken(env, config, deadline);
+    const result = await fetchJSON(`https://identitytoolkit.googleapis.com/v1/projects/${config.project}/accounts:delete`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${access}` }, body: JSON.stringify({ localId: uid }),
+    }, deadline);
+    return result.ok || result.data?.error?.message === 'USER_NOT_FOUND';
+  } catch { return false; }
+}
+
 async function configuration(env) {
   try {
     if (!env.DB?.prepare || !env.DB?.batch || typeof env.AUTH_OTP_PEPPER !== 'string' || encoder.encode(env.AUTH_OTP_PEPPER).length < 32) return null;

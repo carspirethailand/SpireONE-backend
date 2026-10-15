@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {fixture,USER} from './tech-fixtures.mjs';
+import {fixture,USER,form} from './tech-fixtures.mjs';
 import {handleTech} from '../src/techs.js';
 
 const MECH='mech|mech@unit.test';
@@ -66,4 +66,36 @@ test('LINE: a failing LINE API never breaks the job',async()=>{
   const {f,call}=lineSetup();const tid=await withMechanic(f),id=crypto.randomUUID();
   globalThis.fetch=async()=>{throw Error('LINE down');};
   assert.equal((await call(USER,'/api/tech/jobs',job(tid,id))).status,200);
+});
+
+/* ทีมงาน: เจ้าของ (OWNERS ตามอีเมล) และ moderator ที่ผูก LINE แล้ว */
+function staffSetup(){
+  const x=lineSetup();
+  x.f.sqlite.exec('ALTER TABLE users ADD COLUMN email TEXT');
+  for(const [uid,role,email] of [['boss','user','boss@unit.test'],['mod','moderator','mod@unit.test'],['plain','user','plain@unit.test']]){
+    x.f.sqlite.prepare('INSERT INTO users (uid,role,banned,email) VALUES (?,?,0,?)').run(uid,role,email);
+    x.f.sqlite.prepare('INSERT INTO line_link VALUES (?,?,?,1,?)').run('U'+uid,uid,'th',Date.now());
+  }
+  return x;
+}
+test('LINE: ทีมงานได้การ์ดเมื่อมีใบสมัครช่างใหม่ — ไม่มีชื่อ เบอร์ หรือเลขบัตรผู้สมัคร และรวบเป็นการ์ดเดียวต่อ 10 นาที',async()=>{
+  const {call,pushes}=staffSetup();
+  const r=await call(USER,'/api/tech/apply',form());assert.equal(r.status,200,JSON.stringify(r));
+  const staff=pushes.filter(p=>/ใบสมัครช่างใหม่/.test(words(p)));
+  assert.deepEqual(staff.map(p=>p.body.to).sort(),['Uboss','Umod'],'เจ้าของกับทีมงานเท่านั้น ผู้ใช้ทั่วไปไม่ได้');
+  assert.match(words(staff[0]),/https:\/\/app\.unit\.test\/staff\/review\?openExternalBrowser=1/);
+  assert.ok(!/สมชาย|0812345678|1101700203450/.test(words(staff[0])),'ไม่มีข้อมูลส่วนตัวของผู้สมัครใน LINE');
+  const r2=await call('second|second@unit.test','/api/tech/apply',form({idNo:'3100503399632',phone:'0898765432'}));assert.equal(r2.status,200,JSON.stringify(r2));
+  assert.equal(pushes.filter(p=>/ใบสมัครช่างใหม่/.test(words(p))).length,2,'ใบที่สองภายใน 10 นาทีไม่ส่งซ้ำ');
+});
+test('LINE: ข้อพิพาทแจ้งทีมงานพร้อมลิงก์ใบงาน',async()=>{
+  const {f,call,pushes}=staffSetup();const tid=await withMechanic(f),id=crypto.randomUUID();
+  await call(USER,'/api/tech/jobs',job(tid,id));
+  const rev=async w=>(await call(w,'/api/tech/jobs/'+id)).job.revision;
+  await call(MECH,'/api/tech/jobs/'+id,{action:'quote',revision:await rev(MECH),labor:800,parts:400,travel:100,scope:'ล้างระบบแอร์และเติมน้ำยา',appointment:'พรุ่งนี้ 9 โมง',warranty:30});
+  assert.equal((await call(USER,'/api/tech/jobs/'+id,{action:'accept',revision:await rev(USER),consent:true})).status,200);
+  const d=await call(USER,'/api/tech/jobs/'+id,{action:'dispute',revision:await rev(USER),note:'ช่างไม่มาตามนัดและติดต่อไม่ได้เลย'});assert.equal(d.status,200,JSON.stringify(d));
+  const staff=pushes.filter(p=>/ข้อพิพาท/.test(words(p))&&['Uboss','Umod'].includes(p.body.to));
+  assert.equal(staff.length,2);assert.match(words(staff[0]),new RegExp('\\?job='+id));
+  assert.ok(!/0812345678|ซอยลับเฉพาะ/.test(words(staff[0])));
 });
