@@ -113,9 +113,11 @@ test('Didit session → signed webhook → decision re-fetched → approval work
   const me=(await f.call(USER,'/api/tech/me')).application;assert.deepEqual(me.identity,{mode:'didit',status:'approved',updatedAt:me.identity.updatedAt});
   const a=await staffView(f);assert.equal(a.identity.status,'approved');assert.equal(a.identity.name,'สมชาย ใจดี');assert.equal(a.identity.last3,'450');assert.deepEqual(a.identity.flags,[]);
   assert.ok(!JSON.stringify(f.sqlite.prepare('SELECT * FROM tech_identity').get()).includes('private.jpg'),'Didit image links are not stored');
-  assert.match(f.sqlite.prepare('SELECT id_hash FROM tech_applications').get().id_hash,/^[0-9a-f]{64}$/);
+  assert.match(f.sqlite.prepare('SELECT id_hash FROM tech_applications').get().id_hash,/^h2:[0-9a-f]{64}$/,'แฮชเลขบัตรแบบมีกุญแจเสมอ');
+  const rawIdent=f.sqlite.prepare('SELECT data FROM tech_identity').get().data;assert.match(rawIdent,/^enc:v1:/);assert.ok(!rawIdent.includes('สมชาย'),'ชื่อตามบัตรในฐานข้อมูลต้องอ่านไม่ออก');
   assert.equal((await f.call(ADMIN,'/api/tech/review',review(a,{evidence:didEv()}))).status,200);
-  const left=JSON.parse(f.sqlite.prepare('SELECT data FROM tech_identity').get().data);assert.equal(left.name,undefined);assert.equal(left.birth,undefined);assert.equal(left.last3,'450');
+  const {open,CTX}=await import('../src/vault.js');
+  const left=JSON.parse(await open(f.env,f.sqlite.prepare('SELECT data FROM tech_identity').get().data,CTX.ident('applicant')));assert.equal(left.name,undefined);assert.equal(left.birth,undefined);assert.equal(left.last3,'450');
   assert.equal((await f.call('','/api/tech')).techs[0].vetting.identity,true);
 });
 test('Didit: declined → applicant can try again; name mismatch needs a staff note; under-18 cannot be approved',async()=>{
@@ -150,7 +152,10 @@ test('Didit endpoints refuse when Didit is not configured or there is no applica
 /* ── แฮชเลขบัตรด้วยกุญแจลับ ── */
 test('ID_HASH_KEY: new hashes are keyed, old rows are upgraded on first request, duplicates still caught',async()=>{
   fakeVision();const f=fixture();await pending(f);
-  const legacy=f.sqlite.prepare('SELECT id_hash FROM tech_applications').get().id_hash;assert.match(legacy,/^[0-9a-f]{64}$/);
+  /* จำลองแถวเก่าที่ถูกแฮชแบบไม่มีกุญแจ (ก่อนมี ID_HASH_KEY) — ตอนนี้ระบบไม่ยอมรับใบสมัครถ้าไม่มีกุญแจแล้ว */
+  const {idHashOf}=await import('../src/tech-identity.js');const legacy=await idHashOf({},'1101700203450');
+  for(const t of ['tech_applications','tech_identity_claims'])f.sqlite.prepare(`UPDATE ${t} SET id_hash=?`).run(legacy);
+  assert.match(legacy,/^[0-9a-f]{64}$/);
   const g={...f,env:{...f.env,ID_HASH_KEY:'test-key-only'}};
   const {handleTech:h}=await import('../src/techs.js');const call=async(token,path,body)=>{const r=await h(new Request('https://unit.test'+path,{method:body?'POST':'GET',headers:{Authorization:'Bearer '+token},body:body?JSON.stringify(body):undefined}),{...f.env,ID_HASH_KEY:'test-key-only',DB:{...f.env.DB,prepare:f.env.DB.prepare,batch:f.env.DB.batch}},undefined,{verifyToken:async t=>{const [uid,email]=t.split('|');return {sub:uid,email,email_verified:true};}});return {...await r.json(),status:r.status};};
   fakeVision();const dup=await call('other|other@unit.test','/api/tech/apply',form());assert.equal(dup.status,409,'the same card on another account is still caught after the upgrade');

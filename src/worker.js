@@ -3,7 +3,7 @@ import { EMAIL_AUTH_SQL, handleEmailAuth, deleteFirebaseUser } from './email-aut
 import { exportAccount, resetAccount, deleteAccount, deleteBlockers } from './account-data.js';
 import { ONBOARDING_SQL, handleOnboarding, onboardingName, sanitizeSetupState } from './onboarding.js';
 import { buildFeatureRequest } from './features-ai.mjs';
-import { handleTech, reconcileDiditIdentities } from './techs.js';
+import { handleTech, reconcileDiditIdentities, vaultSweep, expireStaleApplications } from './techs.js';
 import { richMenuStatus, setupRichMenu, lineStatus, lineFixWebhook } from './line-menu.js';
 import { appUrl, card } from './line-notify.js';
 import { refreshNews, newsStatus } from './news.js';
@@ -6183,12 +6183,16 @@ ${convo}`;
     /* Didit retries only briefly; reconcile incomplete identity sessions on the
        hourly schedule (before the early return below) so a missed webhook cannot strand an applicant. */
     ctx.waitUntil(reconcileDiditIdentities(env).catch(() => {}));
+    /* ตู้เซฟใบสมัคร: เข้ารหัสแถวรุ่นเก่าที่ยังอ่านออก / เข้ารหัสใหม่หลังเปลี่ยนกุญแจ (ทีละชุด ทุกชั่วโมง) */
+    ctx.waitUntil(vaultSweep(env).catch(e => console.error('vault sweep', e && e.message)));
     /* นิตยสาร: เช็กทุกชั่วโมง อัปเดตจริงทุก 5 ชั่วโมง (รอบของตัวเอง ไม่พ่วงงานหนักรายวัน) */
     if (event.cron === NEWS_CRON) { ctx.waitUntil(refreshNews(env)); return; }
     if (event.cron !== '*/10 * * * *') {
       ctx.waitUntil(runPushRound(env));
       ctx.waitUntil(runOdoRound(env));
       ctx.waitUntil(refreshKb(env).catch(() => {}));
+      /* ใบสมัครช่างค้างรอตรวจเกิน 30 วัน: หมดอายุ ลบรูปบัตรทิ้ง แจ้งให้ส่งใหม่ */
+      ctx.waitUntil(expireStaleApplications(env).catch(e => console.error('expire apps', e && e.message)));
     }
   }
 };

@@ -46,16 +46,22 @@ export async function diditHook(f,sessionId,{secret=DIDIT.DIDIT_WEBHOOK_SECRET,t
   const r=await handleTech(new Request('https://unit.test/api/tech/didit/webhook',{method:'POST',headers:{'Content-Type':'application/json','X-Timestamp':String(ts),'X-Signature':await hmacHex(secret,raw)},body:raw}),f.env,undefined,{});
   return {...await r.json(),status:r.status};
 }
+export const TEST_DATA_KEY=Buffer.alloc(32,5).toString('base64');
 export function fixture(extra={}){
   const sqlite=new DatabaseSync(':memory:');sqlite.exec('CREATE TABLE users(uid TEXT PRIMARY KEY,role TEXT,banned INTEGER)');let queue=Promise.resolve();
   const DB={prepare(sql){let values=[];return {bind(...v){values=v;return this;},async first(){return sqlite.prepare(sql).get(...values)||null;},async all(){return {results:sqlite.prepare(sql).all(...values)};},async run(){const r=sqlite.prepare(sql).run(...values);return {meta:{changes:Number(r.changes)}};}};},batch(list){const task=queue.then(async()=>{sqlite.exec('BEGIN');try{const out=[];for(const st of list)out.push(await st.run());sqlite.exec('COMMIT');return out;}catch(e){sqlite.exec('ROLLBACK');throw e;}});queue=task.catch(()=>{});return task;}};
-  const env={DB,AI,OWNERS:'boss@unit.test',...extra};
+  /* กุญแจทดสอบเท่านั้น — ของจริงตั้งด้วย wrangler secret put (ดู DEPLOY.md) */
+  const env={DB,AI,OWNERS:'boss@unit.test',APP_DATA_KEY:TEST_DATA_KEY,ID_HASH_KEY:'test-only-id-hash-key',...extra};
   const verifyToken=async token=>{const [uid,email,verified]=token.split('|');if(!uid)throw Error('invalid');return {sub:uid,email,email_verified:verified!=='unverified'};};
   const call=async(token,path,body)=>{const r=await handleTech(new Request('https://unit.test'+path,{method:body?'POST':'GET',headers:token?{Authorization:'Bearer '+token}:{},body:body?JSON.stringify(body):undefined}),env,undefined,{verifyToken});return {...await r.json(),status:r.status};};
   return {call,sqlite,env};
 }
 export const USER='applicant|person@unit.test',ADMIN='boss|boss@unit.test';
-export async function pending(f,over={}){const r=await f.call(USER,'/api/tech/apply',form(over));if(r.status!==200)throw Error(JSON.stringify(r));return (await f.call(ADMIN,'/api/tech/applications')).applications[0];}
+/* ส่งใบสมัคร แล้วทีมงานตรวจเลขบัตรตามขั้นตอนปกติ (พิมพ์เลขที่เห็นบนรูปบัตร ระบบเทียบแฮช) · idcheck:false = ข้ามขั้นนี้ ใช้ทดสอบว่าระบบบังคับจริง */
+export async function pending(f,over={},{idcheck=true}={}){const body=form(over),r=await f.call(USER,'/api/tech/apply',body);if(r.status!==200)throw Error(JSON.stringify(r));
+  const a=(await f.call(ADMIN,'/api/tech/applications')).applications[0];
+  if(idcheck&&a.identity?.mode!=='didit'&&body.idNo){const c=await f.call(ADMIN,'/api/tech/review/idcheck',{uid:a.uid,idNo:body.idNo});if(!c.match)throw Error('idcheck '+JSON.stringify(c));}
+  return a;}
 /* ข้อสงสัยด่านบัตร (ทีมงานเทียบเลขบัตรเอง / ข้อสงสัยจาก Didit) ต้องมีบันทึกของทีมงาน — เติมให้เฉพาะด่านบัตร ด่านรูปผลงานยังให้แต่ละเทสต์กำหนดเอง */
 export const idNotes=a=>Object.fromEntries([...(a.ai?.flags||[]),...(a.identity?.flags||[])].filter(f=>f.source==='identity'&&f.level!=='low'&&!f.block).map(f=>[f.code,{outcome:'false_positive',note:'Test-only: compared the ID number digit by digit with the form.'}]));
 export const review=(a,over={})=>({uid:a.uid,revision:a.revision,decision:'approve',checks:Object.fromEntries(['identity','phone','work','skills','shop','terms'].map(k=>[k,true])),evidence:evidence(),note:'Test-only completed human review with evidence.',...over,resolutions:{...idNotes(a),...(over.resolutions||{})}});

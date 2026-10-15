@@ -1,3 +1,4 @@
+import { open, CTX } from './vault.js';
 /* ══════════════════════════════════════════════════════════════════
    ข้อมูลส่วนตัวของบัญชี (สิทธิ์ตาม PDPA): ดาวน์โหลดข้อมูลของฉัน · ล้างข้อมูล · ลบบัญชีถาวร
 
@@ -89,10 +90,18 @@ const unwrap = v => { if (typeof v !== 'string' || !/^[\[{]/.test(v)) return v; 
 
 /* ดาวน์โหลดข้อมูลของฉัน — ทุกตารางที่ผูกกับบัญชี ยกเว้นความลับของระบบ (กุญแจ token แฮชบัตร) และไฟล์ดิบ
    ไฟล์แนบ (รูป/เสียง/วิดีโอ) ให้เป็นรายการพร้อมรหัส เปิดดาวน์โหลดทีละไฟล์ได้จาก /api/media/<id> */
+/* ข้อมูลใบสมัครช่าง/ผลยืนยันตัวตนเก็บแบบเข้ารหัส (vault.js) — เจ้าของบัญชีดาวน์โหลดแล้วต้องอ่านได้ จึงถอดให้ตรงนี้ */
+const SEALED = { tech_applications: CTX.app, tech_identity: CTX.ident };
+async function unseal(env, table, r) {
+  const ctx = SEALED[table];
+  if (!ctx || r.data == null) return r;
+  try { return { ...r, data: await open(env, r.data, ctx(r.uid)) }; }
+  catch { return { ...r, data: null, data_note: 'ถอดรหัสไม่ได้ — ติดต่อทีมงาน' }; }
+}
 export async function exportAccount(env, uid, { email = '' } = {}) {
   const data = {};
   for (const [table, where, omit] of TABLES) {
-    const list = (await rows(env, table, where, uid)).map(r => Object.fromEntries(Object.entries(r).filter(([k]) => !omit.includes(k)).map(([k, v]) => [k, unwrap(v)])));
+    const list = (await Promise.all((await rows(env, table, where, uid)).map(r => unseal(env, table, r)))).map(r => Object.fromEntries(Object.entries(r).filter(([k]) => !omit.includes(k)).map(([k, v]) => [k, unwrap(v)])));
     if (!list.length) continue;
     const key = table === 'tech_jobs' && where === MY_SHOP ? 'tech_jobs_as_mechanic' : table;
     data[key] = (data[key] || []).concat(list);

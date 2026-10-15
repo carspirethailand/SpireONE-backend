@@ -119,6 +119,6 @@ test('uploads lose embedded GPS/EXIF and text metadata; plain images pass unchan
 test('staff actions are written to an audit log without full ID numbers; only admins can read it',async()=>{
   const {fakeVision,pending,review,ADMIN}=await import('./tech-fixtures.mjs');fakeVision();
   const f=fixture(),a=await pending(f);await f.call(ADMIN,'/api/tech/docs?uid='+a.uid);await f.call(ADMIN,'/api/tech/review',review(a));
-  const log=(await f.call(ADMIN,'/api/tech/audit')).log;assert.deepEqual(log.map(x=>x.action).sort(),['approve','view_docs']);
+  const log=(await f.call(ADMIN,'/api/tech/audit')).log;assert.deepEqual(log.map(x=>x.action).sort(),['approve','idcheck_match','view_docs']);
   assert.ok(!JSON.stringify(log).includes('1101700203450'));assert.equal((await f.call(USER,'/api/tech/audit')).status,403);
 });
