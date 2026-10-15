@@ -6,7 +6,8 @@ import {parseFeed, pick, refreshNews, newsAI} from '../src/news.js';
 import {chatModels} from '../src/fastai.js';
 
 /* นิตยสาร: รวมข่าวจากฟีดจริง + Gemini แยกจากแชต — เว็บข่าวและ AI ในเทสต์เป็นของปลอมทั้งหมด */
-const NOW=Date.UTC(2026,9,9,6,0,0);
+/* ข่าวตัวอย่างอิงเวลาปัจจุบัน — ระบบตัดข่าวที่เก่ากว่า 4 วัน ถ้าตรึงวันที่ไว้ เทสต์จะพังเองเมื่อเวลาผ่านไป */
+const NOW=Math.floor(Date.now()/3600000)*3600000;
 const rss=(items)=>`<?xml version="1.0"?><rss xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:media="http://search.yahoo.com/mrss/"><channel>${items.join('')}</channel></rss>`;
 const wpItem=(n,{img=true,ago=1}={})=>`<item><title><![CDATA[ข่าวรถที่ ${n} &amp; สเปก]]></title><link>https://th.example/news-${n}</link>
   <pubDate>${new Date(NOW-ago*3600000).toUTCString()}</pubDate><description><![CDATA[สรุปสั้น ${n}]]></description>
@@ -18,8 +19,8 @@ test('feeds: WordPress, Atom, media:content and Google News are all read correct
   assert.match(wp.text,/ราคา 799,000 บาท/);assert.doesNotMatch(wp.text,/<p>|<img/);assert.equal(wp.at,NOW-3600000);
   const mc=parseFeed(rss([`<item><title>EV range</title><link>https://en.example/a</link><media:content url="http://cdn.example/a.jpg" medium="image"/><description>&lt;p&gt;Battery &lt;b&gt;up&lt;/b&gt;&lt;/p&gt;</description></item>`]),{name:'Motor1',lang:'en'},NOW)[0];
   assert.equal(mc.image,'https://cdn.example/a.jpg','http images are upgraded to https');assert.equal(mc.text,'Battery up');
-  const atom=parseFeed(`<feed><entry><title>Atom story</title><link rel="alternate" href="https://atom.example/1"/><updated>2026-10-09T05:00:00Z</updated><summary>Short</summary></entry></feed>`,{name:'Atom',lang:'en'},NOW)[0];
-  assert.equal(atom.url,'https://atom.example/1');assert.equal(atom.at,Date.parse('2026-10-09T05:00:00Z'));
+  const atom=parseFeed(`<feed><entry><title>Atom story</title><link rel="alternate" href="https://atom.example/1"/><updated>${new Date(NOW-3600000).toISOString()}</updated><summary>Short</summary></entry></feed>`,{name:'Atom',lang:'en'},NOW)[0];
+  assert.equal(atom.url,'https://atom.example/1');assert.equal(atom.at,NOW-3600000);
   const g=parseFeed(rss([`<item><title>BYD ลดราคา Atto 3 - ไทยรัฐ</title><link>https://news.google.com/rss/articles/abc</link><source url="https://thairath.co.th">ไทยรัฐ</source><description>&lt;a href="x"&gt;BYD&lt;/a&gt;</description></item>`]),{name:'Google News',lang:'th',google:true},NOW)[0];
   assert.equal(g.title,'BYD ลดราคา Atto 3');assert.equal(g.source,'ไทยรัฐ');assert.equal(g.text,'');
 });
