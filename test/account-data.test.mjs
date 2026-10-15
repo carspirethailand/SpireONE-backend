@@ -161,3 +161,11 @@ test('PDPA: chat_logs ไม่เก็บข้อความแชต · ค
   assert.match(src,/async function cacheSave\(env, carInfo, question, answer, uid\)/);
   assert.match(src,/CACHE_PII\.test\(question\) \|\| CACHE_PII\.test\(answer\)/);
 });
+
+test('PDPA: บริบทที่ส่งให้ AI ไม่มีอีเมลของผู้ใช้ (ตรงกับหน้า /privacy)',()=>{
+  const src=readFileSync(new URL('../src/worker.js',import.meta.url),'utf8');
+  const body=src.slice(src.indexOf('async function userContext('),src.indexOf('async function userContext(')+6000);
+  assert.ok(body.length>1000);
+  assert.doesNotMatch(body,/SELECT[^']*email[^']*FROM users/i,'ห้ามดึงอีเมลมาประกอบคำสั่ง AI');
+  assert.doesNotMatch(body,/อีเมล: \$\{/,'ห้ามใส่อีเมลในคำสั่ง AI');
+});

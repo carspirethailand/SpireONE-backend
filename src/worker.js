@@ -1396,7 +1396,7 @@ async function userContext(env, uid, carId, hint) {
   const q = (sql, ...a) => env.DB.prepare(sql).bind(...a);
   const [setup, gar, sel, uRow, carRs, maintRs, sparesRs, memRs] = await Promise.all([
     stateOf(env, uid, 'setup'), stateOf(env, uid, 'garage'), stateOf(env, uid, 'selCar'),
-    q('SELECT name, email FROM users WHERE uid = ?', uid).first().catch(() => null),
+    q('SELECT name FROM users WHERE uid = ?', uid).first().catch(() => null),
     q('SELECT id, make, model, year, mileage FROM cars WHERE uid = ? ORDER BY created_at DESC LIMIT 8', uid).all().catch(() => null),
     carId ? q(`SELECT part, last_km, last_at, interval_km FROM maint_item
         WHERE uid = ? AND car_id = ? AND last_at IS NOT NULL ORDER BY last_at DESC LIMIT 10`, uid, String(carId)).all().catch(() => null) : null,
@@ -1406,12 +1406,11 @@ async function userContext(env, uid, carId, hint) {
 
   /* ── ชื่อ ── ชื่อเล่นที่ผู้ใช้ตั้งเองมาก่อนเสมอ ค่อยตกมาที่ชื่อบัญชี */
   let name = (setup && typeof setup === 'object' && setup.name) ? String(setup.name).trim() : '';
-  let email = '';
-  if (uRow) { if (!name && uRow.name) name = String(uRow.name); email = String(uRow.email || '') }
+  /* ไม่ส่งอีเมลให้ผู้ให้บริการ AI — AI ไม่ต้องใช้ และเป็นข้อมูลที่ระบุตัวตนได้ตรง ๆ (ตรงกับหน้า /privacy) */
+  if (uRow && !name && uRow.name) name = String(uRow.name);
   /* หน้าเว็บส่งชื่อมาด้วยทุกครั้ง ใช้เป็นตัวสำรองกรณีข้อมูลยังซิงก์ขึ้นมาไม่ทัน */
   if (!name && hint && hint.userName) name = String(hint.userName).trim().slice(0, 60);
   if (name) parts.push(`ชื่อผู้ใช้ (เรียกเขาด้วยชื่อนี้ได้เลย): ${name}`);
-  if (email) parts.push(`อีเมล: ${email}`);
   if (setup && typeof setup === 'object') {
     const lv = { basic: 'มือใหม่ อธิบายให้ง่าย เลี่ยงศัพท์ช่าง',
                  advance: 'พอมีพื้นฐาน อธิบายลงรายละเอียดได้',
