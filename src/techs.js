@@ -1713,6 +1713,15 @@ function postOut(p, extra, exact = false) {
 }
 /* ระยะทางให้ช่างดู: ปัดขึ้นเป็นกิโลเมตรเต็ม กันการเอาระยะจากหลายจุดมาคำนวณย้อนหาบ้านลูกค้า */
 const roughKm = d => Math.max(1, Math.ceil(d));
+/* ช่างคนไหนเห็นประกาศนี้ใน "หางานใกล้ฉัน": อยู่ในรัศมีรับงานของร้าน (อย่างน้อย 30 กม.) ไม่ใช่เจ้าของประกาศ ร้านไม่ถูกพัก
+   หมวดตรง (หรือประกาศไม่ระบุหมวด) · งานด่วนเห็นทุกร้านในรัศมีไม่ดูหมวด — รถเสียกลางทาง ใครใกล้ช่วยได้ก่อน */
+const postVisible = (p, t, d, dist) => dist <= Math.max(Number(d.radius) || 0, 30)
+  && (!p.test || t.test) && (p.urgent || !p.cat || (d.cats || []).includes(p.cat) || t.test);
+async function postAudience(env, p) {
+  const { results } = await env.DB.prepare('SELECT id, uid, data, test FROM tech_profiles WHERE suspended = 0 AND uid != ?').bind(p.customer_uid).all();
+  return results.map(t => { const d = parse(t.data) || {}; return { t, d, dist: d.lat == null ? Infinity : km(d.lat, d.lng, p.lat, p.lng) }; })
+    .filter(x => postVisible(p, x.t, x.d, x.dist)).sort((a, b) => a.dist - b.dist);
+}
 
 async function createPost(env, me, b) {
   const id = String(b.id || '');
@@ -1726,14 +1735,20 @@ async function createPost(env, me, b) {
   if (open.n >= 3 && !me.staff) fail(429, 'มีประกาศที่เปิดอยู่ 3 รายการแล้ว ปิดอันเก่าก่อน');
   const ts = now();
   const photos = mediaIn(b);
-  /* ประกาศของทีมงานเป็นงานทดสอบ — ช่างจริงไม่เห็น เห็นเฉพาะช่างทีมงาน */
+  /* ประกาศเป็นงานจริงเสมอ (เหมือนใบขอราคาตรงถึงร้าน) — เดิมประกาศจากบัญชีทีมงาน/เจ้าของถูกตั้งเป็นงานทดสอบอัตโนมัติ
+     ช่างจริงจึงไม่เห็นเลย เจ้าของทดสอบเรียกช่างด่วนแล้วไม่ถึงใคร · ทีมงานที่ตั้งใจทดสอบ ส่ง test:true มาเอง */
+  const test = me.staff && b.test === true ? 1 : 0, urgent = b.urgent ? 1 : 0;
   await env.DB.prepare(`INSERT INTO tech_posts (id,customer_uid,status,test,car,symptom,cat,lat,lng,area,address,phone,requested_time,mode,urgent,created_at,updated_at,note)
-    VALUES (?,?,'open',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(id, me.uid, me.staff ? 1 : 0,
-    str(b.car, 'รถ / รุ่น / ปี', 2, 200), str(b.symptom, 'อาการ', 10, 2000), cat, c.lat, c.lng,
+    VALUES (?,?,'open',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(id, me.uid, test,
+    str(b.car, 'รถ / รุ่น / ปี', 2, 200), str(b.symptom, 'อาการ', urgent ? 3 : 10, 2000), cat, c.lat, c.lng,
     str(b.area, 'พื้นที่', 3, 160), str(b.address, 'ที่อยู่', 4, 500), phone(b.phone, 'เบอร์โทร'),
-    str(b.requestedTime, 'วันและเวลา', 2, 160), b.mode === 'shop' ? 'shop' : 'mobile', b.urgent ? 1 : 0, ts, ts, noteIn(b)).run();
+    str(b.requestedTime, 'วันและเวลา', 2, 160), b.mode === 'shop' ? 'shop' : 'mobile', urgent, ts, ts, noteIn(b)).run();
   await saveMedia(env, id, me.uid, photos);
-  return { id };
+  /* บอกลูกค้าตามจริงว่ามีช่างกี่ร้านเห็นประกาศนี้ · งานด่วน = แจ้งทาง LINE ทันทีทุกร้านในรัศมี (ไม่ต้องรอช่างเปิดแอปเอง) */
+  const near = await postAudience(env, { customer_uid: me.uid, test, urgent, cat, lat: c.lat, lng: c.lng });
+  if (urgent) for (const x of near.slice(0, 25)) tell(env, x.t.uid, () => card({ tag: 'งานด่วน — รถเสียใกล้คุณ', title: String(b.car || '').slice(0, 60), url: appUrl(env, '/work'), label: 'ดูและเสนอราคา',
+    lines: [String(b.symptom || '').slice(0, 90), `ห่างร้านคุณประมาณ ${roughKm(x.dist)} กม.`, String(b.area || '').slice(0, 60)] }));
+  return { id, reach: near.length };
 }
 
 /* รายละเอียดประกาศพร้อมรูป — เจ้าของประกาศ หรือช่างที่มองเห็นประกาศนี้ได้ */
@@ -1781,7 +1796,7 @@ async function nearPosts(env, me) {
     mc.forEach(r => { pc[r.owner] = r.n; });
   }
   const posts = results.map(p => ({ p, dist: km(d.lat, d.lng, p.lat, p.lng) }))
-    .filter(x => x.dist <= radius && (!x.p.cat || (d.cats || []).includes(x.p.cat) || t.test || (x.p.urgent && (d.mobile || d.urgent))))
+    .filter(x => postVisible(x.p, t, d, x.dist))
     .sort((a, b) => (b.p.urgent - a.p.urgent) || a.dist - b.dist)
     .map(x => postOut(x.p, { dist: roughKm(x.dist), mine: mine[x.p.id] || null, photos: pc[x.p.id] || 0 }));
   return { posts, radius, center: { lat: d.lat, lng: d.lng } };

@@ -39,3 +39,20 @@ test('a shop approved by staff (manual ID check) is never paused by a stale Didi
   f.sqlite.prepare("UPDATE tech_profiles SET suspended=1,id_hold=0").run();
   assert.equal((await releaseWrongHolds(f.env)).released,0);assert.equal(f.sqlite.prepare('SELECT suspended FROM tech_profiles').get().suspended,1);
 });
+
+test('an urgent post from the owner/staff account is a real job: real mechanics in range see it, and the customer is told how many', async()=>{
+  const f=fixture();await withMechanic(f,{cats:['air'],mobile:false});
+  const r=await f.call(ADMIN,'/api/tech/posts',post({cat:'eng',urgent:true,symptom:'แบตหมด'}));
+  assert.equal(r.status,200,r.error);assert.equal(r.reach,1,'one mechanic can see it');
+  assert.equal(f.sqlite.prepare('SELECT test FROM tech_posts').get().test,0,'not silently a hidden test job');
+  const near=(await f.call(MECH,'/api/tech/posts/near')).posts;assert.equal(near.length,1);assert.equal(near[0].urgent,true);
+  /* ทีมงานที่ตั้งใจทดสอบยังทำได้ — ช่างจริงไม่เห็น */
+  const t=await f.call(ADMIN,'/api/tech/posts',post({test:true,symptom:'ทดสอบระบบ ไม่ใช่งานจริง'}));assert.equal(t.reach,0);
+  assert.equal((await f.call(MECH,'/api/tech/posts/near')).posts.length,1);
+});
+
+test('reach is honest: nobody in range = 0, and the poster never counts their own shop', async()=>{
+  const f=fixture();await withMechanic(f,{lat:18.79,lng:98.98});
+  assert.equal((await f.call(USER,'/api/tech/posts',post({urgent:true}))).reach,0,'shop is in Chiang Mai, post is in Bangkok');
+  assert.equal((await f.call(MECH,'/api/tech/posts',post({urgent:true,lat:18.79,lng:98.98}))).reach,0,'own shop is not counted');
+});
