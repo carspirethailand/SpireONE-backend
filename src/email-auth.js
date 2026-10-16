@@ -39,6 +39,11 @@ const BODY_LIMIT = 2048, UPSTREAM_LIMIT = 64 * 1024, REQUEST_BUDGET = 24_000;
 const CUSTOM_AUD = 'https://identitytoolkit.googleapis.com/google.identity.identitytoolkit.v1.IdentityToolkit';
 const OAUTH_URL = 'https://oauth2.googleapis.com/token';
 const oauthCache = new WeakMap();
+/* ส่งรหัสผ่าน Gmail ของทีม (Gmail API · สิทธิ์ gmail.send อย่างเดียว) — ไม่ต้องมีโดเมนอีเมลของตัวเอง
+   ต้องมี secret ครบ 3 ตัว: GMAIL_CLIENT_ID · GMAIL_CLIENT_SECRET · GMAIL_REFRESH_TOKEN และ AUTH_EMAIL_FROM = อีเมล Gmail นั้น */
+const GMAIL_SEND = 'https://gmail.googleapis.com/gmail/v1/users/me/messages/send';
+const gmailCache = new WeakMap();
+const gmailReady = env => ['GMAIL_CLIENT_ID', 'GMAIL_CLIENT_SECRET', 'GMAIL_REFRESH_TOKEN'].every(k => typeof env[k] === 'string' && env[k].trim().length > 0);
 
 class AuthFailure extends Error {
   constructor(status, code, message, retryAfter) {
@@ -157,7 +162,7 @@ async function configuration(env) {
   try {
     if (!env.DB?.prepare || !env.DB?.batch || typeof env.AUTH_OTP_PEPPER !== 'string' || encoder.encode(env.AUTH_OTP_PEPPER).length < 32) return null;
     const from = emailOf(env.AUTH_EMAIL_FROM);
-    if (!from || (typeof env.EMAIL?.send !== 'function' && !(typeof env.RESEND_API_KEY === 'string' && env.RESEND_API_KEY.trim()))) return null;
+    if (!from || (typeof env.EMAIL?.send !== 'function' && !gmailReady(env) && !(typeof env.RESEND_API_KEY === 'string' && env.RESEND_API_KEY.trim()))) return null;
     if (typeof env.FIREBASE_SERVICE_ACCOUNT_JSON !== 'string') return null;
     const service = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT_JSON);
     if (service.type !== 'service_account' || !/^[a-z][a-z0-9-]{4,62}$/.test(env.FIREBASE_PROJECT_ID || '') || service.project_id !== env.FIREBASE_PROJECT_ID ||
@@ -227,13 +232,50 @@ async function fetchJSON(url, init, deadline) {
   finally { controller.abort(); }
 }
 
+const b64 = bytes => { let s = ''; for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000)); return btoa(s); };
+const utf8b64 = text => b64(new TextEncoder().encode(text));
+/* ข้อความอีเมลแบบ MIME (ข้อความ + HTML) · ทุกหัวข้อเข้ารหัส UTF-8 · ผู้รับผ่าน emailOf แล้ว จึงไม่มีขึ้นบรรทัดแทรกหัวอีเมล */
+function mimeMessage(from, to, subject, text, html) {
+  const boundary = 'cendon-' + crypto.randomUUID(), wrap = s => s.replace(/.{1,76}/g, '$&\r\n').trimEnd();
+  return [`From: =?UTF-8?B?${utf8b64('Cendon')}?= <${from}>`, `To: <${to}>`, `Subject: =?UTF-8?B?${utf8b64(subject)}?=`, 'MIME-Version: 1.0',
+    `Content-Type: multipart/alternative; boundary="${boundary}"`, '',
+    `--${boundary}`, 'Content-Type: text/plain; charset=UTF-8', 'Content-Transfer-Encoding: base64', '', wrap(utf8b64(text)),
+    `--${boundary}`, 'Content-Type: text/html; charset=UTF-8', 'Content-Transfer-Encoding: base64', '', wrap(utf8b64(html)),
+    `--${boundary}--`, ''].join('\r\n');
+}
+async function gmailAccessToken(env, deadline) {
+  const cached = gmailCache.get(env);
+  if (cached?.credential === env.GMAIL_REFRESH_TOKEN && cached.expires > Date.now() + 60_000) return cached.token;
+  const result = await fetchJSON(OAUTH_URL, {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ grant_type: 'refresh_token', client_id: env.GMAIL_CLIENT_ID.trim(), client_secret: env.GMAIL_CLIENT_SECRET.trim(), refresh_token: env.GMAIL_REFRESH_TOKEN.trim() }).toString(),
+  }, deadline);
+  if (!result.ok || typeof result.data.access_token !== 'string' || !result.data.access_token || !Number.isFinite(Number(result.data.expires_in)) || Number(result.data.expires_in) <= 60) throw unavailable();
+  gmailCache.set(env, { token: result.data.access_token, credential: env.GMAIL_REFRESH_TOKEN, expires: Date.now() + Math.min(3600, Number(result.data.expires_in)) * 1000 });
+  return result.data.access_token;
+}
+
 async function deliver(env, config, email, code, deadline) {
-  const subject = 'รหัสเข้าใช้งาน Cendon';
-  const text = `รหัสของคุณ: ${code}\n\nใช้รหัสนี้เพื่อเข้าใช้งาน Cendon ภายใน 10 นาที ไม่ต้องตั้งรหัสผ่าน\nห้ามบอกรหัสนี้กับใคร รวมถึงผู้ที่อ้างว่าเป็นเจ้าหน้าที่ Cendon\nหากคุณไม่ได้ขอรหัสนี้ ไม่ต้องดำเนินการใด ๆ`;
-  const html = `<div style="font-family:system-ui,sans-serif;background:#faf8f3;padding:32px;color:#292722"><p>Cendon</p><h2>ยินดีต้อนรับกลับ</h2><p>รหัสเข้าใช้งานของคุณ</p><p style="font-size:32px;letter-spacing:8px;font-weight:600">${code}</p><p>ใช้ได้ภายใน 10 นาที ไม่ต้องตั้งรหัสผ่าน</p><p>ห้ามบอกรหัสนี้กับใคร รวมถึงผู้ที่อ้างว่าเป็นเจ้าหน้าที่ Cendon</p><p>หากคุณไม่ได้ขอรหัสนี้ ไม่ต้องดำเนินการใด ๆ</p></div>`;
+  const subject = `รหัสเข้าสู่ระบบ Cendon: ${code}`;
+  const text = `รหัสของคุณ: ${code}\n\nใช้รหัสนี้เพื่อเข้าสู่ระบบ Cendon ภายใน 10 นาที (ใช้ได้ครั้งเดียว)\nห้ามบอกรหัสนี้กับใคร รวมถึงผู้ที่อ้างว่าเป็นเจ้าหน้าที่ Cendon\nหากคุณไม่ได้ขอรหัสนี้ ไม่ต้องทำอะไร บัญชีของคุณยังปลอดภัย`;
+  const html = `<!doctype html><html lang="th"><body style="margin:0;padding:0;background:#0b0b0c"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#0b0b0c;padding:32px 12px"><tr><td align="center">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:440px;background:#141416;border:1px solid #2a2a2e;border-radius:18px;font-family:Kanit,'Segoe UI',system-ui,sans-serif;color:#f5f3ef">
+<tr><td style="padding:28px 28px 6px;font-size:15px;font-weight:700;letter-spacing:.06em">CENDON</td></tr>
+<tr><td style="padding:6px 28px 0;font-size:22px;font-weight:600">รหัสเข้าสู่ระบบของคุณ</td></tr>
+<tr><td style="padding:18px 28px"><div style="background:#0b0b0c;border:1px solid #2a2a2e;border-radius:14px;padding:18px 0;text-align:center;font-size:34px;font-weight:600;letter-spacing:10px;color:#ffffff">${code}</div></td></tr>
+<tr><td style="padding:0 28px 6px;font-size:14px;line-height:1.7;color:#a29d96">ใช้ได้ภายใน 10 นาที และใช้ได้ครั้งเดียว</td></tr>
+<tr><td style="padding:0 28px 26px;font-size:13px;line-height:1.7;color:#77726b">ห้ามบอกรหัสนี้กับใคร รวมถึงผู้ที่อ้างว่าเป็นเจ้าหน้าที่ Cendon · หากคุณไม่ได้ขอรหัสนี้ ไม่ต้องทำอะไร บัญชีของคุณยังปลอดภัย</td></tr>
+</table></td></tr></table></body></html>`;
   if (typeof env.EMAIL?.send === 'function') {
     const accepted = await limited(env.EMAIL.send({ from: { email: config.from, name: 'Cendon' }, to: email, subject, text, html }), Math.min(6000, deadline - Date.now()));
     if (!accepted?.messageId) throw unavailable();
+    return;
+  }
+  if (gmailReady(env)) {
+    const token = await gmailAccessToken(env, deadline);
+    const raw = utf8b64(mimeMessage(config.from, email, subject, text, html)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const result = await fetchJSON(GMAIL_SEND, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ raw }) }, deadline);
+    if (!result.ok || typeof result.data.id !== 'string' || !result.data.id) throw unavailable();
     return;
   }
   const result = await fetchJSON('https://api.resend.com/emails', {

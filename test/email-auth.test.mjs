@@ -14,7 +14,7 @@ const project = 'cendon-unit1', clientEmail = `auth@${project}.iam.gserviceaccou
 const service = { type: 'service_account', project_id: project, client_email: clientEmail, private_key: await exportPKCS8(privateKey) };
 const customAud = 'https://identitytoolkit.googleapis.com/google.identity.identitytoolkit.v1.IdentityToolkit';
 
-function fixture({ users = [], native = true, mailFailure = false, firebaseFailure = false, createRace = false } = {}) {
+function fixture({ users = [], native = true, gmail = false, mailFailure = false, firebaseFailure = false, createRace = false } = {}) {
   const sqlite = new DatabaseSync(':memory:');
   sqlite.exec('CREATE TABLE users(uid TEXT PRIMARY KEY, banned INTEGER NOT NULL DEFAULT 0)');
   for (const sql of EMAIL_AUTH_SQL) sqlite.exec(sql);
@@ -44,18 +44,36 @@ function fixture({ users = [], native = true, mailFailure = false, firebaseFailu
     AUTH_OTP_PEPPER: 'unit-test-pepper-not-a-production-secret-32-bytes', AUTH_EMAIL_FROM: 'hello@cendon.unit.test',
     AUTH_ALLOWED_ORIGINS: 'https://cendon.unit.test',
   };
-  if (native) env.EMAIL = { async send(message) {
+  const gmailCalls = [];
+  if (gmail) Object.assign(env, { GMAIL_CLIENT_ID: 'unit-only-client.apps.googleusercontent.com', GMAIL_CLIENT_SECRET: 'unit-only-client-secret', GMAIL_REFRESH_TOKEN: 'unit-only-refresh-token' });
+  else if (native) env.EMAIL = { async send(message) {
     sent.push(message);
     if (mailFailure) throw Error('provider-sensitive-example');
     return { messageId: 'unit-only-message-' + sent.length };
   } };
   else env.RESEND_API_KEY = 'unit-only-resend-key';
+  /* อ่าน MIME ที่ส่งเข้า Gmail กลับเป็นข้อความ (base64url → หัวอีเมล + ส่วนข้อความ) */
+  const unmime = raw => { const mime = Buffer.from(raw.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+    const [head] = mime.split('\r\n\r\n'), parts = mime.split(/--cendon-[0-9a-f-]+/);
+    const part = type => { const p = parts.find(x => x.includes('Content-Type: ' + type)); return Buffer.from(p.split('\r\n\r\n')[1].replace(/\s+/g, ''), 'base64').toString('utf8'); };
+    return { mime, head, text: part('text/plain'), html: part('text/html') }; };
   globalThis.fetch = async (url, init) => {
     url = String(url);
     if (url === 'https://api.resend.com/emails') {
       assert.equal(init.headers.Authorization, 'Bearer unit-only-resend-key');
       const message = JSON.parse(init.body); sent.push(message);
       return mailFailure ? Response.json({ message: 'provider-sensitive-example' }, { status: 400 }) : Response.json({ id: 'unit-only-resend-message' });
+    }
+    if (url === 'https://gmail.googleapis.com/gmail/v1/users/me/messages/send') {
+      assert.equal(init.headers.Authorization, 'Bearer unit-gmail-access'); assert.equal(init.redirect, 'error');
+      const message = unmime(JSON.parse(init.body).raw); sent.push(message); gmailCalls.push({ kind: 'send' });
+      return mailFailure ? Response.json({ error: { message: 'provider-sensitive-example' } }, { status: 400 }) : Response.json({ id: 'unit-only-gmail-message' });
+    }
+    if (url === 'https://oauth2.googleapis.com/token' && new URLSearchParams(init.body).get('grant_type') === 'refresh_token') {
+      const grant = new URLSearchParams(init.body);
+      assert.equal(grant.get('client_id'), 'unit-only-client.apps.googleusercontent.com'); assert.equal(grant.get('refresh_token'), 'unit-only-refresh-token');
+      gmailCalls.push({ kind: 'token' });
+      return Response.json({ access_token: 'unit-gmail-access', expires_in: 3599 });
     }
     if (url === 'https://oauth2.googleapis.com/token') {
       const grant = new URLSearchParams(init.body);
@@ -96,7 +114,7 @@ function fixture({ users = [], native = true, mailFailure = false, firebaseFailu
   const request = email => call('/api/auth/email/request', { email });
   const code = (index = sent.length - 1) => sent[index].text.match(/^รหัสของคุณ: (\d{6})/m)[1];
   const verify = (id, value = code()) => call('/api/auth/email/verify', { challengeId: id, code: value });
-  return { sqlite, env, sent, identityCalls, accounts, call, request, verify, code };
+  return { sqlite, env, sent, identityCalls, gmailCalls, accounts, call, request, verify, code };
 }
 
 test('email auth: unrelated routes are untouched, route methods and cache headers are explicit', async () => {
@@ -165,6 +183,34 @@ test('email auth: Resend delivery sends one recipient and requires provider ackn
   assert.equal(result.status, 200); assert.deepEqual(f.sent[0].to, ['person@unit.test']);
   assert.equal(f.sent[0].from, 'Cendon <hello@cendon.unit.test>');
   assert.match(f.code(), /^\d{6}$/); assert.equal(f.identityCalls.length, 0);
+});
+
+test('email auth: Gmail delivery (no own domain needed) sends one UTF-8 message from the team Gmail and the code signs in', async () => {
+  const f = fixture({ gmail: true, native: false });
+  assert.equal((await f.call('/api/auth/config')).body.emailOtpReady, true);
+  const result = await f.request(' Person@Unit.Test ');
+  assert.equal(result.status, 200);
+  const m = f.sent[0];
+  assert.match(m.head, /^From: =\?UTF-8\?B\?Q2VuZG9u\?= <hello@cendon\.unit\.test>$/m);
+  assert.match(m.head, /^To: <person@unit\.test>$/m);
+  assert.equal(m.head.match(/^(To|Cc|Bcc):/gm).length, 1, 'exactly one recipient header');
+  const subject = Buffer.from(m.head.match(/^Subject: =\?UTF-8\?B\?([^?]+)\?=$/m)[1], 'base64').toString('utf8');
+  assert.equal(subject, 'รหัสเข้าสู่ระบบ Cendon: ' + f.code());
+  assert.match(m.html, new RegExp(f.code())); assert.match(m.text, /10 นาที/);
+  assert.deepEqual(f.gmailCalls.map(c => c.kind), ['token', 'send']);
+  await f.request('other@unit.test'); assert.deepEqual(f.gmailCalls.map(c => c.kind), ['token', 'send', 'send'], 'the Gmail access token is reused');
+  const verified = await f.verify(result.body.challengeId, f.code(0));
+  assert.equal(verified.status, 200); assert.ok(verified.body.customToken);
+});
+
+test('email auth: half-configured Gmail stays off; Gmail failure makes the code unusable', async () => {
+  for (const missing of ['GMAIL_CLIENT_ID', 'GMAIL_CLIENT_SECRET', 'GMAIL_REFRESH_TOKEN']) {
+    const f = fixture({ gmail: true, native: false }); delete f.env.RESEND_API_KEY; f.env[missing] = '  ';
+    assert.equal((await f.call('/api/auth/config')).body.emailOtpReady, false, missing);
+  }
+  const f = fixture({ gmail: true, native: false, mailFailure: true }), result = await f.request('person@unit.test');
+  assert.equal(result.status, 503); assert.equal(result.body.code, 'auth/unavailable');
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM auth_otp WHERE ready = 1').get().n, 0);
 });
 
 test('email auth: failed native or Resend delivery makes any delivered code unusable', async () => {

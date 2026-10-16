@@ -6,13 +6,13 @@
 
 | ช่องทาง | ฝั่ง Firebase | ที่ยังขาด |
 |---|---|---|
-| Google | เปิดแล้ว | **โดเมน `cendon-beta.pages.dev` ยังไม่อยู่ใน Authorized domains** (ส่วน 1) |
+| Google | เปิดแล้ว · โดเมน `cendon-beta.pages.dev` เพิ่มแล้ว ✓ | หลังบ้านต้อง deploy ตัวใหม่ (ส่วน 4) |
 | อีเมล + รหัสผ่าน | เปิดแล้ว | หลังบ้านต้อง deploy ตัวใหม่ (ส่วน 4) |
 | ลิงก์เข้าสู่ระบบทางอีเมล | ต้องเปิดสวิตช์ | ส่วน 1 ข้อ 3 |
-| Apple | ยังไม่เปิด | ส่วน 2 |
-| รหัส 6 หลักทางอีเมล | ไม่เกี่ยวกับ Firebase | ต้องมีโดเมนอีเมล + คีย์ (ส่วน 5) — ระหว่างนี้แอปส่ง "ลิงก์" แทนให้อัตโนมัติ |
+| Apple | ยังไม่มีบัญชี Apple Developer — **พักไว้ก่อน** (ปุ่ม Apple ซ่อนอยู่จนกว่าจะตั้ง `AUTH_APPLE_ENABLED=1`) | ส่วน 2 |
+| รหัส 6 หลักทางอีเมล | ไม่เกี่ยวกับ Firebase | ส่งผ่าน **Gmail ของทีม** ได้เลย ไม่ต้องมีโดเมน (ส่วน 5) — ระหว่างนี้แอปส่ง "ลิงก์" แทนให้อัตโนมัติ |
 
-ลำดับที่แนะนำ: **1 → 3 → 4 → 2 → 5 → 6**
+ลำดับที่แนะนำ: **1 → 3 → 4 → 5 → 6** (ส่วน 2 Apple ทำเมื่อมีบัญชี Apple Developer)
 
 ---
 
@@ -29,7 +29,7 @@
 
 ---
 
-## ส่วน 2 — Sign in with Apple (ต้องมี Apple Developer Program · 99 USD/ปี · ~20 นาที)
+## ส่วน 2 — Sign in with Apple (ต้องมี Apple Developer Program · 99 USD/ปี · ~20 นาที) — พักไว้ก่อน
 
 ที่ https://developer.apple.com/account → **Certificates, Identifiers & Profiles**
 
@@ -48,6 +48,7 @@
    - OAuth code flow configuration: **Apple team ID** · **Key ID** · **Private key** = เปิดไฟล์ .p8 แล้วคัดลอกทั้งหมด (รวมบรรทัด BEGIN/END)
    → **Save**
 6. ให้อีเมลจาก Firebase ส่งถึงผู้ใช้ที่ซ่อนอีเมลกับ Apple: Apple Developer → **Services → Sign in with Apple for Email Communication → Configure** → เพิ่มอีเมล `noreply@cendon-1.firebaseapp.com`
+7. เปิดปุ่ม Apple ในแอป: `wrangler.jsonc` → `"AUTH_APPLE_ENABLED": "1"` → `npx wrangler deploy`
 
 ---
 
@@ -91,19 +92,43 @@ npx wrangler deploy
 
 ---
 
-## ส่วน 5 — รหัส 6 หลักทางอีเมล (ทำเมื่อมีโดเมนของตัวเอง)
+## ส่วน 5 — รหัส 6 หลักทางอีเมล (ส่งจาก Gmail ของทีม · ไม่ต้องมีโดเมน · ~15 นาที)
 
-ระหว่างที่ยังไม่ทำ แอปจะส่ง **ลิงก์เข้าสู่ระบบ** แทนให้อัตโนมัติ (ส่วน 1 ข้อ 3) — ทำส่วนนี้เสร็จเมื่อไร ปุ่มจะเปลี่ยนเป็น "ส่งรหัสเข้าอีเมลแทน" เอง
+ระหว่างที่ยังไม่ทำ แอปส่ง **ลิงก์เข้าสู่ระบบ** แทนให้อัตโนมัติ — ทำเสร็จเมื่อไร ปุ่มจะเปลี่ยนเป็น "ส่งรหัสเข้าอีเมลแทน" เอง
+หลังบ้านขอสิทธิ์ **ส่งอีเมลอย่างเดียว** (`gmail.send`) อ่านกล่องจดหมายไม่ได้ · Gmail ธรรมดาส่งได้ราว 500 ฉบับ/วัน
 
-1. ต้องมีโดเมนของเราเอง (เช่น `cendon.co.th`) — `pages.dev` ใช้ส่งอีเมลไม่ได้
-2. https://resend.com → สมัคร → **Domains → Add Domain** → ใส่โดเมน → นำระเบียน DNS ที่ Resend ให้ (SPF/DKIM/MX) ไปใส่ที่ผู้ให้บริการ DNS → รอจนขึ้น **Verified**
-3. **API Keys → Create API Key** (Sending access · เลือกโดเมนนั้น) → คัดลอก (เห็นครั้งเดียว)
-4. ```bash
-   npx wrangler secret put RESEND_API_KEY
-   openssl rand -base64 48 | npx wrangler secret put AUTH_OTP_PEPPER
-   ```
-5. ใน `wrangler.jsonc` ส่วน `vars` เพิ่ม `"AUTH_EMAIL_FROM": "no-reply@โดเมนของเรา"` → `npx wrangler deploy`
-6. ต้องมี `FIREBASE_SERVICE_ACCOUNT_JSON` จากส่วน 4 ด้วย
+### 5.1 เปิด Gmail API และหน้าขอสิทธิ์ (Google Cloud ของโปรเจกต์ cendon-1)
+1. https://console.cloud.google.com → มุมซ้ายบนเลือกโปรเจกต์ **cendon-1**
+2. **APIs & Services → Library** → ค้น `Gmail API` → **Enable**
+3. **Google Auth Platform** (หรือ APIs & Services → OAuth consent screen)
+   - Branding: App name `Cendon` · User support email = อีเมลทีม → Save
+   - Audience: ถ้ายังเป็น **Testing** ให้กด **Publish app** (ถ้าค้าง Testing รหัสจะหยุดส่งทุก 7 วัน)
+4. **Clients → Create client** (หรือ Credentials → Create credentials → OAuth client ID)
+   - Application type: **Web application** · Name `Cendon mail`
+   - Authorized redirect URIs: `https://developers.google.com/oauthplayground`
+   - Create → จด **Client ID** และ **Client secret** (ห้ามส่งในแชต)
+
+### 5.2 ขอ refresh token จากบัญชี Gmail ที่จะใช้ส่ง
+1. เปิด https://developers.google.com/oauthplayground
+2. ⚙ มุมขวาบน → ติ๊ก **Use your own OAuth credentials** → วาง Client ID / Client secret
+3. ช่อง "Input your own scopes" ใส่ `https://www.googleapis.com/auth/gmail.send` → **Authorize APIs**
+4. ล็อกอิน Gmail ของทีม → ถ้าขึ้น "Google hasn't verified this app" กด **Advanced → Go to Cendon (unsafe)** (เป็นแอปของเราเอง) → **Continue/Allow**
+5. **Exchange authorization code for tokens** → คัดลอก **Refresh token**
+6. ⚙ → ยกเลิกติ๊ก Use your own OAuth credentials (กันค้างไว้ในเบราว์เซอร์)
+
+### 5.3 ใส่ในหลังบ้าน (ปอนด์)
+```bash
+npx wrangler secret put GMAIL_CLIENT_ID
+npx wrangler secret put GMAIL_CLIENT_SECRET
+npx wrangler secret put GMAIL_REFRESH_TOKEN
+openssl rand -base64 48 | npx wrangler secret put AUTH_OTP_PEPPER
+```
+`wrangler.jsonc` ส่วน `vars` เพิ่ม `"AUTH_EMAIL_FROM": "<อีเมล Gmail ที่ใช้ส่ง ตัวเดียวกับข้อ 5.2>"` → `npx wrangler deploy`
+ต้องมี `FIREBASE_SERVICE_ACCOUNT_JSON` จากส่วน 4 ด้วย
+
+### ทางเลือก: Resend (เมื่อมีโดเมนของตัวเอง)
+แทน 5.1–5.3 ได้: ยืนยันโดเมนที่ resend.com → `npx wrangler secret put RESEND_API_KEY` → `AUTH_EMAIL_FROM` = `no-reply@โดเมนของเรา`
+(ถ้าตั้งทั้งสองแบบ หลังบ้านใช้ Gmail ก่อน)
 
 ---
 
@@ -118,5 +143,6 @@ npx wrangler deploy
 - หน้าเข้าสู่ระบบ → **เข้าสู่ระบบด้วย Google** ต้องเด้งหน้าต่างเลือกบัญชี Google และกลับเข้าแอปได้
 - **ส่งลิงก์เข้าอีเมลแทน** → อีเมลจาก `noreply@cendon-1.firebaseapp.com` (เช็กจดหมายขยะ) → กดลิงก์บนเครื่องเดิม → เข้าแอป
 - **สร้างบัญชี** ด้วยอีเมล + รหัสผ่าน → ได้หน้าตั้งค่าครั้งแรก
+- **ส่งรหัสเข้าอีเมลแทน** (หลังทำส่วน 5) → รหัส 6 หลักจาก Gmail ของทีม → กรอก → เข้าแอป
 - **ใช้บัญชี Apple** (หลังทำส่วน 2)
 - บอก Claude ว่า "ทำเสร็จแล้ว" — เช็กโดเมน/Apple จากภายนอกให้ได้
