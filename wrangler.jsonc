@@ -20,7 +20,9 @@
     }
   },
   "vars": {
-    "FIREBASE_PROJECT_ID": "sp1p-82396",
+    "FIREBASE_PROJECT_ID": "cendon-1",
+    // ช่วงย้ายจากโปรเจกต์ Firebase เดิม: ยังรับ token ของโปรเจกต์เก่า (ย้ายผู้ใช้ครบแล้วลบบรรทัดนี้ทิ้ง)
+    "FIREBASE_LEGACY_PROJECT_IDS": "sp1p-82396",
     "ONBOARDING_PRIVACY_URL": "https://cendon-beta.pages.dev/privacy",
     "APP_URL": "https://cendon-beta.pages.dev",
     "AUTH_APPLE_ENABLED": "0",

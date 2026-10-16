@@ -11,7 +11,7 @@
  *   - ใบงานเปลี่ยนสถานะได้ตามเส้นทางที่กำหนดเท่านั้น ข้ามขั้นไม่ได้
  *   - เบอร์กับที่อยู่ลูกค้าเปิดให้ช่างเห็นหลังลูกค้ายืนยันราคาแล้วเท่านั้น
  */
-import { verifyFirebaseToken } from './auth.js';
+import { verifyFirebaseToken, firebaseProjects } from './auth.js';
 import { screenApplication, screeningSnapshot, aiConsented, visionReady } from './tech-screen.js';
 import { applicantErrors, imageInfo, approvalError, CONSENT_VER } from './tech-vetting.js';
 import { diditReady, verifyDidit, diditFacts, identityFlags, diditFetch, idHashOf, upgradeHash, sameHex } from './tech-identity.js';
@@ -247,7 +247,7 @@ async function who(request, env, required = true, verifyToken = verifyFirebaseTo
   if (!h.startsWith('Bearer ')) return required ? fail(401, 'กรุณาเข้าสู่ระบบ') : null;
   const token = h.slice(7);
   let uid,email,emailVerified=false;
-  try{const payload=await verifyToken(token,env.FIREBASE_PROJECT_ID);uid=payload.sub;email=payload.email||'';emailVerified=payload.email_verified===true;}
+  try{const payload=await verifyToken(token,firebaseProjects(env));uid=payload.sub;email=payload.email||'';emailVerified=payload.email_verified===true;}
   catch(e){return fail(401,'เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่');}
   if (!uid) return fail(401, 'กรุณาเข้าสู่ระบบ');
   email = String(email || '').toLowerCase();

@@ -1,4 +1,4 @@
-import { verifyFirebaseToken } from './auth.js';
+import { verifyFirebaseToken, firebaseProjects } from './auth.js';
 import { EMAIL_AUTH_SQL, handleEmailAuth, deleteFirebaseUser } from './email-auth.js';
 import { exportAccount, resetAccount, deleteAccount, deleteBlockers } from './account-data.js';
 import { ONBOARDING_SQL, handleOnboarding, onboardingName, sanitizeSetupState } from './onboarding.js';
@@ -55,14 +55,14 @@ async function getAuthenticatedUser(request, env) {
     throw new Error('Missing or invalid Authorization header');
   }
   const token = authHeader.split('Bearer ')[1];
-  const projectId = env.FIREBASE_PROJECT_ID;
-  if (!projectId) throw new Error('FIREBASE_PROJECT_ID is not configured');
+  const projects = firebaseProjects(env);
+  if (!projects.length) throw new Error('FIREBASE_PROJECT_ID is not configured');
   /* ทดสอบในเครื่องเท่านั้น (DEV_AUTH ไม่มีในเซิร์ฟเวอร์จริง) — ใช้แบบเดียวกับ techs.js */
   if (env.DEV_AUTH === '1' && token.startsWith('dev:')) {
     const [, sub, email] = token.split(':');
     return { sub, email, email_verified: true, name: email.split('@')[0] };
   }
-  return await verifyFirebaseToken(token, projectId);
+  return await verifyFirebaseToken(token, projects);
 }
 
 /** Returns { payload, role, banned, email }. Owner role comes from env, others from DB. */
