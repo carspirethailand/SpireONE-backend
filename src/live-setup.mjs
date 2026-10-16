@@ -18,8 +18,8 @@ const thinking = m => /2\.5/.test(m) ? { thinkingConfig: { thinkingBudget: 0, in
 /* handle = รหัสต่อสายต่อที่ Google ให้มาในสายก่อนหน้า (sessionResumptionUpdate) — ต่อใหม่แล้วจำบทสนทนาเดิมได้ */
 export const cleanHandle = h => typeof h === 'string' && /^[\w\-.:/+=]{8,600}$/.test(h) ? h : '';
 
-export function liveToken({ model, system, tools, agent = false, handle, resume, now = Date.now() }) {
-  const declarations=[...(tools ? LIVE_TOOLS[0].functionDeclarations : []),...(agent === true ? LIVE_CALL_TOOLS[0].functionDeclarations : [])];
+export function liveToken({ model, system, tools, agent = false, agentVersion = 1, handle, resume, now = Date.now() }) {
+  const declarations=[...(tools ? LIVE_TOOLS[0].functionDeclarations : []),...(agent === true ? LIVE_CALL_TOOLS[0].functionDeclarations.slice(0,agentVersion===2?10:4) : [])];
   return {
     uses: 1,
     expireTime: new Date(now + 30 * 60 * 1000).toISOString(),

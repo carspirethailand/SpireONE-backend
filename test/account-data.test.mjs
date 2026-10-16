@@ -33,6 +33,7 @@ function seed(db,uid,{shop=false,suspended=0}={}){
   q('INSERT INTO users (uid,name,email,role,last_login,created_at,banned) VALUES (?,?,?,?,?,?,0)',uid,'Name '+uid,uid+'@unit.test','user',t,t);
   q('INSERT INTO user_state VALUES (?,?,?,?)',uid,'chat','{"m":["hi"]}',t);
   q("INSERT INTO cars (id,uid,make,model,created_at) VALUES (?,?,'Honda','Civic',?)",'car-'+uid,uid,t);
+  q("INSERT INTO tech_agent_actions (id,uid,tech_id,text,secret_hash,state,created_at,expires_at) VALUES (?,?,?,'Pending message','confirm-secret','pending',?,?)",'agent-'+uid,uid,'tp-test',t,t+600000);
   q("INSERT INTO odo_anchor (id,uid,car_id,km,source,observed_at,t) VALUES (?,?,?,1000,'manual',?,?)",'a-'+uid,uid,'car-'+uid,t,t);
   q("INSERT INTO maint_item (id,uid,car_id,part,t) VALUES (?,?,?,'oil',?)",'mi-'+uid,uid,'car-'+uid,t);
   q("INSERT INTO notify_state (car_id,uid) VALUES (?,?)",'car-'+uid,uid);
@@ -85,7 +86,7 @@ test('PDPA: ดาวน์โหลดข้อมูลของฉันไ�
     assert.ok(d[t]&&d[t].length,'ต้องมีตาราง '+t);
   assert.deepEqual(d.user_state[0].v,{m:['hi']},'ค่า JSON แปลงกลับให้อ่านง่าย');
   assert.ok(!raw.includes('other@unit.test')&&!raw.includes('U-other'),'ไม่มีข้อมูลของคนอื่น');
-  for(const secret of ['top-secret','"pk"','"ak"','h2:abc','h2:claim-me','BASE64','https://push/me','h-me'])assert.ok(!raw.includes(secret),'ห้ามส่งออก '+secret);
+  for(const secret of ['top-secret','confirm-secret','"pk"','"ak"','h2:abc','h2:claim-me','BASE64','https://push/me','h-me'])assert.ok(!raw.includes(secret),'ห้ามส่งออก '+secret);
 });
 
 test('PDPA: ลบบัญชีถาวรต้องพิมพ์ยืนยัน และลบครบทุกตาราง โดยไม่แตะบัญชีอื่น',async()=>{

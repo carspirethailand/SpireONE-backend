@@ -3,19 +3,20 @@ import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import {liveToken} from '../src/live-setup.mjs';
 import {LIVE_CALL_TOOLS,LIVE_CALL_AGENT_RULES} from '../src/live-call-tools.mjs';
-const setup=o=>liveToken({model:'unit-live',now:0,...o}).bidiGenerateContentSetup;
+const setup=o=>liveToken({model:'unit-live',now:0,agentVersion:2,...o}).bidiGenerateContentSetup;
 test('opt-in adds only fixed read/prepare tools and keeps existing engine tools',()=>{
   const names=setup({tools:true,agent:true}).tools[0].functionDeclarations.map(t=>t.name);
-  assert.deepEqual(names,['listen_engine','scan_engine_bay','get_my_car','find_mechanics','show_mechanic','prepare_urgent_request']);
+  assert.deepEqual(names,['listen_engine','scan_engine_bay','get_my_car','find_mechanics','show_mechanic','prepare_urgent_request','get_my_garage','get_my_requests','get_my_conversations','read_my_conversation','prepare_mechanic_message','open_app_page']);
   assert.equal(new Set(names).size,names.length);
   assert.match(LIVE_CALL_AGENT_RULES,/NOT submitted/);assert.match(LIVE_CALL_AGENT_RULES,/untrusted data/);
-  assert.equal(LIVE_CALL_TOOLS[0].functionDeclarations.length,4);
+  assert.equal(LIVE_CALL_TOOLS[0].functionDeclarations.length,10);
 });
 test('old clients stay voice-only or keep their two engine tools; string truthy is not agent consent',()=>{
   assert.equal(setup({}).tools,undefined);
   assert.equal(setup({agent:'true'}).tools,undefined);
   assert.deepEqual(setup({tools:true}).tools[0].functionDeclarations.map(t=>t.name),['listen_engine','scan_engine_bay']);
-  assert.equal(setup({agent:true}).tools[0].functionDeclarations.length,4);
+  assert.equal(setup({agent:true}).tools[0].functionDeclarations.length,10);
+  assert.equal(setup({agent:true,agentVersion:1}).tools[0].functionDeclarations.length,4);
 });
 test('agent rules are server-owned and resumption and safe speech detection are preserved',()=>{
   const s=setup({agent:true,handle:'resume_12345',system:'x'.repeat(10000)});

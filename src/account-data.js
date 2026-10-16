@@ -73,6 +73,7 @@ export const TABLES = [
   ['tech_reads', MINE, []],
   ['tech_shares', MINE, ['token']],
   ['tech_limits', MINE, []],
+  ['tech_agent_actions', MINE, ['secret_hash']],
   /* Car Passport ที่เจ้าของเปิดไว้ (ลิงก์ไม่ส่งออก — เป็นกุญแจเปิดหน้า) */
   ['car_passports', MINE, ['token']],
   /* ตัวนับเครื่องมือ AI รายวัน (f:<tool>:<uid>) อยู่ในตาราง usage */
@@ -119,7 +120,7 @@ export async function exportAccount(env, uid, { email = '' } = {}) {
 
 /* ล้างข้อมูลการใช้งาน แต่คงบัญชี ร้านช่าง และการเชื่อม LINE ไว้ (ปุ่ม "รีเซ็ตบัญชี") */
 export const RESET_TABLES = ['user_onboarding', 'cars', 'usage', 'usage_win', 'user_state', 'user_memory', 'push_subs', 'push_jobs', 'chat_prefs',
-  'odo_anchor', 'odo_state', 'maint_item', 'notify_state', 'obd_device', 'spares_cache', 'ai_events', 'chat_logs'];
+  'odo_anchor', 'odo_state', 'maint_item', 'notify_state', 'obd_device', 'spares_cache', 'ai_events', 'chat_logs', 'tech_agent_actions'];
 export async function resetAccount(env, uid) {
   const removed = {};
   for (const t of RESET_TABLES) {

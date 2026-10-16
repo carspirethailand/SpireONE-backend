@@ -17,6 +17,7 @@ import { applicantErrors, imageInfo, approvalError, CONSENT_VER } from './tech-v
 import { diditReady, verifyDidit, diditFacts, identityFlags, diditFetch, idHashOf, upgradeHash, sameHex } from './tech-identity.js';
 import { notify, jobCard, card, once, appUrl } from './line-notify.js';
 import { MEDIA_SQL, MediaError, putMedia, getMedia, deleteMedia, claimMedia, mediaLabel } from './media.js';
+import { AGENT_SCHEMA, agentAction } from './call-agent-actions.mjs';
 import { seal, open, vaultReady, needsReseal, currentKeyId, CTX } from './vault.js';
 const CATS = ['body', 'ev', 'tyre', 'air', 'eng'];
 const CAT_TH = { body: 'ตัวถัง & สี', ev: 'ไฟฟ้า & EV', tyre: 'ยาง & ช่วงล่าง', air: 'แอร์รถยนต์', eng: 'เครื่องยนต์' };
@@ -34,6 +35,9 @@ const now = () => Date.now();
 
 /* ── ตาราง ── สร้างเองครั้งแรกที่มีคนเรียก /api/tech แบบเดียวกับ ensureSchema ของระบบหลัก */
 const TECH_SQL = [
+  AGENT_SCHEMA,
+  `CREATE INDEX IF NOT EXISTS tech_agent_actions_owner ON tech_agent_actions(uid, created_at)`,
+  `CREATE INDEX IF NOT EXISTS tech_agent_actions_expiry ON tech_agent_actions(state, expires_at)`,
   `CREATE TABLE IF NOT EXISTS tech_limits (scope TEXT, uid TEXT, bucket INTEGER, n INTEGER NOT NULL, PRIMARY KEY(scope,uid,bucket))`,
   `CREATE TABLE IF NOT EXISTS tech_identity_claims (id_hash TEXT PRIMARY KEY, uid TEXT NOT NULL UNIQUE)`,
   /* ผลยืนยันตัวตนกับ Didit ต่อบัญชี — data = {url, vendor, name, birth, last3, flags} ชื่อ/วันเกิดถูกลบหลังทีมงานตรวจใบสมัครเสร็จ */
@@ -2447,6 +2451,14 @@ async function route(request, env, verifyToken) {
   if (p === '/api/tech/didit/webhook' && m === 'POST') return diditWebhook(env, request);
 
   const me = await who(request, env,true,verifyToken);
+  if (/^\/api\/tech\/agent(?:\/(confirm|cancel))?$/.test(p) && m === 'POST') {
+    const mode = p.endsWith('/confirm') ? 'confirm' : p.endsWith('/cancel') ? 'cancel' : 'execute';
+    try {
+      return await agentAction(env, me, await body(), { mode, getTech: id => techById(env,id),
+        limit: () => limit(env,'agent-draft',me.uid,20), mask,
+        send: (b, scoped) => startThread(env, scoped, b) });
+    } catch(e) { if(Number.isInteger(e.status)) fail(e.status,e.message); throw e; }
+  }
   if (p === '/api/tech/me' && m === 'GET') return meInfo(env, me);
   if (p === '/api/tech/apply' && m === 'POST') return apply(env, me, await body());
   if (p === '/api/tech/apply/identity' && m === 'POST') return startIdentity(env, me);
