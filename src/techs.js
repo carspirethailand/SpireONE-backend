@@ -175,6 +175,13 @@ const TECH_ALTER = [
     test INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE (tech_id, customer_uid))`,
   `CREATE INDEX IF NOT EXISTS tech_threads_customer ON tech_threads(customer_uid, updated_at)`,
   `CREATE INDEX IF NOT EXISTS tech_threads_tech ON tech_threads(tech_id, updated_at)`,
+  /* ช่างกำลังมา (แบบ Grab): จุดล่าสุดจุดเดียว JSON {lat,lng,acc,heading,speed,at} — ไม่เก็บเส้นทาง · ลบทิ้งเมื่อออกจากสถานะ enroute */
+  `ALTER TABLE tech_jobs ADD COLUMN live TEXT`,
+  /* Car Passport: หน้าประวัติรถที่เจ้าของเลือกเปิดให้คนอื่นดู (ขายรถมือสอง) — ไม่มีชื่อ ทะเบียน เบอร์ · ยกเลิกได้ทุกเมื่อ
+     data = ที่เจ้าของบันทึกเอง (ป้าย "บันทึกโดยเจ้าของ") · jobs = รหัสใบงานที่ซ่อมผ่าน Cendon (ป้าย "ยืนยันโดยร้าน" ดึงจากฐานข้อมูลตอนเปิดดู ปลอมไม่ได้) */
+  `CREATE TABLE IF NOT EXISTS car_passports (token TEXT PRIMARY KEY, uid TEXT NOT NULL, car_key TEXT NOT NULL, data TEXT NOT NULL, jobs TEXT,
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, views INTEGER NOT NULL DEFAULT 0)`,
+  `CREATE INDEX IF NOT EXISTS car_passports_uid ON car_passports(uid, car_key)`,
 ];
 const techReady = new WeakMap();
 async function ensureTech(env) {
@@ -1550,6 +1557,8 @@ async function updateJob(env, me, id, b) {
       'UPDATE tech_profiles SET rating_sum = rating_sum + ?, review_count = review_count + 1 WHERE id = ?').bind(rating, t.id));
   }
   const hist = parse(j.history) || [];
+  /* ออกจาก "ช่างกำลังมา" (เริ่มซ่อม/ยกเลิก/มีปัญหา) = ลบตำแหน่งช่างทิ้งทันที */
+  if (next && next !== 'enroute' && j.live) set.live = null;
   if (next) { set.status = next; hist.push({ status: next, at: ts, by, ...(codeOk ? { code: true } : {}) }); }
   else hist.push({ status: action, at: ts, by });
   set.history = JSON.stringify(hist);
@@ -1620,10 +1629,120 @@ async function shareView(env, token) {
   const j = await env.DB.prepare('SELECT * FROM tech_jobs WHERE id = ?').bind(s0.job_id).first();
   if (!j) fail(404, 'ลิงก์นี้หมดอายุหรือถูกยกเลิกแล้ว');
   const t = await techById(env, j.tech_id), d = parse(t && t.data) || {}, q = parse(j.quote) || {}, h = parse(j.history) || [];
+  /* คนที่ไว้ใจเห็นช่างวิ่งมาบนแผนที่ + เวลาถึงโดยประมาณ แต่ไม่เห็นจุดหมาย (ที่อยู่ลูกค้า) */
+  const lv = liveOf(j), eta = lv && etaOf(lv, destOf(j.address));
   return { trip: { status: j.status, updatedAt: (h[h.length - 1] || {}).at || j.updated_at, car: j.car, area: j.area, mode: j.mode,
     appointment: q.appointment || j.requested_time, expiresAt: s0.expires_at,
+    live: lv ? { lat: lv.lat, lng: lv.lng, heading: lv.heading, at: lv.at, ...(eta || {}) } : null,
     tech: { name: d.shop || d.name || 'ช่าง', avatar: d.avatar || null, verified: !!(t && t.verified),
       vetting: d.vetting && t && t.verified ? { identity: !!d.vetting.identity, cats: d.vetting.cats || [] } : null } } };
+}
+
+/* ── ช่างกำลังมา (แบบ Grab) ──
+   ช่างส่งตำแหน่งได้เฉพาะตอนสถานะ "ช่างกำลังมา" · เก็บแค่จุดล่าสุดจุดเดียว (ทับของเดิม) ไม่เก็บเส้นทาง
+   ลูกค้าเห็นตำแหน่งที่ส่งมาภายใน 3 นาทีล่าสุดเท่านั้น · เวลาถึงเป็นค่าประมาณจากระยะทาง ไม่ใช่เส้นทางจริง */
+const LIVE_FRESH = 3 * 60000;
+const destOf = a => { const m = String(a || '').match(/[?&]q=(-?\d{1,3}(?:\.\d+)?),\s*(-?\d{1,3}(?:\.\d+)?)/); return m ? { lat: Number(m[1]), lng: Number(m[2]) } : null; };
+const liveOf = j => { if (j.status !== 'enroute') return null; const v = parse(j.live); return v && now() - v.at < LIVE_FRESH ? v : null; };
+function etaOf(a, b) {
+  if (!a || !b) return null;
+  const R = 6371, rad = x => x * Math.PI / 180, dLat = rad(b.lat - a.lat), dLng = rad(b.lng - a.lng);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLng / 2) ** 2;
+  const km = 2 * R * Math.asin(Math.sqrt(h)) * 1.35;          /* ถนนจริงอ้อมกว่าเส้นตรงราว 35% */
+  const kmh = km > 20 ? 55 : km > 5 ? 35 : 25;                /* ในเมืองช้า ทางไกลเร็วกว่า */
+  return { km: Math.round(km * 10) / 10, etaMin: km < 0.15 ? 0 : Math.max(1, Math.round(km / kmh * 60 + 1)) };
+}
+const clampN = (v, lo, hi) => { const n = Number(v); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, Math.round(n))) : null; };
+async function liveSet(env, me, id, b) {
+  const { j, isTech } = await loadJob(env, me, id);
+  if (!isTech) fail(403, 'เฉพาะช่างของใบงานนี้ที่ส่งตำแหน่งได้');
+  if (j.status !== 'enroute') fail(409, 'ส่งตำแหน่งได้เฉพาะตอนกำลังเดินทางไปหาลูกค้า');
+  const lat = Number(b.lat), lng = Number(b.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180 || (!lat && !lng)) fail(400, 'ตำแหน่งไม่ถูกต้อง');
+  await limit(env, 'live', me.uid, 4000);
+  const v = { lat: Math.round(lat * 1e5) / 1e5, lng: Math.round(lng * 1e5) / 1e5, acc: clampN(b.acc, 0, 5000), heading: clampN(b.heading, 0, 359), speed: clampN(b.speed, 0, 90), at: now() };
+  /* ไม่แตะ updated_at — ตำแหน่งขยับบ่อย ไม่ควรทำให้รายการงานทั้งหมดของทั้งสองฝั่งโหลดใหม่ทุกครั้ง */
+  await env.DB.prepare("UPDATE tech_jobs SET live = ? WHERE id = ? AND status = 'enroute'").bind(JSON.stringify(v), j.id).run();
+  return { ok: true, at: v.at };
+}
+async function liveGet(env, me, id) {
+  const { j, role } = await loadJob(env, me, id);
+  const lv = liveOf(j), dest = role !== 'technician' || j.accepted_at ? destOf(j.address) : null;
+  return { status: j.status, live: lv ? { lat: lv.lat, lng: lv.lng, acc: lv.acc, heading: lv.heading, at: lv.at } : null,
+    stale: j.status === 'enroute' && !!j.live && !lv, dest, ...(lv && etaOf(lv, destOf(j.address)) || {}) };
+}
+
+/* ── Car Passport ── */
+const PASS_TOKEN = () => btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(18)))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const cleanTxt = (v, n) => String(v == null ? '' : v).replace(/[\u0000-\u001f<>]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, n);
+const cleanDate = v => { const s = String(v || '').slice(0, 10); return /^\d{4}-\d{2}-\d{2}$/.test(s) && s >= '1990-01-01' && s <= new Date(now() + 86400000).toISOString().slice(0, 10) ? s : null; };
+/* ตัวเลขติดลบ/เกินจริง = ข้อมูลเพี้ยน ทิ้งไป (ไม่ปัดเป็น 0 ให้ดูเหมือนจริง) */
+const kmOk = v => { const n = Number(v); return Number.isFinite(n) && n >= 0 && n <= 3000000 ? Math.round(n) : null; };
+function passportData(b) {
+  const c = b.car || {};
+  const car = { make: cleanTxt(c.make, 40), model: cleanTxt(c.model, 60), year: clampN(c.year, 1950, new Date().getFullYear() + 1), fuel: cleanTxt(c.fuel, 20), body: cleanTxt(c.body, 20), color: cleanTxt(c.color, 20) };
+  if (!car.make && !car.model) fail(400, 'ระบุยี่ห้อหรือรุ่นรถก่อน');
+  const odo = (Array.isArray(b.odo) ? b.odo : []).slice(0, 200).map(x => ({ date: cleanDate(x && x.date), km: kmOk(x && x.km) }))
+    .filter(x => x.date && x.km != null).sort((a, b2) => a.date < b2.date ? -1 : 1);
+  const showCost = b.showCost === true;
+  const services = (Array.isArray(b.services) ? b.services : []).slice(0, 200).map(x => ({ date: cleanDate(x && x.date), km: kmOk(x && x.km),
+    item: cleanTxt(x && x.item, 80), ...(showCost ? { amount: kmOk(x && x.amount) } : {}) })).filter(x => x.date && x.item)
+    .sort((a, b2) => a.date < b2.date ? 1 : -1);
+  return { car, odo, services, showCost, km: kmOk(b.km) };
+}
+async function passportSave(env, me, b) {
+  const key = cleanTxt(b.carKey, 60);
+  if (!key) fail(400, 'ไม่พบรถคันนี้');
+  const data = passportData(b);
+  /* ใบงานที่ "ยืนยันโดยร้าน" ต้องเป็นของเราเอง และซ่อมเสร็จแล้วจริง — ส่งรหัสอื่นมาก็ถูกตัดทิ้ง */
+  const want = [...new Set((Array.isArray(b.jobs) ? b.jobs : []).map(String).filter(x => /^[0-9a-f-]{36}$/i.test(x)))].slice(0, 60);
+  let jobs = [];
+  if (want.length) {
+    const { results } = await env.DB.prepare(`SELECT id FROM tech_jobs WHERE customer_uid = ? AND status = 'completed' AND id IN (${want.map(() => '?').join(',')})`).bind(me.uid, ...want).all();
+    jobs = results.map(r => r.id);
+  }
+  await limit(env, 'passport', me.uid, 40);
+  const ts = now();
+  const cur = await env.DB.prepare('SELECT token FROM car_passports WHERE uid = ? AND car_key = ? AND revoked = 0').bind(me.uid, key).first();
+  if (cur) {
+    await env.DB.prepare('UPDATE car_passports SET data = ?, jobs = ?, updated_at = ? WHERE token = ?').bind(JSON.stringify(data), JSON.stringify(jobs), ts, cur.token).run();
+    return { ok: true, token: cur.token, updatedAt: ts, jobs: jobs.length };
+  }
+  const token = PASS_TOKEN();
+  await env.DB.prepare('INSERT INTO car_passports (token, uid, car_key, data, jobs, created_at, updated_at) VALUES (?,?,?,?,?,?,?)')
+    .bind(token, me.uid, key, JSON.stringify(data), JSON.stringify(jobs), ts, ts).run();
+  return { ok: true, token, updatedAt: ts, jobs: jobs.length };
+}
+async function passportMine(env, me, url) {
+  const key = cleanTxt(url.searchParams.get('car'), 60);
+  const r = key && await env.DB.prepare('SELECT token, updated_at, views, jobs FROM car_passports WHERE uid = ? AND car_key = ? AND revoked = 0').bind(me.uid, key).first();
+  return { passport: r ? { token: r.token, updatedAt: r.updated_at, views: r.views, jobs: (parse(r.jobs) || []).length } : null };
+}
+async function passportRevoke(env, me, b) {
+  const key = cleanTxt(b.carKey, 60);
+  await env.DB.prepare('UPDATE car_passports SET revoked = 1 WHERE uid = ? AND car_key = ? AND revoked = 0').bind(me.uid, key).run();
+  return { ok: true };
+}
+/* หน้าที่คนซื้อรถเปิดดู (ไม่ต้องล็อกอิน) — ไม่มีชื่อเจ้าของ ทะเบียน ที่อยู่ เบอร์ หรือข้อความที่ลูกค้าพิมพ์คุยกับช่าง */
+async function passportView(env, token) {
+  const r = await env.DB.prepare('SELECT * FROM car_passports WHERE token = ?').bind(token).first();
+  if (!r || r.revoked) fail(404, 'เจ้าของรถปิดหน้านี้แล้ว หรือลิงก์ไม่ถูกต้อง');
+  const data = parse(r.data) || {}, ids = parse(r.jobs) || [];
+  let verified = [];
+  if (ids.length) {
+    const { results } = await env.DB.prepare(`SELECT * FROM tech_jobs WHERE customer_uid = ? AND status = 'completed' AND id IN (${ids.map(() => '?').join(',')})`).bind(r.uid, ...ids).all();
+    verified = await Promise.all(results.map(async j => {
+      const t = await techById(env, j.tech_id), d = parse(t && t.data) || {}, q = parse(j.quote) || {}, h = parse(j.history) || [];
+      const doneAt = ((h.filter(x => x.status === 'completed').pop()) || {}).at || j.updated_at;
+      const km = (String(j.car).match(/([\d,]{3,9})\s*กม/) || [])[1];
+      return { at: doneAt, shop: d.shop || d.name || 'ร้านใน Cendon', shopVerified: !!(t && t.verified), test: !!j.test,
+        work: cleanTxt(j.completion || q.scope || '', 220), warranty: Number(q.warranty) || 0, rating: (parse(j.review) || {}).rating || null,
+        km: km ? Number(km.replace(/,/g, '')) : null, ...(data.showCost && q.total ? { amount: q.total } : {}) };
+    }));
+    verified.sort((a, b) => b.at - a.at);
+  }
+  env.bg && env.bg(env.DB.prepare('UPDATE car_passports SET views = views + 1 WHERE token = ?').bind(token).run());
+  return { passport: { ...data, verified, createdAt: r.created_at, updatedAt: r.updated_at } };
 }
 
 const CODE_TTL = 7 * 86400000, CODE_TRIES = 5;
@@ -2236,6 +2355,8 @@ async function route(request, env, verifyToken) {
   }
   const shm = p.match(/^\/api\/tech\/share\/([A-Za-z0-9_-]{20,64})$/);
   if (shm && m === 'GET') return shareView(env, shm[1]);
+  const psm = p.match(/^\/api\/tech\/passport\/([A-Za-z0-9_-]{20,64})$/);
+  if (psm && m === 'GET') return passportView(env, psm[1]);
   if (p === '/api/tech/reviews' && m === 'GET') {
     let me = null;
     try { me = await who(request, env, false); } catch (e) {}
@@ -2282,6 +2403,12 @@ async function route(request, env, verifyToken) {
   if (p === '/api/tech/gig/unsponsor' && m === 'POST') return unsponsorGig(env, me, await body());
   if (p === '/api/tech/stats' && m === 'GET') return stats(env, me);
   if (p === '/api/tech/pulse' && m === 'GET') return pulse(env, me);
+  if (p === '/api/tech/passport' && m === 'POST') return passportSave(env, me, await body());
+  if (p === '/api/tech/passport' && m === 'GET') return passportMine(env, me, url);
+  if (p === '/api/tech/passport/revoke' && m === 'POST') return passportRevoke(env, me, await body());
+  const lvm = p.match(/^\/api\/tech\/jobs\/([0-9a-f-]{36})\/live$/i);
+  if (lvm && m === 'GET') return liveGet(env, me, lvm[1]);
+  if (lvm && m === 'POST') return liveSet(env, me, lvm[1], await body());
   if (p === '/api/tech/advice' && m === 'GET') return advice(env, me);
   const pd = p.match(/^\/api\/tech\/posts\/([0-9a-f-]{36})$/i);
   if (pd && m === 'GET') return postDetail(env, me, pd[1]);

@@ -73,6 +73,10 @@ export const TABLES = [
   ['tech_reads', MINE, []],
   ['tech_shares', MINE, ['token']],
   ['tech_limits', MINE, []],
+  /* Car Passport ที่เจ้าของเปิดไว้ (ลิงก์ไม่ส่งออก — เป็นกุญแจเปิดหน้า) */
+  ['car_passports', MINE, ['token']],
+  /* ตัวนับเครื่องมือ AI รายวัน (f:<tool>:<uid>) อยู่ในตาราง usage */
+  ['usage', "uid LIKE 'f:%:' || ?", []],
 ];
 
 const missing = e => /no such table|no such column/i.test(String(e && e.message || e));
@@ -191,8 +195,11 @@ export async function deleteAccount(env, uid, { email = '' } = {}) {
   add('tech_identity_claims', keepClaim
     ? await run(env, "UPDATE tech_identity_claims SET uid = 'deleted:' || id_hash WHERE uid = ?", uid)
     : await run(env, 'DELETE FROM tech_identity_claims WHERE uid = ?', uid));
-  for (const t of ['tech_applications', 'tech_identity', 'tech_docs', 'tech_media', 'tech_shares', 'tech_limits', 'technicians'])
+  for (const t of ['tech_applications', 'tech_identity', 'tech_docs', 'tech_media', 'tech_shares', 'tech_limits', 'technicians', 'car_passports'])
     add(t, await run(env, `DELETE FROM ${t} WHERE uid = ?`, uid));
+  add('usage', await run(env, "DELETE FROM usage WHERE uid LIKE 'f:%:' || ?", uid));
+  /* ตำแหน่งล่าสุดตอนเราเป็นช่างที่กำลังเดินทาง: ลบทิ้ง */
+  if (shop) add('tech_jobs_live', await run(env, 'UPDATE tech_jobs SET live = NULL WHERE tech_id = ? AND live IS NOT NULL', shop.id));
 
   /* LINE: ลบการเชื่อม ประวัติคุยกับบอท และลิงก์เชื่อมที่ค้าง */
   for (const t of ['line_chat', 'line_link_token']) add(t, await run(env, `DELETE FROM ${t} WHERE ${MY_LINE}`, uid));

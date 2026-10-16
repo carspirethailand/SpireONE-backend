@@ -2,10 +2,10 @@ import { verifyFirebaseToken } from './auth.js';
 import { EMAIL_AUTH_SQL, handleEmailAuth, deleteFirebaseUser } from './email-auth.js';
 import { exportAccount, resetAccount, deleteAccount, deleteBlockers } from './account-data.js';
 import { ONBOARDING_SQL, handleOnboarding, onboardingName, sanitizeSetupState } from './onboarding.js';
-import { buildFeatureRequest } from './features-ai.mjs';
+import { buildFeatureRequest, cleanFeatureJson, featureCap } from './features-ai.mjs';
 import { handleTech, reconcileDiditIdentities, vaultSweep, expireStaleApplications, releaseWrongHolds } from './techs.js';
 import { richMenuStatus, setupRichMenu, lineStatus, lineFixWebhook } from './line-menu.js';
-import { appUrl, card } from './line-notify.js';
+import { appUrl, card, notify } from './line-notify.js';
 import { refreshNews, newsStatus } from './news.js';
 import { ensureSpec, getSpec, specKey, equipmentKey, validQuery, reportSpec, listSpecs, verifySpec, specLogList, specAI } from './carspec.js';
 import { decodeVin, vpic, cleanInfo } from './vin.js';
@@ -750,10 +750,12 @@ async function tokensToday(env, uid) {
 }
 
 /* ===== Gemini (server-side only — key never leaves the Worker) ===== */
-async function callGemini(env, { contents, system, search, temp, json: wantJson, maxTokens, meter }) {
+async function callGemini(env, { contents, system, search, temp, json: wantJson, maxTokens, meter, prefer }) {
   const geminiKey = env.GEMINI_KEY;
   if (!geminiKey) throw new Error('AI is not configured');
   const models = [
+    /* prefer = รุ่นที่งานนั้นอยากลองก่อน (เช่น ตีกรอบชิ้นส่วนในภาพต้องการรุ่นที่ดูภาพเก่งกว่า) */
+    ...(Array.isArray(prefer) ? prefer : []),
     'gemini-3.5-flash-lite',
     'gemini-3.1-flash-lite',
     env.GEMINI_MODEL
@@ -3661,7 +3663,9 @@ async function runPushRound(env) {
 /* ส่งงานที่นัดเวลาไว้และถึงกำหนดแล้ว — รันถี่กว่ารอบเตือนประจำวัน
    เพราะเรื่องอย่างหมดเวลาจอดรถ ช้าไปสิบนาทีก็ไม่มีประโยชน์แล้ว */
 async function runDueJobs(env) {
-  if (!env.VAPID_PRIVATE || !env.VAPID_PUBLIC) return;
+  const webPush = !!(env.VAPID_PRIVATE && env.VAPID_PUBLIC);
+  /* ไม่มีกุญแจ web push แต่มี LINE: ยังส่งเตือนปฏิทินค่าใช้จ่ายทาง LINE ได้ */
+  if (!webPush && !env.LINE_CHANNEL_TOKEN) return;
   let rows;
   try {
     rows = await env.DB.prepare(
@@ -3673,10 +3677,15 @@ async function runDueJobs(env) {
 
   for (const j of jobs) {
     let subs = [];
-    try {
+    if (webPush) try {
       const r = await env.DB.prepare('SELECT * FROM push_subs WHERE uid = ?').bind(j.uid).all();
       subs = (r && r.results) || [];
     } catch (e) {}
+    /* ปฏิทินค่าใช้จ่าย (tag cendon-cal): ส่งการ์ดทาง LINE ด้วย ถ้าผู้ใช้เชื่อม LINE ไว้ */
+    if (j.tag === 'cendon-cal') try {
+      await notify(env, j.uid, card({ tag: 'ปฏิทินค่าใช้จ่าย', title: j.title, lines: [j.body],
+        url: appUrl(env, String(j.url || '/garage').startsWith('/') ? j.url : '/garage'), label: 'เปิดปฏิทิน' }));
+    } catch (e) { /* LINE ล้มต้องไม่ทำให้คิวค้าง */ }
     for (const sub of subs) {
       try {
         const res = await sendPush(env, sub, { title: j.title, body: j.body, url: j.url, tag: j.tag });
@@ -5087,7 +5096,16 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
           if (!candidates.length) return deny('Live token error: no working live model', 502);
           const now = Date.now();
 
-          const mk = liveModel => ({
+          /* เครื่องมือที่ผู้ช่วยเสียงเรียกเองได้ระหว่างโทร: ผู้ใช้พูดว่า "ฟังเสียงเครื่องหน่อย" / "ดูห้องเครื่องให้หน่อย"
+             หน้าเว็บเปิดโหมดฟังเสียงดิบ (ไม่กรองเสียงรบกวน) หรือสแกนภาพจากกล้อง แล้วส่งผลกลับให้ AI พูดต่อ */
+          const LIVE_TOOLS = [{ functionDeclarations: [
+            { name: 'listen_engine', description: 'Record about 10 seconds of raw engine or car sound from the phone microphone (no noise filtering) and analyse it. Call this whenever the user asks you to listen to the engine, a noise, a knock, a squeal or any car sound, or says they will hold the phone near the car.',
+              parameters: { type: 'OBJECT', properties: { area: { type: 'STRING', description: 'Where the phone is held, e.g. engine bay, wheel, exhaust, cabin' }, when: { type: 'STRING', description: 'When the sound happens, e.g. idle, revving, braking, turning' } } } },
+            { name: 'scan_engine_bay', description: 'Take a sharp photo from the rear camera and label the visible parts of the engine bay on screen (dipstick, coolant, brake fluid, battery and so on) with short safety-first checks. Call this when the user asks you to look at, scan or explain the engine bay or under the bonnet.',
+              parameters: { type: 'OBJECT', properties: {} } },
+          ] }];
+          const withTools = b.tools === true;
+          const mk = (liveModel, tools) => ({
             uses: 1,
             expireTime: new Date(now + 30 * 60 * 1000).toISOString(),
             newSessionExpireTime: new Date(now + 2 * 60 * 1000).toISOString(),
@@ -5102,6 +5120,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                 startOfSpeechSensitivity: 'START_SENSITIVITY_HIGH', endOfSpeechSensitivity: 'END_SENSITIVITY_HIGH',
                 prefixPaddingMs: 40, silenceDurationMs: 350 } },
               systemInstruction: { parts: [{ text: String(b.system || '').slice(0, 6000) }] },
+              ...(tools ? { tools: LIVE_TOOLS } : {}),
               inputAudioTranscription: {},
               outputAudioTranscription: {},
             },
@@ -5109,14 +5128,24 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
 
           let lastErr = '';
           for (const liveModel of candidates) {
-            const res = await fetch(`${baseUrl}/v1alpha/auth_tokens`, {
+            let tools = withTools;
+            let res = await fetch(`${baseUrl}/v1alpha/auth_tokens`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey },
-              body: JSON.stringify(mk(liveModel)),
+              body: JSON.stringify(mk(liveModel, tools)),
             });
+            /* รุ่นนี้ไม่รับเครื่องมือ → ขอใหม่แบบไม่มีเครื่องมือ (ปุ่มบนจอยังใช้ได้ครบ) */
+            if (!res.ok && tools && res.status === 400) {
+              const why = await res.clone().text().catch(() => '');
+              if (/tool|function/i.test(why)) {
+                tools = false;
+                res = await fetch(`${baseUrl}/v1alpha/auth_tokens`, { method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey }, body: JSON.stringify(mk(liveModel, false)) });
+              }
+            }
             if (res.ok) {
               const tok = await res.json();
-              return json({ token: tok.name, model: liveModel });
+              return json({ token: tok.name, model: liveModel, tools });
             }
             lastErr = `${liveModel} ${res.status}: ${(await res.text()).slice(0, 200)}`;
             /* รุ่นนี้ใช้ไม่ได้ (ไม่มี/ไม่มีสิทธิ์) → ลองรุ่นถัดไป · คีย์ผิดหรือโควตาหมด → ลองต่อก็ไม่ช่วย */
@@ -5895,10 +5924,16 @@ ${convo}`;
           const at = Number(b.sendAt);
           if (!Number.isFinite(at)) return deny('Bad sendAt', 400);
           // กันตั้งเวลาย้อนหลังหรือไกลเกินสองวัน ซึ่งไม่ใช่การใช้งานที่ตั้งใจ
-          if (at < Date.now() - 60000 || at > Date.now() + 2 * 86400000) {
+          // ยกเว้นเตือนจากปฏิทินค่าใช้จ่าย 12 เดือน (tag cendon-cal) ตั้งล่วงหน้าได้ถึง 400 วัน ไม่เกิน 40 รายการค้างต่อคน
+          const cal = b.tag === 'cendon-cal';
+          if (at < Date.now() - 60000 || at > Date.now() + (cal ? 400 : 2) * 86400000) {
             return deny('sendAt out of range', 400);
           }
           const id = String(b.id || crypto.randomUUID()).slice(0, 60);
+          if (cal) {
+            const n = await env.DB.prepare("SELECT COUNT(*) AS n FROM push_jobs WHERE uid = ? AND tag = 'cendon-cal' AND done = 0 AND id != ?").bind(actor.payload.sub, id).first();
+            if (n && n.n >= 40) return deny('Too many reminders', 429);
+          }
           const w = [];
           await safe(env, w, 'jobs.save', () => env.DB.prepare(`
             INSERT INTO push_jobs (id, uid, send_at, title, body, url, tag, done, t)
@@ -5906,6 +5941,7 @@ ${convo}`;
             ON CONFLICT(id) DO UPDATE SET
               send_at = excluded.send_at, title = excluded.title, body = excluded.body,
               url = excluded.url, tag = excluded.tag, done = 0
+              WHERE push_jobs.uid = excluded.uid
           `).bind(id, actor.payload.sub, Math.round(at),
             String(b.title || 'Cendon').slice(0, 120),
             String(b.body || '').slice(0, 200),
@@ -5938,19 +5974,34 @@ ${convo}`;
           const warnings = [];
           const limits = await getConfig(env, 'limits', {});
           const limit = limits.aiDaily || parseInt(env.AI_DAILY_LIMIT || '60', 10);
+          /* เครื่องมือใหม่ที่ใช้ AI หนัก มีเพดานต่อคนต่อวันของตัวเอง (นับแยกในตาราง usage ด้วยคีย์ f:<tool>:<uid>) */
+          const cap = featureCap(limits, body.tool);
+          const capKey = cap ? `f:${body.tool}:${uid}` : '';
           if (rank(actor.role) < rank('admin')) {
             const used = await env.DB.prepare('SELECT count FROM usage WHERE uid = ? AND day = ?').bind(uid, day).first();
             if (used && used.count >= limit) return deny('quota', 429);
             const quota = await quotaState(env, uid, actor.role);
             if (quota && quota.used >= quota.limit) return json({ error: 'quota', quota }, 429);
+            if (cap) {
+              const f = await env.DB.prepare('SELECT count FROM usage WHERE uid = ? AND day = ?').bind(capKey, day).first();
+              if (f && f.count >= cap) return json({ error: 'feature_quota', limit: cap }, 429);
+            }
           }
           const meter = newMeter();
-          const text = await callGemini(env, { ...input, meter });
+          const prefer = body.tool === 'bay' && env.GEMINI_VISION_MODEL ? [env.GEMINI_VISION_MODEL] : undefined;
+          const text = await callGemini(env, { ...input, meter, prefer });
+          let data = null;
+          if (input.json) {
+            try { data = cleanFeatureJson(body.tool, text); }
+            catch (e) { await meterTokens(env, uid, meter); return deny('AI ตอบกลับไม่สมบูรณ์ ลองใหม่อีกครั้ง', 502); }
+          }
           await meterTokens(env, uid, meter);
           // meterTokens already counted one call; multimodal tools cost three calls total.
           await safe(env, warnings, 'usage.write', () => env.DB.prepare(`INSERT INTO usage (uid, day, count) VALUES (?, ?, 2)
             ON CONFLICT(uid, day) DO UPDATE SET count = count + 2`).bind(uid, day).run(), null);
-          return json({ text, tool: body.tool, source: 'ai', warnings });
+          if (cap) await safe(env, warnings, 'usage.feature', () => env.DB.prepare(`INSERT INTO usage (uid, day, count) VALUES (?, ?, 1)
+            ON CONFLICT(uid, day) DO UPDATE SET count = count + 1`).bind(capKey, day).run(), null);
+          return json(data ? { data, tool: body.tool, source: 'ai', limit: cap || undefined, warnings } : { text, tool: body.tool, source: 'ai', warnings });
         })();
       }
 
