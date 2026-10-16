@@ -4,6 +4,7 @@ import { exportAccount, resetAccount, deleteAccount, deleteBlockers } from './ac
 import { ONBOARDING_SQL, handleOnboarding, onboardingName, sanitizeSetupState } from './onboarding.js';
 import { buildFeatureRequest, cleanFeatureJson, featureCap } from './features-ai.mjs';
 import { liveToken, cleanHandle } from './live-setup.mjs';
+import { valetPrompt } from './agent-prompt.mjs';
 import { handleTech, reconcileDiditIdentities, vaultSweep, expireStaleApplications, releaseWrongHolds, expireOpenJobs } from './techs.js';
 import { richMenuStatus, setupRichMenu, lineStatus, lineFixWebhook } from './line-menu.js';
 import { appUrl, card, notify } from './line-notify.js';
@@ -1292,8 +1293,8 @@ async function cacheSave(env, carInfo, question, answer, uid) {
   if (!make && !model) return;
   const qn = normQ(question);
   if (qn.length < 6 || !answer || answer.length < 40) return;
-  /* คำตอบที่ยังถามข้อมูลเพิ่มอยู่ ไม่ใช่คำตอบจบ อย่าเก็บไว้ใช้ซ้ำ */
-  if (/\[\[ASK\]\]/.test(answer)) return;
+  /* คำตอบที่ยังถามข้อมูลเพิ่มอยู่ ไม่ใช่คำตอบจบ อย่าเก็บไว้ใช้ซ้ำ · คำสั่ง Valet เป็นของบัญชีนั้นคนเดียว */
+  if (/\[\[(ASK|ACT)\]\]/.test(answer)) return;
   if (CACHE_PII.test(question) || CACHE_PII.test(answer)) return;
   if (uid) {
     try {
@@ -4809,7 +4810,7 @@ export default {
               /* ส่วนที่เหมือนกันทุกข้อความไว้หน้า ส่วนที่เปลี่ยนไว้หลัง — Gemini จำส่วนหน้าไว้ได้ ตอบรอบถัดไปเร็วขึ้น */
               const sys = `${IDENTITY}
 
-${STREAM_TALK}${featuresBlock()}${smartBlock()}${stylePrompt(activeStyle, activeCustom)}${depthNote(body.depth)}
+${STREAM_TALK}${featuresBlock()}${valetPrompt(body)}${smartBlock()}${stylePrompt(activeStyle, activeCustom)}${depthNote(body.depth)}
 ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext}` : ''}${userBlock}${kbBlock}${skillBlock}${fresh ? FORCE_SEARCH : ''}`;
 
               await send({ type: 'status', key: fresh ? 'search' : (hasMedia ? 'media' : 'think'),
@@ -4975,7 +4976,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                ไม่เรียกโมเดลเลย จึงไม่หักโควตาสักหน่วย
                ข้ามขั้นนี้ถ้ามีไฟล์แนบ เพราะต้องดูของจริงทุกครั้ง
                หรือผู้ใช้เลือกสกิลไว้ เพราะคำสั่งเปลี่ยนคำตอบ */
-            if (!hasMedia && !(body.skillIds && body.skillIds.length) && body.fresh !== true
+            if (!hasMedia && !(body.skillIds && body.skillIds.length) && body.fresh !== true && !body.agent
                 && !needsFresh(question)) {
               const hit = await cacheLookup(env, carInfo, question);
               if (hit) {
@@ -5003,7 +5004,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
               ? `\nรถของผู้ใช้: ${carInfo.make || ''} ${carInfo.model || ''} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` : '';
             const sys = `${IDENTITY}
 
-${STREAM_TALK}${featuresBlock()}${smartBlock()}${stylePrompt(activeStyle, activeCustomStyle)}${depthNote(body.depth)}
+${STREAM_TALK}${featuresBlock()}${valetPrompt(body)}${smartBlock()}${stylePrompt(activeStyle, activeCustomStyle)}${depthNote(body.depth)}
 ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext}` : ''}${userBlock}${kbBlock}${skillPrompt || ''}${fresh ? FORCE_SEARCH : ''}`;
             try {
               const r = await fastAnswer(env, {
