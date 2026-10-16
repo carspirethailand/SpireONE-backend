@@ -469,10 +469,10 @@ async function meInfo(env, me) {
   /* งานที่รอเราทำอะไรสักอย่าง + ข้อความที่ยังไม่ได้อ่าน
      ใช้ขึ้นตัวเลขบนปุ่ม "งานของฉัน" ช่างจะได้ไม่พลาดคำขอราคา
      เพราะเรายังไม่มีการแจ้งเตือนทาง SMS */
-  const jobs = await myJobs(env, me, t);
+  /* ใบงานกับห้องทักดึงพร้อมกัน (เดิมทีละอย่าง) — หน้า Studio/หน้าแรกเปิดเร็วขึ้น */
+  const [jobs, thr] = await Promise.all([myJobs(env, me, t), myThreads(env, me, new URL('https://x/')).catch(() => null)]);
   /* ห้องทักช่างที่มีข้อความยังไม่อ่าน นับรวมด้วย — ช่างไม่พลาดลูกค้าที่ทักมาถาม */
-  let msgs = 0;
-  try { msgs = (await myThreads(env, me, new URL('https://x/'))).threads.filter(x => x.unread > 0).length; } catch (e) {}
+  const msgs = thr ? thr.threads.filter(x => x.unread > 0).length : 0;
   const attention = jobs.filter(j => j.needsMe || j.unread > 0).length + msgs;
   return {
     uid: me.uid, email: me.email, admin: me.admin, staff: me.staff, version: API_VERSION,
@@ -1689,6 +1689,10 @@ async function groupOf(env, me, gid) {
    แต่เบอร์โทรยังเปิดหลังลูกค้ายืนยันราคาเท่านั้น
    ══════════════════════════════════════════════════════════════════ */
 const POST_TTL = 48 * 3600 * 1000;
+/* งานด่วน = รถเสียตอนนี้ ค้างนานกว่านี้แปลว่าลูกค้าได้คนช่วยแล้วหรือหมดความจำเป็น — ไม่แสดงให้ช่างเห็นค้างอยู่ตลอด */
+const URGENT_TTL = 3 * 3600 * 1000;
+const postTtl = p => p.urgent ? URGENT_TTL : POST_TTL;
+const postLive = p => p.status === 'open' && p.created_at + postTtl(p) > now();
 function km(a, b, c, d) {
   const R = 6371, r = Math.PI / 180, dLa = (c - a) * r, dLo = (d - b) * r;
   const h = Math.sin(dLa / 2) ** 2 + Math.cos(a * r) * Math.cos(c * r) * Math.sin(dLo / 2) ** 2;
@@ -1768,13 +1772,27 @@ async function myPosts(env, me) {
   const out = [];
   for (const p of results) {
     const o = await env.DB.prepare("SELECT COUNT(*) AS n, MIN(CASE WHEN quote IS NOT NULL THEN json_extract(quote,'$.total') END) AS lo FROM tech_jobs WHERE group_id = ? AND status != 'cancelled'").bind(p.id).first();
-    const expired = p.status === 'open' && p.created_at + POST_TTL < now();
+    const expired = p.status === 'open' && !postLive(p);
     out.push(postOut({ ...p, status: expired ? 'expired' : p.status }, { offers: o.n, lowest: o.lo, address: p.address }, true));
   }
   return { posts: out };
 }
 
 /* งานรอบตัวช่าง — เฉพาะประกาศที่ยังเปิด ไม่หมดอายุ อยู่ในรัศมีรับงาน และหมวดตรง (หรือไม่ระบุหมวด) */
+/* ชีพจรของ Studio: ใบงานของร้าน ข้อความในใบงาน ห้องทัก และประกาศที่เปิดอยู่ เปลี่ยนเมื่อไร ค่า v เปลี่ยน
+   หน้า Studio ถามทุกไม่กี่วินาที (เบามาก) แล้วค่อยดึงรายการเต็มเฉพาะตอนมีอะไรใหม่ = เห็นงานเกือบทันที โดยไม่ยิงหนัก */
+async function pulse(env, me) {
+  const shop = "(SELECT id FROM tech_profiles WHERE uid = ?)";
+  /* สี่คำถามยิงพร้อมกัน — รอเท่ากับอันที่ช้าที่สุดอันเดียว */
+  const r = await Promise.all([
+    env.DB.prepare(`SELECT COUNT(*) AS n, MAX(updated_at) AS m FROM tech_jobs WHERE tech_id = ${shop} OR customer_uid = ?`).bind(me.uid, me.uid).first(),
+    env.DB.prepare(`SELECT MAX(id) AS m FROM tech_messages WHERE job_id IN (SELECT id FROM tech_jobs WHERE (tech_id = ${shop} OR customer_uid = ?) AND status NOT IN ('completed','cancelled'))`).bind(me.uid, me.uid).first(),
+    env.DB.prepare(`SELECT MAX(updated_at) AS m FROM tech_threads WHERE tech_id = ${shop} OR customer_uid = ?`).bind(me.uid, me.uid).first(),
+    env.DB.prepare("SELECT COUNT(*) AS n, MAX(updated_at) AS m FROM tech_posts WHERE status = 'open' AND created_at > ?").bind(now() - POST_TTL).first(),
+  ]);
+  const v = r.map(o => { o = o || {}; return (o.n ?? '') + ':' + (o.m ?? ''); }).join('|');
+  return { v };
+}
 async function nearPosts(env, me) {
   const t = await env.DB.prepare('SELECT * FROM tech_profiles WHERE uid = ?').bind(me.uid).first();
   if (!t || t.suspended) fail(403, 'ต้องเป็นช่างในระบบก่อน');
@@ -1796,7 +1814,7 @@ async function nearPosts(env, me) {
     mc.forEach(r => { pc[r.owner] = r.n; });
   }
   const posts = results.map(p => ({ p, dist: km(d.lat, d.lng, p.lat, p.lng) }))
-    .filter(x => postVisible(x.p, t, d, x.dist))
+    .filter(x => postLive(x.p) && postVisible(x.p, t, d, x.dist))
     .sort((a, b) => (b.p.urgent - a.p.urgent) || a.dist - b.dist)
     .map(x => postOut(x.p, { dist: roughKm(x.dist), mine: mine[x.p.id] || null, photos: pc[x.p.id] || 0 }));
   return { posts, radius, center: { lat: d.lat, lng: d.lng } };
@@ -1805,7 +1823,7 @@ async function nearPosts(env, me) {
 async function offer(env, me, postId, b) {
   const p = await env.DB.prepare('SELECT * FROM tech_posts WHERE id = ?').bind(postId).first();
   if (!p) fail(404, 'ไม่พบประกาศ');
-  if (p.status !== 'open' || p.created_at + POST_TTL < now()) fail(409, 'ประกาศนี้ปิดแล้ว');
+  if (!postLive(p)) fail(409, 'ประกาศนี้ปิดแล้ว');
   const t = await env.DB.prepare('SELECT * FROM tech_profiles WHERE uid = ?').bind(me.uid).first();
   if (!t || t.suspended) fail(403, 'ต้องเป็นช่างในระบบก่อน');
   if (p.test && !t.test) fail(404, 'ไม่พบประกาศ');
@@ -2263,6 +2281,7 @@ async function route(request, env, verifyToken) {
   if (p === '/api/tech/gig/sponsor' && m === 'POST') return sponsorGig(env, me, await body());
   if (p === '/api/tech/gig/unsponsor' && m === 'POST') return unsponsorGig(env, me, await body());
   if (p === '/api/tech/stats' && m === 'GET') return stats(env, me);
+  if (p === '/api/tech/pulse' && m === 'GET') return pulse(env, me);
   if (p === '/api/tech/advice' && m === 'GET') return advice(env, me);
   const pd = p.match(/^\/api\/tech\/posts\/([0-9a-f-]{36})$/i);
   if (pd && m === 'GET') return postDetail(env, me, pd[1]);

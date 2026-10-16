@@ -56,3 +56,24 @@ test('reach is honest: nobody in range = 0, and the poster never counts their ow
   assert.equal((await f.call(USER,'/api/tech/posts',post({urgent:true}))).reach,0,'shop is in Chiang Mai, post is in Bangkok');
   assert.equal((await f.call(MECH,'/api/tech/posts',post({urgent:true,lat:18.79,lng:98.98}))).reach,0,'own shop is not counted');
 });
+
+test('pulse changes the moment something new arrives (new urgent job/post, a message) and stays the same otherwise', async()=>{
+  const f=fixture();await withMechanic(f);
+  const v0=(await f.call(MECH,'/api/tech/pulse')).v;assert.equal((await f.call(MECH,'/api/tech/pulse')).v,v0,'nothing new = same value');
+  assert.equal((await f.call(USER,'/api/tech/jobs',urgentJob())).status,200);
+  const v1=(await f.call(MECH,'/api/tech/pulse')).v;assert.notEqual(v1,v0,'new urgent job');
+  assert.equal((await f.call(USER,'/api/tech/posts',post({urgent:true}))).status,200);
+  const v2=(await f.call(MECH,'/api/tech/pulse')).v;assert.notEqual(v2,v1,'new urgent post nearby');
+  assert.equal((await f.call('', '/api/tech/pulse')).status,401,'needs sign-in');
+});
+
+test('an urgent post disappears from mechanics once the customer picks a shop, or after 3 hours', async()=>{
+  const f=fixture();await withMechanic(f);
+  const p=post({urgent:true});assert.equal((await f.call(USER,'/api/tech/posts',p)).status,200);
+  assert.equal((await f.call(MECH,'/api/tech/posts/near')).posts.length,1);
+  f.sqlite.prepare("UPDATE tech_posts SET created_at=?").run(Date.now()-3*3600*1000-60000);
+  assert.equal((await f.call(MECH,'/api/tech/posts/near')).posts.length,0,'stale urgent post is gone');
+  const q=post({urgent:true});assert.equal((await f.call(USER,'/api/tech/posts',q)).status,200);
+  f.sqlite.prepare("UPDATE tech_posts SET status='matched' WHERE id=?").run(q.id);
+  assert.equal((await f.call(MECH,'/api/tech/posts/near')).posts.length,0,'customer already chose another shop');
+});
