@@ -7,7 +7,7 @@ image-analysis pipeline. No model weights have been trained or fine-tuned.
 It does not recognise every possible part, reveal hidden parts, diagnose faults,
 establish roadworthiness, or guarantee correct identification.
 
-- 42 server-owned component types, Thai/English names, functions and safety text.
+- 47 server-owned component types, Thai/English names, functions and safety text.
 - At most 24 distinct visible objects per image. Separate hoses/coils may have
   the same type. Unknown-purpose hoses remain explicitly unidentified.
 - The model returns only a known part ID, a tight box, subjective certainty and
@@ -34,6 +34,31 @@ shared 18-second model-attempt budget, with at most 10 seconds per attempt.
 Existing auth, quota, role and metering guards remain in force. Old unversioned
 scan clients keep the legacy contract.
 
+`src/cover-policy.mjs` owns optional target-specific cover guidance. Valid
+`context.targetPart` and bounded `context.viewAttempts` select `leave_on`,
+`change_view`, or `manual_required` after accepted visible detections. None
+authorises removal. Missing hardware is not proof it sits under this cover.
+Forged approval flags and model-produced removal advice are not accepted.
+The prompt distinguishes cosmetic cover, sealed/bolted valve cover, airbox,
+battery enclosure, service trim, remote jump terminal and visible filler neck.
+The ten supplied photo cases in `test/engine-reference-cases.mjs` are provisional
+visual-review notes only, NOT expert labels, training or model-evaluation results.
+Original photos, private paths, plates and VINs are not included.
+
+## Reference attachments during the existing voice call
+
+The authenticated feature endpoint also accepts `tool:"call_context"`. Images,
+small PDFs or `context.referenceText` are untrusted material, not executable
+instructions. Up to three attachments and 6,000,000 aggregate base64 characters
+are accepted. Audio is not accepted by this task; legacy feature MIME rules
+remain unchanged. A bounded JSON summary and uncertainty list use at most 1,200
+output tokens and an 18-second total model-attempt budget. The frontend adds
+the summary as a user turn into its existing Live socket; raw files never enter
+the Live transport. No new provider, public upload URL, file database or raw
+request logging is added. Existing authentication, metering, quotas and the
+provider's data-handling terms still apply. This is not a privacy/redaction
+guarantee for arbitrary file contents; users should avoid sensitive identifiers.
+
 Deploy this backend BEFORE the paired frontend. A new client receiving an old
 contract shows a version error, never guesses a result. No migration, new
 secret, billing switch or configuration change is required. Do not deploy the
@@ -41,7 +66,7 @@ dirty primary backend checkout or include Backyard files.
 
 ## Verification and release gap
 
-- Backend: 345 automated tests pass, including schema/provider transport mocks,
+- Backend: 351 automated tests pass, including schema/provider transport mocks,
   all affected legacy features, input bounds and filtering adversarial outputs.
 - Wrangler 4.105.0 dry run compiles. A dry run does not deploy or prove the remote
   model accepts the schema.
@@ -74,4 +99,9 @@ human-labelled dataset and a separate training/validation/serving workflow;
 that work has not been performed here.
 
 References: [Gemini image understanding/object detection](https://ai.google.dev/gemini-api/docs/image-understanding),
-[structured outputs](https://ai.google.dev/gemini-api/docs/structured-output).
+[structured outputs](https://ai.google.dev/gemini-api/docs/structured-output),
+[Live conversation turns](https://ai.google.dev/gemini-api/docs/live-api/capabilities),
+[PDF processing](https://ai.google.dev/gemini-api/docs/document-processing).
+Safety examples informing the conservative policy, not exact procedures for
+the supplied vehicles: [Mercedes owner manual](https://www.mbusa.com/content/dam/mb-nafta/us/owners/manuals/2016/operators/MY16_CLS_Operator.pdf),
+[Tesla high-voltage precautions](https://www.tesla.com/ownersmanual/model3/en_gb/GUID-8FA15856-1720-440F-838B-ACFBA8D7D608.html).

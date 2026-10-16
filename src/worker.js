@@ -5989,7 +5989,7 @@ ${convo}`;
           const text = await callGemini(env, { ...input, meter, prefer });
           let data = null;
           if (input.json) {
-            try { data = cleanFeatureJson(body.tool, text, {scanVersion:body.scanVersion,lang:body.lang}); }
+            try { data = cleanFeatureJson(body.tool, text, {scanVersion:body.scanVersion,lang:body.lang,targetPart:body.context?.targetPart,viewAttempts:body.context?.viewAttempts}); }
             catch (e) { await meterTokens(env, uid, meter); return deny('AI ตอบกลับไม่สมบูรณ์ ลองใหม่อีกครั้ง', 502); }
           }
           await meterTokens(env, uid, meter);
