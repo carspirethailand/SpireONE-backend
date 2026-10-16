@@ -1433,12 +1433,34 @@ async function createJob(env, me, b) {
   return { id };
 }
 
-/* แจ้งอีกฝ่ายทาง LINE เบื้องหลัง — ผู้กดไม่ต้องรอ LINE ตอบ และ LINE ล่มก็ไม่ทำให้ใบงานพัง
-   make = ฟังก์ชันสร้างการ์ด (ถ้าต้องอ่านฐานข้อมูลก็ไปทำเบื้องหลังด้วย) · ยังไม่ตั้ง LINE = ไม่ทำอะไรเลย */
+/* แจ้งอีกฝ่ายเบื้องหลัง: LINE (ถ้าผูกไว้) + แจ้งเตือนในเครื่อง (Web Push ทุกเครื่องที่เปิดแจ้งเตือนไว้)
+   ผู้กดไม่ต้องรอ และช่องทางไหนล่มก็ไม่ทำให้ใบงานพัง · make = ฟังก์ชันสร้างการ์ด (อ่านฐานข้อมูลเบื้องหลังได้)
+   env.pushTo มาจาก worker (ใช้คีย์ VAPID ชุดเดียวกับการเตือนต่อภาษี) · ไม่มีทั้งสองทาง = ไม่ทำอะไร */
 function tell(env, uid, make) {
-  if (!uid || !env.LINE_CHANNEL_TOKEN) return;
-  const p = (async () => { const m = await make(); if (m) await notify(env, uid, m); })().catch(() => {});
+  if (!uid || (!env.LINE_CHANNEL_TOKEN && !env.pushTo)) return;
+  const p = (async () => {
+    const m = await make(); if (!m) return;
+    await Promise.all([
+      env.LINE_CHANNEL_TOKEN ? notify(env, uid, m).catch(() => {}) : null,
+      env.pushTo ? Promise.resolve().then(() => env.pushTo(uid, pushOf(m))).catch(() => {}) : null,
+    ]);
+  })().catch(() => {});
   if (env.bg) env.bg(p);
+}
+/* การ์ด LINE → ข้อความแจ้งเตือนในเครื่อง: หัวข้อ · ป้าย + บรรทัดแรก · ลิงก์ในแอป
+   tag = ใบงานเดียวกันแทนที่ของเก่า (ไม่กองซ้อนบนจอ) — หน้าเว็บใช้ tag เดียวกันเมื่อแจ้งเองตอนแอปเปิดค้างไว้ */
+export function pushOf(m) {
+  const c = (m && m.contents && m.contents.body && m.contents.body.contents) || [];
+  const tag = String((c[0] && c[0].text) || '').replace(/^CENDON · /, '');
+  const lines = c.slice(2).map(x => x && x.text).filter(Boolean);
+  let url = '/', job = '';
+  try {
+    const u = new URL(m.contents.footer.contents[0].action.uri);
+    u.searchParams.delete('openExternalBrowser'); job = u.searchParams.get('job') || '';
+    url = job ? '/jobs/' + encodeURIComponent(job) : u.pathname + (u.search || '');
+  } catch (e) {}
+  return { title: String((c[1] && c[1].text) || 'Cendon').slice(0, 120), body: [tag, lines[0]].filter(Boolean).join(' · ').slice(0, 200),
+    url, tag: job ? 'cendon-job-' + job : 'cendon' };
 }
 const shopOf = (t) => { const d = parse(t && t.data) || {}; return d.shop || d.name || 'ร้านช่าง'; };
 

@@ -2333,6 +2333,22 @@ async function sendPush(env, sub, payloadObj, ttl = 86400) {
 
 
 
+/* ส่งแจ้งเตือนในเครื่องถึงทุกเครื่องของ uid (ตาราง push_subs) · เครื่องที่ยกเลิกไปแล้ว (404/410) ลบทิ้ง · ยังไม่ตั้ง VAPID = เงียบ */
+async function pushToUid(env, uid, payload) {
+  if (!uid || !env.VAPID_PRIVATE || !env.VAPID_PUBLIC) return 0;
+  let rows = [];
+  try { rows = (await env.DB.prepare('SELECT endpoint, p256dh, auth FROM push_subs WHERE uid = ? LIMIT 10').bind(uid).all()).results || []; } catch (e) { return 0; }
+  let n = 0;
+  for (const sub of rows) {
+    try {
+      const r = await sendPush(env, sub, payload, 6 * 3600);
+      if (r.ok) n++;
+      else if (r.status === 404 || r.status === 410) await env.DB.prepare('DELETE FROM push_subs WHERE endpoint = ?').bind(sub.endpoint).run();
+    } catch (e) {}
+  }
+  return n;
+}
+
 const REG_LABEL = {
   tax: ['ต่อภาษีรถ', 'Road tax'],
   act: ['พ.ร.บ.', 'Compulsory insurance'],
@@ -3736,7 +3752,8 @@ export default {
     if (emailAuth) return emailAuth;
 
     /* ระบบช่าง (Cendon Care) อยู่ในไฟล์ techs.js ทั้งหมด */
-    if (/^\/api\/tech(\/|$)/.test(url.pathname)) return handleTech(request, env, cors, { ctx });
+    /* งานช่างแจ้งเตือนในเครื่องได้ด้วย (Web Push) — ส่งต่อให้ techs.js ผ่าน env */
+    if (/^\/api\/tech(\/|$)/.test(url.pathname)) { if (!env.pushTo) env.pushTo = (uid, p) => pushToUid(env, uid, p); return handleTech(request, env, cors, { ctx }); }
 
     // Wraps a handler with auth + minimum-role + ban checks.
     const guarded = (minRole, handler) => async () => {
