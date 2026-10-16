@@ -1,4 +1,5 @@
 /* ตั้งค่าการโทรคุยกับ Cendon (Gemini Live) ที่ล็อกไว้ในกุญแจใช้ครั้งเดียว — แยกออกมาให้เทสต์ได้โดยไม่ต้องเรียก Google */
+import { LIVE_CALL_TOOLS, LIVE_CALL_AGENT_RULES } from './live-call-tools.mjs';
 
 /* เครื่องมือที่ผู้ช่วยเสียงเรียกเองได้ระหว่างโทร: ผู้ใช้พูดว่า "ฟังเสียงเครื่องหน่อย" / "ดูห้องเครื่องให้หน่อย"
    หน้าเว็บเปิดโหมดฟังเสียงดิบ (ไม่กรองเสียงรบกวน) หรือสแกนกล้องแบบสด แล้วส่งผลกลับให้ AI พูดต่อ */
@@ -16,7 +17,8 @@ const thinking = m => /2\.5/.test(m) ? { thinkingConfig: { thinkingBudget: 0, in
 /* handle = รหัสต่อสายต่อที่ Google ให้มาในสายก่อนหน้า (sessionResumptionUpdate) — ต่อใหม่แล้วจำบทสนทนาเดิมได้ */
 export const cleanHandle = h => typeof h === 'string' && /^[\w\-.:/+=]{8,600}$/.test(h) ? h : '';
 
-export function liveToken({ model, system, tools, handle, resume, now = Date.now() }) {
+export function liveToken({ model, system, tools, agent = false, handle, resume, now = Date.now() }) {
+  const declarations=[...(tools ? LIVE_TOOLS[0].functionDeclarations : []),...(agent === true ? LIVE_CALL_TOOLS[0].functionDeclarations : [])];
   return {
     uses: 1,
     expireTime: new Date(now + 30 * 60 * 1000).toISOString(),
@@ -33,8 +35,8 @@ export function liveToken({ model, system, tools, handle, resume, now = Date.now
         startOfSpeechSensitivity: 'START_SENSITIVITY_LOW', prefixPaddingMs: 120, silenceDurationMs: 600 } },
       /* ต่อสายใหม่ (Google หมุนเวียนการเชื่อมต่อทุกราว 10 นาที / เน็ตสะดุด) โดยจำบทสนทนาเดิมได้ */
       ...(resume !== false ? { sessionResumption: cleanHandle(handle) ? { handle: cleanHandle(handle) } : {} } : {}),
-      systemInstruction: { parts: [{ text: String(system || '').slice(0, 6000) }] },
-      ...(tools ? { tools: LIVE_TOOLS } : {}),
+      systemInstruction: { parts: [{ text: (agent===true ? LIVE_CALL_AGENT_RULES+'\n' : '')+String(system || '').slice(0, agent===true ? 4800 : 6000) }] },
+      ...(declarations.length ? { tools: [{functionDeclarations:declarations}] } : {}),
       inputAudioTranscription: {},
       outputAudioTranscription: {},
     },

@@ -5115,13 +5115,13 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
           if (!candidates.length) return deny('Live token error: no working live model', 502);
           const now = Date.now();
 
-          const withTools = b.tools === true;
+          const withTools = b.tools === true, withAgent = b.agent === true;
           const handle = cleanHandle(b.handle);
-          const mk = (liveModel, tools, resume) => liveToken({ model: liveModel, system: b.system, tools, handle, resume, now });
+          const mk = (liveModel, tools, resume, agent=withAgent) => liveToken({ model: liveModel, system: b.system, tools, agent, handle, resume, now });
 
           let lastErr = '';
           for (const liveModel of candidates) {
-            let tools = withTools, resume = true;
+            let tools = withTools, agent = withAgent, resume = true;
             let res = await fetch(`${baseUrl}/v1alpha/auth_tokens`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey },
@@ -5131,14 +5131,14 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
             if (!res.ok && res.status === 400) {
               const why = await res.clone().text().catch(() => '');
               if (/tool|function|resum|session/i.test(why)) {
-                tools = false; resume = false;
+                tools = false; agent = false; resume = false;
                 res = await fetch(`${baseUrl}/v1alpha/auth_tokens`, { method: 'POST',
-                  headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey }, body: JSON.stringify(mk(liveModel, false, false)) });
+                  headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey }, body: JSON.stringify(mk(liveModel, false, false, false)) });
               }
             }
             if (res.ok) {
               const tok = await res.json();
-              return json({ token: tok.name, model: liveModel, tools, resume, resumed: resume && !!handle });
+              return json({ token: tok.name, model: liveModel, tools, agent, resume, resumed: resume && !!handle });
             }
             lastErr = `${liveModel} ${res.status}: ${(await res.text()).slice(0, 200)}`;
             /* รุ่นนี้ใช้ไม่ได้ (ไม่มี/ไม่มีสิทธิ์) → ลองรุ่นถัดไป · คีย์ผิดหรือโควตาหมด → ลองต่อก็ไม่ช่วย */
