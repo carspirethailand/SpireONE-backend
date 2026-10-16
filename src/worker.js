@@ -3,6 +3,7 @@ import { EMAIL_AUTH_SQL, handleEmailAuth, deleteFirebaseUser } from './email-aut
 import { exportAccount, resetAccount, deleteAccount, deleteBlockers } from './account-data.js';
 import { ONBOARDING_SQL, handleOnboarding, onboardingName, sanitizeSetupState } from './onboarding.js';
 import { buildFeatureRequest, cleanFeatureJson, featureCap } from './features-ai.mjs';
+import { liveToken, cleanHandle } from './live-setup.mjs';
 import { handleTech, reconcileDiditIdentities, vaultSweep, expireStaleApplications, releaseWrongHolds } from './techs.js';
 import { richMenuStatus, setupRichMenu, lineStatus, lineFixWebhook } from './line-menu.js';
 import { appUrl, card, notify } from './line-notify.js';
@@ -5096,56 +5097,30 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
           if (!candidates.length) return deny('Live token error: no working live model', 502);
           const now = Date.now();
 
-          /* เครื่องมือที่ผู้ช่วยเสียงเรียกเองได้ระหว่างโทร: ผู้ใช้พูดว่า "ฟังเสียงเครื่องหน่อย" / "ดูห้องเครื่องให้หน่อย"
-             หน้าเว็บเปิดโหมดฟังเสียงดิบ (ไม่กรองเสียงรบกวน) หรือสแกนภาพจากกล้อง แล้วส่งผลกลับให้ AI พูดต่อ */
-          const LIVE_TOOLS = [{ functionDeclarations: [
-            { name: 'listen_engine', description: 'Record about 10 seconds of raw engine or car sound from the phone microphone (no noise filtering) and analyse it. Call this whenever the user asks you to listen to the engine, a noise, a knock, a squeal or any car sound, or says they will hold the phone near the car.',
-              parameters: { type: 'OBJECT', properties: { area: { type: 'STRING', description: 'Where the phone is held, e.g. engine bay, wheel, exhaust, cabin' }, when: { type: 'STRING', description: 'When the sound happens, e.g. idle, revving, braking, turning' } } } },
-            { name: 'scan_engine_bay', description: 'Take a sharp photo from the rear camera and label the visible parts of the engine bay on screen (dipstick, coolant, brake fluid, battery and so on) with short safety-first checks. Call this when the user asks you to look at, scan or explain the engine bay or under the bonnet.',
-              parameters: { type: 'OBJECT', properties: {} } },
-          ] }];
           const withTools = b.tools === true;
-          const mk = (liveModel, tools) => ({
-            uses: 1,
-            expireTime: new Date(now + 30 * 60 * 1000).toISOString(),
-            newSessionExpireTime: new Date(now + 2 * 60 * 1000).toISOString(),
-            /* REST ใช้ชื่อ bidiGenerateContentSetup (liveConnectConstraints เป็นชื่อฝั่ง SDK — ส่งไปจะได้ 400 Unknown name) */
-            bidiGenerateContentSetup: {
-              model: 'models/' + liveModel,
-              /* ความหน่วง: ปิดการคิดยาวของรุ่น 2.5 (คิดก่อนพูดทำให้เงียบไป 1-3 วิ) */
-              generationConfig: { responseModalities: ['AUDIO'], ...(/2\.5/.test(liveModel) ? { thinkingConfig: { thinkingBudget: 0, includeThoughts:false } } : /gemini-3\.1/.test(liveModel) ? { thinkingConfig:{thinkingLevel:'minimal',includeThoughts:false} } : /extended-thinking/.test(liveModel) ? { thinkingConfig:{thinkingLevel:'low',includeThoughts:false} } : {}) },
-              contextWindowCompression:{slidingWindow:{}},
-              /* จับจังหวะพูดไวขึ้น: รู้ว่าเริ่มพูดเร็ว และเงียบแค่ 0.35 วิ ก็ถือว่าพูดจบ ส่งให้ AI ตอบทันที */
-              realtimeInputConfig: { automaticActivityDetection: {
-                startOfSpeechSensitivity: 'START_SENSITIVITY_HIGH', endOfSpeechSensitivity: 'END_SENSITIVITY_HIGH',
-                prefixPaddingMs: 40, silenceDurationMs: 350 } },
-              systemInstruction: { parts: [{ text: String(b.system || '').slice(0, 6000) }] },
-              ...(tools ? { tools: LIVE_TOOLS } : {}),
-              inputAudioTranscription: {},
-              outputAudioTranscription: {},
-            },
-          });
+          const handle = cleanHandle(b.handle);
+          const mk = (liveModel, tools, resume) => liveToken({ model: liveModel, system: b.system, tools, handle, resume, now });
 
           let lastErr = '';
           for (const liveModel of candidates) {
-            let tools = withTools;
+            let tools = withTools, resume = true;
             let res = await fetch(`${baseUrl}/v1alpha/auth_tokens`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey },
-              body: JSON.stringify(mk(liveModel, tools)),
+              body: JSON.stringify(mk(liveModel, tools, resume)),
             });
-            /* รุ่นนี้ไม่รับเครื่องมือ → ขอใหม่แบบไม่มีเครื่องมือ (ปุ่มบนจอยังใช้ได้ครบ) */
-            if (!res.ok && tools && res.status === 400) {
+            /* รุ่นนี้ไม่รับเครื่องมือ/การต่อสายต่อ → ขอใหม่แบบพื้นฐาน (ปุ่มบนจอยังใช้ได้ครบ) */
+            if (!res.ok && res.status === 400) {
               const why = await res.clone().text().catch(() => '');
-              if (/tool|function/i.test(why)) {
-                tools = false;
+              if (/tool|function|resum|session/i.test(why)) {
+                tools = false; resume = false;
                 res = await fetch(`${baseUrl}/v1alpha/auth_tokens`, { method: 'POST',
-                  headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey }, body: JSON.stringify(mk(liveModel, false)) });
+                  headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey }, body: JSON.stringify(mk(liveModel, false, false)) });
               }
             }
             if (res.ok) {
               const tok = await res.json();
-              return json({ token: tok.name, model: liveModel, tools });
+              return json({ token: tok.name, model: liveModel, tools, resume, resumed: resume && !!handle });
             }
             lastErr = `${liveModel} ${res.status}: ${(await res.text()).slice(0, 200)}`;
             /* รุ่นนี้ใช้ไม่ได้ (ไม่มี/ไม่มีสิทธิ์) → ลองรุ่นถัดไป · คีย์ผิดหรือโควตาหมด → ลองต่อก็ไม่ช่วย */
@@ -5988,7 +5963,7 @@ ${convo}`;
             }
           }
           const meter = newMeter();
-          const prefer = body.tool === 'bay' && env.GEMINI_VISION_MODEL ? [env.GEMINI_VISION_MODEL] : undefined;
+          const prefer = (body.tool === 'bay' || body.tool === 'baylive') && env.GEMINI_VISION_MODEL ? [env.GEMINI_VISION_MODEL] : undefined;
           const text = await callGemini(env, { ...input, meter, prefer });
           let data = null;
           if (input.json) {
@@ -5997,7 +5972,8 @@ ${convo}`;
           }
           await meterTokens(env, uid, meter);
           // meterTokens already counted one call; multimodal tools cost three calls total.
-          await safe(env, warnings, 'usage.write', () => env.DB.prepare(`INSERT INTO usage (uid, day, count) VALUES (?, ?, 2)
+          // สแกนสดส่งหลายเฟรมต่อการสแกนหนึ่งครั้ง — นับแค่เพดานของตัวเอง ไม่กินจำนวนครั้ง AI รายวันทั่วไป
+          if (body.tool !== 'baylive') await safe(env, warnings, 'usage.write', () => env.DB.prepare(`INSERT INTO usage (uid, day, count) VALUES (?, ?, 2)
             ON CONFLICT(uid, day) DO UPDATE SET count = count + 2`).bind(uid, day).run(), null);
           if (cap) await safe(env, warnings, 'usage.feature', () => env.DB.prepare(`INSERT INTO usage (uid, day, count) VALUES (?, ?, 1)
             ON CONFLICT(uid, day) DO UPDATE SET count = count + 1`).bind(capKey, day).run(), null);

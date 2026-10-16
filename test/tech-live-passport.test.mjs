@@ -110,3 +110,24 @@ test('per-tool daily caps: defaults, staff overrides from config, and tools with
   assert.equal(featureCap({featureDaily:{bay:-1}},'bay'),8,'bad config falls back to the default');
   assert.equal(featureCap({},'quote'),0);assert.equal(featureCap({},'toString'),0);
 });
+
+test('live call setup: echo/noise-tolerant turn detection, resumable sessions, optional tools', async()=>{
+  const {liveToken,cleanHandle}=await import('../src/live-setup.mjs');
+  const t=liveToken({model:'gemini-live-x',system:'sys',tools:true,handle:'abc_DEF-123/xyz=',now:0}).bidiGenerateContentSetup;
+  assert.equal(t.realtimeInputConfig.automaticActivityDetection.startOfSpeechSensitivity,'START_SENSITIVITY_LOW');
+  assert.ok(t.realtimeInputConfig.automaticActivityDetection.silenceDurationMs>=500,'Thai speakers can pause without being cut off');
+  assert.deepEqual(t.sessionResumption,{handle:'abc_DEF-123/xyz='});
+  assert.deepEqual(t.tools[0].functionDeclarations.map(f=>f.name),['listen_engine','scan_engine_bay']);
+  const fresh=liveToken({model:'m',system:'s',tools:false,handle:'',now:0}).bidiGenerateContentSetup;
+  assert.deepEqual(fresh.sessionResumption,{});assert.equal(fresh.tools,undefined);
+  assert.equal(liveToken({model:'m',resume:false,now:0}).bidiGenerateContentSetup.sessionResumption,undefined,'fallback without resumption');
+  assert.equal(cleanHandle('x"><script>'),'');assert.equal(cleanHandle(42),'');
+});
+test('live scan frames: up to 12 boxes and a separate, larger daily cap',()=>{
+  const img={mime:'image/jpeg',b64:'aGVsbG8='};
+  const r=buildFeatureRequest({tool:'baylive',attachments:[img]});assert.equal(r.json,true);assert.equal(r.maxTokens,1800);
+  assert.match(r.system,/air intake duct or pipe/);
+  const many=Array.from({length:15},(_,i)=>({name:'part'+i,box_2d:[i*10,i*10,i*10+200,i*10+200]}));
+  assert.equal(cleanFeatureJson('baylive',{scene:'engine_bay',items:many}).items.length,12);
+  assert.equal(featureCap({},'baylive'),80);
+});
