@@ -4,7 +4,7 @@ import { exportAccount, resetAccount, deleteAccount, deleteBlockers } from './ac
 import { ONBOARDING_SQL, handleOnboarding, onboardingName, sanitizeSetupState } from './onboarding.js';
 import { buildFeatureRequest, cleanFeatureJson, featureCap } from './features-ai.mjs';
 import { liveToken, cleanHandle } from './live-setup.mjs';
-import { handleTech, reconcileDiditIdentities, vaultSweep, expireStaleApplications, releaseWrongHolds } from './techs.js';
+import { handleTech, reconcileDiditIdentities, vaultSweep, expireStaleApplications, releaseWrongHolds, expireOpenJobs } from './techs.js';
 import { richMenuStatus, setupRichMenu, lineStatus, lineFixWebhook } from './line-menu.js';
 import { appUrl, card, notify } from './line-notify.js';
 import { refreshNews, newsStatus } from './news.js';
@@ -6214,6 +6214,8 @@ ${convo}`;
     ctx.waitUntil(vaultSweep(env).catch(e => console.error('vault sweep', e && e.message)));
     /* ร้านที่ถูกพักผิดเพราะ session Didit ค้าง → เปิดกลับ (ไม่แตะการพักของทีมงาน) */
     ctx.waitUntil(releaseWrongHolds(env).catch(e => console.error('release holds', e && e.message)));
+    /* คำขอ/ข้อเสนอที่หมดอายุ (งานด่วน 3 ชม. · ไม่มีใครตอบ 48 ชม. · ใบเสนอราคา 7 วัน) → ระบบยกเลิกให้ ไม่ค้างในรายการของใคร */
+    ctx.waitUntil(expireOpenJobs(env).catch(e => console.error('expire jobs', e && e.message)));
     /* นิตยสาร: เช็กทุกชั่วโมง อัปเดตจริงทุก 5 ชั่วโมง (รอบของตัวเอง ไม่พ่วงงานหนักรายวัน) */
     if (event.cron === NEWS_CRON) { ctx.waitUntil(refreshNews(env)); return; }
     if (event.cron !== '*/10 * * * *') {

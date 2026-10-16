@@ -1145,6 +1145,58 @@ async function markRead(env, jobId, uid, last) {
     ON CONFLICT(job_id, uid) DO UPDATE SET last = MAX(last, excluded.last)`).bind(jobId, uid, last).run();
 }
 
+/* ══ อายุของคำขอ/ข้อเสนอที่ยังไม่ตกลงกัน ══
+   งานด่วน 3 ชม. · คำขอที่ร้านยังไม่เสนอราคา 48 ชม. · ข้อเสนอในประกาศหาช่าง หมดพร้อมประกาศ (48 ชม. / ด่วน 3 ชม.)
+   · ใบเสนอราคาที่ลูกค้ายังไม่ตอบ 7 วัน (นับจากเสนอครั้งล่าสุด)
+   หมดแล้ว = ระบบยกเลิกให้ ทั้งสองฝ่ายเห็นตรงกัน — ไม่ค้างในรายการ "ต้องทำต่อ" ของช่าง และกดรับราคาเก่าไม่ได้ */
+const QUOTE_TTL = 7 * 86400000;
+function jobExpiry(j, postAt) {
+  if (j.status !== 'requested' && j.status !== 'quoted') return null;
+  const ttl = j.urgent ? URGENT_TTL : POST_TTL;
+  if (postAt != null) return postAt + ttl;
+  if (j.status === 'requested' || j.urgent) return j.created_at + ttl;
+  const q = parse(j.quote);
+  return ((q && q.at) || j.updated_at || j.created_at) + QUOTE_TTL;
+}
+const expiredWhy = (j, post) => j.urgent ? 'หมดอายุ — งานด่วนเปิดรับ 3 ชั่วโมง'
+  : post ? 'หมดอายุ — ประกาศหาช่างครบ 48 ชั่วโมงแล้ว'
+  : j.status === 'requested' ? 'หมดอายุ — ร้านไม่ได้เสนอราคาภายใน 48 ชั่วโมง' : 'หมดอายุ — ลูกค้าไม่ได้ตอบรับราคาภายใน 7 วัน';
+/* ยกเลิกแถวที่หมดอายุ (แก้แถวในอาร์เรย์ให้ตรงกับฐานข้อมูลด้วย) · แถวที่ยังไม่หมดได้ expires_at ไว้บอกหน้าเว็บ */
+async function expireJobs(env, rows) {
+  const open = rows.filter(j => j.status === 'requested' || j.status === 'quoted');
+  if (!open.length) return 0;
+  const gids = [...new Set(open.map(j => j.group_id).filter(Boolean))];
+  const posts = gids.length ? await inAll(env, 'SELECT id, created_at FROM tech_posts WHERE id IN ({IN})', gids) : [];
+  const pa = Object.fromEntries(posts.map(p => [p.id, p.created_at]));
+  const ts = now(), gone = [];
+  for (const j of open) {
+    const e = jobExpiry(j, pa[j.group_id]);
+    if (e != null && e <= ts) gone.push(j); else j.expires_at = e;
+  }
+  if (!gone.length) return 0;
+  /* เงื่อนไข status + revision กันชนกับการกดของคนจริงในจังหวะเดียวกัน (ใครกดก่อนชนะ) */
+  const res = await env.DB.batch(gone.map(j => {
+    const h = parse(j.history) || []; h.push({ status: 'cancelled', at: ts, by: 'system', expired: true });
+    j.next = { resolution: expiredWhy(j, j.group_id in pa), history: JSON.stringify(h) };
+    return env.DB.prepare("UPDATE tech_jobs SET status='cancelled', resolution=?, history=?, updated_at=?, revision=revision+1 WHERE id=? AND status=? AND revision=?")
+      .bind(j.next.resolution, j.next.history, ts, j.id, j.status, j.revision);
+  }));
+  let n = 0;
+  gone.forEach((j, i) => {
+    if (!(res[i] && res[i].meta && res[i].meta.changes)) return;
+    Object.assign(j, { status: 'cancelled', resolution: j.next.resolution, history: j.next.history, updated_at: ts, revision: j.revision + 1 });
+    n++;
+  });
+  return n;
+}
+/* ยกเลิกโดยระบบเพราะหมดอายุ (ดูจากประวัติขั้นสุดท้าย) */
+const wasExpired = j => j.status === 'cancelled' && !!((parse(j.history) || []).slice(-1)[0] || {}).expired;
+/* รอบตั้งเวลา: เก็บกวาดคำขอ/ข้อเสนอที่หมดอายุ แม้ไม่มีใครเปิดแอป — ลูกค้าเห็นสถานะจริง ร้านไม่เห็นงานค้าง */
+export async function expireOpenJobs(env, max = 300) {
+  const { results } = await env.DB.prepare("SELECT * FROM tech_jobs WHERE status IN ('requested','quoted') ORDER BY created_at LIMIT ?").bind(max).all();
+  return { expired: await expireJobs(env, results) };
+}
+
 async function myJobs(env, me, myTech, all) {
   let q, args;
   if (all) { q = 'SELECT * FROM tech_jobs ORDER BY updated_at DESC LIMIT 200'; args = []; }
@@ -1154,6 +1206,8 @@ async function myJobs(env, me, myTech, all) {
   } else { q = 'SELECT * FROM tech_jobs WHERE customer_uid = ? ORDER BY updated_at DESC LIMIT 200'; args = [me.uid]; }
   const { results } = await env.DB.prepare(q).bind(...args).all();
   if (!results.length) return [];
+  /* ถึงรอบตั้งเวลายังไม่กวาด คนที่เปิดรายการก็ต้องไม่เห็นคำขอ/ข้อเสนอที่หมดอายุค้างอยู่ */
+  await expireJobs(env, results);
   const ids = results.map(r => r.id);
   const [names, unread] = await Promise.all([
     inAll(env, 'SELECT id, data FROM tech_profiles WHERE id IN ({IN})', [...new Set(results.map(r => r.tech_id))]),
@@ -1173,7 +1227,7 @@ async function myJobs(env, me, myTech, all) {
       group: j.group_id || null, total: q ? q.total : null,
       car: j.car, symptom: j.symptom, createdAt: j.created_at, updatedAt: j.updated_at, urgent: !!j.urgent,
       side: cust && tech ? 'both' : cust ? 'customer' : tech ? 'technician' : 'admin',
-      needsMe, unread: un[j.id] || 0 };
+      needsMe, unread: un[j.id] || 0, expiresAt: j.expires_at || null, expired: wasExpired(j) };
   });
 }
 
@@ -1418,6 +1472,7 @@ async function bumpView(env, techId, kind) {
 
 async function getJob(env, me, id) {
   const { j, t, role } = await loadJob(env, me, id);
+  await expireJobs(env, [j]);
   const messages = await messagesOf(env, id, 0);
   if (role !== 'admin') await markRead(env, id, me.uid, messages.length ? messages[messages.length - 1].id : 0);
   const out = jobOut(j, t, role, messages);
@@ -1478,6 +1533,8 @@ async function updateJob(env, me, id, b) {
 
   const rule = NEXT[action];
   if (!rule) fail(400, 'ไม่รู้จักคำสั่งนี้');
+  /* คำขอ/ข้อเสนอที่หมดอายุแล้ว ทำต่อไม่ได้ (เช่น กดรับราคาเก่า หรือเสนอราคาให้งานด่วนที่ผ่านไปหลายชั่วโมง) */
+  if (await expireJobs(env, [j])) fail(410, j.resolution);
   const [who_, from, to] = rule;
   const ok = who_ === 'tech' ? isTech : who_ === 'customer' ? isCustomer
     : who_ === 'either' ? (isTech || isCustomer) : me.staff;
@@ -1793,6 +1850,7 @@ async function extraWork(env, ctx, action, b) {
 async function groupOf(env, me, gid) {
   const { results } = await env.DB.prepare('SELECT * FROM tech_jobs WHERE group_id = ? AND customer_uid = ? ORDER BY created_at').bind(gid, me.uid).all();
   if (!results.length) fail(404, 'ไม่พบคำขอ');
+  await expireJobs(env, results);
   const techs = {};
   for (const j of results) if (!techs[j.tech_id]) techs[j.tech_id] = await techById(env, j.tech_id);
   return { jobs: results.map(j => { const t = techs[j.tech_id]; const pt = t ? publicTech(t) : {};
@@ -1832,7 +1890,7 @@ function postOut(p, extra, exact = false) {
   const loc = exact ? { lat: p.lat, lng: p.lng } : { lat: approx(p.lat), lng: approx(p.lng), approxKm: APPROX_KM };
   return { id: p.id, status: p.status, test: !!p.test, car: p.car, symptom: p.symptom, cat: p.cat,
     ...loc, area: p.area, requestedTime: p.requested_time, mode: p.mode, urgent: !!p.urgent,
-    note: p.note || '', createdAt: p.created_at, expiresAt: p.created_at + POST_TTL, ...(extra || {}) };
+    note: p.note || '', createdAt: p.created_at, expiresAt: p.created_at + postTtl(p), ...(extra || {}) };
 }
 /* ระยะทางให้ช่างดู: ปัดขึ้นเป็นกิโลเมตรเต็ม กันการเอาระยะจากหลายจุดมาคำนวณย้อนหาบ้านลูกค้า */
 const roughKm = d => Math.max(1, Math.ceil(d));
