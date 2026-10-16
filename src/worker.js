@@ -752,7 +752,7 @@ async function tokensToday(env, uid) {
 }
 
 /* ===== Gemini (server-side only — key never leaves the Worker) ===== */
-async function callGemini(env, { contents, system, search, temp, json: wantJson, maxTokens, meter, prefer }) {
+async function callGemini(env, { contents, system, search, temp, json: wantJson, maxTokens, meter, prefer, schema, timeoutMs }) {
   const geminiKey = env.GEMINI_KEY;
   if (!geminiKey) throw new Error('AI is not configured');
   const models = [
@@ -766,7 +766,9 @@ async function callGemini(env, { contents, system, search, temp, json: wantJson,
   const baseUrl = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
 
   let lastErr = null;
+  const deadline = timeoutMs ? Date.now() + timeoutMs : 0;
   for (const model of modelsToTry) {
+    if (deadline && Date.now() >= deadline) break;
     const url = `${baseUrl}/v1beta/models/${model}:generateContent`;
 
     const gen = { temperature: typeof temp === 'number' ? Math.min(Math.max(temp, 0), 1) : 0.5 };
@@ -774,6 +776,7 @@ async function callGemini(env, { contents, system, search, temp, json: wantJson,
     if (wantJson) {
       // Ask for JSON directly and switch thinking to minimal.
       gen.responseMimeType = 'application/json';
+      if (schema) gen.responseSchema = schema;
       if (/gemini-3|gemini-[4-9]/.test(model)) gen.thinkingConfig = { thinkingLevel: 'minimal' };
       else if (/2\.5/.test(model)) gen.thinkingConfig = { thinkingBudget: 0 };
     }
@@ -787,6 +790,7 @@ async function callGemini(env, { contents, system, search, temp, json: wantJson,
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey },
         body: JSON.stringify(body),
+        ...(deadline ? {signal:AbortSignal.timeout(Math.max(1,Math.min(10000,deadline-Date.now())))} : {}),
       });
       if (!res.ok) {
         const t = await res.text().catch(() => '');
@@ -5985,7 +5989,7 @@ ${convo}`;
           const text = await callGemini(env, { ...input, meter, prefer });
           let data = null;
           if (input.json) {
-            try { data = cleanFeatureJson(body.tool, text); }
+            try { data = cleanFeatureJson(body.tool, text, {scanVersion:body.scanVersion,lang:body.lang}); }
             catch (e) { await meterTokens(env, uid, meter); return deny('AI ตอบกลับไม่สมบูรณ์ ลองใหม่อีกครั้ง', 502); }
           }
           await meterTokens(env, uid, meter);
