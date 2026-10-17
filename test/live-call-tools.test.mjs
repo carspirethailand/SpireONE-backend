@@ -36,8 +36,12 @@ test('token fallback honestly removes both tool groups and never accepts a clien
 test('voice Valet: confirm step required, no dangerous actions, emergency numbers first',()=>{
   const decl=Object.fromEntries(LIVE_CALL_TOOLS[0].functionDeclarations.map(d=>[d.name,d]));
   const dos=decl.valet.parameters.properties.do.enum;
-  assert.deepEqual(dos,['urgent','post_job','book','msg_shop','job','jobs','log','due']);
-  for(const bad of ['delete','pay','password','email','share_location','ads'])assert.ok(!dos.includes(bad),bad);
+  assert.deepEqual(dos,['urgent','post_job','book','msg_shop','job','jobs','log','due','go','search','setting','pick_car','cars','threads','add_car','car_km','shop_status']);
+  for(const bad of ['delete','pay','password','email','share_location','ads','admin','staff','users','approve'])assert.ok(!dos.includes(bad),bad);
+  /* หน้าที่พาไปได้เป็นรายการคงที่ ไม่มีหน้าทีมงาน/แอดมิน */
+  const pages=decl.valet.parameters.properties.to.enum;assert.ok(pages.includes('garage')&&pages.includes('studio'));for(const bad of ['admin','handbook','staff'])assert.ok(!pages.includes(bad),bad);
+  assert.deepEqual(decl.valet.parameters.properties.value.enum,['light','dark']);
+  assert.match(LIVE_CALL_AGENT_RULES,/Never access other people's data or staff\/admin tools/);assert.match(LIVE_CALL_AGENT_RULES,/the call minimizes and keeps going/);
   assert.deepEqual(decl.valet_confirm.parameters.required,['pending_id']);
   assert.match(decl.valet.description,/Nothing is sent yet/);
   assert.match(LIVE_CALL_AGENT_RULES,/only after the user clearly agrees, call valet_confirm/);
@@ -45,5 +49,5 @@ test('voice Valet: confirm step required, no dangerous actions, emergency number
   assert.match(LIVE_CALL_AGENT_RULES,/cannot pay, delete data or accounts, change passwords/);
   /* ไม่มีช่องให้โมเดลส่งพิกัดหรือ URL เอง — ตำแหน่งมาจาก GPS ของเครื่องเท่านั้น */
   const props=Object.keys(decl.valet.parameters.properties);
-  for(const k of ['lat','lng','url','address','techId'])assert.ok(!props.includes(k),k);
+  for(const k of ['lat','lng','url','href','address','techId','uid'])assert.ok(!props.includes(k),k);
 });
