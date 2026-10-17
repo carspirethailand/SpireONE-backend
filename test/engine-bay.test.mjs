@@ -2,15 +2,15 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import {readFile} from 'node:fs/promises';
-import {ENGINE_PARTS,ENGINE_SCAN_MAX,ENGINE_BAY_PROMPT,ENGINE_BAY_SCHEMA,partInfo,cleanEngineScan} from '../src/engine-bay.mjs';
+import {ENGINE_PARTS,ENGINE_SCANNABLE_PARTS,ENGINE_SCAN_MAX,ENGINE_BAY_PROMPT,ENGINE_BAY_SCHEMA,partInfo,cleanEngineScan} from '../src/engine-bay.mjs';
 import {buildFeatureRequest,cleanFeatureJson} from '../src/features-ai.mjs';
 const image={mime:'image/jpeg',b64:'aGVsbG8='};
 const item=(extra={})=>({part:'battery',certainty:'high',evidence:'Visible case and two terminals',box_2d:[100,100,350,400],...extra});
 const scan=(items=[item()],extra={})=>({scene:'engine_bay',quality:'clear',items,...extra});
 const request=(extra={})=>buildFeatureRequest({tool:'baylive',scanVersion:2,attachments:[image],...extra});
 
-test('42 distinct component types with owned bilingual labels and safety; prototype IDs cannot resolve',()=>{
-  assert.equal(Object.keys(ENGINE_PARTS).length,42);
+test('131 distinct component types with owned bilingual labels and safety; prototype IDs cannot resolve',()=>{
+  assert.equal(Object.keys(ENGINE_PARTS).length,131);
   for(const id of Object.keys(ENGINE_PARTS))for(const lang of ['th','en']){
     const p=partInfo(id,lang);assert.ok(p.name&&p.what&&p.check);assert.equal(p.part,id);
     assert.match(p.check,lang==='en'?/do not|Do not/:/ห้าม|ไม่เปิด/);
@@ -22,12 +22,12 @@ test('42 distinct component types with owned bilingual labels and safety; protot
 test('versioned multimodal request has all recognition rules, fixed schema and bounded latency; fits actual 8K system limit',()=>{
   const r=request();assert.equal(r.schema,ENGINE_BAY_SCHEMA);assert.equal(r.search,false);assert.equal(r.timeoutMs,18000);
   assert.equal(r.maxTokens,3600);assert.ok(r.system.length<8000);assert.equal(r.contents[0].parts[1].inlineData.data,image.b64);
-  for(const word of ['hose_unknown','42','not a trained'])if(word!=='hose_unknown')assert.ok(!ENGINE_BAY_PROMPT.includes(word));
+  assert.match(ENGINE_BAY_PROMPT,/not a trained detector/);
   for(const rule of [/never evidence that a hidden component exists/,/visible polarity marking/,/colour alone/,/NOT measured accuracy/,/untrusted data/,/never copy them/,/0-1000/])assert.match(r.system,rule);
   assert.equal(r.schema.properties.items.maxItems,undefined);
   assert.equal(r.schema.properties.items.items.properties.box_2d.minItems,undefined);
   assert.equal(r.schema.properties.items.items.properties.box_2d.maxItems,undefined);
-  assert.deepEqual(r.schema.properties.items.items.properties.part.enum,Object.keys(ENGINE_PARTS));
+  assert.deepEqual(r.schema.properties.items.items.properties.part.enum,ENGINE_SCANNABLE_PARTS);
 });
 test('v2 accepts exactly one bounded image; no ambiguous multi-photo boxes or audio',()=>{
   assert.throws(()=>request({attachments:[]}),/exactly one image/);
