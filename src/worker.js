@@ -7,6 +7,8 @@ import { engineScanFailure } from './engine-scan-errors.mjs';
 import { liveToken, cleanHandle } from './live-setup.mjs';
 import { valetPrompt } from './agent-prompt.mjs';
 import { garageCheckin, GARAGE_CARE_KEY } from './garage-care.mjs';
+import { garageRulesFor, validateGarageWrite, appendGarageLog } from './garage-state.mjs';
+import { infoPatch, costReferences } from './garage-rules.mjs';
 import { handleTech, reconcileDiditIdentities, vaultSweep, expireStaleApplications, releaseWrongHolds, expireOpenJobs } from './techs.js';
 import { richMenuStatus, setupRichMenu, lineStatus, lineFixWebhook } from './line-menu.js';
 import { appUrl, card, notify } from './line-notify.js';
@@ -3298,7 +3300,7 @@ async function kmLineReply(env, link, t, now = Date.now()) {
   await savePending(env, link.uid, p);
   return txt(said + (p.q.length > 1 ? '\nครบทุกคันแล้ว ขอบคุณครับ' : '\nขอบคุณครับ พรุ่งนี้ 18:00 จะถามอีกครั้ง'));
 }
-/* รอบ 18:00 — เฉพาะคนที่เปิดไว้ · คันที่จดวันนี้แล้วไม่ถาม · LINE ก่อน (ตอบเลขได้ในแชต) ไม่ได้ค่อยแจ้งเตือนในเครื่อง
+/* รอบ 18:00 — เฉพาะคนที่เปิดไว้ · คันที่จดวันนี้แล้วไม่ถาม · ส่งทั้ง LINE และแจ้งในเครื่องตามสิทธิ์ที่ผู้ใช้เปิดไว้
    วันละครั้งต่อบัญชี (sent_day) ส่งไม่สำเร็จก็ไม่ยิงซ้ำในวันเดียวกัน */
 async function runKmRound(env, now = Date.now()) {
   const haveWeb = !!(env.VAPID_PRIVATE && env.VAPID_PUBLIC), haveLine = !!env.LINE_CHANNEL_TOKEN;
@@ -3308,6 +3310,8 @@ async function runKmRound(env, now = Date.now()) {
   const rs = await env.DB.prepare('SELECT uid FROM km_remind WHERE on_ = 1 AND (sent_day IS NULL OR sent_day <> ?) LIMIT 500').bind(day).all();
   for (const { uid } of (rs && rs.results) || []) {
     try {
+      const claimed=await env.DB.prepare('UPDATE km_remind SET sent_day=? WHERE uid=? AND on_=1 AND (sent_day IS NULL OR sent_day<>?) RETURNING uid').bind(day,uid,day).first();
+      if(!claimed)continue;
       const [cars, done, line] = await Promise.all([
         env.DB.prepare('SELECT id, make, model FROM cars WHERE uid = ? ORDER BY created_at ASC LIMIT 6').bind(uid).all(),
         env.DB.prepare('SELECT DISTINCT car_id FROM odo_anchor WHERE uid = ? AND observed_at >= ?').bind(uid, start).all(),
@@ -3323,7 +3327,7 @@ async function runKmRound(env, now = Date.now()) {
           else if (r) { let detail = ''; try { detail = String((await r.json()).message || '').slice(0, 200); } catch (e) {}
             await lineNote(env, 'line_last_push_error', { status: r.status, detail }); }
         }
-        if (!sent && haveWeb) {
+        if (haveWeb) {
           const subs = await env.DB.prepare('SELECT * FROM push_subs WHERE uid = ?').bind(uid).all();
           for (const sub of (subs && subs.results) || []) {
             try {
@@ -4327,13 +4331,15 @@ export default {
           const uid = actor.payload.sub;
           const now = Date.now();
           const saved = [];
-          const skipped = [];
+          const skipped = [], errors = {};
           const deleted = (Object.hasOwn(items, 'garage') || Object.hasOwn(items, 'selCar'))
             ? await carDeletions(env, uid) : { ids: new Set(), t: 0 };
           for (const k of Object.keys(items).slice(0, 40)) {
             if (k.startsWith(CAR_DELETED_PREFIX) || k === GARAGE_CARE_KEY || !/^[A-Za-z0-9_:.-]{1,64}$/.test(k)) { skipped.push(k); continue; }
             const item = items[k] || {};
             let value = withoutDeletedCars(k, item.v === undefined ? null : item.v, deleted);
+            try { value = await validateGarageWrite(env, uid, k, value, items.garage?.v); }
+            catch { skipped.push(k); errors[k] = 'ข้อมูลบันทึกไม่ผ่านการตรวจสอบ กรุณาตรวจชื่อ วันที่ และตัวเลข / Check the record text, dates and numbers'; continue; }
             if (k === 'setup') value = await sanitizeSetupState(env, uid, value);
             const raw = JSON.stringify(value);
             /* กันคนยัดข้อมูลก้อนใหญ่จนฐานข้อมูลบวม 256KB ต่อคีย์พอสำหรับบทสนทนาเป็นร้อย */
@@ -4347,7 +4353,7 @@ export default {
             `).bind(uid, k, raw, t).run();
             saved.push(k);
           }
-          return json({ ok: true, saved, skipped, now });
+          return json({ ok: true, saved, skipped, errors, now });
         })();
       }
 
@@ -5253,7 +5259,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
 
           const withTools = b.tools === true, withAgent = b.agent === true;
           const handle = cleanHandle(b.handle);
-          const mk = (liveModel, tools, resume, agent=withAgent) => liveToken({ model: liveModel, system: b.system, tools, agent, garageCare:b.garageCare===true&&agent, handle, resume, now });
+          const mk = (liveModel, tools, resume, agent=withAgent) => liveToken({ model: liveModel, system: b.system, tools, agent, garageCare:b.garageCare===true&&agent, garageAssist:b.garageAssist===true&&agent, handle, resume, now });
 
           let lastErr = '';
           for (const liveModel of candidates) {
@@ -5450,6 +5456,26 @@ ${convo}`;
       }
 
       /* ===== CARS ===== */
+      if (url.pathname === '/api/garage/context' && request.method === 'GET') {
+        return await guarded('user', async actor => {
+          const data=await garageRulesFor(env,actor.payload.sub,url.searchParams.get('car'));
+          if(!data)return deny('Car not found',404);
+          const context=await chatSpecContext(env,actor.payload.sub,data.car.id,data.car,'spec');
+          return json({context,source:'saved-library',researched:false});
+        })();
+      }
+      if (url.pathname === '/api/garage/log' && request.method === 'POST') {
+        return await guarded('user', async actor => {
+          try { return json({ok:true,...await appendGarageLog(env,actor.payload.sub,await readBody())}); }
+          catch(e) { return deny('บันทึกไม่สำเร็จ ตรวจรถ วันที่ ชื่อ และตัวเลข / Check car, date, text and numbers',e.status||503); }
+        })();
+      }
+      if (url.pathname === '/api/garage/cost-policy' && request.method === 'GET') {
+        return await guarded('user', async actor => {
+          const data=await garageRulesFor(env,actor.payload.sub,url.searchParams.get('car'));
+          return data?json({policy:data.policy}):deny('Car not found',404);
+        })();
+      }
       if (url.pathname === '/api/garage/check-in' && request.method === 'POST') {
         return await guarded('user', async actor => {
           const maintenance = await getConfig(env, 'maintenance', {enabled:false});
@@ -5485,7 +5511,12 @@ ${convo}`;
           const color = /^#[0-9a-f]{6}$/i.test(String(bodyData.color || '')) ? String(bodyData.color).toUpperCase() : null;
           const body = CAR_BODIES.includes(bodyData.body) ? bodyData.body : null;
           /* ข้อมูลเพิ่มเติม: ไม่ส่งมา = คงค่าเดิม · ส่งมา = แทนทั้งชุด (ช่องที่ลบออกก็หายจริง) */
-          const info = bodyData.info === undefined ? null : JSON.stringify(cleanInfo(bodyData.info) || {});
+          let info=null;
+          if(bodyData.info!==undefined){
+            const old=await env.DB.prepare('SELECT info FROM cars WHERE id=? AND uid=?').bind(carId,actor.payload.sub).first();
+            let previous={};try{previous=JSON.parse(old?.info||'{}')}catch{}
+            try{info=JSON.stringify(infoPatch(bodyData.info,previous))}catch{return deny('Invalid car details',400)}
+          }
           const result = await env.DB.prepare(`
             INSERT INTO cars (id, uid, make, model, year, mileage, color, body, info, created_at)
             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
@@ -5935,6 +5966,11 @@ ${convo}`;
         return await guarded('admin', async (actor) => {
           const b = await readBody();
           if (!b) return deny('Invalid JSON body', 400);
+          if (b.garageCostReferences !== undefined) {
+            let rows;try{rows=costReferences(b.garageCostReferences)}catch{return deny('Invalid model-year cost references',400)}
+            await setConfig(env,'garage_cost_reference',rows);
+            await logAudit(env,actor.email,'config.garage_cost_reference','',String(rows.length)+' reviewed references');
+          }
           if (b.announcement) {
             const a = {
               enabled: !!b.announcement.enabled,
