@@ -7,7 +7,8 @@ test('valet: no permission → no action list; app says it is off → only a hin
   assert.equal(valetPrompt({}),'','other clients (LINE etc.) get nothing');
   assert.equal(valetPrompt({agent:{v:2}}),'','unknown version is ignored');
   assert.equal(valetPrompt({valet:false}),VALET_OFF);
-  assert.doesNotMatch(VALET_OFF,/"do":/,'the off hint never teaches the action format');
+  assert.match(VALET_OFF,/\{"do":"enable"\}/,'off: only the one-tap allow card');
+  assert.equal((VALET_OFF.match(/"do":/g)||[]).length,1,'the off hint never teaches any other action');
 });
 
 test('valet: customers get app actions but no shop controls; mechanics also get Studio and shop status',()=>{
