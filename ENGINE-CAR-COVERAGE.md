@@ -20,7 +20,9 @@ The previously released v3 stays on production; this document does not deploy v4
   `generationVerified:false`, `layoutVerified:false`.
 - The vision request receives only the relevant short caution block, not all 82
   names. System text stays below the actual 8,000-character limit in both
-  languages. There is no added web/model call, provider, secret or billing change.
+  languages. With the default configuration there is no added web/model call,
+  provider, secret or billing change. An explicitly enabled experimental review
+  mode adds a second image observation as described below.
 - Catalogue v4: 136 concepts / 134 released-in-experiment locator IDs. New concepts
   are fuel water separator, fuel primer, AC condenser, brake master cylinder and
   explicitly unidentified fluid reservoir. Existing vacuum pump/intercooler
@@ -34,8 +36,56 @@ The previously released v3 stays on production; this document does not deploy v4
   Motorcycle, already-exposed internal, hidden-part and no-disassembly guards
   remain. Medium/low/unclear or geometrically invalid items do not get boxes.
 - Auth, quotas, role checks, image-size limits, 18-second provider-attempt budget
-  and 3,600 output-token cap are unchanged. No original photo, raw AI text,
+  and 3,600 output-token cap per observation are retained. No original photo, raw AI text,
   marking or base64 is added to app persistence/logs by this change.
+
+## Automatic blind second-pass experiment (not enabled in production)
+
+The app can identify parts automatically; a mechanic is needed to establish a
+development/held-out reference set, NOT approve every customer scan. Model
+self-review cannot establish independent correctness or replace that benchmark.
+
+`src/engine-review.mjs` is connected to the authenticated scan route, but only
+the exact server environment value `ENGINE_SCAN_BLIND_REVIEW=1` enables it.
+The repository's deployment configuration deliberately does NOT set this flag.
+Client request flags cannot enable or bypass it. Do not enable for production
+until recall, precision, latency and quota impact have been independently reviewed.
+
+When enabled, the first observation gets up to 10 seconds. One batch second
+observation receives the SAME image plus numbered boxes only: no first-pass
+names, confidence, evidence, garage context, user question or previous chat.
+It independently names each visible object or abstains. The server only retains
+an original item if the class agrees, the reviewer reports clear visibility and
+high certainty, all existing safety checks pass again, and whole-image box IoU
+is at least 0.65. Duplicate/missing candidate indices, scene conflicts, uncertain
+identities and mismatches withhold the box. It never promotes/relabels/moves a
+box or emits reviewer prose, markings or diagnoses to the app.
+
+Both observations/fallback attempts share the original 18-second total provider
+budget. Both token totals are charged through the existing meter, including
+completed inference on review failure. No extra per-image provider or paid model
+was introduced. Existing provider fallbacks stay within their shared budget.
+On timeout, quota failure or malformed review there is NO fallback to the first
+unreviewed boxes. The route returns the existing safe scan error plus
+`stage:review`. An empty first answer needs no second call and reports
+`status:not_required`, not a fabricated completed review. The extra model call
+still uses quota and normally increases latency; this is not a speed improvement.
+
+Three real development photos were rerun end-to-end on 17 October 2026:
+
+| Development image | First-pass boxes | Retained after blind agreement | End-to-end time |
+| --- | ---: | ---: | ---: |
+| Corolla Cross hybrid | 8 | 6 | 6.097 s |
+| CR-V hybrid | 5 | 4 | 4.834 s |
+| Honda R20A-labelled user photo | 11 | 6 | 6.818 s |
+
+In that Corolla run the previously observed air-box/fuse-box confusion was
+withheld. This is a useful rejection observation, NOT an accuracy score: some
+plausible correct Honda parts (including alternator) were also withheld. The
+CR-V first pass already chose washer_filler in this rerun, so this does NOT prove
+the reviewer fixes the earlier washer-tank error. Independent mechanic labels:
+still zero. The same model can agree with itself on a wrong identity. Therefore
+this feature stays experimental and disabled; no production update was made.
 
 ## All app inventory targets (not a validation checklist marked complete)
 
@@ -126,11 +176,14 @@ separate model/dataset/compute/serving decision. None has been purchased or run.
 
 ## Verification
 
-- Backend full suite: 384 tests before the final documentation-only changes.
+- Backend full suite: 405 tests after blind-review integration (see current run).
 - Frontend existing scanner suite: 14 tests pass; no frontend modification needed.
 - All 134 locator IDs pass the actual backend-cleaner to existing client-reader
   transport check using synthetic data. This is NOT 134 vision-accuracy tests.
 - Wrangler dry run compiles. Real inference accepts the expanded portable schema.
+- Blind-review tests cover label/context isolation, disagreement, duplicate/missing
+  answers, geometry/scene conflicts, repeated fluid/polarity safeguards, failed
+  review, exact server-only gating, shared deadline and combined token metering.
 - Independent mechanic-approved held-out cases: zero. Real mobile camera tests
   and comprehensive image accuracy evaluation remain outstanding.
 

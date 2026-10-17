@@ -4,6 +4,7 @@ import { exportAccount, resetAccount, deleteAccount, deleteBlockers } from './ac
 import { ONBOARDING_SQL, handleOnboarding, onboardingName, sanitizeSetupState } from './onboarding.js';
 import { buildFeatureRequest, cleanFeatureJson, featureCap } from './features-ai.mjs';
 import { engineScanFailure } from './engine-scan-errors.mjs';
+import { buildEngineReviewRequest, applyEngineReview } from './engine-review.mjs';
 import { liveToken, cleanHandle } from './live-setup.mjs';
 import { valetPrompt } from './agent-prompt.mjs';
 import { handleTech, reconcileDiditIdentities, vaultSweep, expireStaleApplications, releaseWrongHolds, expireOpenJobs } from './techs.js';
@@ -5995,9 +5996,14 @@ ${convo}`;
           const prefer = (body.tool === 'bay' || body.tool === 'baylive') && env.GEMINI_VISION_MODEL ? [env.GEMINI_VISION_MODEL] : undefined;
           let text;
           const engineScan = (body.tool === 'bay' || body.tool === 'baylive') && body.scanVersion === 2;
-          try { text = await callGemini(env, { ...input, meter, prefer }); }
+          // DRAFT opt-in only: two observations share the existing 18s budget.
+          // A client flag cannot enable/disable review or bypass quotas.
+          const blindReview = engineScan && env.ENGINE_SCAN_BLIND_REVIEW === '1';
+          const scanDeadline = blindReview ? Date.now() + 18000 : 0;
+          try { text = await callGemini(env, { ...input, meter, prefer, ...(blindReview ? {timeoutMs:10000} : {}) }); }
           catch (e) {
             if (!engineScan) throw e;
+            if (blindReview && meter.calls) await meterTokens(env, uid, meter);
             const {status,...failure}=engineScanFailure(e),requestId=crypto.randomUUID();
             console.warn(JSON.stringify({event:'engine_scan_failed',code:failure.error,requestId}));
             return json({...failure,requestId},status);
@@ -6011,6 +6017,26 @@ ${convo}`;
               const requestId=crypto.randomUUID();
               console.warn(JSON.stringify({event:'engine_scan_failed',code:'scan_invalid_result',requestId}));
               return json({error:'scan_invalid_result',requestId},502);
+            }
+          }
+          if (blindReview && data) {
+            if (!data.items.length) {
+              data.review = {mode:'blind_second_pass',status:'not_required',submitted:0,retained:0,withheld:0,independentlyValidated:false};
+            } else {
+              try {
+                const remaining = scanDeadline - Date.now();
+                if (remaining < 1000) throw new DOMException('Review budget exhausted', 'TimeoutError');
+                const reviewInput = buildEngineReviewRequest(input, data);
+                const second = await callGemini(env, {...reviewInput,meter,prefer,timeoutMs:remaining});
+                data = applyEngineReview(data, second, body.lang);
+              } catch (e) {
+                // Fail closed: never fall back to unreviewed boxes on a timeout,
+                // quota failure or malformed second answer. Meter BOTH responses.
+                await meterTokens(env, uid, meter);
+                const {status,...failure}=engineScanFailure(e),requestId=crypto.randomUUID();
+                console.warn(JSON.stringify({event:'engine_scan_failed',code:failure.error,requestId}));
+                return json({...failure,requestId,stage:'review'},status);
+              }
             }
           }
           await meterTokens(env, uid, meter);
