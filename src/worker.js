@@ -13,6 +13,7 @@ import { appUrl, card, notify } from './line-notify.js';
 import { refreshNews, newsStatus } from './news.js';
 import { ensureSpec, getSpec, specKey, equipmentKey, validQuery, reportSpec, listSpecs, verifySpec, specLogList, specAI } from './carspec.js';
 import { wantsSpec, ownBlock, specBlock } from './chat-spec.mjs';
+import { KM_CRON, kmTable, thDay, thDayStart, parseKm, parseConfirm, SKIP_RE, OFF_RE, checkKm, askLine, pushText, replyFor, toAsk, setGarageKm, getPref, setPref, getPending, savePending } from './km-remind.mjs';
 import { decodeVin, vpic, cleanInfo } from './vin.js';
 import { LINE_AI, LINE_TALK, LINE_MARK, linePlain, lineChunks, lineCodeIn } from './line-chat.js';
 import { handleVec, kbScores, refreshKb } from './vectors.js';
@@ -3237,6 +3238,8 @@ const CMD_HELP = /^(เมนู|ช่วยเหลือ|วิธีใช�
 
 async function lineHandleText(env, ev, link) {
   const t = String(ev.message.text || '').trim();
+  /* กำลังรอเลขไมล์จากการเตือน 18:00 → ตอบเรื่องนั้นก่อน (เลข 6 หลักบางชุดหน้าตาเหมือนรหัสเชื่อมบัญชี) */
+  if (link) { const km = await kmLineReply(env, link, t); if (km) return km; }
   if (CMD_CONNECT.test(t)) return await lineConnectReply(env, ev.source.userId, link);
   /* รหัส 6 ตัวแบบเดิม (ขอจากในแอป) ยังใช้ได้ */
   const code = lineCodeIn(t);
@@ -3258,6 +3261,81 @@ async function lineHandleText(env, ev, link) {
   }
   /* ที่เหลือคือคุยกับ AI */
   return await lineAsk(env, ev, link, t);
+}
+
+/* ═══ เตือนจดเลขไมล์ 18:00 (km-remind.mjs) ═══ */
+const kmN = v => Math.round(Number(v) || 0).toLocaleString('en-US');
+async function kmEst(env, carId, now) {
+  try { const st = await env.DB.prepare('SELECT * FROM odo_state WHERE car_id = ?').bind(String(carId)).first(); return st ? estimateAt(st, now) : null; }
+  catch (e) { return null; }
+}
+/* คำตอบใน LINE ระหว่างรอเลขไมล์: ตัวเลข = บันทึก · "ข้ามคันนี้" · "หยุดเตือนไมล์" · ข้อความอื่น = ไม่ยุ่ง (คืน null ให้ AI ตอบตามปกติ) */
+async function kmLineReply(env, link, t, now = Date.now()) {
+  let p = null;
+  try { p = await getPending(env, link.uid, now); } catch (e) { return null; }
+  if (!p) return null;
+  if (OFF_RE.test(t)) { await setPref(env, link.uid, false, now); return txt('ปิดการเตือนจดเลขไมล์แล้วครับ เปิดใหม่ได้ที่กระดิ่งแจ้งเตือนในแอป'); }
+  const forced = parseConfirm(t), v = forced != null ? forced : parseKm(t), skip = SKIP_RE.test(t);
+  if (!skip && v == null) return null;
+  const carRow = id => env.DB.prepare('SELECT id, make, model FROM cars WHERE id = ? AND uid = ?').bind(String(id), link.uid).first();
+  const car = await carRow(p.q[p.i]);
+  let said = 'ข้ามคันนี้ครับ';
+  if (car && !skip) {
+    /* เทียบกับเลขที่ยืนยันจริงล่าสุดเท่านั้น (ไม่ใช่เลขประเมิน ซึ่งอาจสูงกว่าความจริง) */
+    const last = await env.DB.prepare('SELECT km, observed_at AS at FROM odo_anchor WHERE car_id = ? AND uid = ? ORDER BY observed_at DESC LIMIT 1')
+      .bind(String(car.id), link.uid).first();
+    const chk = checkKm(v, last, now);
+    if (!chk.ok && !(forced != null && chk.why === 'jump')) return txt(replyFor(chk, v));
+    await addAnchor(env, link.uid, String(car.id), v, 'manual', now, 'line');
+    try { await setGarageKm(env, link.uid, String(car.id), v, now); } catch (e) {}
+    said = `บันทึกแล้ว ✓ ${`${car.make || ''} ${car.model || ''}`.trim()} ${kmN(v)} กม.`;
+  }
+  /* คันถัดไปที่ยังไม่ได้ถาม (คันที่ถูกลบไประหว่างนั้นข้ามไป) */
+  for (p.i++; p.i < p.q.length; p.i++) {
+    const next = await carRow(p.q[p.i]);
+    if (next) { await savePending(env, link.uid, p); return [txt(said), askLine(next, await kmEst(env, next.id, now), p.i, p.q.length)]; }
+  }
+  await savePending(env, link.uid, p);
+  return txt(said + (p.q.length > 1 ? '\nครบทุกคันแล้ว ขอบคุณครับ' : '\nขอบคุณครับ พรุ่งนี้ 18:00 จะถามอีกครั้ง'));
+}
+/* รอบ 18:00 — เฉพาะคนที่เปิดไว้ · คันที่จดวันนี้แล้วไม่ถาม · LINE ก่อน (ตอบเลขได้ในแชต) ไม่ได้ค่อยแจ้งเตือนในเครื่อง
+   วันละครั้งต่อบัญชี (sent_day) ส่งไม่สำเร็จก็ไม่ยิงซ้ำในวันเดียวกัน */
+async function runKmRound(env, now = Date.now()) {
+  const haveWeb = !!(env.VAPID_PRIVATE && env.VAPID_PUBLIC), haveLine = !!env.LINE_CHANNEL_TOKEN;
+  if (!haveWeb && !haveLine) return;
+  try { await kmTable(env); } catch (e) { return; }
+  const day = thDay(now), start = thDayStart(now);
+  const rs = await env.DB.prepare('SELECT uid FROM km_remind WHERE on_ = 1 AND (sent_day IS NULL OR sent_day <> ?) LIMIT 500').bind(day).all();
+  for (const { uid } of (rs && rs.results) || []) {
+    try {
+      const [cars, done, line] = await Promise.all([
+        env.DB.prepare('SELECT id, make, model FROM cars WHERE uid = ? ORDER BY created_at ASC LIMIT 6').bind(uid).all(),
+        env.DB.prepare('SELECT DISTINCT car_id FROM odo_anchor WHERE uid = ? AND observed_at >= ?').bind(uid, start).all(),
+        haveLine ? env.DB.prepare('SELECT line_uid FROM line_link WHERE uid = ? AND active = 1').bind(uid).first() : null,
+      ]);
+      const ask = toAsk(cars.results, new Set(((done && done.results) || []).map(r => String(r.car_id))));
+      if (ask.length) {
+        const est = await kmEst(env, ask[0].id, now);
+        let sent = false;
+        if (line) {
+          const r = await linePush(env, line.line_uid, [askLine(ask[0], est, 0, ask.length)]);
+          if (r && r.ok) { sent = true; await savePending(env, uid, { q: ask.map(c => String(c.id)), i: 0, at: now }); }
+          else if (r) { let detail = ''; try { detail = String((await r.json()).message || '').slice(0, 200); } catch (e) {}
+            await lineNote(env, 'line_last_push_error', { status: r.status, detail }); }
+        }
+        if (!sent && haveWeb) {
+          const subs = await env.DB.prepare('SELECT * FROM push_subs WHERE uid = ?').bind(uid).all();
+          for (const sub of (subs && subs.results) || []) {
+            try {
+              const r = await sendPush(env, sub, pushText(ask, est));
+              if (r.status === 404 || r.status === 410) await env.DB.prepare('DELETE FROM push_subs WHERE endpoint = ?').bind(sub.endpoint).run();
+            } catch (e) { /* เครื่องเดียวล้มต้องไม่ทำให้ทั้งรอบหยุด */ }
+          }
+        }
+      }
+      await env.DB.prepare('UPDATE km_remind SET sent_day = ? WHERE uid = ?').bind(day, uid).run();
+    } catch (e) { console.error('[km remind]', e && e.message); }
+  }
 }
 
 /* ถามเลขไมล์ — ตอบด้วยค่าที่ระบบใช้จริง ไม่ใช่คำนวณใหม่อีกชุด */
@@ -4123,6 +4201,23 @@ export default {
       }
 
       // บันทึกจุดยืนยันเลขไมล์ — ใช้ร่วมกันทุกแหล่ง (ใบเสร็จ/ยืนยัน/น้ำมัน/OBD)
+      /* เตือนจดเลขไมล์ 18:00 — เปิด/ปิด (กระดิ่งแจ้งเตือน) · บอกด้วยว่าจะไปทาง LINE หรือในเครื่อง */
+      if (url.pathname === '/api/km/remind' && (request.method === 'GET' || request.method === 'POST')) {
+        return await guarded('user', async (actor) => {
+          const uid = actor.payload.sub;
+          let on;
+          if (request.method === 'POST') {
+            const b = await readBody();
+            if (!b || typeof b.on !== 'boolean') return deny('on (true|false) required', 400);
+            on = await setPref(env, uid, b.on);
+          } else on = await getPref(env, uid);
+          const [line, sub] = await Promise.all([
+            env.DB.prepare('SELECT 1 AS x FROM line_link WHERE uid = ? AND active = 1').bind(uid).first().catch(() => null),
+            env.DB.prepare('SELECT 1 AS x FROM push_subs WHERE uid = ? LIMIT 1').bind(uid).first().catch(() => null)]);
+          return json({ on, line: !!line, push: !!sub, at: '18:00' });
+        })();
+      }
+
       if (url.pathname === '/api/odo/anchor' && request.method === 'POST') {
         return await guarded('user', async (actor) => {
           const b = await readBody();
@@ -6302,6 +6397,8 @@ ${convo}`;
     ctx.waitUntil(expireOpenJobs(env).catch(e => console.error('expire jobs', e && e.message)));
     /* นิตยสาร: เช็กทุกชั่วโมง อัปเดตจริงทุก 5 ชั่วโมง (รอบของตัวเอง ไม่พ่วงงานหนักรายวัน) */
     if (event.cron === NEWS_CRON) { ctx.waitUntil(refreshNews(env)); return; }
+    /* 18:00 เวลาไทย: เตือนจดเลขไมล์ (เฉพาะคนที่เปิดไว้) */
+    if (event.cron === KM_CRON) { ctx.waitUntil(runKmRound(env)); return; }
     if (event.cron !== '*/10 * * * *') {
       ctx.waitUntil(runPushRound(env));
       ctx.waitUntil(runOdoRound(env));

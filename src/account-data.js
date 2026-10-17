@@ -34,6 +34,8 @@ export const TABLES = [
   ['odo_state', MINE, []],
   ['maint_item', MINE, []],
   ['notify_state', MINE, []],
+  /* เตือนจดเลขไมล์ 18:00: เปิด/ปิด + คันที่รอคำตอบใน LINE (km-remind.mjs) */
+  ['km_remind', MINE, []],
   ['obd_device', MINE, ['secret']],
   ['usage', MINE, []],
   ['usage_win', MINE, []],
@@ -119,7 +121,7 @@ export async function exportAccount(env, uid, { email = '' } = {}) {
 
 /* ล้างข้อมูลการใช้งาน แต่คงบัญชี ร้านช่าง และการเชื่อม LINE ไว้ (ปุ่ม "รีเซ็ตบัญชี") */
 export const RESET_TABLES = ['user_onboarding', 'cars', 'usage', 'usage_win', 'user_state', 'user_memory', 'push_subs', 'push_jobs', 'chat_prefs',
-  'odo_anchor', 'odo_state', 'maint_item', 'notify_state', 'obd_device', 'spares_cache', 'ai_events', 'chat_logs'];
+  'odo_anchor', 'odo_state', 'maint_item', 'notify_state', 'km_remind', 'obd_device', 'spares_cache', 'ai_events', 'chat_logs'];
 export async function resetAccount(env, uid) {
   const removed = {};
   for (const t of RESET_TABLES) {
