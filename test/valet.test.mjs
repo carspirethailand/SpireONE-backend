@@ -46,3 +46,10 @@ test('valet: real mechanic actions are listed for everyone, with confirm-in-card
     assert.doesNotMatch(t,/"do":"(delete|pay|password|share_location)"/);
   }
 });
+
+test('car_info: the AI can save car details the user states, never guessed ones', () => {
+  const p = valetBlock(cleanAgent({ v: 1, cars: [{ id: 'c1', name: 'Toyota Vios', year: '2018', km: 90000 }] }));
+  assert.match(p, /- car_info — บันทึกข้อมูลรถที่ผู้ใช้บอกเอง/);
+  assert.match(p, /trim \(รุ่นย่อย\) · engine · engine_code · model_year · gear · fuel · drive \(FWD\|RWD\|AWD\|4WD\) · tire · vin · plate · province/);
+  assert.match(p, /ห้ามเดาหรือเติมจากสเปกทั่วไป/);
+});

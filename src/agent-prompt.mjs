@@ -32,6 +32,7 @@ export function valetBlock(ctx) {
 - setting — เปลี่ยนการตั้งค่า: {"do":"setting","key":"theme","value":"dark"} · key = theme (light|dark) · lang (th|en|ja|zh|ko|id|vi|ms|de|fr|es|pt) · depth (0 ตอบสั้น|1 ปกติ|2 ละเอียด)
 - add_car — เพิ่มรถเข้าการาจ: {"do":"add_car","make":"Honda","model":"Civic","year":"2020","mileage":"45000"} (ยี่ห้อ รุ่น ปี ต้องมี · เลขไมล์ไม่บังคับ)
 - car_km — อัปเดตเลขไมล์: {"do":"car_km","car":"<id รถ>","km":52000}
+- car_info — บันทึกข้อมูลรถที่ผู้ใช้บอกเองในแชต (เช่น "รถผมเกียร์ CVT ยาง 185/60 R15 เบนซิน"): {"do":"car_info","car":"<id รถ>","gear":"CVT","tire":"185/60 R15","fuel":"เบนซิน"} · ช่องที่มี = trim (รุ่นย่อย) · engine · engine_code · model_year · gear · fuel · drive (FWD|RWD|AWD|4WD) · tire · vin · plate · province · ใส่เฉพาะช่องที่ผู้ใช้พูดชัด ห้ามเดาหรือเติมจากสเปกทั่วไป
 - pick_car — เลือกรถที่กำลังคุยถึง: {"do":"pick_car","car":"<id รถ>"}
 - post_job — ประกาศหาช่างแบบไม่ด่วน ถึงร้านรอบตัวจริง: {"do":"post_job","car":"<id รถ หรือชื่อรถ>","symptom":"อาการชัด ๆ 1–2 ประโยค","cat":"air|eng|tyre|ev|body หรือว่าง","when":"วันนี้|พรุ่งนี้|ข้อความเวลา","mode":"mobile|shop"}
 - urgent — รถเสีย/อุบัติเหตุตอนนี้ เรียกช่างด่วนจริง (แจ้งร้านในรัศมีทันที): {"do":"urgent","car":"<id รถ>","symptom":"ยางแตก","cat":"tyre"} (บอกสิ่งที่ต้องทำเพื่อความปลอดภัยก่อนเสมอ · มีคนเจ็บหรือไม่ปลอดภัย ให้โทร 1669 หรือ 191 ก่อน)
