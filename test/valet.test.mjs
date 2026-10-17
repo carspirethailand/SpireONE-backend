@@ -33,3 +33,15 @@ test('valet: car list from the page is cleaned — no newlines, brackets or fake
   const t=valetBlock(c);assert.match(t,/c123: Honda City ปี 2019 · 45000 กม\./);
   assert.equal((t.match(/\[\[ACT\]\]/g)||[]).length,1,'only the one format example');
 });
+
+test('valet: real mechanic actions are listed for everyone, with confirm-in-card and no-danger rules',()=>{
+  for(const mech of [false,true]){
+    const t=valetPrompt({agent:{v:1,mech,cars:[]}});
+    for(const d of ['urgent','post_job','book','msg_shop','job','log','due'])assert.match(t,new RegExp(`"do":"${d}"`),d);
+    assert.match(t,/accept\|cancel\|complete\|message/);
+    assert.match(t,/1669/,'urgent always reminds to call emergency services first');
+    assert.match(t,/ไม่ต้องถามเบอร์โทรหรือที่อยู่ในแชต/,'phone and address stay in the card, not the chat');
+    assert.match(t,/ลบรถ/);assert.match(t,/จ่ายเงิน/);
+    assert.doesNotMatch(t,/"do":"(delete|pay|password|share_location)"/);
+  }
+});
