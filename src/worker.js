@@ -12,6 +12,7 @@ import { richMenuStatus, setupRichMenu, lineStatus, lineFixWebhook } from './lin
 import { appUrl, card, notify } from './line-notify.js';
 import { refreshNews, newsStatus } from './news.js';
 import { ensureSpec, getSpec, specKey, equipmentKey, validQuery, reportSpec, listSpecs, verifySpec, specLogList, specAI } from './carspec.js';
+import { wantsSpec, ownBlock, specBlock } from './chat-spec.mjs';
 import { decodeVin, vpic, cleanInfo } from './vin.js';
 import { LINE_AI, LINE_TALK, LINE_MARK, linePlain, lineChunks, lineCodeIn } from './line-chat.js';
 import { handleVec, kbScores, refreshKb } from './vectors.js';
@@ -1405,6 +1406,30 @@ function withoutDeletedCars(key, value, deleted) {
   }
   if (key === 'selCar' && deleted.ids.has(String(value))) return '';
   return value;
+}
+
+/* สเปกรุ่นรถจากคลัง car_specs + ข้อมูลที่เจ้าของบันทึกเอง ให้ AI ตอบตรงรุ่น (chat-spec.mjs)
+   อ่านอย่างเดียว ไม่ค้นใหม่ ไม่เรียก AI · พังก็แค่ไม่ใส่ แชตยังตอบได้ตามปกติ */
+async function chatSpecContext(env, uid, carId, carInfo, question) {
+  if (!carInfo || !(carInfo.make || carInfo.model)) return '';
+  try {
+    const gar = carId && uid ? await stateOf(env, uid, 'garage') : null;
+    const c = Array.isArray(gar) ? gar.find(x => x && String(x.id) === String(carId)) : null;
+    const info = c && c.info && typeof c.info === 'object' ? c.info : null;
+    const own = ownBlock(info);
+    let spec = '';
+    if (wantsSpec(question)) {
+      const q = { make: carInfo.make, model: carInfo.model, year: carInfo.year };
+      const vs = [validQuery({ ...q, market: (info && info.market) || 'GLOBAL' }), validQuery({ ...q, market: 'GLOBAL' })].filter(Boolean);
+      if (vs.length) {
+        const keys = f => [...new Set(vs.map(v => f(v.make, v.model, v.year, v.market)))];
+        const pick = async ks => { for (const k of ks) { const r = await getSpec(env, k); if (r && ['ready', 'verified'].includes(r.status)) return r; } return null; };
+        const [sp, eq] = await Promise.all([pick(keys(specKey)), pick(keys(equipmentKey))]);
+        spec = specBlock(sp, eq);
+      }
+    }
+    return (own ? '\n' + own : '') + spec;
+  } catch (e) { console.error('[chat spec]', e && e.message); return ''; }
 }
 
 async function userContext(env, uid, carId, hint) {
@@ -3294,13 +3319,14 @@ async function lineAsk(env, ev, link, text) {
       if (c) { carId = c.id; carInfo = { make: c.make || '', model: c.model || '', year: c.year != null ? String(c.year) : '', mileage: c.mileage != null ? String(c.mileage) : '' }; }
     } catch (e) {}
   }
-  const [userBlock, kbBlock] = await Promise.all([
+  const [userBlock, kbBlock, specCtx] = await Promise.all([
     link ? userContext(env, link.uid, carId, { userName: name }).catch(() => '') : '',
     kbFor(env, carInfo, text).catch(() => ''),
+    link ? chatSpecContext(env, link.uid, carId, carInfo, text) : '',
   ]);
   const carContext = (carInfo.make || carInfo.model)
     ? `\n[รถที่กำลังคุยถึง]\nรถของผู้ใช้: ${carInfo.make} ${carInfo.model} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` : '';
-  const sys = `${IDENTITY}\n\n${STREAM_TALK}\n\n${LINE_TALK}${carContext}${userBlock || ''}${kbBlock || ''}${needsFresh(text) ? FORCE_SEARCH : ''}`;
+  const sys = `${IDENTITY}\n\n${STREAM_TALK}\n\n${LINE_TALK}${carContext}${carContext ? specCtx : ''}${userBlock || ''}${kbBlock || ''}${needsFresh(text) ? FORCE_SEARCH : ''}`;
   const contents = [...hist, { role: 'user', parts: [{ text: text.slice(0, 2000) }] }];
   const meter = newMeter();
 
@@ -4823,12 +4849,13 @@ export default {
                 }
                 return ci;
               })();
-              const [ci, kbBlock, userBlock, prefs, skillBlock] = await Promise.all([
+              const [ci, kbBlock, userBlock, prefs, skillBlock, specCtx] = await Promise.all([
                 carP,
                 carP.then(c => kbFor(env, c, question)),
                 userContext(env, uid, body.carId, { userName: body.userName }),
                 getChatPrefs(env, uid),
                 skillsPrompt(env, uid, body.skillIds),
+                carP.then(c => chatSpecContext(env, uid, body.carId, c, question)),
               ]);
               carInfo = ci;
               const activeStyle = (body.style && (CHAT_STYLES[body.style] || body.style === 'custom')) ? body.style : prefs.style;
@@ -4841,7 +4868,7 @@ export default {
               const sys = `${IDENTITY}
 
 ${STREAM_TALK}${featuresBlock()}${valetPrompt(body)}${smartBlock()}${stylePrompt(activeStyle, activeCustom)}${depthNote(body.depth)}
-${carContext ? `\n[รถที่กำลังคุยถึง]${carContext}` : ''}${userBlock}${kbBlock}${skillBlock}${fresh ? FORCE_SEARCH : ''}`;
+${carContext ? `\n[รถที่กำลังคุยถึง]${carContext}${specCtx}` : ''}${userBlock}${kbBlock}${skillBlock}${fresh ? FORCE_SEARCH : ''}`;
 
               await send({ type: 'status', key: fresh ? 'search' : (hasMedia ? 'media' : 'think'),
                 text: fresh ? 'กำลังค้นข้อมูลล่าสุด' : hasMedia ? 'กำลังดูไฟล์ที่แนบมา' : 'กำลังคิด' });
@@ -5021,9 +5048,10 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
               }
             }
 
-            const [userBlock, kbBlock] = await Promise.all([
+            const [userBlock, kbBlock, specCtx] = await Promise.all([
               userContext(env, actor.payload.sub, body.carId, { userName: body.userName }),
               kbFor(env, carInfo, question),
+              chatSpecContext(env, actor.payload.sub, body.carId, carInfo, question),
             ]);
 
             /* ── เครื่องตอบเร็ว: Gemini ค้นเว็บ ดูรูป และตอบในการเรียกครั้งเดียว ──
@@ -5035,7 +5063,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
             const sys = `${IDENTITY}
 
 ${STREAM_TALK}${featuresBlock()}${valetPrompt(body)}${smartBlock()}${stylePrompt(activeStyle, activeCustomStyle)}${depthNote(body.depth)}
-${carContext ? `\n[รถที่กำลังคุยถึง]${carContext}` : ''}${userBlock}${kbBlock}${skillPrompt || ''}${fresh ? FORCE_SEARCH : ''}`;
+${carContext ? `\n[รถที่กำลังคุยถึง]${carContext}${specCtx}` : ''}${userBlock}${kbBlock}${skillPrompt || ''}${fresh ? FORCE_SEARCH : ''}`;
             try {
               const r = await fastAnswer(env, {
                 system: sys,
