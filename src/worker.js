@@ -6,6 +6,7 @@ import { buildFeatureRequest, cleanFeatureJson, featureCap } from './features-ai
 import { engineScanFailure } from './engine-scan-errors.mjs';
 import { liveToken, cleanHandle } from './live-setup.mjs';
 import { valetPrompt } from './agent-prompt.mjs';
+import { garageCheckin, GARAGE_CARE_KEY } from './garage-care.mjs';
 import { handleTech, reconcileDiditIdentities, vaultSweep, expireStaleApplications, releaseWrongHolds, expireOpenJobs } from './techs.js';
 import { richMenuStatus, setupRichMenu, lineStatus, lineFixWebhook } from './line-menu.js';
 import { appUrl, card, notify } from './line-notify.js';
@@ -4187,7 +4188,7 @@ export default {
           const deleted = await carDeletions(env, actor.payload.sub);
           const state = {};
           for (const r of rs.results || []) {
-            if (r.k.startsWith(CAR_DELETED_PREFIX)) continue;
+            if (r.k.startsWith(CAR_DELETED_PREFIX) || r.k === GARAGE_CARE_KEY) continue;
             let v = null;
             try { v = JSON.parse(r.v); } catch (e) { v = r.v; }
             if (r.k === 'setup') v = await sanitizeSetupState(env, actor.payload.sub, v);
@@ -4209,7 +4210,7 @@ export default {
           const deleted = (Object.hasOwn(items, 'garage') || Object.hasOwn(items, 'selCar'))
             ? await carDeletions(env, uid) : { ids: new Set(), t: 0 };
           for (const k of Object.keys(items).slice(0, 40)) {
-            if (k.startsWith(CAR_DELETED_PREFIX) || !/^[A-Za-z0-9_:.-]{1,64}$/.test(k)) { skipped.push(k); continue; }
+            if (k.startsWith(CAR_DELETED_PREFIX) || k === GARAGE_CARE_KEY || !/^[A-Za-z0-9_:.-]{1,64}$/.test(k)) { skipped.push(k); continue; }
             const item = items[k] || {};
             let value = withoutDeletedCars(k, item.v === undefined ? null : item.v, deleted);
             if (k === 'setup') value = await sanitizeSetupState(env, uid, value);
@@ -5129,7 +5130,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
 
           const withTools = b.tools === true, withAgent = b.agent === true;
           const handle = cleanHandle(b.handle);
-          const mk = (liveModel, tools, resume, agent=withAgent) => liveToken({ model: liveModel, system: b.system, tools, agent, handle, resume, now });
+          const mk = (liveModel, tools, resume, agent=withAgent) => liveToken({ model: liveModel, system: b.system, tools, agent, garageCare:b.garageCare===true&&agent, handle, resume, now });
 
           let lastErr = '';
           for (const liveModel of candidates) {
@@ -5150,7 +5151,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
             }
             if (res.ok) {
               const tok = await res.json();
-              return json({ token: tok.name, model: liveModel, tools, agent, resume, resumed: resume && !!handle });
+              return json({ token: tok.name, model: liveModel, tools, agent, resume, garageCare:b.garageCare===true&&agent, resumed: resume && !!handle });
             }
             lastErr = `${liveModel} ${res.status}: ${(await res.text()).slice(0, 200)}`;
             /* รุ่นนี้ใช้ไม่ได้ (ไม่มี/ไม่มีสิทธิ์) → ลองรุ่นถัดไป · คีย์ผิดหรือโควตาหมด → ลองต่อก็ไม่ช่วย */
@@ -5326,6 +5327,17 @@ ${convo}`;
       }
 
       /* ===== CARS ===== */
+      if (url.pathname === '/api/garage/check-in' && request.method === 'POST') {
+        return await guarded('user', async actor => {
+          const maintenance = await getConfig(env, 'maintenance', {enabled:false});
+          if (maintenance.enabled && rank(actor.role) < rank('moderator')) return deny('maintenance', 503);
+          try {
+            const result = await garageCheckin(env, actor.payload.sub, await readBody());
+            const {status=200,...data} = result;
+            return json(data, status);
+          } catch { return json({question:null}, 503); }
+        })();
+      }
       if (url.pathname === '/api/cars' && request.method === 'GET') {
         return await guarded('user', async (actor) => {
           const { results } = await env.DB.prepare('SELECT * FROM cars WHERE uid = ? ORDER BY created_at DESC')
