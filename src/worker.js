@@ -27,9 +27,10 @@ import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll
 
 const ROLE_RANK = { owner: 4, admin: 3, moderator: 2, user: 1 };
 
+/* เจ้าของบริษัท — อยู่ในรายการเจ้าของเสมอ แม้ตั้ง OWNERS บน Cloudflare แล้วลืมใส่ (เจ้าของต้องไม่หลุดสิทธิ์ของตัวเอง) */
+const FOUNDERS = ['anapatmaliwong@gmail.com', 'carspirethailand@gmail.com'];
 function owners(env) {
-  return (env.OWNERS || 'anapatmaliwong@gmail.com,carspirethailand@gmail.com')
-    .toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
+  return [...new Set([...FOUNDERS, ...String(env.OWNERS || '').toLowerCase().split(',').map(s => s.trim()).filter(Boolean)])];
 }
 
 function corsHeaders(env, request) {

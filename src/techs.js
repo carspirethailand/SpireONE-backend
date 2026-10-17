@@ -239,8 +239,10 @@ const json = (data, status, headers) => new Response(JSON.stringify(data), {
 });
 
 /* ── ตัวตน ── */
+/* เจ้าของบริษัท — อยู่ในรายการเจ้าของเสมอ แม้ตั้ง OWNERS บน Cloudflare แล้วลืมใส่ (เจ้าของต้องไม่หลุดสิทธิ์ของตัวเอง) */
+const FOUNDERS = ['anapatmaliwong@gmail.com', 'carspirethailand@gmail.com'];
 function owners(env) {
-  return (env.OWNERS || 'anapatmaliwong@gmail.com,carspirethailand@gmail.com').toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
+  return [...new Set([...FOUNDERS, ...String(env.OWNERS || '').toLowerCase().split(',').map(s => s.trim()).filter(Boolean)])];
 }
 async function who(request, env, required = true, verifyToken = verifyFirebaseToken) {
   const h = request.headers.get('Authorization') || '';
@@ -254,14 +256,16 @@ async function who(request, env, required = true, verifyToken = verifyFirebaseTo
   /* ผู้ดูแลระบบช่าง = OWNERS หรือคนที่ระบบหลักตั้งยศ admin ขึ้นไป
      บัญชีที่ถูกแบนในระบบหลัก ใช้ระบบช่างไม่ได้ด้วย */
   /* staff = ผู้ดูแลกับทีมงาน (moderator) — เห็นช่างทดสอบ ตรวจใบสมัคร และจัดการระบบช่างได้ */
-  let admin = emailVerified && owners(env).includes(email), staff = admin;
+  /* owner = เจ้าของระบบ (อีเมลยืนยันแล้วในรายการเจ้าของ) — สิทธิ์สูงสุด แก้/ลบของทุกร้านได้ อนุมัติทดสอบได้ */
+  const owner = emailVerified && owners(env).includes(email);
+  let admin = owner, staff = admin;
   try {
     const u = await env.DB.prepare('SELECT role, banned FROM users WHERE uid = ?').bind(uid).first();
     if (u && u.banned) fail(403, 'บัญชีนี้ถูกระงับ');
     if (u && (u.role === 'admin' || u.role === 'owner' && emailVerified && owners(env).includes(email))) admin = staff = true;
     if (u && u.role === 'moderator') staff = true;
   } catch (e) { if (e instanceof HttpError) throw e; }
-  return { uid, email, admin, staff };
+  return { uid, email, admin, staff, owner };
 }
 const adminOnly = me => { if (!me.staff) fail(403, 'เฉพาะผู้ดูแลและทีมงาน'); };
 
@@ -482,7 +486,7 @@ async function meInfo(env, me) {
   const msgs = thr ? thr.threads.filter(x => x.unread > 0).length : 0;
   const attention = jobs.filter(j => j.needsMe || j.unread > 0).length + msgs;
   return {
-    uid: me.uid, email: me.email, admin: me.admin, staff: me.staff, version: API_VERSION,
+    uid: me.uid, email: me.email, admin: me.admin, staff: me.staff, owner: !!me.owner, version: API_VERSION,
     application: appOut(await openApp(env, a), false, ident),
     technician: t ? { ...publicTech((await withPhotos(env, [t]))[0]), suspended: !!t.suspended,
       identityHold: !!(!t.test && t.suspended && t.id_hold),
@@ -623,6 +627,8 @@ async function apply(env, me, b) {
   d.hasCert = docs.some(x => x.kind === 'cert');
   d.submissionId=crypto.randomUUID();const packed=await sealApp(env,me.uid,d);
   for (const x of docs) x.store = await sealDoc(env, me.uid, x.kind, x.data);
+  const prev=await env.DB.prepare('SELECT status,test FROM tech_applications WHERE uid=?').bind(me.uid).first();
+  if(prev&&prev.status==='declined'&&!prev.test)fail(409,'ใบสมัครนี้ไม่ผ่านการคัดเลือก จึงส่งใหม่ไม่ได้ — ติดต่อทีมงานถ้าคิดว่าผิดพลาด');
   /* ส่งใหม่หลังถูกตีกลับ = เอกสารชุดใหม่ทั้งชุด ลบชุดเก่าทิ้ง */
   const stored=await env.DB.batch([
     env.DB.prepare(`INSERT INTO tech_applications (uid,email,data,status,test,review,revision,created_at,updated_at)
@@ -956,6 +962,7 @@ async function idCheck(env, me, b) {
 }
 async function review(env, me, b) {
   adminOnly(me);
+  if (b && b.decision === 'approve_test') return testApprove(env, me, b);
   if(!me.admin)fail(403,'เฉพาะ admin ที่อนุมัติใบสมัครจริงได้');
   const a = await openApp(env, await env.DB.prepare('SELECT * FROM tech_applications WHERE uid = ?').bind(String(b.uid || '')).first());
   if (!a) fail(404, 'ไม่พบใบสมัคร');
@@ -965,7 +972,8 @@ async function review(env, me, b) {
   if(me.uid===a.uid)fail(403,'ต้องให้ admin คนอื่นตรวจใบสมัครจริง ไม่อนุมัติตัวเอง');
   const checks = Object.fromEntries(CHECKS.map(k => [k, b.checks?.[k]===true]));
   const note = str(b.note, 'บันทึกการตรวจ', 10, 2000);
-  if(!['approve','reject'].includes(b.decision))fail(400,'คำตัดสินไม่ถูกต้อง');
+  /* approve = อนุมัติ · reject = ให้แก้ (ผู้สมัครแก้แล้วส่งใหม่ได้) · decline = ไม่ผ่าน (ปิดใบสมัคร ส่งใหม่ไม่ได้) */
+  if(!['approve','reject','decline'].includes(b.decision))fail(400,'คำตัดสินไม่ถูกต้อง');
   const decision = b.decision;
   if (decision === 'approve' && !CHECKS.every(k => checks[k])) fail(400, 'อนุมัติได้เมื่อตรวจครบทุกข้อเท่านั้น');
   let evidence={},resolutions={};
@@ -995,7 +1003,7 @@ async function review(env, me, b) {
   /* ใบสมัครรุ่นเก่า (ก่อนมีตู้เซฟ) อาจยังมีเลขบัตรเต็ม — ตรวจเสร็จเหลือแค่ 3 หลักท้าย และเข้ารหัสทั้งก้อน */
   const dd = scrubIdNo(parse(a.data) || {});
   const stmts = [env.DB.prepare("UPDATE tech_applications SET status=?,review=?,data=?,updated_at=?,revision=revision+1 WHERE uid=? AND status='pending' AND revision=? AND ai IS ?")
-    .bind(decision === 'approve' ? 'approved' : 'rejected', rv, await sealApp(env, a.uid, dd), t, a.uid,a.revision,a.ai),
+    .bind(decision === 'approve' ? 'approved' : decision === 'decline' ? 'declined' : 'rejected', rv, await sealApp(env, a.uid, dd), t, a.uid,a.revision,a.ai),
     /* ตรวจเสร็จแล้ว ลบรูปบัตร เซลฟี่ และใบรับรองทิ้งทันที ไม่เก็บไว้เกินจำเป็น (PDPA)
        เหลือแค่บันทึกว่าใครตรวจอะไรไปเมื่อไร */
     env.DB.prepare(`DELETE FROM tech_docs WHERE uid=? AND kind IN (${PRIVATE_DOCS.map(() => '?').join(',')}) AND EXISTS(SELECT 1 FROM tech_applications WHERE uid=? AND review=?)`)
@@ -1020,15 +1028,56 @@ async function review(env, me, b) {
       ON CONFLICT(uid) DO UPDATE SET data=json_set(CASE WHEN tech_profiles.data IS NULL OR tech_profiles.data='' OR tech_profiles.data='{}' THEN excluded.data ELSE tech_profiles.data END,'$.vetting',json(?)),phone=excluded.phone,verified=1,test=0,suspended=0,updated_at=excluded.updated_at`)
       .bind(id,a.uid,d.phone,JSON.stringify(profile),t,t,a.uid,rv,JSON.stringify(vetting)));
   }
+  /* ให้แก้ = ปล่อยเลขบัตรคืนให้ส่งใหม่ได้ · ไม่ผ่าน = เก็บแฮชเลขบัตรไว้ กันใช้บัตรเดิมสมัครซ้ำจากบัญชีอื่น */
   if(decision==='reject')stmts.push(env.DB.prepare('DELETE FROM tech_identity_claims WHERE uid=? AND EXISTS(SELECT 1 FROM tech_applications WHERE uid=? AND review=?)').bind(a.uid,a.uid,rv));
   const result=await env.DB.batch(stmts);if(!result[0].meta.changes)fail(409,'ใบสมัครเปลี่ยนแล้ว กรุณาโหลดใหม่');
   await audit(env, me, decision, a.uid, decision === 'approve' ? 'ผ่านการตรวจครบทุกข้อ' : note.slice(0, 200));
   tell(env, a.uid, () => decision === 'approve'
     ? card({ tag: 'ผ่านการตรวจ', title: 'ร้านของคุณเปิดใน Cendon แล้ว', url: appUrl(env, '/?studio=1'), label: 'เปิด Studio',
         lines: ['ตั้งค่าร้าน ลงบริการพร้อมราคา แล้วเริ่มรับงานได้เลย'] })
-    : card({ tag: 'ใบสมัครช่าง', title: 'ใบสมัครยังไม่ผ่าน', url: appUrl(env, '/?join=1'), label: 'ดูสิ่งที่ต้องแก้',
+    : decision === 'decline'
+    ? card({ tag: 'ใบสมัครช่าง', title: 'ใบสมัครไม่ผ่านการคัดเลือก', url: appUrl(env, '/?join=1'), label: 'ดูรายละเอียด',
+        lines: [note, 'ถ้าคิดว่าผิดพลาด ติดต่อทีมงานได้'] })
+    : card({ tag: 'ใบสมัครช่าง', title: 'ใบสมัครต้องแก้ไข', url: appUrl(env, '/?join=1'), label: 'ดูสิ่งที่ต้องแก้',
         lines: [note, 'แก้ไขแล้วส่งใหม่ได้ในแอป'] }));
   return { ok: true };
+}
+
+/* ── อนุมัติทดสอบ (เจ้าของระบบเท่านั้น) ──
+   ข้ามทุกด่าน (ผล AI · เทียบเลขบัตร · ติ๊กครบ · อนุมัติตัวเอง · ใบทดสอบ) เพื่อเอาผู้สมัครมาลองระบบก่อน
+   แต่ผลคือ "ร้านทดสอบ" เสมอ: ลูกค้าทั่วไปไม่เห็น ไม่มีป้ายยืนยันตัวตน/ทักษะ — ทางนี้ไม่มีทางกลายเป็นร้านจริง
+   จะเปิดให้ลูกค้าเห็น ผู้สมัครต้องส่งใบสมัครจริงแล้วผ่านการตรวจเต็มตามปกติ (ใบที่อนุมัติทดสอบส่งใหม่ได้) */
+async function testApprove(env, me, b) {
+  if (!me.owner) fail(403, 'อนุมัติทดสอบได้เฉพาะเจ้าของระบบ');
+  const a = await openApp(env, await env.DB.prepare('SELECT * FROM tech_applications WHERE uid = ?').bind(String(b.uid || '')).first());
+  if (!a) fail(404, 'ไม่พบใบสมัคร');
+  if (a.status !== 'pending') fail(409, 'ใบสมัครนี้ถูกตรวจไปแล้ว');
+  if (b.revision != null && Number(b.revision) !== a.revision) fail(409, 'ผู้สมัครเพิ่งแก้ใบสมัคร กรุณาโหลดใหม่ก่อนตรวจ');
+  const t = now(), note = String(b.note || '').trim().slice(0, 2000) || 'อนุมัติทดสอบโดยเจ้าของระบบ (ข้ามการตรวจ)';
+  const rv = JSON.stringify({ id: crypto.randomUUID(), by: me.email, note, decision: 'approve_test', testOnly: true, at: t });
+  const d = scrubIdNo(parse(a.data) || {});
+  const id = 't_' + (await sha(a.uid)).slice(0, 16);
+  const profile = { name: d.name, shop: d.shop, area: d.area, cats: d.cats, about: d.about, years: d.years,
+    from: d.from, warranty: d.warranty, radius: d.radius, mobile: d.mobile, urgent: d.urgent, lat: d.lat, lng: d.lng, cert: !!d.hasCert };
+  const stmts = [
+    env.DB.prepare("UPDATE tech_applications SET status='approved',test=1,review=?,data=?,updated_at=?,revision=revision+1 WHERE uid=? AND status='pending' AND revision=?")
+      .bind(rv, await sealApp(env, a.uid, d), t, a.uid, a.revision),
+    /* ตัดสินแล้ว = ลบรูปบัตร เซลฟี่ ใบรับรองทิ้งทันที เหมือนการตรวจจริง (PDPA) */
+    env.DB.prepare(`DELETE FROM tech_docs WHERE uid=? AND kind IN (${PRIVATE_DOCS.map(() => '?').join(',')}) AND EXISTS(SELECT 1 FROM tech_applications WHERE uid=? AND review=?)`)
+      .bind(a.uid, ...PRIVATE_DOCS, a.uid, rv),
+    /* ร้านจริงที่ผ่านการตรวจอยู่แล้ว ไม่ถูกลดเป็นร้านทดสอบ */
+    env.DB.prepare(`INSERT INTO tech_profiles (id,uid,phone,data,verified,test,suspended,created_at,updated_at)
+      SELECT ?,?,?,?,0,1,0,?,? FROM tech_applications WHERE uid=? AND review=?
+      ON CONFLICT(uid) DO UPDATE SET test=1,suspended=0,updated_at=excluded.updated_at WHERE tech_profiles.verified=0`)
+      .bind(id, a.uid, d.phone || '', JSON.stringify(profile), t, t, a.uid, rv)];
+  const ir = await identityRow(env, a.uid);
+  if (ir) { const x = parse(ir.data) || {}; delete x.name; delete x.birth; delete x.url;
+    stmts.push(env.DB.prepare('UPDATE tech_identity SET data=? WHERE uid=? AND EXISTS(SELECT 1 FROM tech_applications WHERE uid=? AND review=?)').bind(await sealIdent(env, a.uid, x), a.uid, a.uid, rv)); }
+  const result = await env.DB.batch(stmts); if (!result[0].meta.changes) fail(409, 'ใบสมัครเปลี่ยนแล้ว กรุณาโหลดใหม่');
+  await audit(env, me, 'approve_test', a.uid, note.slice(0, 200));
+  tell(env, a.uid, () => card({ tag: 'ทดลองใช้', title: 'เปิดร้านทดลองให้แล้ว', url: appUrl(env, '/studio'), label: 'เปิด Studio',
+    lines: ['ลองใช้ Studio ได้ทุกขั้น · ลูกค้าทั่วไปยังไม่เห็นร้านนี้', 'ร้านจะเปิดให้ลูกค้าเห็นเมื่อผ่านการตรวจจริง'] }));
+  return { ok: true, testOnly: true };
 }
 
 async function moderate(env, me, b) {
@@ -1815,7 +1864,7 @@ async function passportView(env, token) {
       const doneAt = ((h.filter(x => x.status === 'completed').pop()) || {}).at || j.updated_at;
       const km = (String(j.car).match(/([\d,]{3,9})\s*กม/) || [])[1];
       return { at: doneAt, shop: d.shop || d.name || 'ร้านใน Cendon', shopVerified: !!(t && t.verified), test: !!j.test,
-        work: cleanTxt(j.completion || q.scope || '', 220), warranty: Number(q.warranty) || 0, rating: (parse(j.review) || {}).rating || null,
+        work: cleanTxt(j.completion || q.scope || '', 220), warranty: Number(q.warranty) || 0, rating: (r => r && !r.hidden ? r.rating : null)(parse(j.review)) || null,
         km: km ? Number(km.replace(/,/g, '')) : null, ...(data.showCost && q.total ? { amount: q.total } : {}) };
     }));
     verified.sort((a, b) => b.at - a.at);
@@ -2053,15 +2102,17 @@ async function offer(env, me, postId, b) {
 
 async function closePost(env, me, postId) {
   const p = await env.DB.prepare('SELECT customer_uid, status FROM tech_posts WHERE id = ?').bind(postId).first();
-  if (!p || p.customer_uid !== me.uid) fail(404, 'ไม่พบประกาศ');
+  if (!p || (p.customer_uid !== me.uid && !me.owner)) fail(404, 'ไม่พบประกาศ');
+  const by = p.customer_uid === me.uid ? 'customer' : 'admin';
   const ts = now();
   const { results } = await env.DB.prepare("SELECT id, history FROM tech_jobs WHERE group_id = ? AND status IN ('requested','quoted')").bind(postId).all();
   await env.DB.batch([
     env.DB.prepare("UPDATE tech_posts SET status = 'closed', updated_at = ? WHERE id = ?").bind(ts, postId),
-    ...results.map(o => { const h = parse(o.history) || []; h.push({ status: 'cancelled', at: ts, by: 'customer' });
+    ...results.map(o => { const h = parse(o.history) || []; h.push({ status: 'cancelled', at: ts, by });
       return env.DB.prepare("UPDATE tech_jobs SET status='cancelled', resolution=?, history=?, updated_at=?, revision=revision+1 WHERE id=?")
-        .bind('ลูกค้าปิดประกาศแล้ว', JSON.stringify(h), ts, o.id); }),
+        .bind(by === 'customer' ? 'ลูกค้าปิดประกาศแล้ว' : 'ทีมงานปิดประกาศแล้ว', JSON.stringify(h), ts, o.id); }),
   ]);
+  if (by === 'admin') await audit(env, me, 'close_post', postId);
   return { ok: true };
 }
 
@@ -2071,6 +2122,15 @@ async function myShop(env, me) {
   if (!t) fail(403, 'ต้องเป็นช่างในระบบก่อน');
   return t;
 }
+/* ร้านที่จะแก้: ร้านตัวเอง หรือ (เจ้าของระบบ) ร้านไหนก็ได้ด้วย b.tech — แก้ร้านคนอื่นมีบันทึกทุกครั้ง */
+async function shopFor(env, me, b) {
+  const id = String(b && b.tech || '');
+  if (!id) return myShop(env, me);
+  if (!me.owner) fail(403, 'เฉพาะเจ้าของระบบที่แก้ร้านของคนอื่นได้');
+  const t = await techById(env, id);
+  if (!t) fail(404, 'ไม่พบร้าน');
+  return t;
+}
 async function setOnline(env, me, b) {
   const t = await myShop(env, me);
   if(t.suspended && b.online) fail(403,'บัญชีช่างอยู่ระหว่างตรวจสอบ จึงเปิดรับงานไม่ได้ชั่วคราว');
@@ -2078,9 +2138,10 @@ async function setOnline(env, me, b) {
   return { ok: true, online: !!b.online };
 }
 async function editShop(env, me, b) {
-  const t = await myShop(env, me);
+  const t = await shopFor(env, me, b), other = t.uid !== me.uid;
   const d = parse(t.data) || {};
-  if(!t.test){
+  /* เจ้าของระบบแก้ได้ทุกช่อง รวมข้อมูลที่ผ่านการตรวจแล้ว */
+  if(!t.test&&!me.owner){
     const changed=['about','cats','lat','lng'].some(k=>b[k]!=null&&JSON.stringify(k==='cats'&&Array.isArray(b[k])?[...b[k]].sort():b[k])!==JSON.stringify(k==='cats'&&Array.isArray(d[k])?[...d[k]].sort():d[k]));
     if(changed||b.addPhotos?.length||b.removePhotos?.length)fail(409,'ข้อมูลทักษะ ตำแหน่ง และรูปที่รับรองแล้ว ต้องให้ทีมงานตรวจใหม่ก่อนเปลี่ยน ติดต่อทีมงาน');
   }
@@ -2097,7 +2158,7 @@ async function editShop(env, me, b) {
   /* ตั้งรูปที่มีอยู่เป็นปก หรืออัปโหลดรูปปกใหม่ (นับรวมโควตา 12 รูป) */
   if (b.cover != null) {
     const id = Number(b.cover) || 0;
-    if (id && !(await env.DB.prepare("SELECT 1 FROM tech_docs WHERE id = ? AND uid = ? AND kind IN ('shop','work')").bind(id, me.uid).first())) fail(400, 'ไม่พบรูปนี้ในร้าน');
+    if (id && !(await env.DB.prepare("SELECT 1 FROM tech_docs WHERE id = ? AND uid = ? AND kind IN ('shop','work')").bind(id, t.uid).first())) fail(400, 'ไม่พบรูปนี้ในร้าน');
     d.cover = id || null;
   }
   if (b.phone != null) d.phone = String(b.phone).replace(/[^0-9+]/g, '').slice(0, 15);
@@ -2126,33 +2187,34 @@ async function editShop(env, me, b) {
   if (b.addAvatar) {
     const m = imgClean(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(b.addAvatar.data || '')));
     if (!m || m[2].length > 600000) fail(400, 'ไฟล์ต้องเป็นรูปภาพ');
-    const r = await env.DB.prepare('INSERT INTO tech_docs (uid, kind, mime, data, created_at) VALUES (?,?,?,?,?)').bind(me.uid, 'shop', m[1], m[2], now()).run();
-    if (d.avatar) await env.DB.prepare("DELETE FROM tech_docs WHERE id = ? AND uid = ? AND kind = 'shop'").bind(d.avatar, me.uid).run();
+    const r = await env.DB.prepare('INSERT INTO tech_docs (uid, kind, mime, data, created_at) VALUES (?,?,?,?,?)').bind(t.uid, 'shop', m[1], m[2], now()).run();
+    if (d.avatar) await env.DB.prepare("DELETE FROM tech_docs WHERE id = ? AND uid = ? AND kind = 'shop'").bind(d.avatar, t.uid).run();
     d.avatar = r.meta && r.meta.last_row_id || null;
   }
   if (b.addCover) {
     const m = imgClean(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(b.addCover.data || '')));
     if (!m || m[2].length > 1400000) fail(400, 'ไฟล์ต้องเป็นรูปภาพ');
-    const have = await env.DB.prepare("SELECT COUNT(*) AS n FROM tech_docs WHERE uid = ? AND kind IN ('shop','work')").bind(me.uid).first();
+    const have = await env.DB.prepare("SELECT COUNT(*) AS n FROM tech_docs WHERE uid = ? AND kind IN ('shop','work')").bind(t.uid).first();
     if (have.n >= 1000) fail(400, 'รูปร้านเยอะเกินไป');
-    const r = await env.DB.prepare('INSERT INTO tech_docs (uid, kind, mime, data, created_at) VALUES (?,?,?,?,?)').bind(me.uid, 'shop', m[1], m[2], now()).run();
+    const r = await env.DB.prepare('INSERT INTO tech_docs (uid, kind, mime, data, created_at) VALUES (?,?,?,?,?)').bind(t.uid, 'shop', m[1], m[2], now()).run();
     d.cover = r.meta && r.meta.last_row_id || null;
   }
   const stmts = [env.DB.prepare('UPDATE tech_profiles SET data = ?, updated_at = ? WHERE id = ?').bind(JSON.stringify(d), now(), t.id)];
   /* รูปใหม่ต่อท้าย รูปที่ลบคือรหัสรูปของร้านนี้เท่านั้น — ลบรูปร้านอื่นผ่านทางนี้ไม่ได้ */
   if (Array.isArray(b.removePhotos)) b.removePhotos.slice(0, 20).forEach(id =>
-    stmts.push(env.DB.prepare("DELETE FROM tech_docs WHERE id = ? AND uid = ? AND kind IN ('shop','work')").bind(Number(id), me.uid)));
+    stmts.push(env.DB.prepare("DELETE FROM tech_docs WHERE id = ? AND uid = ? AND kind IN ('shop','work')").bind(Number(id), t.uid)));
   if (Array.isArray(b.addPhotos)) {
-    const have = await env.DB.prepare("SELECT COUNT(*) AS n FROM tech_docs WHERE uid = ? AND kind IN ('shop','work')").bind(me.uid).first();
+    const have = await env.DB.prepare("SELECT COUNT(*) AS n FROM tech_docs WHERE uid = ? AND kind IN ('shop','work')").bind(t.uid).first();
     if (have.n + b.addPhotos.length > 1000) fail(400, 'รูปร้านเยอะเกินไป');
     b.addPhotos.forEach(x => {
       const m = imgClean(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(x && x.data || '')));
       if (!m || m[2].length > 1400000) fail(400, 'ไฟล์ต้องเป็นรูปภาพ');
       stmts.push(env.DB.prepare('INSERT INTO tech_docs (uid, kind, mime, data, created_at) VALUES (?,?,?,?,?)')
-        .bind(me.uid, x.kind === 'shop' ? 'shop' : 'work', m[1], m[2], now()));
+        .bind(t.uid, x.kind === 'shop' ? 'shop' : 'work', m[1], m[2], now()));
     });
   }
   await env.DB.batch(stmts);
+  if (other) await audit(env, me, 'owner_edit_shop', t.id);
   return { ok: true };
 }
 
@@ -2177,7 +2239,7 @@ async function sponsorMap(env, ids) {
 }
 async function ownGig(env, me, id) {
   const g = await env.DB.prepare('SELECT * FROM tech_gigs WHERE id = ?').bind(Number(id) || 0).first();
-  if (!g || g.uid !== me.uid || !g.active) fail(404, 'ไม่พบบริการ');
+  if (!g || (g.uid !== me.uid && !me.owner) || !g.active) fail(404, 'ไม่พบบริการ');
   const t = await env.DB.prepare('SELECT * FROM tech_profiles WHERE id = ?').bind(g.tech_id).first();
   if (!t || t.suspended) fail(403, 'ร้านถูกระงับชั่วคราว');
   return { g, t };
@@ -2228,7 +2290,15 @@ const GIG_BASE = { air: 'air', 'air-clean': 'air', eng: 'eng', oil: 'eng', servi
   tyre: 'tyre', brake: 'tyre', susp: 'tyre', align: 'tyre', ev: 'ev', battery: 'ev', audio: 'ev',
   body: 'body', detail: 'body', glass: 'body', wash: 'body', mobile: 'mobile', tow: 'mobile' };
 async function saveGig(env, me, b) {
-  const t = await myShop(env, me);
+  /* แก้บริการเดิม = ร้านของบริการนั้น · เจ้าของระบบแก้/ลงบริการให้ร้านไหนก็ได้ (b.tech) */
+  let t;
+  if (b.id) {
+    const g0 = await env.DB.prepare('SELECT uid, tech_id, active FROM tech_gigs WHERE id = ?').bind(+b.id).first();
+    if (!g0 || !g0.active || (g0.uid !== me.uid && !me.owner)) fail(404, 'ไม่พบโพสต์');
+    t = g0.uid === me.uid ? await myShop(env, me) : await techById(env, g0.tech_id);
+    if (!t) fail(404, 'ไม่พบร้าน');
+  } else t = await shopFor(env, me, b);
+  const other = t.uid !== me.uid;
   const kind = 'package';
   const title = String(b.title || '').trim().slice(0, 100);
   if (title.length < 3) fail(400, 'ใส่หัวข้อโพสต์อย่างน้อย 3 ตัวอักษร');
@@ -2242,7 +2312,7 @@ async function saveGig(env, me, b) {
   for (const c of catList) {
     const base = GIG_BASE[c];
     if (!base) fail(400, 'หมวดหมู่บริการไม่ถูกต้อง');
-    if (!t.test && (base === 'mobile' ? !sd.mobile : !(sd.cats || []).includes(base))) fail(403, 'ลงบริการได้เฉพาะหมวดที่ผ่านการตรวจทักษะแล้ว — ถ้าต้องการรับหมวดนี้ ติดต่อทีมงานเพื่อตรวจเพิ่ม');
+    if (!t.test && !me.owner && (base === 'mobile' ? !sd.mobile : !(sd.cats || []).includes(base))) fail(403, 'ลงบริการได้เฉพาะหมวดที่ผ่านการตรวจทักษะแล้ว — ถ้าต้องการรับหมวดนี้ ติดต่อทีมงานเพื่อตรวจเพิ่ม');
   }
   const cats = JSON.stringify(catList);
   const brands = JSON.stringify((Array.isArray(b.brands) ? b.brands : []).map(x => String(x).slice(0, 30)).slice(0, 10));
@@ -2250,33 +2320,37 @@ async function saveGig(env, me, b) {
   /* รูปไม่จำกัดต่อโพสต์ — แอปส่งมาเป็นชุดละไม่กี่รูป (คำขอเดียวไม่ใหญ่เกิน) เพดานกันพังไว้ 300 */
   const add = Array.isArray(b.addPhotos) ? b.addPhotos.slice(0, 6) : [];
   if (photos.length + add.length > 300) fail(400, 'รูปในโพสต์เดียวเยอะเกินไป');
-  if (!b.id) {
-    const c = await env.DB.prepare("SELECT COUNT(*) AS n FROM tech_gigs WHERE uid = ? AND active = 1 AND kind = 'package'").bind(me.uid).first();
+  if (!b.id && !me.owner) {
+    const c = await env.DB.prepare("SELECT COUNT(*) AS n FROM tech_gigs WHERE uid = ? AND active = 1 AND kind = 'package'").bind(t.uid).first();
     if (c.n >= GIG_MAX) fail(400, `โพสต์บริการได้สูงสุด ${GIG_MAX} รายการ ลบหรือแก้รายการเดิมแทน`);
   }
   for (const x of add) {
     const m = imgClean(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(x && x.data || '')));
     if (!m || m[2].length > 1400000) fail(400, 'ไฟล์ต้องเป็นรูปภาพ');
-    const r = await env.DB.prepare('INSERT INTO tech_docs (uid, kind, mime, data, created_at) VALUES (?,?,?,?,?)').bind(me.uid, 'gig', m[1], m[2], now()).run();
+    /* รูปเป็นของร้านนั้นเสมอ (uid เจ้าของร้าน) — /api/tech/img เปิดรูปตามร้าน */
+    const r = await env.DB.prepare('INSERT INTO tech_docs (uid, kind, mime, data, created_at) VALUES (?,?,?,?,?)').bind(t.uid, 'gig', m[1], m[2], now()).run();
     photos.push(r.meta && r.meta.last_row_id);
   }
-  photos = JSON.stringify(photos.filter(Boolean));
+  const list = photos.filter(Boolean);
+  photos = JSON.stringify(list);
   if (b.id) {
-    const g = await env.DB.prepare('SELECT uid, active FROM tech_gigs WHERE id = ?').bind(+b.id).first();
-    if (!g || g.uid !== me.uid || !g.active) fail(404, 'ไม่พบโพสต์');
     await env.DB.prepare('UPDATE tech_gigs SET kind=?,title=?,body=?,price=?,cats=?,brands=?,photos=?,updated_at=? WHERE id=?')
       .bind(kind, title, body, price, cats, brands, photos, now(), +b.id).run();
-    return { ok: true, id: +b.id };
+    if (other) await audit(env, me, 'owner_edit_gig', String(+b.id));
+    return { ok: true, id: +b.id, photos: list };
   }
   const r = await env.DB.prepare('INSERT INTO tech_gigs (uid,tech_id,kind,title,body,price,cats,brands,photos,active,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,1,?,?)')
-    .bind(me.uid, t.id, kind, title, body, price, cats, brands, photos, now(), now()).run();
-  return { ok: true, id: r.meta && r.meta.last_row_id };
+    .bind(t.uid, t.id, kind, title, body, price, cats, brands, photos, now(), now()).run();
+  const nid = r.meta && r.meta.last_row_id;
+  if (other) await audit(env, me, 'owner_add_gig', String(nid), t.id);
+  return { ok: true, id: nid, photos: list };
 }
 async function delGig(env, me, b) {
   const g = await env.DB.prepare('SELECT uid FROM tech_gigs WHERE id = ?').bind(+b.id).first();
   if (!g || (g.uid !== me.uid && !me.staff)) fail(404, 'ไม่พบโพสต์');
   await env.DB.batch([env.DB.prepare('UPDATE tech_gigs SET active = 0, updated_at = ? WHERE id = ?').bind(now(), +b.id),
     env.DB.prepare('UPDATE tech_sponsors SET cancelled_at = ? WHERE gig_id = ? AND cancelled_at IS NULL AND ends_at > ?').bind(now(), +b.id, now())]);
+  if (g.uid !== me.uid) await audit(env, me, 'delete_gig', String(+b.id));
   return { ok: true };
 }
 
@@ -2286,11 +2360,27 @@ async function listReviews(env, me, url) {
   const t = id && await techById(env, id);
   if (!t || t.suspended || !(t.verified || (t.test && me && me.staff))) fail(404, 'ไม่พบร้าน');
   const { results } = await env.DB.prepare(
-    'SELECT review, test FROM tech_jobs WHERE tech_id = ? AND review IS NOT NULL ORDER BY updated_at DESC LIMIT 200').bind(t.id).all();
-  const reviews = results.filter(j => !j.test || (me && me.staff)).map(j => parse(j.review)).filter(Boolean)
-    .map(r => ({ rating: r.rating, text: r.text || '', photos: r.photos || [], at: r.at }))
+    'SELECT id, review, test FROM tech_jobs WHERE tech_id = ? AND review IS NOT NULL ORDER BY updated_at DESC LIMIT 200').bind(t.id).all();
+  /* รีวิวที่เจ้าของระบบซ่อนแล้ว ไม่แสดงต่อใคร · เจ้าของระบบได้รหัสใบงานไว้กดซ่อน (คนอื่นไม่ได้) */
+  const reviews = results.filter(j => !j.test || (me && me.staff)).map(j => ({ j, r: parse(j.review) })).filter(x => x.r && !x.r.hidden)
+    .map(({ j, r }) => ({ rating: r.rating, text: r.text || '', photos: r.photos || [], at: r.at, ...(me && me.owner ? { job: j.id } : {}) }))
     .sort((a, b) => b.at - a.at);
   return { reviews };
+}
+
+/* ซ่อนรีวิว (เจ้าของระบบ) — ไม่แสดงที่ไหนอีก และหักออกจากคะแนนร้าน (เฉพาะรีวิวที่เคยถูกนับ) */
+async function hideReview(env, me, b) {
+  if (!me.owner) fail(403, 'ซ่อนรีวิวได้เฉพาะเจ้าของระบบ');
+  const j = await env.DB.prepare('SELECT id, tech_id, review, test FROM tech_jobs WHERE id = ?').bind(String(b.job || '')).first();
+  const r = j && parse(j.review);
+  if (!r) fail(404, 'ไม่พบรีวิว');
+  if (r.hidden) return { ok: true };
+  r.hidden = { at: now() };
+  const stmts = [env.DB.prepare('UPDATE tech_jobs SET review = ? WHERE id = ?').bind(JSON.stringify(r), j.id)];
+  if (!j.test) stmts.push(env.DB.prepare('UPDATE tech_profiles SET rating_sum = MAX(0, rating_sum - ?), review_count = MAX(0, review_count - 1) WHERE id = ?').bind(Number(r.rating) || 0, j.tech_id));
+  await env.DB.batch(stmts);
+  await audit(env, me, 'hide_review', j.id);
+  return { ok: true };
 }
 
 async function stats(env, me) {
@@ -2315,7 +2405,7 @@ async function stats(env, me) {
       if (at >= month) earnMonth += q.total;
       const slot = daily.find(x => at >= x.d && at < x.d + day); if (slot) slot.v += q.total;
     }
-    const rv = parse(j.review); if (rv) reviews.push(rv);
+    const rv = parse(j.review); if (rv && !rv.hidden) reviews.push(rv);
   }
   reviews.sort((a, b) => b.at - a.at);
   const pt = publicTech(t);
@@ -2336,7 +2426,7 @@ async function stats(env, me) {
       const s1 = slot30(at); if (s1) s1.earn += tot;
       if (at >= month) { M.earn += tot; M.done++; } else if (at >= prevMonth) { P.earn += tot; P.done++; }
     }
-    const rv = parse(j.review);
+    const rv0 = parse(j.review), rv = rv0 && !rv0.hidden ? rv0 : null;
     if (rv) { if (rv.at >= month) { M.reviews++; M.rsum += rv.rating; } else if (rv.at >= prevMonth) { P.reviews++; P.rsum += rv.rating; } }
   }
   const { results: vs } = await env.DB.prepare('SELECT day, kind, n FROM tech_views WHERE tech_id = ? AND day >= ?')
@@ -2439,7 +2529,7 @@ async function route(request, env, verifyToken) {
   if (psm && m === 'GET') return passportView(env, psm[1]);
   if (p === '/api/tech/reviews' && m === 'GET') {
     let me = null;
-    try { me = await who(request, env, false); } catch (e) {}
+    try { me = await who(request, env, false, verifyToken); } catch (e) {}
     return listReviews(env, me, url);
   }
   /* หน้าเว็บใช้เช็กว่าเซิร์ฟเวอร์มีระบบช่างรุ่นนี้แล้ว — ถ้าไม่มี แสดงให้ทีมงานรู้ว่ายังไม่ได้ deploy */
@@ -2456,6 +2546,7 @@ async function route(request, env, verifyToken) {
   if (p === '/api/tech/docs' && m === 'GET') return appDocs(env, me, String(url.searchParams.get('uid') || ''));
   if (p === '/api/tech/review' && m === 'POST') return review(env, me, await body());
   if (p === '/api/tech/review/idcheck' && m === 'POST') return idCheck(env, me, await body());
+  if (p === '/api/tech/reviews/hide' && m === 'POST') return hideReview(env, me, await body());
   if (p === '/api/tech/rescreen' && m === 'POST') return rescreen(env, me, await body());
   if (p === '/api/tech/moderate' && m === 'POST') return moderate(env, me, await body());
   if (p === '/api/tech/jobs' && m === 'GET') {
