@@ -24,7 +24,10 @@ test('versioned multimodal request has all recognition rules, fixed schema and b
   assert.equal(r.maxTokens,3600);assert.ok(r.system.length<8000);assert.equal(r.contents[0].parts[1].inlineData.data,image.b64);
   for(const word of ['hose_unknown','42','not a trained'])if(word!=='hose_unknown')assert.ok(!ENGINE_BAY_PROMPT.includes(word));
   for(const rule of [/never evidence that a hidden component exists/,/visible polarity marking/,/colour alone/,/NOT measured accuracy/,/untrusted data/,/never copy them/,/0-1000/])assert.match(r.system,rule);
-  assert.equal(r.schema.properties.items.maxItems,24);assert.deepEqual(r.schema.properties.items.items.properties.part.enum,Object.keys(ENGINE_PARTS));
+  assert.equal(r.schema.properties.items.maxItems,undefined);
+  assert.equal(r.schema.properties.items.items.properties.box_2d.minItems,undefined);
+  assert.equal(r.schema.properties.items.items.properties.box_2d.maxItems,undefined);
+  assert.deepEqual(r.schema.properties.items.items.properties.part.enum,Object.keys(ENGINE_PARTS));
 });
 test('v2 accepts exactly one bounded image; no ambiguous multi-photo boxes or audio',()=>{
   assert.throws(()=>request({attachments:[]}),/exactly one image/);

@@ -1,5 +1,17 @@
 # Engine-bay identification v2 — 16 October 2026
 
+## 17 October 2026 compatibility fix
+
+Real Cloudflare remote-development inference reproduced HTTP 400 on both configured
+Flash Lite models with the original nested enum + array-length schema. Removing
+only `minItems`/`maxItems` from the provider schema restored successful results.
+Types, required fields and part enums remain. Server validation still requires
+exactly four bounded coordinates, evidence, high certainty, valid scenes and
+at most 24 accepted objects. No unvalidated JSON/fake-coordinate fallback is used.
+Provider failures now return finite safe codes instead of raw provider messages.
+Logs contain only an event code and random request reference, never image/text.
+Temporary provider capacity is not labelled as the customer's daily allowance.
+
 ## What this is (and is not)
 
 This is a versioned, prompt/schema/catalogue upgrade to the existing Gemini
