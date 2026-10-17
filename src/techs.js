@@ -1043,6 +1043,27 @@ async function review(env, me, b) {
   return { ok: true };
 }
 
+/* ── ผู้สมัครยกเลิกการสมัครเอง ──
+   ได้เมื่อ: รอตรวจ · ต้องแก้ · ร้านทดลอง (อนุมัติทดสอบ) → ลบใบสมัคร เอกสาร ผลยืนยันตัวตน ร้านทดลอง และปล่อยเลขบัตรคืน (สมัครใหม่ได้ภายหลัง)
+   ไม่ได้เมื่อ: "ไม่ผ่าน" (ถอนแล้วสมัครใหม่ = เลี่ยงคำตัดสิน) · ร้านจริงที่ผ่านการตรวจแล้ว (ปิดร้านผ่านทีมงาน มีงานลูกค้าค้างได้) */
+async function withdraw(env, me) {
+  const a = await env.DB.prepare('SELECT status, test FROM tech_applications WHERE uid = ?').bind(me.uid).first();
+  const t = await env.DB.prepare('SELECT id, test FROM tech_profiles WHERE uid = ?').bind(me.uid).first();
+  if (t && !t.test) fail(409, 'ร้านของคุณผ่านการตรวจแล้ว — ถ้าต้องการปิดร้าน ติดต่อทีมงาน');
+  if (!a && !t) fail(404, 'ไม่พบใบสมัคร');
+  if (a && a.status === 'declined' && !a.test) fail(409, 'ใบสมัครนี้ไม่ผ่านการคัดเลือกแล้ว จึงยกเลิกไม่ได้');
+  if (a && a.status === 'approved' && !a.test) fail(409, 'ใบสมัครนี้อนุมัติแล้ว — ถ้าต้องการปิดร้าน ติดต่อทีมงาน');
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM tech_applications WHERE uid = ?').bind(me.uid),
+    env.DB.prepare('DELETE FROM tech_docs WHERE uid = ?').bind(me.uid),
+    env.DB.prepare('DELETE FROM tech_identity WHERE uid = ?').bind(me.uid),
+    env.DB.prepare('DELETE FROM tech_identity_claims WHERE uid = ?').bind(me.uid),
+    env.DB.prepare('UPDATE tech_gigs SET active = 0, updated_at = ? WHERE uid = ?').bind(now(), me.uid),
+    env.DB.prepare('DELETE FROM tech_profiles WHERE uid = ? AND test = 1').bind(me.uid)]);
+  await audit(env, me, 'withdraw', me.uid, a ? a.status : 'trial');
+  return { ok: true };
+}
+
 /* ── อนุมัติทดสอบ (เจ้าของระบบเท่านั้น) ──
    ข้ามทุกด่าน (ผล AI · เทียบเลขบัตร · ติ๊กครบ · อนุมัติตัวเอง · ใบทดสอบ) เพื่อเอาผู้สมัครมาลองระบบก่อน
    แต่ผลคือ "ร้านทดสอบ" เสมอ: ลูกค้าทั่วไปไม่เห็น ไม่มีป้ายยืนยันตัวตน/ทักษะ — ทางนี้ไม่มีทางกลายเป็นร้านจริง
@@ -1843,8 +1864,9 @@ async function passportSave(env, me, b) {
 }
 async function passportMine(env, me, url) {
   const key = cleanTxt(url.searchParams.get('car'), 60);
-  const r = key && await env.DB.prepare('SELECT token, updated_at, views, jobs FROM car_passports WHERE uid = ? AND car_key = ? AND revoked = 0').bind(me.uid, key).first();
-  return { passport: r ? { token: r.token, updatedAt: r.updated_at, views: r.views, jobs: (parse(r.jobs) || []).length } : null };
+  const r = key && await env.DB.prepare('SELECT token, updated_at, views, jobs, data FROM car_passports WHERE uid = ? AND car_key = ? AND revoked = 0').bind(me.uid, key).first();
+  /* showCost: หน้าตั้งค่าเริ่มสวิตช์ตามที่หน้าจริงใช้อยู่ */
+  return { passport: r ? { token: r.token, updatedAt: r.updated_at, views: r.views, jobs: (parse(r.jobs) || []).length, showCost: !!(parse(r.data) || {}).showCost } : null };
 }
 async function passportRevoke(env, me, b) {
   const key = cleanTxt(b.carKey, 60);
@@ -2540,6 +2562,7 @@ async function route(request, env, verifyToken) {
   if (p === '/api/tech/me' && m === 'GET') return meInfo(env, me);
   if (p === '/api/tech/apply' && m === 'POST') return apply(env, me, await body());
   if (p === '/api/tech/apply/identity' && m === 'POST') return startIdentity(env, me);
+  if (p === '/api/tech/apply/withdraw' && m === 'POST') return withdraw(env, me);
   if (p === '/api/tech/apply/identity/refresh' && m === 'POST') return refreshIdentity(env, me);
   if (p === '/api/tech/applications' && m === 'GET') return pendingApps(env, me);
   if (p === '/api/tech/audit' && m === 'GET') return auditLog(env, me);

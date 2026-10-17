@@ -114,3 +114,26 @@ test('founders stay owners even when OWNERS on Cloudflare leaves them out',async
   assert.equal((await f.call('founder|anapatmaliwong@gmail.com|unverified','/api/tech/me')).owner,false,'only with a verified email');
   assert.equal((await f.call('x|someone@unit.test','/api/tech/me')).owner,true);
 });
+
+test('applicant can cancel a pending, needs-fix or trial application — not a declined one or a verified shop',async()=>{
+  const f=fixture();fakeVision();await f.call('', '/api/tech/ping');
+  let a=await pending(f,{},{idcheck:false});
+  assert.equal((await f.call(USER,'/api/tech/apply/withdraw',{})).status,200);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) n FROM tech_applications WHERE uid=?').get(a.uid).n,0);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) n FROM tech_docs WHERE uid=?').get(a.uid).n,0,'documents deleted');
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) n FROM tech_identity_claims WHERE uid=?').get(a.uid).n,0,'ID number released');
+  assert.equal((await f.call(USER,'/api/tech/apply',form())).status,200,'can apply again later');
+  /* ร้านทดลอง: ยกเลิกได้ ร้านหายไปด้วย */
+  a=(await f.call(ADMIN,'/api/tech/applications')).applications[0];
+  assert.equal((await f.call(ADMIN,'/api/tech/review',{uid:a.uid,decision:'approve_test'})).status,200);
+  assert.equal((await f.call(USER,'/api/tech/apply/withdraw',{})).status,200);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) n FROM tech_profiles WHERE uid=?').get(a.uid).n,0);
+  /* ไม่ผ่าน: ยกเลิกไม่ได้ */
+  await f.call(USER,'/api/tech/apply',form());a=(await f.call(ADMIN,'/api/tech/applications')).applications[0];
+  await f.call(ADMIN,'/api/tech/review',{uid:a.uid,revision:a.revision,decision:'decline',note:'ไม่ผ่านการคัดเลือก ทดสอบ'});
+  assert.equal((await f.call(USER,'/api/tech/apply/withdraw',{})).status,409);
+  /* ร้านจริง: ต้องติดต่อทีมงาน */
+  const g=fixture();await g.call('', '/api/tech/ping');
+  g.sqlite.prepare('INSERT INTO tech_profiles (id,uid,phone,data,verified,test,suspended,created_at,updated_at) VALUES (?,?,?,?,1,0,0,1,1)').run('t_real','applicant','0811111111','{}');
+  assert.equal((await g.call(USER,'/api/tech/apply/withdraw',{})).status,409);
+});
