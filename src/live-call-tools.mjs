@@ -1,6 +1,7 @@
 // Fixed server-owned schema: no arbitrary URLs or code, no payments, deletes or account changes.
 // Valet actions run in the user's own app with their own login, only after they confirm (voice or tap).
 export const LIVE_CALL_TOOLS=[{functionDeclarations:[
+  {name:'garage_checkin_control',description:'Only on the user\'s explicit request: skip the current optional garage question, disable future check-ins, or re-enable them. Does not change car data.',parameters:{type:'OBJECT',properties:{action:{type:'STRING',enum:['skip','disable','enable']}},required:['action']}},
   {name:'get_my_car',description:'Read the car selected by the signed-in user. User-saved data, not verified specifications.',parameters:{type:'OBJECT',properties:{}}},
   {name:'find_mechanics',description:'Find real approved Cendon mechanics. Ask for area/category if needed. Never invent shops.',parameters:{type:'OBJECT',properties:{query:{type:'STRING',description:'Shop name or area, not a long symptom description'},category:{type:'STRING',enum:['eng','air','tyre','body','ev']},on_site:{type:'BOOLEAN'},limit:{type:'INTEGER'}}}},
   {name:'show_mechanic',description:'Show a shop ID returned by find_mechanics. Does not book or contact anyone.',parameters:{type:'OBJECT',properties:{shop_id:{type:'STRING'}},required:['shop_id']}},
