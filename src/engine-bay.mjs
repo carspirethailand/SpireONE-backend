@@ -69,7 +69,9 @@ export const ENGINE_BAY_PROMPT = [
   'Keep evidence under 80 characters. Return JSON only: {"scene":"engine_bay","quality":"clear","items":[{"part":"battery","box_2d":[100,100,300,400],"certainty":"high","evidence":"case and two marked terminals"}]}. The coordinates above illustrate format ONLY; never copy them.'
 ].join('\n');
 export const ENGINE_BAY_SCHEMA = {
-  type:'OBJECT', properties:{scene:{type:'STRING',enum:['engine_bay','car_other','not_car']},quality:{type:'STRING',enum:['clear','limited','blurred','dark','blocked']},items:{type:'ARRAY',maxItems:ENGINE_SCAN_MAX,items:{type:'OBJECT',properties:{part:{type:'STRING',enum:Object.keys(ENGINE_PARTS)},box_2d:{type:'ARRAY',items:{type:'INTEGER'},minItems:4,maxItems:4},certainty:{type:'STRING',enum:['high','medium','low']},evidence:{type:'STRING'}},required:['part','box_2d','certainty','evidence']}}},required:['scene','quality','items']
+  // Gemini Flash Lite rejects this nested enum schema when array length constraints
+  // are also present (HTTP 400). Keep types/enums here; enforce lengths below.
+  type:'OBJECT', properties:{scene:{type:'STRING',enum:['engine_bay','car_other','not_car']},quality:{type:'STRING',enum:['clear','limited','blurred','dark','blocked']},items:{type:'ARRAY',items:{type:'OBJECT',properties:{part:{type:'STRING',enum:Object.keys(ENGINE_PARTS)},box_2d:{type:'ARRAY',items:{type:'INTEGER'}},certainty:{type:'STRING',enum:['high','medium','low']},evidence:{type:'STRING'}},required:['part','box_2d','certainty','evidence']}}},required:['scene','quality','items']
 };
 const clean = (v,n) => typeof v === 'string' ? v.replace(/[<>\u0000-\u001f]/g,' ').replace(/\s+/g,' ').trim().slice(0,n) : '';
 const overlap = (a,b) => {

@@ -3,6 +3,7 @@ import { EMAIL_AUTH_SQL, handleEmailAuth, deleteFirebaseUser } from './email-aut
 import { exportAccount, resetAccount, deleteAccount, deleteBlockers } from './account-data.js';
 import { ONBOARDING_SQL, handleOnboarding, onboardingName, sanitizeSetupState } from './onboarding.js';
 import { buildFeatureRequest, cleanFeatureJson, featureCap } from './features-ai.mjs';
+import { engineScanFailure } from './engine-scan-errors.mjs';
 import { liveToken, cleanHandle } from './live-setup.mjs';
 import { valetPrompt } from './agent-prompt.mjs';
 import { handleTech, reconcileDiditIdentities, vaultSweep, expireStaleApplications, releaseWrongHolds, expireOpenJobs } from './techs.js';
@@ -5992,11 +5993,25 @@ ${convo}`;
           }
           const meter = newMeter();
           const prefer = (body.tool === 'bay' || body.tool === 'baylive') && env.GEMINI_VISION_MODEL ? [env.GEMINI_VISION_MODEL] : undefined;
-          const text = await callGemini(env, { ...input, meter, prefer });
+          let text;
+          const engineScan = (body.tool === 'bay' || body.tool === 'baylive') && body.scanVersion === 2;
+          try { text = await callGemini(env, { ...input, meter, prefer }); }
+          catch (e) {
+            if (!engineScan) throw e;
+            const {status,...failure}=engineScanFailure(e),requestId=crypto.randomUUID();
+            console.warn(JSON.stringify({event:'engine_scan_failed',code:failure.error,requestId}));
+            return json({...failure,requestId},status);
+          }
           let data = null;
           if (input.json) {
             try { data = cleanFeatureJson(body.tool, text, {scanVersion:body.scanVersion,lang:body.lang}); }
-            catch (e) { await meterTokens(env, uid, meter); return deny('AI ตอบกลับไม่สมบูรณ์ ลองใหม่อีกครั้ง', 502); }
+            catch (e) {
+              await meterTokens(env, uid, meter);
+              if (!engineScan) return deny('AI ตอบกลับไม่สมบูรณ์ ลองใหม่อีกครั้ง', 502);
+              const requestId=crypto.randomUUID();
+              console.warn(JSON.stringify({event:'engine_scan_failed',code:'scan_invalid_result',requestId}));
+              return json({error:'scan_invalid_result',requestId},502);
+            }
           }
           await meterTokens(env, uid, meter);
           // meterTokens already counted one call; multimodal tools cost three calls total.
