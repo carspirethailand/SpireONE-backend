@@ -22,7 +22,7 @@ Valet grants are scoped to the signed-in UID. Legacy browser-wide grants require
 
 ## Rollout and verification
 
-Deploy backend then matching frontend in the same release. New clients enable care only when `/api/ai/live-token` explicitly advertises `garageCare: true`; old clients retain their existing tool schema. Frontend cache: `cendon-v302-garage-care`; versioned call-session r7, call-agent r6, Valet v4, core v5 and garage-care v1. The latest main Garage validation and notification changes are retained.
+Deploy backend then matching frontend in the same release. New clients enable care only when `/api/ai/live-token` explicitly advertises `garageCare: true`; old clients retain their existing tool schema. Frontend cache: `cendon-v303-garage-care`; versioned call-session r7, call-agent r6, Valet v4, core v5 and garage-care v1. The latest main Garage validation, calm-motion, car-menu and notification changes are retained.
 
 Validation: full offline frontend/backend suites, Worker bundle dry-run, anonymous endpoint denial and public asset checks. No real mechanic was messaged and no customer Garage data was altered for testing. Live microphone behavior on a user's phone still requires a real-device check; passing fixtures is not measured speech-model accuracy.
 
