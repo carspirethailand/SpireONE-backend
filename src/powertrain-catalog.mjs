@@ -2,6 +2,11 @@
    [id, Thai, English, visible cue, Thai function, English function, restrictions]
    m=motorcycle-only, i=exposed internals only, h=high voltage. */
 export const POWERTRAIN_EXTRA_ROWS = [
+  ['fuel_water_separator','กรองดักน้ำในเชื้อเพลิง','Fuel filter water separator','identified fuel filter with separator bowl/sensor and traced fuel circuit','แยกน้ำออกจากเชื้อเพลิง ห้ามเปิดหรือระบายเอง','Separates water from fuel; do not open or drain'],
+  ['fuel_primer','ปั๊มไล่อากาศเชื้อเพลิง','Fuel hand primer','identified primer on a traced fuel-filter assembly','ใช้ในระบบเชื้อเพลิง ห้ามกดทดลองขณะสแกน','Primes a fuel circuit; do not operate during a scan'],
+  ['ac_condenser','คอนเดนเซอร์แอร์','AC condenser','finned heat exchanger with traced refrigerant pipes','ระบายความร้อนสารทำความเย็น ห้ามเปิดระบบ','Rejects refrigerant heat; do not open the system'],
+  ['brake_master_cylinder','แม่ปั๊มเบรก','Brake master cylinder','cylinder with traced brake lines/reservoir connection','สร้างแรงดันในระบบเบรก ไม่ใช่หม้อลมเบรก','Generates braking pressure; not the brake booster'],
+  ['reservoir_unknown','ถังของเหลวที่ยังระบุชนิดไม่ได้','Unidentified fluid reservoir','visible fluid container without identifiable system marking/connections','เห็นถังของเหลว แต่ยังระบุระบบไม่ได้ ห้ามเปิดหรือเติม','Visible fluid container of uncertain purpose; do not open or fill'],
   ['valve_cover','ฝาครอบวาล์ว','Valve cover','sealed cover bolted to head','ปิดชุดวาล์วและกักน้ำมันเครื่อง ไม่ใช่ฝาตกแต่ง','Seals the valvetrain; not a decorative cover'],
   ['battery_cover','ฝาครอบแบตเตอรี่','Battery cover','battery enclosure, cell case unseen','ครอบป้องกันแบตเตอรี่ ไม่ยืนยันว่ามองเห็นตัวแบตเตอรี่','Protects a battery; does not expose its cells'],
   ['service_panel','แผงปิดช่องบริการ','Service access panel','access trim, internals concealed','ปิดช่องเข้าถึงอุปกรณ์ ไม่บอกว่าข้างใต้มีอะไร','Covers service access; contents remain unknown'],

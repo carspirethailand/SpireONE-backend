@@ -1,0 +1,337 @@
+{
+  "schemaVersion": 1,
+  "scope": "Existing Cendon app model selections, not all global models/generations",
+  "sourceFrontendCommit": "0ff7aed6d5427b83acc3222e0c9025df8d49188e",
+  "sourceBlob": "f391933aa1195ce818a387393a5eebbdca5b03c1",
+  "snapshotDate": "2026-10-17",
+  "models": [
+    {
+      "make": "Mitsubishi",
+      "model": "Mirage"
+    },
+    {
+      "make": "Mitsubishi",
+      "model": "Attrage"
+    },
+    {
+      "make": "Mitsubishi",
+      "model": "Lancer"
+    },
+    {
+      "make": "Mitsubishi",
+      "model": "Lancer EX"
+    },
+    {
+      "make": "Mitsubishi",
+      "model": "Triton"
+    },
+    {
+      "make": "Mitsubishi",
+      "model": "Pajero Sport"
+    },
+    {
+      "make": "Mitsubishi",
+      "model": "Outlander"
+    },
+    {
+      "make": "Mitsubishi",
+      "model": "Outlander PHEV"
+    },
+    {
+      "make": "Mitsubishi",
+      "model": "Xpander"
+    },
+    {
+      "make": "Mitsubishi",
+      "model": "Xpander Cross"
+    },
+    {
+      "make": "Mitsubishi",
+      "model": "Xforce"
+    },
+    {
+      "make": "Mitsubishi",
+      "model": "Space Wagon"
+    },
+    {
+      "make": "Toyota",
+      "model": "Corolla"
+    },
+    {
+      "make": "Toyota",
+      "model": "Corolla Altis"
+    },
+    {
+      "make": "Toyota",
+      "model": "Corolla Cross"
+    },
+    {
+      "make": "Toyota",
+      "model": "Camry"
+    },
+    {
+      "make": "Toyota",
+      "model": "Vios"
+    },
+    {
+      "make": "Toyota",
+      "model": "Yaris"
+    },
+    {
+      "make": "Toyota",
+      "model": "Yaris Ativ"
+    },
+    {
+      "make": "Toyota",
+      "model": "Yaris Cross"
+    },
+    {
+      "make": "Toyota",
+      "model": "C-HR"
+    },
+    {
+      "make": "Toyota",
+      "model": "Fortuner"
+    },
+    {
+      "make": "Toyota",
+      "model": "Hilux"
+    },
+    {
+      "make": "Toyota",
+      "model": "Hilux Revo"
+    },
+    {
+      "make": "Toyota",
+      "model": "Hilux Champ"
+    },
+    {
+      "make": "Toyota",
+      "model": "Innova"
+    },
+    {
+      "make": "Toyota",
+      "model": "Innova Zenix"
+    },
+    {
+      "make": "Toyota",
+      "model": "Veloz"
+    },
+    {
+      "make": "Toyota",
+      "model": "Avanza"
+    },
+    {
+      "make": "Toyota",
+      "model": "Sienta"
+    },
+    {
+      "make": "Toyota",
+      "model": "Alphard"
+    },
+    {
+      "make": "Toyota",
+      "model": "Vellfire"
+    },
+    {
+      "make": "Toyota",
+      "model": "Majesty"
+    },
+    {
+      "make": "Toyota",
+      "model": "Commuter"
+    },
+    {
+      "make": "Toyota",
+      "model": "Granvia"
+    },
+    {
+      "make": "Toyota",
+      "model": "Supra"
+    },
+    {
+      "make": "Toyota",
+      "model": "GR86"
+    },
+    {
+      "make": "Toyota",
+      "model": "GR Yaris"
+    },
+    {
+      "make": "Toyota",
+      "model": "Prius"
+    },
+    {
+      "make": "Toyota",
+      "model": "bZ4X"
+    },
+    {
+      "make": "Toyota",
+      "model": "Land Cruiser"
+    },
+    {
+      "make": "Toyota",
+      "model": "Land Cruiser Prado"
+    },
+    {
+      "make": "Toyota",
+      "model": "Rush"
+    },
+    {
+      "make": "Toyota",
+      "model": "Raize"
+    },
+    {
+      "make": "Toyota",
+      "model": "Crown"
+    },
+    {
+      "make": "Toyota",
+      "model": "Wish"
+    },
+    {
+      "make": "Toyota",
+      "model": "86"
+    },
+    {
+      "make": "Isuzu",
+      "model": "D-Max"
+    },
+    {
+      "make": "Isuzu",
+      "model": "D-Max V-Cross"
+    },
+    {
+      "make": "Isuzu",
+      "model": "D-Max Spark"
+    },
+    {
+      "make": "Isuzu",
+      "model": "MU-X"
+    },
+    {
+      "make": "Isuzu",
+      "model": "MU-7"
+    },
+    {
+      "make": "Ford",
+      "model": "Ranger"
+    },
+    {
+      "make": "Ford",
+      "model": "Ranger Raptor"
+    },
+    {
+      "make": "Ford",
+      "model": "Everest"
+    },
+    {
+      "make": "Ford",
+      "model": "Mustang"
+    },
+    {
+      "make": "Ford",
+      "model": "Mustang Mach-E"
+    },
+    {
+      "make": "Ford",
+      "model": "Focus"
+    },
+    {
+      "make": "Ford",
+      "model": "Fiesta"
+    },
+    {
+      "make": "Ford",
+      "model": "EcoSport"
+    },
+    {
+      "make": "Ford",
+      "model": "Territory"
+    },
+    {
+      "make": "Ford",
+      "model": "Escape"
+    },
+    {
+      "make": "Ford",
+      "model": "Explorer"
+    },
+    {
+      "make": "Honda",
+      "model": "City"
+    },
+    {
+      "make": "Honda",
+      "model": "City Hatchback"
+    },
+    {
+      "make": "Honda",
+      "model": "Civic"
+    },
+    {
+      "make": "Honda",
+      "model": "Civic Type R"
+    },
+    {
+      "make": "Honda",
+      "model": "Accord"
+    },
+    {
+      "make": "Honda",
+      "model": "Jazz"
+    },
+    {
+      "make": "Honda",
+      "model": "Fit"
+    },
+    {
+      "make": "Honda",
+      "model": "HR-V"
+    },
+    {
+      "make": "Honda",
+      "model": "CR-V"
+    },
+    {
+      "make": "Honda",
+      "model": "BR-V"
+    },
+    {
+      "make": "Honda",
+      "model": "WR-V"
+    },
+    {
+      "make": "Honda",
+      "model": "e:N1"
+    },
+    {
+      "make": "Honda",
+      "model": "Mobilio"
+    },
+    {
+      "make": "Honda",
+      "model": "Freed"
+    },
+    {
+      "make": "Honda",
+      "model": "Odyssey"
+    },
+    {
+      "make": "Honda",
+      "model": "StepWGN"
+    },
+    {
+      "make": "Honda",
+      "model": "Brio"
+    },
+    {
+      "make": "Honda",
+      "model": "Elysion"
+    },
+    {
+      "make": "Honda",
+      "model": "Stream"
+    }
+  ]
+}

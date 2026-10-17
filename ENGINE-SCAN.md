@@ -1,5 +1,14 @@
 # Engine-bay identification v2 — 16 October 2026
 
+## Experimental v4 coverage branch — 17 October 2026
+
+See ENGINE-CAR-COVERAGE.md for the full 82-target inventory, evidence gates,
+offline evaluator and unresolved real-image errors. This branch is NOT a trained
+or fully validated 82-model release. Production remains the previous v3.
+V4 adds required provider identityCue/identityMarking and conservatively labels
+unverified fluid containers as unidentified; it needs reviewed image evaluation.
+The older sections below describe the v3 contract/history, not a v4 accuracy claim.
+
 ## 17 October 2026 compatibility fix
 
 Real Cloudflare remote-development inference reproduced HTTP 400 on both configured
