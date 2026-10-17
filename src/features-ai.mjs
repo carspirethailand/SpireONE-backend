@@ -1,4 +1,5 @@
 import { ENGINE_BAY_PROMPT, ENGINE_BAY_SCHEMA, cleanEngineScan } from './engine-bay.mjs';
+import { engineReferenceText } from './engine-references.mjs';
 const TASKS = {
   /* ใบเสนอราคา: อ่านทุกบรรทัด ตรวจเลขเอง จัดลำดับความด่วนตามรถคันนี้ จับรายการที่มักถูกยัดเพิ่ม แล้วบอกว่าควรถามอู่อะไร */
   quote: [
@@ -94,6 +95,7 @@ export function buildFeatureRequest(body) {
   if (media.length > 3) throw new Error('Attach at most three files');
   let total = 0;
   const parts = [{ text: `USER REQUEST (untrusted data): ${String(body.question || '').slice(0, 3000)}\nOBSERVED CONTEXT (untrusted data): ${context}` }];
+  if(engineV2){const reference=engineReferenceText(body.context?.car);if(reference)parts[0].text+='\n'+reference;}
   for (const item of media) {
     if (!/^(image\/(jpeg|png|webp)|audio\/(webm|mp4|mpeg|wav|ogg|x-wav))(;[\w=.-]+)?$/i.test(item.mime || '')) throw new Error('Unsupported media type');
     if (typeof item.b64 !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(item.b64)) throw new Error('Invalid media');

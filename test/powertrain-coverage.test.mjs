@@ -6,7 +6,7 @@ import {buildFeatureRequest} from '../src/features-ai.mjs';
 const item=(part,extra={})=>({part,box_2d:[100,100,300,400],certainty:'high',visibility:'visible',evidence:'Clearly visible identifying structure',...extra});
 const frame=(items,extra={})=>({scene:'engine_bay',quality:'clear',vehicleKind:'motorcycle',powertrain:'combustion',view:'motorcycle_side',items,...extra});
 test('catalogue is unique, bounded and bilingual; every new ID is accepted by the existing client ID grammar',()=>{
-  assert.equal(ENGINE_CATALOGUE_VERSION,3);assert.equal(POWERTRAIN_FAMILIES.length,8);
+  assert.equal(ENGINE_CATALOGUE_VERSION,4);assert.equal(POWERTRAIN_FAMILIES.length,8);
   assert.equal(new Set(POWERTRAIN_EXTRA_ROWS.map(x=>x[0])).size,POWERTRAIN_EXTRA_ROWS.length);
   for(const [id,p]of Object.entries(ENGINE_PARTS)){
     assert.match(id,/^[a-z_]{2,30}$/);assert.ok(p.cue&&p.whatTh&&p.whatEn);
@@ -19,7 +19,7 @@ test('larger coverage retains the proven portable provider schema and fits the a
   const r=buildFeatureRequest({tool:'baylive',scanVersion:2,attachments:[{mime:'image/jpeg',b64:'aA=='}]});
   assert.ok(r.system.length<8000);assert.equal(r.timeoutMs,18000);assert.equal(r.maxTokens,3600);
   assert.ok(!JSON.stringify(ENGINE_BAY_SCHEMA).includes('minItems'));assert.ok(!JSON.stringify(ENGINE_BAY_SCHEMA).includes('maxItems'));
-  assert.equal(ENGINE_BAY_SCHEMA.properties.items.items.properties.part.enum.length,129);
+  assert.equal(ENGINE_BAY_SCHEMA.properties.items.items.properties.part.enum.length,134);
   for(const key of ['vehicleKind','powertrain','view'])assert.ok(ENGINE_BAY_SCHEMA.required.includes(key));
   for(const phrase of ['motorcycle','CVT','washer_filler','battery_cover','valve_cover','dipstick_unknown','already exposed','cutaway illustration','never evidence that a hidden component exists','NOT measured accuracy'])assert.ok(ENGINE_BAY_PROMPT.includes(phrase),phrase);
 });
