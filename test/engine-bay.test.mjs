@@ -9,8 +9,8 @@ const item=(extra={})=>({part:'battery',certainty:'high',evidence:'Visible case 
 const scan=(items=[item()],extra={})=>({scene:'engine_bay',quality:'clear',items,...extra});
 const request=(extra={})=>buildFeatureRequest({tool:'baylive',scanVersion:2,attachments:[image],...extra});
 
-test('42 distinct component types with owned bilingual labels and safety; prototype IDs cannot resolve',()=>{
-  assert.equal(Object.keys(ENGINE_PARTS).length,42);
+test('47 distinct component types with owned bilingual labels and safety; prototype IDs cannot resolve',()=>{
+  assert.equal(Object.keys(ENGINE_PARTS).length,47);
   for(const id of Object.keys(ENGINE_PARTS))for(const lang of ['th','en']){
     const p=partInfo(id,lang);assert.ok(p.name&&p.what&&p.check);assert.equal(p.part,id);
     assert.match(p.check,lang==='en'?/do not|Do not/:/ห้าม|ไม่เปิด/);

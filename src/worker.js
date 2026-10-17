@@ -4,6 +4,7 @@ import { exportAccount, resetAccount, deleteAccount, deleteBlockers } from './ac
 import { ONBOARDING_SQL, handleOnboarding, onboardingName, sanitizeSetupState } from './onboarding.js';
 import { buildFeatureRequest, cleanFeatureJson, featureCap } from './features-ai.mjs';
 import { liveToken, cleanHandle } from './live-setup.mjs';
+import { expireAgentActions } from './call-agent-actions.mjs';
 import { valetPrompt } from './agent-prompt.mjs';
 import { handleTech, reconcileDiditIdentities, vaultSweep, expireStaleApplications, releaseWrongHolds, expireOpenJobs } from './techs.js';
 import { richMenuStatus, setupRichMenu, lineStatus, lineFixWebhook } from './line-menu.js';
@@ -5127,7 +5128,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
 
           const withTools = b.tools === true, withAgent = b.agent === true;
           const handle = cleanHandle(b.handle);
-          const mk = (liveModel, tools, resume, agent=withAgent) => liveToken({ model: liveModel, system: b.system, tools, agent, handle, resume, now });
+          const mk = (liveModel, tools, resume, agent=withAgent) => liveToken({ model: liveModel, system: b.system, tools, agent, agentVersion:b.agentVersion===2?2:1, handle, resume, now });
 
           let lastErr = '';
           for (const liveModel of candidates) {
@@ -5995,7 +5996,7 @@ ${convo}`;
           const text = await callGemini(env, { ...input, meter, prefer });
           let data = null;
           if (input.json) {
-            try { data = cleanFeatureJson(body.tool, text, {scanVersion:body.scanVersion,lang:body.lang}); }
+            try { data = cleanFeatureJson(body.tool, text, {scanVersion:body.scanVersion,lang:body.lang,targetPart:body.context?.targetPart,viewAttempts:body.context?.viewAttempts}); }
             catch (e) { await meterTokens(env, uid, meter); return deny('AI ตอบกลับไม่สมบูรณ์ ลองใหม่อีกครั้ง', 502); }
           }
           await meterTokens(env, uid, meter);
@@ -6233,6 +6234,7 @@ ${convo}`;
   async scheduled(event, env, ctx) {
     /* cron ทำงานได้แม้ยังไม่มีใครเปิดเว็บเลย จึงต้องตรวจตรงนี้ด้วย */
     ctx.waitUntil(ensureSchema(env));
+    ctx.waitUntil(expireAgentActions(env).catch(() => {}));
     // รอบถี่ทำเฉพาะงานที่นัดเวลาไว้ ส่วนงานหนักปล่อยให้รอบวันละครั้งทำ
     ctx.waitUntil(runDueJobs(env));
     /* Didit retries only briefly; reconcile incomplete identity sessions on the

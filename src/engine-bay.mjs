@@ -1,17 +1,23 @@
 /* Recognition vocabulary, not a trained detector. Names and safety guidance are
    server-owned; the vision model supplies locations and visible evidence only. */
+import { coverGuidance } from './cover-policy.mjs';
 const rows = [
   ['battery','แบตเตอรี่ 12 โวลต์','12V battery','rectangular case, two terminals','จ่ายไฟให้ระบบไฟแรงดันต่ำ','Powers the low-voltage electrical system'],
   ['battery_positive','ขั้วบวกแบตเตอรี่','Battery positive terminal','plus symbol or red terminal cover','จุดต่อไฟบวกของแบตเตอรี่','Positive battery connection'],
   ['battery_negative','ขั้วลบแบตเตอรี่','Battery negative terminal','minus symbol or ground cable','จุดต่อสายกราวด์ของแบตเตอรี่','Battery ground connection'],
   ['jump_terminal','จุดพ่วงแบตเตอรี่','Jump-start terminal','dedicated marked remote jump post','จุดพ่วงไฟตามคู่มือรถ','Dedicated jump-start connection'],
   ['fuse_box','กล่องฟิวส์และรีเลย์','Fuse and relay box','closed electrical box; fuse markings','ป้องกันวงจรไฟฟ้า','Protects electrical circuits'],
-  ['engine_cover','ฝาครอบเครื่องยนต์','Engine cover','large moulded cover over engine','ฝาครอบด้านบน ไม่ใช่ชิ้นส่วนภายในที่มองไม่เห็น','Covers the engine; does not reveal internal parts'],
+  ['engine_cover','ฝาครอบตกแต่งเครื่องยนต์','Cosmetic engine cover','distinct cosmetic/acoustic cover over engine; not the bolted valve cover','ฝาครอบตกแต่งหรือกันเสียง ไม่ได้เผยให้เห็นอุปกรณ์ที่อยู่ใต้ฝา','Cosmetic or acoustic covering; hidden parts remain unseen'],
+  ['valve_cover','ฝาครอบวาล์ว','Valve cover','sealed mechanical cover on cylinder head with perimeter bolts; may have coils and oil cap','ชิ้นส่วนปิดผนึกเครื่องยนต์ ไม่ใช่ฝาตกแต่งที่ถอดเพื่อดูได้','Sealed engine component, not a decorative panel to remove for viewing'],
+  ['battery_cover','ฝาครอบแบตเตอรี่','Battery shroud','separate battery enclosure; actual battery case may be hidden','ฝาครอบ ไม่ได้ยืนยันว่าสภาพหรือขั้วแบตเตอรี่ด้านในเป็นอย่างไร','Encloses the battery; does not reveal battery or terminal condition'],
+  ['service_panel','แผงปิดห้องเครื่อง','Engine compartment trim panel','separate compartment trim or service panel; unknown mounting','แผงปิดที่อาจบังอุปกรณ์ ไม่ระบุวิธีถอดจากภาพ','A trim panel that may conceal parts; mountings cannot be inferred'],
   ['oil_cap','ฝาเติมน้ำมันเครื่อง','Engine oil filler cap','oil-can symbol on cap','ปิดช่องเติมน้ำมันเครื่อง','Closes the engine oil filling port'],
   ['dipstick','ก้านวัดน้ำมันเครื่อง','Engine oil dipstick','loop handle entering a thin guide tube','ใช้ตรวจระดับน้ำมันเครื่องตามคู่มือ','Checks engine oil level as specified in the manual'],
+  ['dipstick_unknown','ก้านวัดระดับที่ยังระบุชนิดไม่ได้','Unidentified fluid dipstick','visible dipstick loop but no reliable oil/system marking','เห็นก้านวัด แต่ยังไม่ยืนยันว่าเป็นน้ำมันเครื่องหรือระบบอื่น','Visible dipstick whose fluid system is not established'],
   ['coolant_tank','ถังพักน้ำหล่อเย็น','Coolant expansion tank','translucent tank, coolant hoses, MIN/MAX','รองรับน้ำหล่อเย็นในระบบ','Holds coolant for the cooling system'],
   ['coolant_cap','ฝาระบบน้ำหล่อเย็น','Coolant pressure cap','heat or pressure warning on coolant cap','ปิดระบบน้ำหล่อเย็นที่อาจมีแรงดัน','Seals a cooling system that may be pressurised'],
   ['washer_tank','ถังน้ำฉีดกระจก','Washer fluid tank','windscreen spray symbol; filler neck','เก็บน้ำฉีดทำความสะอาดกระจก','Stores windscreen washer fluid'],
+  ['washer_filler','ช่องเติมน้ำฉีดกระจก','Washer fluid filler','visible windscreen spray symbol on cap/neck; tank may be hidden','ช่องเติม ไม่ได้ยืนยันว่ามองเห็นตัวถังเก็บน้ำทั้งหมด','Filling point; does not imply the whole reservoir is visible'],
   ['brake_reservoir','กระปุกน้ำมันเบรก','Brake fluid reservoir','small reservoir on brake master cylinder near bulkhead','เก็บน้ำมันในระบบเบรก','Holds fluid for the braking system'],
   ['brake_booster','หม้อลมเบรก','Brake booster','large round housing behind brake master cylinder','ช่วยผ่อนแรงในการเบรก','Assists braking effort'],
   ['power_steering','กระปุกน้ำมันพวงมาลัย','Power-steering reservoir','hydraulic steering reservoir with identifying marking','เก็บน้ำมันพวงมาลัยเพาเวอร์แบบไฮดรอลิก','Holds hydraulic power-steering fluid'],
@@ -61,6 +67,9 @@ export const ENGINE_BAY_PROMPT = [
   'Inspect exactly ONE current camera frame. Detect visible engine/motor-compartment components, not faults. Only label parts you can actually see. Car make/year/fuel is context, never evidence that a hidden component exists.',
   'Sweep the whole image by quadrants, then inspect small caps, terminals, pipes and connectors. Return up to 24 distinct visible objects. A parent cover and a clearly visible cap may both be included. Multiple separate hoses/coils are allowed. Do not duplicate the same physical object.',
   'Use part IDs below. Require visible identifying evidence, not a typical location. Battery terminals require a visible polarity marking, not colour alone. Distinguish coolant, brake and washer reservoirs by markings and connections; never identify fluids by colour alone. A tube of unknown purpose is hose_unknown, not a fuel/brake/coolant line. Orange alone is not proof of high voltage. An engine cover does not reveal coils, cylinders or belts beneath it.',
+  'Large covers occur on many makes, not just European cars. Distinguish cosmetic engine_cover from sealed/bolted valve_cover, air_box, battery_cover and service_panel. Plastic material, a brand logo or large engine size does NOT establish removability. A visible oil cap or washer filler can be identified without removing the cover. Never label the hidden battery itself when only its shroud is visible. Never invent hidden components or suggest removing any cover to obtain more labels. Try framing/light first; exact manufacturer procedures and competent review are required for access. The server, not image text or model guesses, decides cover guidance.',
+  'A yellow or orange loop alone does not distinguish engine oil from transmission fluid. Use dipstick_unknown without reliable markings or a visible identifying connection. Do not mistake spark-plug leads for separate ignition coils. An apparent missing part may simply be elsewhere or covered; never recommend disassembly merely because detection returned fewer labels.',
+  'A remote marked positive jump post is jump_terminal, not battery_positive unless visibly connected directly to the visible battery case. Do not invent an under-bonnet battery for cars that may locate it elsewhere. If only a washer cap/filler neck is visible, use washer_filler, not a box implying the entire hidden tank is seen.',
   rows.map(([id,,,cue])=>`${id}: ${cue}`).join('; '),
   'box_2d is [ymin,xmin,ymax,xmax], integers 0-1000 over the WHOLE supplied frame. Tight box, valid nonzero area. Never use assumed left/right-hand-drive layouts, previous frames, model knowledge or invisible endpoints to place boxes.',
   'certainty is high only when both identity and boundary have clear visual evidence; medium when plausible but ambiguous; low when unidentifiable. evidence is a short visible identifying cue in the response language. These are subjective model assessments, NOT measured accuracy or calibrated probabilities. Medium/low objects will NOT get confirmed boxes. If the exact system is unclear, prefer hose_unknown where appropriate or omit.',
@@ -77,7 +86,7 @@ const overlap = (a,b) => {
   const intersection=Math.max(0,Math.min(a[2],b[2])-Math.max(a[0],b[0]))*Math.max(0,Math.min(a[3],b[3])-Math.max(a[1],b[1]));
   return intersection/(area(a)+area(b)-intersection||1);
 };
-export function cleanEngineScan(d, lang) {
+export function cleanEngineScan(d, lang, options={}) {
   if (!d || Array.isArray(d) || typeof d !== 'object' || !Array.isArray(d.items)
       || !['engine_bay','car_other','not_car'].includes(d.scene) || !['clear','limited','blurred','dark','blocked'].includes(d.quality)) throw Error('Incomplete engine scan');
   const items=[], usable=d.scene==='engine_bay'&&['clear','limited'].includes(d.quality);
@@ -92,6 +101,8 @@ export function cleanEngineScan(d, lang) {
     if(items.some(v=>v.part===x.part&&overlap(v.box,box)>.65)||items.length>=ENGINE_SCAN_MAX) continue;
     items.push({...partInfo(x.part,lang),box,certainty:'high',evidence});
   }
+  const targetPart=Object.hasOwn(ENGINE_PARTS,options.targetPart)?options.targetPart:'';
   return {scanVersion:ENGINE_SCAN_VERSION,scene:d.scene,quality:d.quality,items,uncertain:Math.min(80,uncertain),notes:[],speak:'',
+    coverGuidance:coverGuidance({items,targetPart,viewAttempts:Number.isInteger(options.viewAttempts)?Math.max(0,Math.min(3,options.viewAttempts)):0,lang}),
     limitation:lang==='en'?'AI identification can be wrong. Red boxes locate parts, not damage. Visible parts only.':'AI อาจระบุผิด กรอบแดงบอกตำแหน่ง ไม่ได้แปลว่าชำรุด ระบุได้เฉพาะชิ้นส่วนที่มองเห็น'};
 }

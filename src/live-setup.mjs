@@ -1,5 +1,6 @@
 /* ตั้งค่าการโทรคุยกับ Cendon (Gemini Live) ที่ล็อกไว้ในกุญแจใช้ครั้งเดียว — แยกออกมาให้เทสต์ได้โดยไม่ต้องเรียก Google */
 import { LIVE_CALL_TOOLS, LIVE_CALL_AGENT_RULES } from './live-call-tools.mjs';
+import { ENGINE_PARTS } from './engine-bay.mjs';
 
 /* เครื่องมือที่ผู้ช่วยเสียงเรียกเองได้ระหว่างโทร: ผู้ใช้พูดว่า "ฟังเสียงเครื่องหน่อย" / "ดูห้องเครื่องให้หน่อย"
    หน้าเว็บเปิดโหมดฟังเสียงดิบ (ไม่กรองเสียงรบกวน) หรือสแกนกล้องแบบสด แล้วส่งผลกลับให้ AI พูดต่อ */
@@ -7,7 +8,7 @@ export const LIVE_TOOLS = [{ functionDeclarations: [
   { name: 'listen_engine', description: 'Record about 10 seconds of raw engine or car sound from the phone microphone (no noise filtering) and analyse it. Call this whenever the user asks you to listen to the engine, a noise, a knock, a squeal or any car sound, or says they will hold the phone near the car.',
     parameters: { type: 'OBJECT', properties: { area: { type: 'STRING', description: 'Where the phone is held, e.g. engine bay, wheel, exhaust, cabin' }, when: { type: 'STRING', description: 'When the sound happens, e.g. idle, revving, braking, turning' } } } },
   { name: 'scan_engine_bay', description: 'Start a rear-camera component identification scan. Red numbered boxes locate clearly identified visible engine/motor-compartment parts; red does NOT mean damaged. The tool may return no confirmed parts or ask for a clearer view. Use its latest results only, never guess hidden parts from the car model. This is fallible visual identification, not a diagnosis or safety inspection. Tell the user to park safely, switch off, let the engine cool and observe without touching. Never suggest opening caps, disconnecting parts or touching high-voltage equipment. Call when asked to identify, scan, highlight or explain under-bonnet parts.',
-    parameters: { type: 'OBJECT', properties: {} } },
+    parameters: { type: 'OBJECT', properties: {target_part:{type:'STRING',enum:Object.keys(ENGINE_PARTS),description:'Only when the user asks about a specific component. Omit for a general scan. Missing parts are not proof that cover removal is necessary.'}} } },
 ] }];
 
 const thinking = m => /2\.5/.test(m) ? { thinkingConfig: { thinkingBudget: 0, includeThoughts: false } }
@@ -17,8 +18,8 @@ const thinking = m => /2\.5/.test(m) ? { thinkingConfig: { thinkingBudget: 0, in
 /* handle = รหัสต่อสายต่อที่ Google ให้มาในสายก่อนหน้า (sessionResumptionUpdate) — ต่อใหม่แล้วจำบทสนทนาเดิมได้ */
 export const cleanHandle = h => typeof h === 'string' && /^[\w\-.:/+=]{8,600}$/.test(h) ? h : '';
 
-export function liveToken({ model, system, tools, agent = false, handle, resume, now = Date.now() }) {
-  const declarations=[...(tools ? LIVE_TOOLS[0].functionDeclarations : []),...(agent === true ? LIVE_CALL_TOOLS[0].functionDeclarations : [])];
+export function liveToken({ model, system, tools, agent = false, agentVersion = 1, handle, resume, now = Date.now() }) {
+  const declarations=[...(tools ? LIVE_TOOLS[0].functionDeclarations : []),...(agent === true ? LIVE_CALL_TOOLS[0].functionDeclarations.slice(0,agentVersion===2?10:4) : [])];
   return {
     uses: 1,
     expireTime: new Date(now + 30 * 60 * 1000).toISOString(),
