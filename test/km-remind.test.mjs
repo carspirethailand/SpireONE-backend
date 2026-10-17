@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {DatabaseSync} from 'node:sqlite';
-import {createHmac} from 'node:crypto';
+import {createHmac,createECDH,randomBytes} from 'node:crypto';
 import {readFileSync} from 'node:fs';
 import {parseKm, parseConfirm, checkKm, thDay, thDayStart, toAsk, askLine, pushText, KM_CRON} from '../src/km-remind.mjs';
 import {TABLES, RESET_TABLES} from '../src/account-data.js';
@@ -61,11 +61,12 @@ async function setup() {
     all: async () => ({results: sqlite.prepare(sql).all(...a)}), run: async () => ({meta: {changes: Number(sqlite.prepare(sql).run(...a).changes)}}), _run() {return sqlite.prepare(sql).run(...a);}};},
     batch: async list => {sqlite.exec('BEGIN'); try {const r = list.map(s => s._run()); sqlite.exec('COMMIT'); return r;} catch (e) {sqlite.exec('ROLLBACK'); throw e;}}};
   const env = {DB, DEV_AUTH: '1', FIREBASE_PROJECT_ID: 'cendon-unit-test', ALLOWED_ORIGINS: '*', LINE_CHANNEL_TOKEN: 'test-only-token', LINE_CHANNEL_SECRET: 'test-only-secret', APP_URL: 'https://app.unit.test'};
-  const pushes = [], replies = [];
+  const pushes = [], replies = [], devicePushes=[];
   globalThis.fetch = async (url, init = {}) => {const u = String(url);
     if (u === 'https://api.line.me/v2/bot/message/push') {pushes.push(JSON.parse(init.body)); return Response.json({});}
     if (u === 'https://api.line.me/v2/bot/message/reply') {replies.push(JSON.parse(init.body).messages); return Response.json({});}
     if (u.startsWith('https://api.line.me/')) return Response.json({});
+    if(u==='https://push.unit.test/me'){devicePushes.push(init);return new Response(null,{status:201})}
     throw Error('unexpected fetch ' + u);};
   const call = async (method, path, body, uid = 'me') => {
     const r = await worker.fetch(new Request('https://w.unit.test' + path, {method, headers: {'Content-Type': 'application/json', Authorization: `Bearer dev:${uid}:${uid}@unit.test`}, ...(body === undefined ? {} : {body: JSON.stringify(body)})}), env, {waitUntil() {}});
@@ -83,7 +84,7 @@ async function setup() {
   q("INSERT INTO odo_anchor (id,uid,car_id,km,source,observed_at,t) VALUES ('a1','me','v1',50000,'manual',?,?)", t - 3 * DAY, t);
   q("INSERT INTO line_link (line_uid,uid,lang,active,linked_at) VALUES ('Ume','me','th',1,?)", t);
   q('INSERT INTO user_state VALUES (?,?,?,?)', 'me', 'garage', JSON.stringify([{id: 'v1', name: 'Vios', mileage: '50000'}, {id: 'c2', name: 'City', mileage: 30000}]), t - 1000);
-  return {sqlite, call, say, cron, pushes};
+  return {sqlite, call, say, cron, pushes,env,devicePushes};
 }
 
 test('off by default; turning it on says which channel will be used', async () => {
@@ -134,6 +135,16 @@ test('cars already logged today are skipped; other chat still reaches the AI; st
   assert.match(ai[0].text, /น้ำยาแอร์/, 'a normal question is not swallowed by the reminder');
   assert.match((await say('หยุดเตือนไมล์'))[0].text, /ปิดการเตือนจดเลขไมล์แล้ว/);
   assert.equal((await call('GET', '/api/km/remind')).json.on, false);
+});
+
+test('both opted-in channels send even when LINE succeeds; concurrent cron invocations claim the day only once',async()=>{
+  const f=await setup(),vapid=createECDH('prime256v1'),subscriber=createECDH('prime256v1');vapid.generateKeys();subscriber.generateKeys();
+  f.env.VAPID_PRIVATE=vapid.getPrivateKey().toString('base64url');f.env.VAPID_PUBLIC=vapid.getPublicKey().toString('base64url');
+  f.sqlite.prepare('INSERT INTO push_subs(endpoint,uid,p256dh,auth,cars,lang,sent,t) VALUES(?,?,?,?,?,?,?,?)').run('https://push.unit.test/me','me',subscriber.getPublicKey().toString('base64url'),randomBytes(16).toString('base64url'),'[]','th','{}',Date.now());
+  await f.call('POST','/api/km/remind',{on:true});await Promise.all([f.cron(),f.cron()]);
+  assert.equal(f.pushes.length,1,'one LINE message');assert.equal(f.devicePushes.length,1,'one device push as well');
+  assert.equal(f.devicePushes[0].headers['Content-Encoding'],'aes128gcm');
+  await f.cron();assert.equal(f.pushes.length,1);assert.equal(f.devicePushes.length,1);
 });
 
 test('worker wiring: LINE checks the pending reading before link codes; 18:00 cron returns early', () => {

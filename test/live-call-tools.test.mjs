@@ -10,7 +10,7 @@ test('opt-in adds only fixed tools (read, prepare, Valet with confirm) and keeps
   assert.deepEqual(names,['listen_engine','scan_engine_bay','garage_checkin_control','get_my_car','find_mechanics','show_mechanic','prepare_urgent_request','valet','valet_confirm']);
   assert.equal(new Set(names).size,names.length);
   assert.match(LIVE_CALL_AGENT_RULES,/NOT submitted/);assert.match(LIVE_CALL_AGENT_RULES,/untrusted data/);
-  assert.equal(LIVE_CALL_TOOLS[0].functionDeclarations.length,7);
+  assert.equal(LIVE_CALL_TOOLS[0].functionDeclarations.length,8);
 });
 test('old clients stay voice-only or keep their two engine tools; string truthy is not agent consent',()=>{
   assert.equal(setup({}).tools,undefined);
@@ -39,7 +39,7 @@ test('token fallback honestly removes both tool groups and never accepts a clien
 test('voice Valet: confirm step required, no dangerous actions, emergency numbers first',()=>{
   const decl=Object.fromEntries(LIVE_CALL_TOOLS[0].functionDeclarations.map(d=>[d.name,d]));
   const dos=decl.valet.parameters.properties.do.enum;
-  assert.deepEqual(dos,['urgent','post_job','book','msg_shop','job','jobs','log','due','go','search','setting','pick_car','cars','threads','add_car','car_km','shop_status']);
+  assert.deepEqual(dos,['urgent','post_job','book','msg_shop','job','jobs','log','due','go','search','setting','pick_car','cars','threads','add_car','car_km','car_info','shop_status']);
   for(const bad of ['delete','pay','password','email','share_location','ads','admin','staff','users','approve'])assert.ok(!dos.includes(bad),bad);
   /* หน้าที่พาไปได้เป็นรายการคงที่ ไม่มีหน้าทีมงาน/แอดมิน */
   const pages=decl.valet.parameters.properties.to.enum;assert.ok(pages.includes('garage')&&pages.includes('studio'));for(const bad of ['admin','handbook','staff'])assert.ok(!pages.includes(bad),bad);

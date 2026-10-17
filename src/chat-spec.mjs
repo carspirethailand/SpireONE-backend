@@ -15,7 +15,7 @@ const clip = (s, n) => String(s == null ? '' : s).replace(/[\r\n\[\]]+/g, ' ').r
 export function ownBlock(info) {
   if (!info || typeof info !== 'object') return '';
   const out = OWN.map(([k, l]) => { const v = clip(info[k], 60); return v ? `${l} ${v}` : ''; }).filter(Boolean);
-  return out.length ? `ข้อมูลที่เจ้าของรถบันทึกเอง (เชื่อได้กว่าสเปกทั่วไป): ${out.join(' · ')}` : '';
+  return out.length ? `ข้อมูลที่เจ้าของรถบันทึกเอง (ยังไม่ยืนยันกับเอกสาร): ${out.join(' · ')}` : '';
 }
 
 const FUEL = { petrol: 'เบนซิน', diesel: 'ดีเซล', hybrid: 'ไฮบริด', phev: 'ปลั๊กอินไฮบริด', ev: 'ไฟฟ้า', lpg: 'LPG' };
@@ -49,14 +49,17 @@ export function specBlock(spec, equip) {
     }).filter(Boolean);
     if (vs.length) lines.push('รุ่นย่อย/เครื่องยนต์:\n' + vs.join('\n'));
     const f = d.facts || {};
-    const fs = ['tank_l', 'tire', 'kerb_kg', 'seats', 'length_mm', 'width_mm', 'height_mm', 'wheelbase_mm']
+    const fs = ['tank_l', 'tire', 'kerb_kg', 'seats', 'doors', 'length_mm', 'width_mm', 'height_mm', 'wheelbase_mm']
       .map(k => { const c = cell(f[k], UNIT[k] || ''); return c ? `${LBL[k]} ${c}` : ''; }).filter(Boolean);
     if (fs.length) lines.push('ข้อมูลตัวรถ: ' + fs.join(' · '));
   }
   const eq = equip && ['ready', 'verified'].includes(equip.status) && Array.isArray(equip.data?.equipment) ? equip.data.equipment : [];
   if (eq.length) lines.push('อุปกรณ์ที่พบในเอกสาร (รุ่นย่อย/ตลาดอาจต่างกัน ไม่ได้ยืนยันว่าคันนี้มีครบ): '
-    + eq.slice(0, 16).map(x => clip(x.name, 50) + (x.availability === 'optional' ? ' (ออปชัน)' : x.availability === 'standard' ? ' (มาตรฐาน)' : '') + (x.variant ? ` [${clip(x.variant, 30)}]` : '')).join(', '));
+    + eq.slice(0, 32).map(x => clip(x.name, 50) + (x.availability === 'optional' ? ' (ออปชัน)' : x.availability === 'standard' ? ' (มาตรฐาน)' : '') + (x.variant ? ` [${clip(x.variant, 30)}]` : '')).join(', '));
   if (!lines.length) return '';
+  const sources=[...(spec?.sources||[]),...(equip?.sources||[])].filter(s=>s&&/^https:\/\//.test(s.url||''));
+  const seen=new Set(),refs=sources.filter(s=>!seen.has(s.url)&&seen.add(s.url)).slice(0,8);
+  if(refs.length)lines.push('เอกสารที่ใช้: '+refs.map(s=>clip(s.title||'Source',90)+' '+s.url.slice(0,500)).join('\n'));
   return `\n[สเปกรุ่นนี้จากคลังของ Cendon — สกัดจากเอกสารอ้างอิง]\n${lines.join('\n')}
 วิธีใช้: ตอบเรื่องสเปกจากข้อมูลนี้ก่อน ✓ = สองแหล่งตรงกัน · (แหล่งเดียว) ให้บอกว่ายังยืนยันได้แหล่งเดียว · ⚠ แหล่งขัดกัน ให้บอกทั้งสองค่า
 มีหลายรุ่นย่อย: เลือกรุ่นที่ตรงกับข้อมูลที่เจ้าของบันทึก ถ้ายังไม่รู้ว่าคันไหน บอกค่าของแต่ละรุ่นหรือถามรุ่นย่อย ห้ามเลือกเอง
