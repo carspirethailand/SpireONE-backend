@@ -19,7 +19,9 @@ image-analysis pipeline. No model weights have been trained or fine-tuned.
 It does not recognise every possible part, reveal hidden parts, diagnose faults,
 establish roadworthiness, or guarantee correct identification.
 
-- 42 server-owned component types, Thai/English names, functions and safety text.
+- Catalogue v3: 131 server-owned component concepts, Thai/English names,
+  functions and safety text; 129 released locator IDs. Kick-start and shift
+  pedals are withheld after real Wave-photo failures (see POWERTRAIN-EVALUATION.md).
 - At most 24 distinct visible objects per image. Separate hoses/coils may have
   the same type. Unknown-purpose hoses remain explicitly unidentified.
 - The model returns only a known part ID, a tight box, subjective certainty and
@@ -46,23 +48,34 @@ shared 18-second model-attempt budget, with at most 10 seconds per attempt.
 Existing auth, quota, role and metering guards remain in force. Old unversioned
 scan clients keep the legacy contract.
 
+Catalogue v3 still uses `scanVersion:2` geometry. New required provider fields
+are `vehicleKind`, `powertrain`, `view`, and item `visibility`. Hidden items
+never get boxes; motorcycle-only types need explicit motorcycle metadata;
+internals need an already-exposed assembly view and explicit visible status.
+Server-owned `coverGuidance` never authorises disassembly. The companion
+frontend displays motorcycle-specific headings and this observe-only guidance.
+Saved garage-car context does not override the photographed motorcycle.
+
 Deploy this backend BEFORE the paired frontend. A new client receiving an old
 contract shows a version error, never guesses a result. No migration, new
 secret, billing switch or configuration change is required. Do not deploy the
 dirty primary backend checkout or include Backyard files.
 
-## Verification and release gap
+## Verification and remaining release gaps — 17 October 2026
 
-- Backend: 345 automated tests pass, including schema/provider transport mocks,
+- Backend: 367 automated tests pass, including schema/provider transport mocks,
   all affected legacy features, input bounds and filtering adversarial outputs.
 - Wrangler 4.105.0 dry run compiles. A dry run does not deploy or prove the remote
   model accepts the schema.
-- Frontend companion has synthetic DOM/browser tests. Those show UI behavior,
-  not vision accuracy. No real camera, microphone, Google request or applicant
-  document was used in these tests.
-- No production deployment has been performed. Before production release, run a
-  live authenticated model/schema smoke test and an annotated real-image
-  evaluation, followed by real iOS Safari and Android Chrome call tests.
+- Frontend companion: 365 automated tests pass after integrating the team's
+  latest recruitment page/cache release. Real model inference on public
+  motorcycle references and the actual camera-crop/red-box renderer are also
+  exercised, using static reference photos rather than camera/microphone access.
+  Unit tests and these spot checks are not a measured vision accuracy score.
+- The previous schema fix is already released. This coverage change needs the
+  paired backend/frontend release. A mechanic-labelled held-out evaluation and
+  real iOS Safari / Android Chrome camera-call tests remain outstanding. No
+  applicant documents are used; no model weights have been trained.
 
 ## Real-image evaluation before calling it “trained” or “accurate”
 
