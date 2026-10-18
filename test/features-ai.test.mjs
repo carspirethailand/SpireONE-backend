@@ -60,7 +60,7 @@ test('quote: reads every line, checks the sums itself, triages for this car and 
 test('listen: describes the sound first, ranks causes for this car, judges urgency and never claims a definite diagnosis',()=>{
   const r=buildFeatureRequest({tool:'listen',attachments:[{mime:'audio/wav',b64:'UklGRg=='},{mime:'image/jpeg',b64:'aGVsbG8='}],
     question:'เสียงมาจาก: ห้องเครื่อง · ได้ยินตอน: เดินเบา',context:{car:{make:'Honda',model:'City',year:'2019',mileage:'42000'}}});
-  for(const re of [/where the owner hears the sound/,/what you actually hear/,/following road speed/,/most likely causes for this car/,/can be normal/,/stop driving/,/never while driving/,/Never claim a definitive diagnosis from audio/,/how to record again/,/frames from the owner's video/])
+  for(const re of [/Never identify make, model/,/what you actually hear/,/possible causes supported by audible clues/,/not verified identity/,/Stop safely/,/safely parked/,/cannot certify roadworthiness/,/speech-filtered/,/never a percentage/])
     assert.match(r.system,re);
   assert.equal(r.contents[0].parts[1].inlineData.mimeType,'audio/wav','WAV from the app reaches the model');
   assert.equal(r.contents[0].parts[2].inlineData.mimeType,'image/jpeg','video frames go along with the sound');

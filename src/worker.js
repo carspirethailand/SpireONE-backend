@@ -3,6 +3,7 @@ import { EMAIL_AUTH_SQL, handleEmailAuth, deleteFirebaseUser } from './email-aut
 import { exportAccount, resetAccount, deleteAccount, deleteBlockers } from './account-data.js';
 import { ONBOARDING_SQL, handleOnboarding, onboardingName, sanitizeSetupState } from './onboarding.js';
 import { buildFeatureRequest, cleanFeatureJson, featureCap } from './features-ai.mjs';
+import { soundText, legacySound, VEHICLE_AUDIO_RULES } from './vehicle-audio.mjs';
 import { engineScanFailure } from './engine-scan-errors.mjs';
 import { liveToken, cleanHandle } from './live-setup.mjs';
 import { valetPrompt } from './agent-prompt.mjs';
@@ -761,6 +762,8 @@ async function tokensToday(env, uid) {
 
 /* ===== Gemini (server-side only — key never leaves the Worker) ===== */
 async function callGemini(env, { contents, system, search, temp, json: wantJson, maxTokens, meter, prefer, schema, timeoutMs }) {
+  const hasAudio=(contents||[]).some(m=>(m.parts||[]).some(p=>/^audio\//i.test((p.inlineData||p.inline_data)?.mimeType||(p.inline_data||{}).mime_type||'')));
+  if(hasAudio&&!String(system||'').includes(VEHICLE_AUDIO_RULES))system=VEHICLE_AUDIO_RULES+'\n'+String(system||'');
   const geminiKey = env.GEMINI_KEY;
   if (!geminiKey) throw new Error('AI is not configured');
   const models = [
@@ -1989,6 +1992,7 @@ async function executeDescribeMediaTool(env, messages, prompt) {
     contents: [{ parts }],
     generationConfig: { temperature: 0.4 }
   };
+  if(parts.some(p=>/^audio\//i.test(p.inlineData?.mimeType||'')))body.systemInstruction={parts:[{text:VEHICLE_AUDIO_RULES}]};
 
   let lastErr = null;
   for (const mName of [...new Set(modelsToTry)]) {
@@ -2185,74 +2189,6 @@ async function getSpares(env, { car, apps, needs, lang }) {
   })).filter(x => x.title);
 }
 
-const LISTEN_TAKES = {
-  cold:  'ตอนสตาร์ทเครื่องเย็น',
-  idle:  'ตอนเดินเบาอยู่กับที่',
-  rev:   'ตอนเร่งเครื่องอยู่กับที่',
-  brake: 'ตอนเหยียบเบรก',
-  drive: 'ตอนขับอยู่',
-};
-
-/* ฟังเสียงเครื่องยนต์ — เจ้าของรถเลียนเสียงให้ช่างฟังไม่เคยเหมือน
-   จึงให้อัดเสียงจริงส่งมาแทน แล้วให้โมเดลบอกว่าน่าจะมาจากอะไร */
-async function listenEngine(env, { audio, mime, take, car, note, lang }) {
-  const carLine = [car.year, car.make, car.model].filter(Boolean).join(' ');
-  const when = LISTEN_TAKES[take] || 'ระหว่างใช้งาน';
-
-  const prompt = `ฟังคลิปเสียงรถคันนี้แล้ววิเคราะห์ให้เจ้าของรถเข้าใจ
-
-รถ: ${carLine || 'ไม่ทราบรุ่น'}${car.mileage ? ` เลขไมล์ประมาณ ${car.mileage} กม.` : ''}
-คลิปนี้อัด: ${when}${note ? `\nเจ้าของบอกเพิ่มว่า: ${String(note).slice(0, 200)}` : ''}
-
-ตอบเป็น JSON object เท่านั้น ห้ามมีคำนำหรือ markdown
-{
- "heard": สิ่งที่ได้ยินจริงในคลิป อธิบายเป็นคำที่คนทั่วไปเข้าใจ 1-2 ประโยค,
- "quality": "clear" ถ้าเสียงชัดพอวิเคราะห์ได้ | "noisy" ถ้าพอได้แต่มีเสียงรบกวนมาก | "unusable" ถ้าฟังไม่ได้เลย,
- "normal": true ถ้าฟังแล้วเป็นเสียงปกติของรถทั่วไป, false ถ้ามีอะไรน่าสงสัย,
- "urgency": "now" ถ้าควรหยุดใช้รถและตรวจทันที | "soon" ถ้าควรตรวจภายในสัปดาห์สองสัปดาห์ | "watch" ถ้าแค่เฝ้าดูอาการ | "fine" ถ้าไม่ต้องทำอะไร,
- "causes": [ { "what": ชิ้นส่วนหรือระบบที่น่าจะเป็นต้นเหตุ,
-               "chance": ความน่าจะเป็นเป็นเปอร์เซ็นต์ 0-100 เป็นตัวเลข,
-               "why": เหตุผลที่คิดแบบนั้นจากเสียงที่ได้ยิน 1 ประโยค,
-               "check": วิธีตรวจยืนยันแบบที่เจ้าของหรือช่างทำได้ 1 ประโยค } ],
- "doNow": [ สิ่งที่ควรทำต่อ 2-4 ข้อ เรียงจากสำคัญที่สุด ],
- "tellShop": ประโยคเดียวที่เอาไปบอกช่างได้ตรง ๆ ว่าให้ตรวจอะไร
-}
-
-กติกา
-- ถ้าคลิปไม่มีเสียงเครื่องยนต์เลย หรือสั้นเกินจนฟังไม่ออก ให้ตอบ {"error":"unusable"}
-- causes ให้ 2-4 ข้อ เรียงจากน่าจะเป็นมากไปน้อย รวมกันไม่ต้องเท่ากับ 100
-- ห้ามฟันธงว่าเสียเป็นอะไรแน่นอนจากเสียงอย่างเดียว ให้พูดในเชิงความน่าจะเป็นเสมอ
-- ถ้าฟังแล้วปกติดี ให้บอกตรง ๆ ว่าปกติ อย่าหาเรื่องให้ซ่อม`;
-
-  const parts = [
-    { inlineData: { mimeType: mime || 'audio/webm', data: audio } },
-    { text: prompt },
-  ];
-  const text = await callGemini(env, {
-    contents: [{ role: 'user', parts }],
-    temp: 0.25, maxTokens: 3072, json: true,
-  });
-  const parsed = parseJsonObject(text);
-  if (!parsed) throw new Error('listen_ai: model did not return a usable result');
-  if (parsed.error === 'unusable' || parsed.quality === 'unusable') throw new Error('listen_unusable');
-
-  const pct = (v) => { const x = Number(v); return Number.isFinite(x) ? Math.min(100, Math.max(0, Math.round(x))) : null; };
-  parsed.heard = String(parsed.heard || '').slice(0, 400);
-  parsed.quality = ['clear', 'noisy'].includes(parsed.quality) ? parsed.quality : 'noisy';
-  parsed.normal = parsed.normal === true;
-  parsed.urgency = ['now', 'soon', 'watch', 'fine'].includes(parsed.urgency) ? parsed.urgency : 'watch';
-  parsed.causes = Array.isArray(parsed.causes) ? parsed.causes.slice(0, 4).map((x) => ({
-    what: String(x.what || '').slice(0, 100),
-    chance: pct(x.chance),
-    why: String(x.why || '').slice(0, 240),
-    check: String(x.check || '').slice(0, 240),
-  })).filter((x) => x.what) : [];
-  parsed.doNow = Array.isArray(parsed.doNow)
-    ? parsed.doNow.slice(0, 4).map((x) => String(x).slice(0, 160)).filter(Boolean) : [];
-  parsed.tellShop = String(parsed.tellShop || '').slice(0, 300);
-  parsed.take = take || '';
-  return parsed;
-}
 
 /* ══════════════════════════════════════════════════════════════════
    WEB PUSH — VAPID + aes128gcm (RFC 8291 / RFC 8292)
@@ -6203,7 +6139,7 @@ ${convo}`;
           }
           let data = null;
           if (input.json) {
-            try { data = cleanFeatureJson(body.tool, text, {scanVersion:body.scanVersion,lang:body.lang}); }
+            try { data = cleanFeatureJson(body.tool, text, {scanVersion:body.scanVersion,lang:body.lang,context:body.context}); }
             catch (e) {
               await meterTokens(env, uid, meter);
               if (!engineScan) return deny('AI ตอบกลับไม่สมบูรณ์ ลองใหม่อีกครั้ง', 502);
@@ -6219,7 +6155,7 @@ ${convo}`;
             ON CONFLICT(uid, day) DO UPDATE SET count = count + 2`).bind(uid, day).run(), null);
           if (cap) await safe(env, warnings, 'usage.feature', () => env.DB.prepare(`INSERT INTO usage (uid, day, count) VALUES (?, ?, 1)
             ON CONFLICT(uid, day) DO UPDATE SET count = count + 1`).bind(capKey, day).run(), null);
-          return json(data ? { data, tool: body.tool, source: 'ai', limit: cap || undefined, warnings } : { text, tool: body.tool, source: 'ai', warnings });
+          return json(data ? { data, ...(body.tool==='listen'?{text:soundText(data,body.lang)}:{}),tool: body.tool, source: 'ai', limit: cap || undefined, warnings } : { text, tool: body.tool, source: 'ai', warnings });
         })();
       }
 
@@ -6247,13 +6183,15 @@ ${convo}`;
             if (used && used.count >= limit) return deny('quota', 429);
           }
 
-          const result = await listenEngine(env, {
-            audio, mime: mime || 'audio/webm', take: String(b.take || '').slice(0, 20),
-            car: b.car || {}, note: b.note || '', lang: b.lang || 'th',
-          });
+          let input;
+          const soundBody={tool:'listen',attachments:[{mime:mime||'audio/webm',b64:audio}],context:{car:b.car||{},audioVehicle:b.audioVehicle,recordingCondition:String(b.take||'').slice(0,20)},question:String(b.note||'').slice(0,500),lang:b.lang};
+          try{input=buildFeatureRequest(soundBody)}catch(e){return deny(e.message,400)}
+          const meter=newMeter();
+          const result=legacySound(cleanFeatureJson('listen',await callGemini(env,{...input,meter}),{context:soundBody.context,lang:b.lang}),String(b.take||'').slice(0,20));
+          await meterTokens(env,uid,meter);
           await safe(env, w, 'usage.write', () => env.DB.prepare(`
-            INSERT INTO usage (uid, day, count) VALUES (?, ?, 3)
-            ON CONFLICT(uid, day) DO UPDATE SET count = count + 3
+            INSERT INTO usage (uid, day, count) VALUES (?, ?, 2)
+            ON CONFLICT(uid, day) DO UPDATE SET count = count + 2
           `).bind(uid, day).run(), null);
 
           return json({ ...result, warnings: w });

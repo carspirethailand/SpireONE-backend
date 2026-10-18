@@ -101,7 +101,7 @@ test('new AI tools: engine-bay boxes are clamped to the photo, labels need a rea
   assert.equal(b.items.length,2);assert.deepEqual(b.items[1].box,[400,0,1000,300],'flipped and clamped into the photo');
   assert.equal(cleanFeatureJson('bay',{scene:'not_car',items:[{name:'x',box_2d:[0,0,500,500]}]}).items.length,0,'no labels on a non-engine photo');
   const e=cleanFeatureJson('ear',{quality:'wat',urgency:'panic',causes:[{name:'สายพาน',likelihood:'likely'}],speak:'ได้ยินเสียงเอี๊ยด'});
-  assert.equal(e.quality,'noisy');assert.equal(e.urgency,'soon');assert.equal(e.causes[0].name,'สายพาน');
+  assert.equal(e.quality,'noisy');assert.equal(e.urgency,'unassessed');assert.deepEqual(e.causes,[],'invalid/noisy input cannot diagnose a part');
   assert.throws(()=>cleanFeatureJson('wrapped','no json here'),/JSON/);
 });
 

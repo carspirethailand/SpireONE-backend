@@ -1,0 +1,19 @@
+{
+  "reviewedOn": "2026-10-18",
+  "purpose": "Evidence register, not a trained acoustic classifier or confirmed model-year fault corpus",
+  "audioDownloaded": false,
+  "weightsTrained": false,
+  "privacy": "Never publish user audio, VIN, registration, conversation or account data as research examples",
+  "sources": [
+    {"url":"https://www.dayco.com/na-en/techhub/diagnosing-drive-system-belt-noise/","publisher":"Dayco","kind":"manufacturer training video landing page","status":"official title and description reviewed; audio not independently evaluated","use":"General differential guidance only; not a Fortuner-specific fault"},
+    {"url":"https://www.dayco.com/na-en/techhub/diagnosing-hd-belt-noise/","publisher":"Dayco","kind":"manufacturer training video landing page","status":"official title and description reviewed; audio not independently evaluated","use":"Reference for a technician; do not send owners to reproduce running-belt tests"},
+    {"url":"https://go.gates.com/RecordedWebinars.html","publisher":"Gates","kind":"manufacturer video library","status":"catalogue reviewed; recording access/evaluation not completed","use":"Candidate technical education, not model-labelled audio"},
+    {"url":"https://www.denso-am.eu/news/denso-injecting-life-into-diesel-technology","publisher":"DENSO","kind":"manufacturer technical article","status":"reviewed","use":"Injection control affects combustion noise; not a specific injector-failure diagnosis or Fortuner bulletin"},
+    {"url":"https://toyotaaeknimit.com/wp-content/uploads/2014/07/fortuner2013.pdf","publisher":"Toyota brochure hosted by Toyota Aeknimit dealer","kind":"model-year brochure","status":"located; no acoustic labels or fault prevalence","use":"Vehicle-specification reference only; not evidence of which vehicle is recorded"},
+    {"url":"https://www.youtube.com/watch?v=-rtZM_5osqo","publisher":"Minh Duc Auto Garage","kind":"first-party repair-case video","status":"discovery only; not watched, no verified audio segments or licence","claimedVehicle":"Toyota Fortuner 2GD 2019","use":"Excluded from runtime grounding and training; NOT applicable to a 2013 3.0 D-4D by model name alone"},
+    {"url":"https://www.youtube.com/watch?v=3g41DVvaATs","publisher":"Minh Duc Auto Garage","kind":"repair-case video","status":"discovery only; not watched, no verified audio segments or licence","claimedVehicle":"Toyota Fortuner 2018","use":"Excluded from runtime grounding and training; engine, market, diagnosis and outcome require independent review"},
+    {"url":"https://ai.google.dev/gemini-api/docs/audio","publisher":"Google","kind":"API documentation","status":"reviewed","use":"Audio input transport support only; not automotive diagnostic validation"}
+  ],
+  "admissionForFutureModelYearCase": ["source permission or appropriate licence", "actual audio segment reviewed", "make/model/model-year/market/engine documented", "cold/warm/RPM/AC and microphone processing recorded", "diagnosis independently supported by workshop tests and repair outcome", "normal and non-matching controls", "held-out recordings from different vehicles and devices", "measured false-negative rate before any safety claim"],
+  "regressionCase": {"make":"Toyota","model":"Fortuner","year":"2013","engine":"3.0L D-4D","source":"user statement for regression fixture","realAudioProvided":false,"knownFaultAsserted":false}
+}
