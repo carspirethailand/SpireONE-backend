@@ -19,8 +19,8 @@ const thinking = m => /2\.5/.test(m) ? { thinkingConfig: { thinkingBudget: 0, in
 /* handle = รหัสต่อสายต่อที่ Google ให้มาในสายก่อนหน้า (sessionResumptionUpdate) — ต่อใหม่แล้วจำบทสนทนาเดิมได้ */
 export const cleanHandle = h => typeof h === 'string' && /^[\w\-.:/+=]{8,600}$/.test(h) ? h : '';
 
-export function liveToken({ model, system, tools, agent = false, garageCare = false, garageAssist = false, handle, resume, now = Date.now() }) {
-  const agentTools=structuredClone(LIVE_CALL_TOOLS[0].functionDeclarations).filter(t=>(t.name!=='garage_checkin_control'||garageCare===true)&&(t.name!=='get_parking'||garageAssist===true));
+export function liveToken({ model, system, tools, agent = false, webResearch = false, garageCare = false, garageAssist = false, handle, resume, now = Date.now() }) {
+  const agentTools=structuredClone(LIVE_CALL_TOOLS[0].functionDeclarations).filter(t=>(t.name!=='web_search'||webResearch===true)&&(t.name!=='garage_checkin_control'||garageCare===true)&&(t.name!=='get_parking'||garageAssist===true));
   if(!garageAssist){const v=agentTools.find(t=>t.name==='valet');if(v)v.parameters.properties.do.enum=v.parameters.properties.do.enum.filter(d=>d!=='car_info');}
   const declarations=[...(tools ? LIVE_TOOLS[0].functionDeclarations : []),...(agent === true ? agentTools : [])];
   return {
