@@ -121,20 +121,25 @@ export async function getMedia(env, me, id, inScope, headers) {
   const row = await env.DB.prepare('SELECT * FROM media WHERE id = ?').bind(id).first();
   /* ไม่มีสิทธิ์ตอบว่า "ไม่พบ" — ไม่บอกคนนอกว่ารหัสนี้มีไฟล์อยู่ */
   if (!row) fail(404, 'ไม่พบไฟล์');
-  const ok = row.uid === me.uid || me.staff || (/^(thread|job):/.test(row.scope) && await inScope(row.scope));
+  const ok = row.uid === me.uid || me.staff || (/^(thread|job|proof):/.test(row.scope) && await inScope(row.scope));
   if (!ok) fail(404, 'ไม่พบไฟล์');
+  return sendMedia(env, row, headers);
+}
+
+/* ส่งไฟล์ออก (ตรวจสิทธิ์มาแล้วจากคนเรียก) — ลิงก์ Passport/ผลงานหน้าร้านใช้ cache สั้นกว่า */
+export async function sendMedia(env, row, headers, cache = 'private, max-age=31536000, immutable') {
   const h = new Headers(headers || {});
   h.set('Content-Type', row.mime);
-  h.set('Cache-Control', 'private, max-age=31536000, immutable');
+  h.set('Cache-Control', cache);
   h.set('Content-Disposition', 'inline');
   h.set('X-Content-Type-Options', 'nosniff');
   if (row.store === 'r2') {
     if (!env.MEDIA) fail(503, 'ที่เก็บไฟล์ไม่พร้อม');
-    const obj = await env.MEDIA.get('m/' + id);
+    const obj = await env.MEDIA.get('m/' + row.id);
     if (!obj) fail(404, 'ไม่พบไฟล์');
     return new Response(obj.body, { headers: h });
   }
-  const { results } = await env.DB.prepare('SELECT n, data FROM media_parts WHERE id = ? ORDER BY n').bind(id).all();
+  const { results } = await env.DB.prepare('SELECT n, data FROM media_parts WHERE id = ? ORDER BY n').bind(row.id).all();
   if (results.length !== row.parts) fail(404, 'ไม่พบไฟล์');
   const out = new Uint8Array(row.size); let at = 0;
   for (const p of results) { const b = unb64(p.data); out.set(b, at); at += b.byteLength; }

@@ -37,7 +37,7 @@ test('LINE: the mechanic hears about a new request, the customer about the quote
   assert.ok(!/0812345678|ซอยลับเฉพาะ/.test(words(pushes[0])),'never the phone or the address');
   assert.match(words(pushes[0]),new RegExp('https://app\\.unit\\.test/\\?job='+id+'&openExternalBrowser=1'),'button opens the job in the phone browser');
   const rev=async w=>(await call(w,'/api/tech/jobs/'+id)).job.revision;
-  assert.equal((await call(MECH,'/api/tech/jobs/'+id,{action:'quote',revision:await rev(MECH),labor:800,parts:400,travel:100,scope:'ล้างระบบแอร์และเติมน้ำยา',appointment:'พรุ่งนี้ 9 โมง',warranty:30})).status,200);
+  assert.equal((await call(MECH,'/api/tech/jobs/'+id,{action:'quote',revision:await rev(MECH),labor:800,parts:400,partsNote:'น้ำยาแอร์ R134a 1 กระป๋อง',travel:100,scope:'ล้างระบบแอร์และเติมน้ำยา',appointment:'พรุ่งนี้ 9 โมง',warranty:30})).status,200);
   assert.equal(pushes.at(-1).body.to,'Ucustomer');assert.match(words(pushes.at(-1)),/เสนอราคา ฿1,300/);
   assert.equal((await call(USER,'/api/tech/jobs/'+id,{action:'accept',revision:await rev(USER),consent:true})).status,200);
   assert.equal(pushes.at(-1).body.to,'Umechanic');assert.match(words(pushes.at(-1)),/ลูกค้ายืนยันราคา/);
@@ -92,7 +92,7 @@ test('LINE: ข้อพิพาทแจ้งทีมงานพร้อ�
   const {f,call,pushes}=staffSetup();const tid=await withMechanic(f),id=crypto.randomUUID();
   await call(USER,'/api/tech/jobs',job(tid,id));
   const rev=async w=>(await call(w,'/api/tech/jobs/'+id)).job.revision;
-  await call(MECH,'/api/tech/jobs/'+id,{action:'quote',revision:await rev(MECH),labor:800,parts:400,travel:100,scope:'ล้างระบบแอร์และเติมน้ำยา',appointment:'พรุ่งนี้ 9 โมง',warranty:30});
+  await call(MECH,'/api/tech/jobs/'+id,{action:'quote',revision:await rev(MECH),labor:800,parts:400,partsNote:'น้ำยาแอร์ R134a 1 กระป๋อง',travel:100,scope:'ล้างระบบแอร์และเติมน้ำยา',appointment:'พรุ่งนี้ 9 โมง',warranty:30});
   assert.equal((await call(USER,'/api/tech/jobs/'+id,{action:'accept',revision:await rev(USER),consent:true})).status,200);
   const d=await call(USER,'/api/tech/jobs/'+id,{action:'dispute',revision:await rev(USER),note:'ช่างไม่มาตามนัดและติดต่อไม่ได้เลย'});assert.equal(d.status,200,JSON.stringify(d));
   const staff=pushes.filter(p=>/ข้อพิพาท/.test(words(p))&&['Uboss','Umod'].includes(p.body.to));
