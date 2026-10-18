@@ -107,6 +107,10 @@ export function jobCard(env, kind, j, shop, x = {}) {
       cut(x.desc, 90), 'งานเพิ่มทำได้ต่อเมื่อคุณกดยอมรับในใบงาน'] });
     case 'extra_ok': case 'extra_no': return card({ tag: 'งานเพิ่ม', title: kind === 'extra_ok' ? 'ลูกค้ายอมรับงานเพิ่ม' : 'ลูกค้าไม่รับงานเพิ่ม', url, label: 'เปิดใบงาน', lines: [
       car, cut(x.desc, 90)] });
+    case 'noreply': return card({ tag: 'รอคุณยืนยันงาน', title: `${shop} ส่งงานแล้ว รอคุณตรวจและยืนยัน`, url, label: 'ตรวจและยืนยัน', lines: [
+      car, 'ช่างส่งงานเกิน 24 ชม. แล้ว ทีมงาน Cendon จะติดต่อช่วยดูแล', 'ถ้างานเรียบร้อย กดยืนยันในใบงานได้เลย'] });
+    case 'showcase': return card({ tag: 'ขอใช้คลิปเป็นผลงาน', title: `${shop} ขอใช้คลิปงานรถของคุณบนหน้าร้าน`, url, label: 'อนุญาตหรือไม่อนุญาต', lines: [
+      `คลิป: ${cut(x.shot, 40)}`, 'คลิปอาจเห็นรถหรือสถานที่ของคุณ — เลือกได้ และถอนการอนุญาตได้ทุกเมื่อ'] });
     case 'message': return card({ tag: 'ข้อความใหม่', title: x.from || 'ข้อความใหม่', url, label: 'ตอบกลับ', lines: [
       cut(x.text, 140), car] });
     default: return null;

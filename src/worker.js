@@ -9,7 +9,7 @@ import { valetPrompt } from './agent-prompt.mjs';
 import { garageCheckin, GARAGE_CARE_KEY } from './garage-care.mjs';
 import { garageRulesFor, validateGarageWrite, appendGarageLog } from './garage-state.mjs';
 import { infoPatch, costReferences } from './garage-rules.mjs';
-import { handleTech, reconcileDiditIdentities, vaultSweep, expireStaleApplications, releaseWrongHolds, expireOpenJobs } from './techs.js';
+import { handleTech, reconcileDiditIdentities, vaultSweep, expireStaleApplications, releaseWrongHolds, expireOpenJobs, verifiedFixes } from './techs.js';
 import { richMenuStatus, setupRichMenu, lineStatus, lineFixWebhook } from './line-menu.js';
 import { appUrl, card, notify } from './line-notify.js';
 import { refreshNews, newsStatus } from './news.js';
@@ -1431,7 +1431,9 @@ async function chatSpecContext(env, uid, carId, carInfo, question) {
         spec = specBlock(sp, eq);
       }
     }
-    return (own ? '\n' + own : '') + spec;
+    /* งานซ่อมจริงใน Cendon ที่จบพร้อมหลักฐาน รุ่นเดียวกัน อาการคล้ายกัน (ไม่มีข้อมูลเจ้าของรถ) */
+    const fixes = await verifiedFixes(env, carInfo, question);
+    return (own ? '\n' + own : '') + spec + fixes;
   } catch (e) { console.error('[chat spec]', e && e.message); return ''; }
 }
 

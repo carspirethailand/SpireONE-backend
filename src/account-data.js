@@ -77,6 +77,14 @@ export const TABLES = [
   ['tech_limits', MINE, []],
   /* Car Passport ที่เจ้าของเปิดไว้ (ลิงก์ไม่ส่งออก — เป็นกุญแจเปิดหน้า) */
   ['car_passports', MINE, ['token']],
+  /* หลักฐานการซ่อม: งานของเรา (ลูกค้า) ได้ครบ · งานที่เราเป็นช่าง ไม่ส่งออกพิกัด (เป็นที่อยู่ของลูกค้า) */
+  ['tech_proofs', 'job_id IN (SELECT id FROM tech_jobs WHERE customer_uid = ?)', ['frame_hash']],
+  ['tech_proofs', `job_id IN (SELECT id FROM tech_jobs WHERE ${MY_SHOP})`, ['frame_hash', 'lat', 'lng']],
+  /* ผลงานบนหน้าร้าน: คลิปจากรถของเรา (ที่ร้านขอ) และที่ร้านของเราขอใช้ */
+  ['tech_showcase', `job_id IN (SELECT id FROM tech_jobs WHERE customer_uid = ?) OR ${MY_SHOP}`, []],
+  /* สิ่งที่เราแจ้งทีมงาน (ร้านที่ถูกแจ้งไม่เห็นว่าใครแจ้ง จึงไม่ส่งออกให้ฝั่งร้าน) */
+  ['tech_reports', MINE, []],
+  ['cust_strikes', MINE, []],
   /* ตัวนับเครื่องมือ AI รายวัน (f:<tool>:<uid>) อยู่ในตาราง usage */
   ['usage', "uid LIKE 'f:%:' || ?", []],
 ];
@@ -109,7 +117,7 @@ export async function exportAccount(env, uid, { email = '' } = {}) {
   for (const [table, where, omit] of TABLES) {
     const list = (await Promise.all((await rows(env, table, where, uid)).map(r => unseal(env, table, r)))).map(r => Object.fromEntries(Object.entries(r).filter(([k]) => !omit.includes(k)).map(([k, v]) => [k, unwrap(v)])));
     if (!list.length) continue;
-    const key = table === 'tech_jobs' && where === MY_SHOP ? 'tech_jobs_as_mechanic' : table;
+    const key = table === 'tech_jobs' && where === MY_SHOP ? 'tech_jobs_as_mechanic' : table === 'tech_proofs' && where.includes('tech_profiles') ? 'tech_proofs_as_mechanic' : table;
     data[key] = (data[key] || []).concat(list);
   }
   return {
@@ -176,6 +184,9 @@ export async function deleteAccount(env, uid, { email = '' } = {}) {
   const cancelled = JSON.stringify({ status: 'cancelled', at, by: 'system' });
   add('tech_jobs_cancelled', await run(env, `UPDATE tech_jobs SET status = 'cancelled', history = json_insert(CASE WHEN json_valid(history) THEN history ELSE '[]' END, '$[#]', json(?)), updated_at = ?
     WHERE status IN ('requested','quoted') AND (customer_uid = ? OR tech_id = ?)`, cancelled, at, uid, shop ? shop.id : '\u0000'));
+  /* รถของเรา: ถอนการอนุญาตให้ร้านใช้คลิปเป็นผลงาน · ลบพิกัดที่ถ่ายหลักฐาน (ที่อยู่ของเรา) */
+  add('tech_showcase', await run(env, "UPDATE tech_showcase SET status = 'no', decided_at = ? WHERE status != 'no' AND job_id IN (SELECT id FROM tech_jobs WHERE customer_uid = ?)", at, uid));
+  add('tech_proofs', await run(env, 'UPDATE tech_proofs SET lat = NULL, lng = NULL WHERE job_id IN (SELECT id FROM tech_jobs WHERE customer_uid = ?)', uid));
   /* ใบงานของเราในฐานะลูกค้า: เก็บประวัติให้ช่าง แต่ตัดทุกอย่างที่ระบุตัวเรา */
   add('tech_jobs', await run(env, `UPDATE tech_jobs SET customer_uid = 'deleted', phone = '', address = '', note = NULL, start_code = NULL, dispute = NULL,
     review = CASE WHEN review IS NOT NULL AND json_valid(review) THEN json_remove(review, '$.text') ELSE NULL END, updated_at = ? WHERE customer_uid = ?`, at, uid));
@@ -189,6 +200,7 @@ export async function deleteAccount(env, uid, { email = '' } = {}) {
     add('tech_gigs', await run(env, 'DELETE FROM tech_gigs WHERE uid = ?', uid));
     add('tech_sponsors', await run(env, 'DELETE FROM tech_sponsors WHERE uid = ?', uid));
     add('tech_views', await run(env, 'DELETE FROM tech_views WHERE tech_id = ?', shop.id));
+    add('tech_showcase', await run(env, 'DELETE FROM tech_showcase WHERE tech_id = ?', shop.id));
     add('tech_profiles', await run(env, `UPDATE tech_profiles SET uid = 'deleted:' || id, phone = NULL, data = ?, verified = 0, suspended = 1, online = 0, updated_at = ? WHERE uid = ?`,
       JSON.stringify({ name: 'ร้านที่ปิดบัญชีแล้ว', shop: 'ร้านที่ปิดบัญชีแล้ว', deleted: true }), at, uid));
   }
@@ -197,7 +209,7 @@ export async function deleteAccount(env, uid, { email = '' } = {}) {
   add('tech_identity_claims', keepClaim
     ? await run(env, "UPDATE tech_identity_claims SET uid = 'deleted:' || id_hash WHERE uid = ?", uid)
     : await run(env, 'DELETE FROM tech_identity_claims WHERE uid = ?', uid));
-  for (const t of ['tech_applications', 'tech_identity', 'tech_docs', 'tech_media', 'tech_shares', 'tech_limits', 'technicians', 'car_passports'])
+  for (const t of ['tech_applications', 'tech_identity', 'tech_docs', 'tech_media', 'tech_shares', 'tech_limits', 'technicians', 'car_passports', 'tech_reports', 'cust_strikes'])
     add(t, await run(env, `DELETE FROM ${t} WHERE uid = ?`, uid));
   add('usage', await run(env, "DELETE FROM usage WHERE uid LIKE 'f:%:' || ?", uid));
   /* ตำแหน่งล่าสุดตอนเราเป็นช่างที่กำลังเดินทาง: ลบทิ้ง */

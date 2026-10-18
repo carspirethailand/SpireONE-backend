@@ -1,7 +1,7 @@
 /* ช่างกำลังมา (แผนที่แบบ Grab) + Car Passport + ปฏิทินค่าใช้จ่าย/เครื่องมือ AI ใหม่ */
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {fixture,USER,ADMIN} from './tech-fixtures.mjs';
+import {fixture,USER,ADMIN,proveShots,fakeVision} from './tech-fixtures.mjs';
 import {withMechanic,MECH} from './tech-safety.test.mjs';
 import {buildFeatureRequest,cleanFeatureJson,featureCap} from '../src/features-ai.mjs';
 import {deleteAccount} from '../src/account-data.js';
@@ -11,7 +11,7 @@ async function accepted(f){
   const tid=await withMechanic(f),id=crypto.randomUUID();
   assert.equal((await f.call(USER,'/api/tech/jobs',{id,techId:tid,car:'Honda City 2019 · 42,000 กม.',symptom:'แบตหมด สตาร์ทไม่ติดเลย',area:'บางนา',address:ADDR,phone:'0812345678',requestedTime:'วันนี้',mode:'mobile'})).status,200);
   const rev=async who=>(await f.call(who,'/api/tech/jobs/'+id)).job.revision;
-  assert.equal((await f.call(MECH,'/api/tech/jobs/'+id,{action:'quote',revision:await rev(MECH),labor:300,parts:2500,travel:100,scope:'เปลี่ยนแบตเตอรี่ใหม่ 60Ah',appointment:'วันนี้ 30 นาที',warranty:180})).status,200);
+  assert.equal((await f.call(MECH,'/api/tech/jobs/'+id,{action:'quote',revision:await rev(MECH),labor:300,parts:2500,partsNote:'แบตเตอรี่ GS 3K MF 55B24L',travel:100,scope:'เปลี่ยนแบตเตอรี่ใหม่ 60Ah',appointment:'วันนี้ 30 นาที',warranty:180})).status,200);
   assert.equal((await f.call(USER,'/api/tech/jobs/'+id,{action:'accept',revision:await rev(USER),consent:true})).status,200);
   return {id,rev};
 }
@@ -50,6 +50,8 @@ async function completed(f){
   const {id,rev}=await accepted(f);
   const code=(await f.call(USER,'/api/tech/jobs/'+id)).job.startCode;
   assert.equal((await f.call(MECH,'/api/tech/jobs/'+id,{action:'start',revision:await rev(MECH),code})).status,200);
+  /* งานเปลี่ยนแบต = มีอะไหล่ → ต้องมีคลิปหลักฐาน 3 ช็อตก่อนส่งงาน */
+  await proveShots(f,MECH,id);
   assert.equal((await f.call(MECH,'/api/tech/jobs/'+id,{action:'done',revision:await rev(MECH),note:'เปลี่ยนแบตเตอรี่ 60Ah ใหม่ ทดสอบระบบไฟชาร์จปกติ'})).status,200);
   assert.equal((await f.call(USER,'/api/tech/jobs/'+id,{action:'complete',revision:await rev(USER)})).status,200);
   return id;

@@ -26,6 +26,8 @@ export function fakeVision(transform=out=>out){
     return {response:'```json\n'+JSON.stringify(out)+'\n```'};};
   return seen;
 }
+/* AI ตรวจคลิปหลักฐานปลอม: answer(step) คืน {result, part, note} หรือ throw = AI ล้ม */
+export function proofVision(answer){const seen={calls:0,steps:[]};vision=async(model,input)=>{seen.calls++;const head=JSON.parse(input.messages.find(m=>m.role==='user').content[0].text);seen.steps.push(head.step);return {response:JSON.stringify(answer(head.step,seen.calls))};};return seen;}
 export function failVision(msg='quota exceeded: private provider details'){const seen={calls:0};vision=async()=>{seen.calls++;throw Error(msg);};return seen;}
 /* Didit ปลอม: เปิด session / ส่งผล · decision = ผลที่จะตอบเมื่อถูกดึง (เปลี่ยนได้ระหว่างเทสต์) */
 export const DIDIT={DIDIT_API_KEY:'test-mock-only',DIDIT_WORKFLOW_ID:'wf-test',DIDIT_WEBHOOK_SECRET:'whsec-test-only'};
@@ -53,8 +55,10 @@ export function fixture(extra={}){
   /* กุญแจทดสอบเท่านั้น — ของจริงตั้งด้วย wrangler secret put (ดู DEPLOY.md) */
   const env={DB,AI,OWNERS:'boss@unit.test',APP_DATA_KEY:TEST_DATA_KEY,ID_HASH_KEY:'test-only-id-hash-key',...extra};
   const verifyToken=async token=>{const [uid,email,verified]=token.split('|');if(!uid)throw Error('invalid');return {sub:uid,email,email_verified:verified!=='unverified'};};
+  /* อัปโหลดไฟล์ดิบ (คลิป/รูป) ผ่าน /api/tech/media แบบเดียวกับหน้าเว็บ */
+  const put=async(token,id,bytes,mime,scope='draft')=>{const r=await handleTech(new Request(`https://unit.test/api/tech/media/${id}?scope=${scope}`,{method:'PUT',headers:{Authorization:'Bearer '+token,'Content-Type':mime},body:bytes}),env,undefined,{verifyToken});return {...await r.json(),status:r.status};};
   const call=async(token,path,body)=>{const r=await handleTech(new Request('https://unit.test'+path,{method:body?'POST':'GET',headers:token?{Authorization:'Bearer '+token}:{},body:body?JSON.stringify(body):undefined}),env,undefined,{verifyToken});return {...await r.json(),status:r.status};};
-  return {call,sqlite,env};
+  return {call,put,sqlite,env};
 }
 export const USER='applicant|person@unit.test',ADMIN='boss|boss@unit.test';
 /* ส่งใบสมัคร แล้วทีมงานตรวจเลขบัตรตามขั้นตอนปกติ (พิมพ์เลขที่เห็นบนรูปบัตร ระบบเทียบแฮช) · idcheck:false = ข้ามขั้นนี้ ใช้ทดสอบว่าระบบบังคับจริง */
@@ -65,3 +69,16 @@ export async function pending(f,over={},{idcheck=true}={}){const body=form(over)
 /* ข้อสงสัยด่านบัตร (ทีมงานเทียบเลขบัตรเอง / ข้อสงสัยจาก Didit) ต้องมีบันทึกของทีมงาน — เติมให้เฉพาะด่านบัตร ด่านรูปผลงานยังให้แต่ละเทสต์กำหนดเอง */
 export const idNotes=a=>Object.fromEntries([...(a.ai?.flags||[]),...(a.identity?.flags||[])].filter(f=>f.source==='identity'&&f.level!=='low'&&!f.block).map(f=>[f.code,{outcome:'false_positive',note:'Test-only: compared the ID number digit by digit with the form.'}]));
 export const review=(a,over={})=>({uid:a.uid,revision:a.revision,decision:'approve',checks:Object.fromEntries(['identity','phone','work','skills','shop','terms'].map(k=>[k,true])),evidence:evidence(),note:'Test-only completed human review with evidence.',...over,resolutions:{...idNotes(a),...(over.resolutions||{})}});
+
+/* หลักฐานการซ่อม: อัดคลิป (ไฟล์ทดสอบเล็ก ๆ) ทีละช็อต แล้วส่งพร้อมภาพนิ่งจากคลิป */
+export const frame=(n=1)=>'data:image/png;base64,'+png(n,64,48).toString('base64');
+export async function proveShots(f,token,jobId,shots=['old','new','fit']){
+  const out=[];
+  for(const [i,shot] of shots.entries()){
+    const mid='m_'+crypto.randomUUID().replace(/-/g,'').slice(0,20);
+    const up=await f.put(token,mid,new Uint8Array([0,0,0,24,102,116,121,112,105+i]),'video/mp4');if(up.status!==200)throw Error('upload '+JSON.stringify(up));
+    const r=await f.call(token,'/api/tech/jobs/'+jobId+'/proof',{shot,media:mid,frames:[frame(10+i+Math.floor(Math.random()*200))]});
+    if(r.status!==200)throw Error('proof '+JSON.stringify(r));out.push(r);
+  }
+  return out;
+}

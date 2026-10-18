@@ -1,7 +1,7 @@
 /* ความปลอดภัยของลูกค้าเมื่อพาช่าง (คนแปลกหน้า) ไปพบลูกค้าและรถ */
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {fixture,USER,ADMIN,fakeVision,pending,review} from './tech-fixtures.mjs';
+import {fixture,USER,ADMIN,fakeVision,pending,review,proveShots} from './tech-fixtures.mjs';
 
 export const MECH='mech|mech@unit.test';
 /* ช่างที่ผ่านการตรวจแล้ว (ใส่ตรงในฐานข้อมูล — การอนุมัติจริงมีเทสต์ของมันเองแล้ว) */
@@ -50,7 +50,7 @@ async function acceptedJob(f){
   const tid=await withMechanic(f),id=crypto.randomUUID();
   assert.equal((await f.call(USER,'/api/tech/jobs',{id,techId:tid,car:'Honda City 2019',symptom:'แอร์ไม่เย็น มีลมออกแต่ไม่เย็น',area:'บางนา',address:'99/1 ซอยทดสอบ บางนา',phone:'0812345678',requestedTime:'พรุ่งนี้เช้า',mode:'mobile'})).status,200);
   const rev=async who=>(await f.call(who,'/api/tech/jobs/'+id)).job.revision;
-  assert.equal((await f.call(MECH,'/api/tech/jobs/'+id,{action:'quote',revision:await rev(MECH),labor:800,parts:400,travel:100,scope:'ล้างระบบแอร์และเติมน้ำยา',appointment:'พรุ่งนี้ 9 โมง',warranty:30})).status,200);
+  assert.equal((await f.call(MECH,'/api/tech/jobs/'+id,{action:'quote',revision:await rev(MECH),labor:800,parts:400,partsNote:'น้ำยาแอร์ R134a 1 กระป๋อง',travel:100,scope:'ล้างระบบแอร์และเติมน้ำยา',appointment:'พรุ่งนี้ 9 โมง',warranty:30})).status,200);
   assert.equal((await f.call(USER,'/api/tech/jobs/'+id,{action:'accept',revision:await rev(USER),consent:true})).status,200);
   return {id,rev};
 }
@@ -82,6 +82,7 @@ test('add-on work changes the price only after the customer accepts; confirmed p
   assert.equal((await f.call(USER,'/api/tech/jobs/'+id,{action:'extra_ok',revision:await rev(USER),extraId:j.extras[0].id})).status,200);
   j=(await f.call(USER,'/api/tech/jobs/'+id)).job;assert.equal(j.agreedTotal,2500);
   const photo='data:image/jpeg;base64,'+Buffer.from([255,216,255,217]).toString('base64');
+  await proveShots(f,MECH,id);
   assert.equal((await f.call(MECH,'/api/tech/jobs/'+id,{action:'done',revision:await rev(MECH),note:'ซ่อมเสร็จเรียบร้อยแล้ว',photos:[photo]})).status,200);
   assert.equal((await f.call(USER,'/api/tech/jobs/'+id)).job.photosAfter.length,1);
 });

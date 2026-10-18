@@ -12,11 +12,13 @@
  *   - เบอร์กับที่อยู่ลูกค้าเปิดให้ช่างเห็นหลังลูกค้ายืนยันราคาแล้วเท่านั้น
  */
 import { verifyFirebaseToken, firebaseProjects } from './auth.js';
-import { screenApplication, screeningSnapshot, aiConsented, visionReady } from './tech-screen.js';
+import { screenApplication, screeningSnapshot, aiConsented, visionReady, sha256 } from './tech-screen.js';
 import { applicantErrors, imageInfo, approvalError, CONSENT_VER } from './tech-vetting.js';
 import { diditReady, verifyDidit, diditFacts, identityFlags, diditFetch, idHashOf, upgradeHash, sameHex } from './tech-identity.js';
 import { notify, jobCard, card, once, appUrl } from './line-notify.js';
-import { MEDIA_SQL, MediaError, putMedia, getMedia, deleteMedia, claimMedia, mediaLabel } from './media.js';
+import { MEDIA_SQL, MEDIA_ID, MediaError, putMedia, getMedia, sendMedia, deleteMedia, claimMedia, mediaLabel } from './media.js';
+import { PROOF_SQL, PROOF_ALTER, ALL_SHOTS, SHOT_TH, MAX_TRIES, proofPlan, proofLevel, partMatch, OPEN_STATES, capOf, NOREPLY_AFTER, NOREPLY_TEXT,
+  STRIKE_LIMIT, STRIKE_WINDOW, checkShot, symptomWords, fixesBlock, scrub } from './proof.js';
 import { seal, open, vaultReady, needsReseal, currentKeyId, CTX } from './vault.js';
 const CATS = ['body', 'ev', 'tyre', 'air', 'eng'];
 const CAT_TH = { body: 'ตัวถัง & สี', ev: 'ไฟฟ้า & EV', tyre: 'ยาง & ช่วงล่าง', air: 'แอร์รถยนต์', eng: 'เครื่องยนต์' };
@@ -27,7 +29,7 @@ const CHECKS = ['identity', 'phone', 'work', 'skills', 'shop', 'terms'];
    ใบรับรองฝีมือไม่บังคับ — ช่างเก่งจำนวนมากไม่มีใบ ทีมงานสัมภาษณ์ทักษะแทนได้ */
 const DOCS = [['id', 1, 1], ['selfie', 1, 1], ['shop', 1, 3], ['work', 3, 6], ['cert', 0, 2]];
 const PRIVATE_DOCS = ['id', 'selfie', 'cert'];
-const API_VERSION = 12;
+const API_VERSION = 13;
 const PHONE = /^0\d{8,9}$/;
 const now = () => Date.now();
 
@@ -186,9 +188,9 @@ const TECH_ALTER = [
 const techReady = new WeakMap();
 async function ensureTech(env) {
   if (!techReady.has(env.DB)) {
-    const task=(async()=>{for(const sql of [...TECH_SQL,...MEDIA_SQL])await env.DB.prepare(sql).run();
+    const task=(async()=>{for(const sql of [...TECH_SQL,...MEDIA_SQL,...PROOF_SQL])await env.DB.prepare(sql).run();
       let holdAdded=false;
-      for(const sql of TECH_ALTER)try{await env.DB.prepare(sql).run();if(/ADD COLUMN id_hold/.test(sql))holdAdded=true}catch(e){if(!/duplicate column|already exists/i.test(e.message||''))throw e;}
+      for(const sql of [...TECH_ALTER,...PROOF_ALTER])try{await env.DB.prepare(sql).run();if(/ADD COLUMN id_hold/.test(sql))holdAdded=true}catch(e){if(!/duplicate column|already exists/i.test(e.message||''))throw e;}
       /* เพิ่งเพิ่มคอลัมน์ครั้งแรก: ร้านที่ถูกพักอยู่และตัวตนยังไม่ผ่าน = ถูกพักเพราะตัวตน (พฤติกรรมเดิมก่อนแยกสถานะ) */
       if(holdAdded)await env.DB.prepare("UPDATE tech_profiles SET id_hold=1 WHERE test=0 AND suspended=1 AND uid IN (SELECT uid FROM tech_identity WHERE status!='approved')").run();
       if(env.ID_HASH_KEY)await upgradeIdHashes(env);})();
@@ -386,6 +388,8 @@ function publicTech(r) {
     subs: d.subs || [], week: d.week || null, brands2: d.brands2 || [], line: d.line || '', facebook: d.facebook || '', address: d.address || '',
     /* โหมดพักร้อน: แสดงบนหน้าร้าน และงดรับคำขอใหม่จนกว่าจะถึงวันที่ตั้ง */
     vacation: vacationOf(d), greet: d.greet || '', theme: d.theme || '',
+    /* งานที่ซ่อมจบพร้อมหลักฐานที่ AI ตรวจผ่าน (รวม + แยกหมวด) · full = งานค้างเต็ม เสนอราคางานใหม่ไม่ได้ชั่วคราว */
+    proven: r.proven ? r.proven.n : 0, provenCats: r.proven ? r.proven.cats : {}, full: !r.test && (r.openJobs || 0) >= capOf(d),
     vetting: d.vetting && r.verified ? { at: d.vetting.at, identity: !!d.vetting.identity, phone: !!d.vetting.phone, shop: d.vetting.shop || '', skills: d.vetting.skills || '', cats: d.vetting.cats || [], mobile: !!d.vetting.mobile } : null,
   };
 }
@@ -409,6 +413,17 @@ async function withPhotos(env, rows) {
   results.forEach(d => (by[d.uid] = by[d.uid] || []).push(d.id));
   return rows.map(r => ({ ...r, photos: by[r.uid] || [] }));
 }
+/* จำนวนงานค้าง + งานที่จบพร้อมหลักฐาน ของทุกร้านในรายการ — ดึงครั้งเดียวทั้งรายการ */
+async function withTrust(env, rows) {
+  if (!rows.length) return rows;
+  const ids = rows.map(r => r.id);
+  const open = await inAll(env, `SELECT tech_id, COUNT(*) AS n FROM tech_jobs WHERE status IN ('accepted','enroute','working','done') AND tech_id IN ({IN}) GROUP BY tech_id`, ids);
+  const proven = await inAll(env, `SELECT j.tech_id, p.cat, COUNT(*) AS n FROM tech_jobs j LEFT JOIN tech_posts p ON p.id = j.group_id
+    WHERE j.status = 'completed' AND j.test = 0 AND json_extract(j.proof, '$.level') = 'verified' AND j.tech_id IN ({IN}) GROUP BY j.tech_id, p.cat`, ids);
+  const o = Object.fromEntries(open.map(r => [r.tech_id, r.n])), pv = {};
+  for (const r of proven) { const x = pv[r.tech_id] = pv[r.tech_id] || { n: 0, cats: {} }; x.n += r.n; if (r.cat) x.cats[r.cat] = (x.cats[r.cat] || 0) + r.n; }
+  return rows.map(r => ({ ...r, openJobs: o[r.id] || 0, proven: pv[r.id] || null }));
+}
 async function techById(env, id) {
   return env.DB.prepare('SELECT * FROM tech_profiles WHERE id = ?').bind(id).first();
 }
@@ -418,7 +433,7 @@ async function listTechs(env, me, url) {
     adminOnly(me);
     const { results } = await env.DB.prepare(
       'SELECT * FROM tech_profiles WHERE test = 1 AND suspended = 0 ORDER BY created_at DESC').all();
-    return { techs: (await withPhotos(env, results)).map(publicTech) };
+    return { techs: (await withTrust(env, await withPhotos(env, results))).map(publicTech) };
   }
   /* ทีมงานเห็นช่างทดสอบปนอยู่ในรายชื่อจริงด้วย (มีป้ายบอก) — ทดสอบได้เหมือนลูกค้าจริงทุกขั้น
      คนทั่วไปไม่เห็นช่างทดสอบเลย */
@@ -426,7 +441,7 @@ async function listTechs(env, me, url) {
     ? 'SELECT * FROM tech_profiles WHERE suspended = 0 AND (verified = 1 OR test = 1) ORDER BY test DESC, online DESC, created_at DESC LIMIT 500'
     : 'SELECT * FROM tech_profiles WHERE test = 0 AND suspended = 0 AND verified = 1 ORDER BY online DESC, created_at DESC LIMIT 500';
   const { results } = await env.DB.prepare(q).all();
-  return { techs: (await withPhotos(env, results)).map(publicTech) };
+  return { techs: (await withTrust(env, await withPhotos(env, results))).map(publicTech) };
 }
 
 /* staff = ทีมงานเห็นผล AI ครบ · ผู้สมัครเห็นแค่สถานะ (ไม่เห็นจุดสงสัย กันการลองหาทางหลบระบบ) */
@@ -488,7 +503,9 @@ async function meInfo(env, me) {
   return {
     uid: me.uid, email: me.email, admin: me.admin, staff: me.staff, owner: !!me.owner, version: API_VERSION,
     application: appOut(await openApp(env, a), false, ident),
-    technician: t ? { ...publicTech((await withPhotos(env, [t]))[0]), suspended: !!t.suspended,
+    technician: t ? { ...publicTech((await withTrust(env, await withPhotos(env, [t])))[0]), suspended: !!t.suspended,
+      /* งานค้าง/เพดาน (Studio บอกช่างก่อนเสนอราคา) */
+      capacity: { open: jobs.filter(x => x.side === 'technician' && OPEN_STATES.includes(x.status)).length, cap: capOf(parse(t.data) || {}) },
       identityHold: !!(!t.test && t.suspended && t.id_hold),
       /* ค่าตั้งของร้านที่เห็นเฉพาะเจ้าของ (Studio → ตั้งค่า) */
       ...(() => { const d = parse(t.data) || {}; return { autoReply: d.autoReply || null, minPrice: d.minPrice || 0, vacationRaw: d.vacation || null }; })() } : null,
@@ -905,7 +922,7 @@ async function mediaRoute(env, request, id, h, verifyToken) {
     const [k, sid] = scope.split(':');
     try {
       if (k === 'thread') { await threadCtx(env, me, sid); return true; }
-      if (k === 'job') { await loadJob(env, me, sid); return true; }
+      if (k === 'job' || k === 'proof') { await loadJob(env, me, sid); return true; }
     } catch (e) { if (!(e instanceof HttpError)) throw e; }
     return false;
   };
@@ -1118,7 +1135,9 @@ const NEXT = {
   enroute:  ['tech',     ['accepted'],                                        'enroute'],
   start:    ['tech',     ['accepted', 'enroute'],                             'working'],
   done:     ['tech',     ['working'],                                         'done'],
-  complete: ['customer', ['done'],                                            'completed'],
+  complete: ['customer', ['done', 'disputed'],                                'completed'],
+  /* ส่งงานแล้วเกิน 24 ชม. ลูกค้าเงียบ → ทีมงานช่วยดูแล (งานนี้เลิกนับเป็นงานค้างของช่างทันที) */
+  noreply:  ['tech',     ['done'],                                            'disputed'],
   cancel:   ['either',   ['requested', 'quoted', 'accepted', 'enroute'],      'cancelled'],
   dispute:  ['either',   ['accepted', 'enroute', 'working', 'done', 'completed'], 'disputed'],
   resolve:  ['admin',    ['disputed'],                                        null],
@@ -1460,6 +1479,7 @@ async function createJob(env, me, b) {
   if (t.test && !me.staff) fail(404, 'ไม่พบช่าง');
   if (!t.test && !t.verified) fail(404, 'ช่างยังไม่ผ่านการตรวจ');
   if (t.uid === me.uid) fail(400, 'ขอราคาจากร้านตัวเองไม่ได้');
+  await strikeCheck(env, me);
   const d = parse(t.data) || {};
   const vac = vacationOf(d);
   if (vac) fail(409, 'ร้านนี้ปิดชั่วคราว' + (vac.note ? ' — ' + vac.note : '') + ' ลองร้านอื่นก่อนนะ');
@@ -1571,6 +1591,12 @@ async function getJob(env, me, id) {
   out.photos = await mediaOf(env, [j.id, j.group_id]);
   out.photosBefore = await mediaOf(env, [j.id + ':before']);
   out.photosAfter = await mediaOf(env, [j.id + ':after']);
+  out.proof = await proofOut(env, j);
+  if (j.noreply_at) out.noreplyAt = j.noreply_at;
+  if (role === 'technician' || role === 'both') {
+    const doneAt = ((parse(j.history) || []).filter(x => x.status === 'done').pop() || {}).at || 0;
+    if (j.status === 'done' && doneAt) out.noreplyFrom = doneAt + NOREPLY_AFTER;
+  }
   if (role === 'customer' || role === 'both') {
     const sh = await env.DB.prepare('SELECT token, expires_at FROM tech_shares WHERE job_id = ? AND revoked = 0 AND expires_at > ? ORDER BY created_at DESC LIMIT 1').bind(j.id, now()).first();
     out.share = sh ? { token: sh.token, expiresAt: sh.expires_at } : null;
@@ -1622,6 +1648,7 @@ async function updateJob(env, me, id, b) {
   if (action === 'newcode') return newStartCode(env, me, ctx);
   if (action === 'share' || action === 'unshare') return shareJob(env, me, ctx, action);
   if (action === 'extra' || action === 'extra_ok' || action === 'extra_no') return extraWork(env, ctx, action, b);
+  if (action === 'showcase_ask' || action === 'showcase_ok' || action === 'showcase_no') return showcase(env, ctx, action, b);
 
   const rule = NEXT[action];
   if (!rule) fail(400, 'ไม่รู้จักคำสั่งนี้');
@@ -1661,24 +1688,35 @@ async function updateJob(env, me, id, b) {
   let reviewPics = [];
 
   if (action === 'quote') {
-    const labor = num(b.labor, 'ค่าแรง', 0, 1000000), parts = num(b.parts, 'อะไหล่', 0, 1000000),
-      travel = num(b.travel, 'ค่าเดินทาง', 0, 100000);
-    if (labor + parts + travel <= 0) fail(400, 'ราคารวมต้องมากกว่า 0');
-    set.quote = JSON.stringify({ labor, parts, travel, total: Math.round((labor + parts + travel) * 100) / 100,
-      scope: str(b.scope, 'ขอบเขตงาน', 10, 2000), appointment: str(b.appointment, 'วันเวลานัด', 4, 200),
-      warranty: num(b.warranty, 'รับประกัน', 0, 365), at: ts });
+    if (isTech) await capCheck(env, t, j.id);
+    set.quote = JSON.stringify(quoteIn(b, ts));
   }
   if (action === 'accept') {
     if (b.consent !== true) fail(400, 'ต้องยอมรับขอบเขตงานและราคาก่อน');
     set.accepted_at = ts;
     set.start_code = startCode(); set.start_exp = ts + CODE_TTL; set.start_tries = 0;
   }
-  if (action === 'done') set.completion = str(b.note, 'สรุปงาน', 10, 2000);
+  if (action === 'done') {
+    set.completion = str(b.note, 'สรุปงาน', 10, 2000);
+    /* งานเปลี่ยนอะไหล่: ต้องมีคลิปหลักฐานครบ 3 ช็อตก่อน · สรุปผลเก็บไว้กับใบงาน (Passport/หน้าร้านใช้ค่านี้) */
+    const plan = proofPlan(parse(j.quote), parse(j.extras)), rows = await proofRows(env, j.id);
+    if (plan.need && proofLevel(plan, rows) === 'none') fail(400, 'งานนี้เปลี่ยนอะไหล่ — ถ่ายคลิปหลักฐานให้ครบ 3 ช็อตก่อนแจ้งซ่อมเสร็จ (อะไหล่เก่า · อะไหล่ใหม่กับป้ายเลข · ใส่เสร็จ)');
+    set.proof = JSON.stringify(proofSummary(plan, rows, parse(j.quote)));
+  }
+  if (action === 'noreply') {
+    const doneAt = ((parse(j.history) || []).filter(x => x.status === 'done').pop() || {}).at || 0;
+    if (!doneAt || ts - doneAt < NOREPLY_AFTER) fail(409, 'กด "ลูกค้าไม่ตอบ" ได้เมื่อส่งงานแล้วเกิน 24 ชั่วโมง');
+    set.dispute = NOREPLY_TEXT; set.noreply_at = ts;
+  }
+  /* ข้อพิพาทจริงต้องให้ทีมงานปิด · ลูกค้ากดยืนยันเองได้เฉพาะกรณีที่ช่างแจ้งว่าลูกค้าไม่ตอบ */
+  if (action === 'complete' && j.status === 'disputed' && !j.noreply_at) fail(409, 'มีการแจ้งปัญหาในงานนี้อยู่ ทีมงานจะช่วยปิดเรื่อง');
   if (action === 'cancel') set.resolution = 'ยกเลิก: ' + str(b.note, 'เหตุผล', 5, 2000);
   if (action === 'dispute') set.dispute = str(b.note, 'รายละเอียดปัญหา', 10, 2000);
   if (action === 'resolve') {
     set.resolution = str(b.note, 'ผลการช่วยเหลือ', 10, 2000);
     next = b.outcome === 'cancelled' ? 'cancelled' : 'completed';
+    /* ทีมงานยืนยันว่าลูกค้าเงียบหายจริง (ปิดงานให้ช่าง) = นับเป็นครั้งของลูกค้า */
+    if (j.noreply_at && next === 'completed' && !j.test) extra.push(env.DB.prepare('INSERT OR IGNORE INTO cust_strikes (uid, job_id, at) VALUES (?,?,?)').bind(j.customer_uid, j.id, ts));
   }
   if (action === 'complete' && t) extra.push(env.DB.prepare('UPDATE tech_profiles SET jobs = jobs + 1 WHERE id = ?').bind(t.id));
   if (action === 'review') {
@@ -1740,14 +1778,235 @@ async function updateJob(env, me, id, b) {
   /* แจ้งอีกฝ่ายทาง LINE เฉพาะจังหวะที่เขาต้องรู้หรือต้องทำอะไรต่อ (เริ่มซ่อม/ทีมงานปิดเรื่อง ไม่แจ้ง) */
   const jj = { ...j, ...set }, shop = shopOf(t), techUid = t && t.uid, other = by === 'customer' ? techUid : j.customer_uid;
   const dest = { quote: j.customer_uid, accept: techUid, enroute: j.customer_uid, done: j.customer_uid,
-    complete: techUid, review: techUid, cancel: other, dispute: other }[action];
+    complete: techUid, review: techUid, cancel: other, dispute: other, noreply: j.customer_uid }[action];
   if (dest && dest !== me.uid) tell(env, dest, () => jobCard(env, action, jj, shop, {
     note: b.note, by, rating: b.rating && Math.round(Number(b.rating)), text: b.note }));
   /* ข้อพิพาท: ทีมงานต้องเข้าไปช่วยตัดสิน — แจ้งทุกใบ (กันกดซ้ำในใบเดียวกัน 1 ชั่วโมง) · งานทดสอบไม่แจ้ง */
+  if (action === 'noreply' && !j.test) tellStaff(env, 'staff:noreply:' + j.id, 3600000, async () => card({
+    tag: 'ทีมงาน', title: 'ช่างแจ้งว่าลูกค้าไม่ยืนยันงาน', label: 'เปิดใบงาน', url: appUrl(env, '/?job=' + j.id),
+    lines: [`ร้าน: ${shop}`, `รถ: ${j.car}`, 'ตรวจหลักฐานแล้วปิดงาน หรือติดต่อลูกค้า'] }));
   if (action === 'dispute' && !j.test) tellStaff(env, 'staff:dispute:' + j.id, 3600000, async () => card({
     tag: 'ทีมงาน', title: 'มีข้อพิพาทในใบงาน ต้องช่วยตัดสิน', label: 'เปิดใบงาน', url: appUrl(env, '/?job=' + j.id),
     lines: [`ร้าน: ${shop}`, `รถ: ${j.car}`, `แจ้งโดย: ${by === 'customer' ? 'ลูกค้า' : 'ช่าง'}`] }));
   return { ok: true };
+}
+
+/* ใบเสนอราคา (จากใบขอราคา หรือจากประกาศหาช่าง) — มีค่าอะไหล่ต้องบอกว่าอะไหล่อะไร
+   ลูกค้าเห็นก่อนยืนยัน · ใช้เทียบกับเลขบนกล่องในคลิปหลักฐาน · ขึ้น Passport ว่าเป็นอะไหล่มือสองตามจริง */
+function quoteIn(b, ts) {
+  const labor = num(b.labor, 'ค่าแรง', 0, 1000000), parts = num(b.parts, 'อะไหล่', 0, 1000000), travel = num(b.travel, 'ค่าเดินทาง', 0, 100000);
+  if (labor + parts + travel <= 0) fail(400, 'ราคารวมต้องมากกว่า 0');
+  const q = { labor, parts, travel, total: Math.round((labor + parts + travel) * 100) / 100,
+    scope: str(b.scope, 'ขอบเขตงาน', 10, 2000), appointment: str(b.appointment, 'วันเวลานัด', 4, 200),
+    warranty: num(b.warranty, 'รับประกัน', 0, 365), at: ts };
+  if (parts > 0) { q.partsNote = str(b.partsNote, 'อะไหล่ที่ใช้ (ชื่อ ยี่ห้อ หรือเลขอะไหล่)', 2, 300); q.partsUsed = b.partsUsed === true; }
+  return q;
+}
+
+/* ── งานค้าง: ยืนยันราคาแล้วแต่ลูกค้ายังไม่กดว่างานเสร็จ ── */
+async function openJobs(env, techId, except) {
+  const r = await env.DB.prepare(`SELECT COUNT(*) AS n FROM tech_jobs WHERE tech_id = ? AND id != ? AND status IN (${OPEN_STATES.map(() => '?').join(',')})`)
+    .bind(techId, except || '', ...OPEN_STATES).first();
+  return Number(r && r.n || 0);
+}
+/* เต็มแล้วเสนอราคางานใหม่ไม่ได้ (ร้านทดสอบของทีมงานไม่จำกัด) */
+async function capCheck(env, t, except) {
+  if (!t || t.test) return;
+  const cap = capOf(parse(t.data) || {}), n = await openJobs(env, t.id, except);
+  if (n >= cap) fail(409, `งานค้างเต็มแล้ว (${n}/${cap} งาน) — ส่งงานให้ลูกค้ายืนยันก่อน หรือกด "ลูกค้าไม่ตอบ" ในงานที่ส่งเกิน 24 ชม. แล้วค่อยเสนอราคาใหม่`);
+}
+/* ลูกค้าที่ทีมงานยืนยันว่าเงียบหายหลังช่างส่งงานหลายครั้ง เรียกช่างใหม่ไม่ได้ชั่วคราว */
+async function strikeCheck(env, me) {
+  if (me.staff) return;
+  const r = await env.DB.prepare('SELECT COUNT(*) AS n FROM cust_strikes WHERE uid = ? AND at > ?').bind(me.uid, now() - STRIKE_WINDOW).first();
+  if (Number(r && r.n || 0) >= STRIKE_LIMIT) fail(403, 'บัญชีนี้ถูกจำกัดการเรียกช่างชั่วคราว เพราะไม่ยืนยันงานหลังช่างส่งงานหลายครั้ง — ติดต่อทีมงานทาง LINE เพื่อขอปลดได้');
+}
+/* ทีมงานตั้งจำนวนช่องซ่อมจริงของอู่ (เพดานงานค้าง) */
+async function setBays(env, me, b) {
+  adminOnly(me);
+  const t = await techById(env, String(b.id || ''));
+  if (!t) fail(404, 'ไม่พบช่าง');
+  const d = parse(t.data) || {}, bays = Math.round(num(b.bays, 'จำนวนช่องซ่อม', 1, 30));
+  await env.DB.prepare('UPDATE tech_profiles SET data = ?, updated_at = ? WHERE id = ?').bind(JSON.stringify({ ...d, bays }), now(), t.id).run();
+  await audit(env, me, 'bays', t.id, String(bays));
+  return { ok: true, bays };
+}
+
+/* ── หลักฐานการซ่อม ── */
+async function proofRows(env, jobId) {
+  const { results } = await env.DB.prepare('SELECT * FROM tech_proofs WHERE job_id = ?').bind(jobId).all();
+  return results;
+}
+function proofSummary(plan, rows, q) {
+  const by = Object.fromEntries(rows.map(r => [r.shot, r]));
+  return { level: proofLevel(plan, rows), need: plan.need,
+    shots: plan.shots.filter(s => by[s]).map(s => ({ shot: s, media: by[s].media_id, result: by[s].result })),
+    partMatch: plan.need ? partMatch(q && q.partsNote, (by.new && by.new.part) || '') : 'unknown', partsUsed: !!(q && q.partsUsed) };
+}
+/* ใบงาน: แผนช็อตของงานนี้ + ช็อตที่ถ่ายแล้ว + ผล AI + สถานะขอใช้เป็นผลงาน */
+async function proofOut(env, j) {
+  const q = parse(j.quote), plan = proofPlan(q, parse(j.extras)), rows = await proofRows(env, j.id);
+  const by = Object.fromEntries(rows.map(r => [r.shot, r]));
+  const stored = parse(j.proof);
+  const ids = rows.map(r => r.media_id);
+  const sc = ids.length ? await inAll(env, 'SELECT media_id, status FROM tech_showcase WHERE media_id IN ({IN})', ids) : [];
+  const show = Object.fromEntries(sc.map(r => [r.media_id, r.status]));
+  return { need: plan.need, plan: plan.shots, level: stored ? stored.level : proofLevel(plan, rows),
+    partMatch: stored ? stored.partMatch : 'unknown', partsUsed: !!(q && q.partsUsed), partsNote: (q && q.partsNote) || '',
+    shots: plan.shots.filter(s => by[s]).map(s => ({ shot: s, media: by[s].media_id, result: by[s].result, note: by[s].note || '', part: by[s].part || '',
+      tries: by[s].tries, retake: by[s].result !== 'pass' && by[s].tries < MAX_TRIES, at: by[s].at, showcase: show[by[s].media_id] || null })) };
+}
+/* ภาพนิ่ง 1–3 ภาพที่แอปตัดจากคลิป (ให้ AI ดู) */
+function framesIn(b) {
+  const list = Array.isArray(b.frames) ? b.frames : [];
+  if (!list.length || list.length > 3) fail(400, 'ต้องมีภาพจากคลิป 1–3 ภาพ');
+  return list.map(x => {
+    const m = /^data:(image\/(?:jpeg|webp|png));base64,([A-Za-z0-9+/=]+)$/.exec(String(x || ''));
+    if (!m || m[2].length > 600000) fail(400, 'ภาพจากคลิปไม่ถูกต้อง');
+    return { mime: m[1], data: m[2] };
+  });
+}
+/* ช่างส่งคลิปหนึ่งช็อต: ต้องอยู่ระหว่างซ่อม · คลิปของตัวเองที่อัปโหลดหลังเริ่มงานนี้ · อัดใหม่ได้ 1 ครั้งเมื่อ AI ไม่แน่ใจ */
+async function saveProof(env, me, id, b) {
+  const { j, t, isTech } = await loadJob(env, me, id);
+  if (!isTech) fail(403, 'เฉพาะช่างในใบงานนี้ที่ถ่ายหลักฐานได้');
+  if (j.status !== 'working') fail(409, 'ถ่ายหลักฐานได้ระหว่างซ่อม (หลังเริ่มงาน ก่อนแจ้งซ่อมเสร็จ)');
+  const shot = String(b.shot || ''), plan = proofPlan(parse(j.quote), parse(j.extras));
+  if (!ALL_SHOTS.includes(shot) || !plan.shots.includes(shot)) fail(400, 'งานนี้ไม่ใช้ช็อตนี้');
+  const mid = String(b.media || '');
+  const m = MEDIA_ID.test(mid) && await env.DB.prepare('SELECT id, uid, scope, kind, created_at FROM media WHERE id = ?').bind(mid).first();
+  if (!m || m.uid !== me.uid || m.kind !== 'video' || !['draft', 'proof:' + j.id].includes(m.scope)) fail(400, 'ไม่พบคลิป กรุณาอัดใหม่');
+  /* คลิปที่อัปโหลดก่อนเริ่มงานนี้ (เช่น คลิปเก่าจากงานอื่น) ใช้ไม่ได้ */
+  const startAt = ((parse(j.history) || []).filter(x => x.status === 'working').pop() || {}).at || j.accepted_at || 0;
+  if (m.created_at < startAt - 60000) fail(400, 'คลิปนี้อัดก่อนเริ่มงาน — อัดใหม่ระหว่างซ่อม');
+  const frames = framesIn(b);
+  const cur = await env.DB.prepare('SELECT tries, media_id, result FROM tech_proofs WHERE job_id = ? AND shot = ?').bind(j.id, shot).first();
+  if (cur && cur.result === 'pass') fail(409, 'ช็อตนี้ AI ตรวจผ่านแล้ว');
+  if (cur && cur.tries >= MAX_TRIES) fail(409, 'ช็อตนี้อัดใหม่ครบแล้ว ส่งงานต่อได้เลย');
+  await limit(env, 'proof', me.uid, 120);
+  const hash = await sha256(frames[0].data);
+  const dup = await env.DB.prepare('SELECT job_id FROM tech_proofs WHERE frame_hash = ? AND job_id != ? LIMIT 1').bind(hash, j.id).first();
+  const ai = dup ? { result: 'unclear', note: 'ภาพซ้ำกับหลักฐานของงานอื่น — ทีมงานจะตรวจ', part: '', model: '' } : await checkShot(env, shot, frames);
+  const ts = now(), tries = cur ? cur.tries + 1 : 1;
+  /* พิกัดหยาบ (~100 ม.) ไว้ให้ทีมงานดูตอนมีข้อพิพาทเท่านั้น ไม่ขึ้น Passport/หน้าร้าน */
+  const la = Number(b.lat), ln = Number(b.lng), geo = Number.isFinite(la) && Number.isFinite(ln) && Math.abs(la) <= 90 && Math.abs(ln) <= 180;
+  await env.DB.batch([
+    env.DB.prepare('UPDATE media SET scope = ? WHERE id = ? AND uid = ?').bind('proof:' + j.id, mid, me.uid),
+    ...(cur && cur.media_id !== mid ? [env.DB.prepare('UPDATE media SET scope = ? WHERE id = ?').bind('proofx:' + j.id, cur.media_id)] : []),
+    env.DB.prepare(`INSERT INTO tech_proofs (job_id, shot, media_id, tries, result, note, part, model, frame_hash, lat, lng, at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(job_id, shot) DO UPDATE SET media_id=excluded.media_id, tries=excluded.tries, result=excluded.result, note=excluded.note, part=excluded.part,
+      model=excluded.model, frame_hash=excluded.frame_hash, lat=excluded.lat, lng=excluded.lng, at=excluded.at`)
+      .bind(j.id, shot, mid, tries, ai.result, ai.note, ai.part, ai.model, hash, geo ? Math.round(la * 1e3) / 1e3 : null, geo ? Math.round(ln * 1e3) / 1e3 : null, ts),
+  ]);
+  if (dup && !j.test) tellStaff(env, 'staff:proofdup:' + j.id, 3600000, async () => card({ tag: 'ทีมงาน', title: 'หลักฐานซ่อมซ้ำกับงานอื่น', label: 'เปิดใบงาน',
+    url: appUrl(env, '/?job=' + j.id), lines: [`ร้าน: ${shopOf(t)}`, `ช็อต: ${SHOT_TH[shot]}`] }));
+  return { shot, media: mid, result: ai.result, note: ai.note, part: ai.part, tries, retake: ai.result !== 'pass' && tries < MAX_TRIES };
+}
+/* ช่างขอใช้คลิปเป็นผลงานบนหน้าร้าน → เจ้าของรถอนุญาต/ไม่อนุญาตทีละคลิป (ถอนการอนุญาตได้ทุกเมื่อ) */
+async function showcase(env, ctx, action, b) {
+  const { j, t, isTech, isCustomer } = ctx;
+  if (j.status !== 'completed') fail(409, 'ขอใช้คลิปเป็นผลงานได้หลังลูกค้ายืนยันงานแล้ว');
+  const mid = String(b.media || '');
+  const p = MEDIA_ID.test(mid) && await env.DB.prepare('SELECT shot FROM tech_proofs WHERE job_id = ? AND media_id = ?').bind(j.id, mid).first();
+  if (!p) fail(404, 'ไม่พบคลิปนี้ในใบงาน');
+  const ts = now(), cur = await env.DB.prepare('SELECT status FROM tech_showcase WHERE media_id = ?').bind(mid).first();
+  if (action === 'showcase_ask') {
+    if (!isTech) fail(403, 'เฉพาะช่างในใบงานนี้ที่ขอได้');
+    if (cur) fail(409, cur.status === 'no' ? 'เจ้าของรถไม่อนุญาตคลิปนี้' : 'ขอใช้คลิปนี้ไปแล้ว');
+    await env.DB.prepare('INSERT INTO tech_showcase (media_id, job_id, tech_id, shot, status, asked_at) VALUES (?,?,?,?,?,?)').bind(mid, j.id, j.tech_id, p.shot, 'asked', ts).run();
+    tell(env, j.customer_uid, () => jobCard(env, 'showcase', j, shopOf(t), { shot: SHOT_TH[p.shot] }));
+    return { ok: true, status: 'asked' };
+  }
+  if (!isCustomer) fail(403, 'เฉพาะเจ้าของรถที่อนุญาตได้');
+  if (!cur) fail(404, 'ร้านยังไม่ได้ขอใช้คลิปนี้');
+  const status = action === 'showcase_ok' ? 'yes' : 'no';
+  await env.DB.prepare('UPDATE tech_showcase SET status = ?, decided_at = ? WHERE media_id = ?').bind(status, ts, mid).run();
+  return { ok: true, status };
+}
+/* รถในผลงาน/สูตรซ่อม: แค่ยี่ห้อ รุ่น ปี (ตัดเลขไมล์ ทะเบียน ตัวเลขยาว) */
+const carModel = s => scrub(String(s || '').split('·')[0], 60);
+/* หน้าร้าน: คลิปที่เจ้าของรถอนุญาตแล้ว (เปิดได้ไม่ต้องล็อกอิน) */
+async function showcaseList(env, techId) {
+  const { results } = await env.DB.prepare(`SELECT s.media_id, s.shot, s.decided_at, j.car FROM tech_showcase s JOIN tech_jobs j ON j.id = s.job_id
+    JOIN tech_profiles p ON p.id = s.tech_id WHERE s.tech_id = ? AND s.status = 'yes' AND p.suspended = 0 ORDER BY s.decided_at DESC LIMIT 30`).bind(techId).all();
+  return { items: results.map(r => ({ media: r.media_id, shot: r.shot, car: carModel(r.car), at: r.decided_at })) };
+}
+async function proofMediaRow(env, mid) {
+  const row = MEDIA_ID.test(mid) && await env.DB.prepare('SELECT * FROM media WHERE id = ?').bind(mid).first();
+  return row && /^proof:/.test(row.scope) ? row : null;
+}
+async function showcaseMedia(env, mid, h) {
+  const s = await env.DB.prepare(`SELECT s.status FROM tech_showcase s JOIN tech_profiles p ON p.id = s.tech_id WHERE s.media_id = ? AND p.suspended = 0`).bind(mid).first();
+  const row = s && s.status === 'yes' && await proofMediaRow(env, mid);
+  if (!row) fail(404, 'ไม่พบไฟล์');
+  return sendMedia(env, row, h, 'private, max-age=600');
+}
+/* คลิปหลักฐานในหน้า Passport: ใบงานต้องอยู่ใน Passport ที่ยังเปิดอยู่ และเป็นรถของเจ้าของ Passport */
+async function passportMedia(env, token, mid, h) {
+  const pp = await env.DB.prepare('SELECT uid, jobs, revoked FROM car_passports WHERE token = ?').bind(token).first();
+  const row = pp && !pp.revoked && await proofMediaRow(env, mid);
+  const jid = row ? row.scope.slice(6) : '';
+  const j = jid && (parse(pp.jobs) || []).includes(jid) && await env.DB.prepare('SELECT customer_uid, status FROM tech_jobs WHERE id = ?').bind(jid).first();
+  if (!j || j.customer_uid !== pp.uid || j.status !== 'completed') fail(404, 'ไม่พบไฟล์');
+  return sendMedia(env, row, h, 'private, max-age=600');
+}
+
+/* ── แจ้งช่างปลอม / หลักฐานน่าสงสัย — ทีมงานตัดสิน · ร้านไม่เห็นว่าใครแจ้ง ── */
+async function report(env, me, b) {
+  const t = await techById(env, String(b.techId || ''));
+  if (!t) fail(404, 'ไม่พบร้าน');
+  if (t.uid === me.uid) fail(400, 'แจ้งร้านตัวเองไม่ได้');
+  const reason = str(b.reason, 'เล่าสิ่งที่พบ', 10, 500);
+  const jobId = /^[0-9a-f-]{36}$/i.test(String(b.jobId || '')) ? String(b.jobId) : null;
+  if (jobId) {
+    const j = await env.DB.prepare('SELECT customer_uid, tech_id FROM tech_jobs WHERE id = ?').bind(jobId).first();
+    if (!j || j.tech_id !== t.id || j.customer_uid !== me.uid) fail(404, 'ไม่พบใบงาน');
+  }
+  const media = MEDIA_ID.test(String(b.media || '')) ? String(b.media) : null;
+  /* แจ้งมั่ว (ทีมงานตัดสินว่าไม่จริง) 3 ครั้งใน 90 วัน = แจ้งเพิ่มไม่ได้ชั่วคราว — กันคู่แข่งกลั่นแกล้ง */
+  const bad = await env.DB.prepare("SELECT COUNT(*) AS n FROM tech_reports WHERE uid = ? AND status = 'rejected' AND decided_at > ?").bind(me.uid, now() - 90 * DAY).first();
+  if (Number(bad && bad.n || 0) >= 3) fail(429, 'บัญชีนี้แจ้งไม่ตรงความจริงหลายครั้ง จึงแจ้งเพิ่มไม่ได้ชั่วคราว');
+  const open = await env.DB.prepare("SELECT id FROM tech_reports WHERE uid = ? AND tech_id = ? AND status = 'open'").bind(me.uid, t.id).first();
+  if (open) fail(409, 'แจ้งร้านนี้ไว้แล้ว ทีมงานกำลังตรวจ');
+  await limit(env, 'report', me.uid, 5);
+  await env.DB.prepare('INSERT INTO tech_reports (uid, tech_id, job_id, media_id, reason, at) VALUES (?,?,?,?,?,?)').bind(me.uid, t.id, jobId, media, reason, now()).run();
+  if (!t.test) tellStaff(env, 'staff:report:' + t.id, 3600000, async () => card({ tag: 'ทีมงาน', title: 'มีคนแจ้งร้าน/หลักฐานน่าสงสัย', label: 'เปิดรายการแจ้ง',
+    url: appUrl(env, '/admin'), lines: [`ร้าน: ${shopOf(t)}`, reason.slice(0, 90)] }));
+  return { ok: true };
+}
+async function reportsList(env, me) {
+  adminOnly(me);
+  const { results } = await env.DB.prepare(`SELECT r.id, r.tech_id, r.job_id, r.media_id, r.reason, r.at, p.data FROM tech_reports r
+    LEFT JOIN tech_profiles p ON p.id = r.tech_id WHERE r.status = 'open' ORDER BY r.at DESC LIMIT 100`).all();
+  return { reports: results.map(r => { const d = parse(r.data) || {}; return { id: r.id, techId: r.tech_id, shop: d.shop || d.name || '', jobId: r.job_id, media: r.media_id, reason: r.reason, at: r.at }; }) };
+}
+async function reportDecide(env, me, b) {
+  adminOnly(me);
+  const status = b.outcome === 'upheld' ? 'upheld' : b.outcome === 'rejected' ? 'rejected' : '';
+  if (!status) fail(400, 'เลือกผล: แจ้งจริง หรือ ไม่จริง');
+  const r = await env.DB.prepare("UPDATE tech_reports SET status = ?, note = ?, decided_at = ? WHERE id = ? AND status = 'open'")
+    .bind(status, str(b.note, 'บันทึกผลการตรวจ', 5, 500), now(), Number(b.id) || 0).run();
+  if (!r.meta.changes) fail(404, 'ไม่พบรายการ หรือตัดสินไปแล้ว');
+  await audit(env, me, 'report_' + status, String(b.id));
+  return { ok: true };
+}
+
+/* ── สูตรซ่อมในแชต AI: งานจริงที่จบพร้อมหลักฐานที่ AI ตรวจผ่าน รุ่นเดียวกัน อาการคล้ายกัน ──
+   worker.js เรียกตอนสร้างบริบทแชต · พังก็คืนค่าว่าง แชตตอบได้ตามปกติ */
+export async function verifiedFixes(env, car, question) {
+  try {
+    const want = symptomWords(question), make = String(car && car.make || '').trim().toLowerCase(), model = String(car && car.model || '').trim().toLowerCase();
+    if (!want.length || !(make || model)) return '';
+    const { results } = await env.DB.prepare(`SELECT j.symptom, j.completion, j.quote, j.tech_id, j.updated_at, p.data FROM tech_jobs j JOIN tech_profiles p ON p.id = j.tech_id
+      WHERE j.status = 'completed' AND j.test = 0 AND p.suspended = 0 AND p.verified = 1 AND json_extract(j.proof, '$.level') = 'verified'
+      AND lower(j.car) LIKE ? AND lower(j.car) LIKE ? ORDER BY j.updated_at DESC LIMIT 60`).bind('%' + make + '%', '%' + model + '%').all();
+    const rows = results.map(r => {
+      const q = parse(r.quote) || {}, d = parse(r.data) || {}, have = symptomWords(r.symptom + ' ' + (r.completion || ''));
+      return { score: want.filter(w => have.includes(w)).length, symptom: r.symptom, completion: r.completion, scope: q.scope, partsNote: q.partsNote || '',
+        shop: d.shop || d.name || 'ร้านใน Cendon', techId: r.tech_id, at: r.updated_at };
+    }).filter(r => r.score > 0).sort((a, b) => b.score - a.score || b.at - a.at).slice(0, 5);
+    return fixesBlock(rows, `${car.make || ''} ${car.model || ''}`.trim());
+  } catch (e) { return ''; }
 }
 
 /* แชร์ใบงานให้คนที่ไว้ใจ (เฉพาะลูกค้า ระหว่างที่งานยังดำเนินอยู่) — ลิงก์อายุ 24 ชม. ยกเลิกได้ทุกเมื่อ */
@@ -1885,7 +2144,11 @@ async function passportView(env, token) {
       const t = await techById(env, j.tech_id), d = parse(t && t.data) || {}, q = parse(j.quote) || {}, h = parse(j.history) || [];
       const doneAt = ((h.filter(x => x.status === 'completed').pop()) || {}).at || j.updated_at;
       const km = (String(j.car).match(/([\d,]{3,9})\s*กม/) || [])[1];
-      return { at: doneAt, shop: d.shop || d.name || 'ร้านใน Cendon', shopVerified: !!(t && t.verified), test: !!j.test,
+      /* หลักฐานการซ่อม: ระดับ + คลิป (เปิดผ่านลิงก์ Passport นี้เท่านั้น) · อะไหล่มือสองบอกตามจริง */
+      const pf = parse(j.proof);
+      const proof = pf && pf.shots && pf.shots.length ? { level: pf.level, clips: pf.shots.map(x => ({ shot: x.shot, media: x.media })) } : null;
+      return { at: doneAt, shop: d.shop || d.name || 'ร้านใน Cendon', shopVerified: !!(t && t.verified), test: !!j.test, proof,
+        parts: q.parts > 0 ? { note: cleanTxt(q.partsNote || '', 120), used: !!q.partsUsed } : null,
         work: cleanTxt(j.completion || q.scope || '', 220), warranty: Number(q.warranty) || 0, rating: (r => r && !r.hidden ? r.rating : null)(parse(j.review)) || null,
         km: km ? Number(km.replace(/,/g, '')) : null, ...(data.showCost && q.total ? { amount: q.total } : {}) };
     }));
@@ -1983,7 +2246,8 @@ function postOut(p, extra, exact = false) {
   const loc = exact ? { lat: p.lat, lng: p.lng } : { lat: approx(p.lat), lng: approx(p.lng), approxKm: APPROX_KM };
   return { id: p.id, status: p.status, test: !!p.test, car: p.car, symptom: p.symptom, cat: p.cat,
     ...loc, area: p.area, requestedTime: p.requested_time, mode: p.mode, urgent: !!p.urgent,
-    note: p.note || '', createdAt: p.created_at, expiresAt: p.created_at + postTtl(p), ...(extra || {}) };
+    note: p.note || '', createdAt: p.created_at, expiresAt: p.created_at + postTtl(p),
+    budget: p.budget || null, usedOk: !!p.used_ok, ...(extra || {}) };
 }
 /* ระยะทางให้ช่างดู: ปัดขึ้นเป็นกิโลเมตรเต็ม กันการเอาระยะจากหลายจุดมาคำนวณย้อนหาบ้านลูกค้า */
 const roughKm = d => Math.max(1, Math.ceil(d));
@@ -2007,16 +2271,19 @@ async function createPost(env, me, b) {
   const open = await env.DB.prepare("SELECT COUNT(*) AS n FROM tech_posts WHERE customer_uid = ? AND status = 'open' AND created_at > ?")
     .bind(me.uid, now() - POST_TTL).first();
   if (open.n >= 3 && !me.staff) fail(429, 'มีประกาศที่เปิดอยู่ 3 รายการแล้ว ปิดอันเก่าก่อน');
+  await strikeCheck(env, me);
+  /* งบที่ลูกค้าตั้ง (ไม่บังคับ) + รับอะไหล่มือสองได้ — ช่างเห็นก่อนเสนอราคา */
+  const budget = b.budget == null || b.budget === '' ? null : Math.round(num(b.budget, 'งบที่ตั้งไว้', 100, 1000000));
   const ts = now();
   const photos = mediaIn(b);
   /* ประกาศเป็นงานจริงเสมอ (เหมือนใบขอราคาตรงถึงร้าน) — เดิมประกาศจากบัญชีทีมงาน/เจ้าของถูกตั้งเป็นงานทดสอบอัตโนมัติ
      ช่างจริงจึงไม่เห็นเลย เจ้าของทดสอบเรียกช่างด่วนแล้วไม่ถึงใคร · ทีมงานที่ตั้งใจทดสอบ ส่ง test:true มาเอง */
   const test = me.staff && b.test === true ? 1 : 0, urgent = b.urgent ? 1 : 0;
-  await env.DB.prepare(`INSERT INTO tech_posts (id,customer_uid,status,test,car,symptom,cat,lat,lng,area,address,phone,requested_time,mode,urgent,created_at,updated_at,note)
-    VALUES (?,?,'open',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(id, me.uid, test,
+  await env.DB.prepare(`INSERT INTO tech_posts (id,customer_uid,status,test,car,symptom,cat,lat,lng,area,address,phone,requested_time,mode,urgent,created_at,updated_at,note,budget,used_ok)
+    VALUES (?,?,'open',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(id, me.uid, test,
     str(b.car, 'รถ / รุ่น / ปี', 2, 200), str(b.symptom, 'อาการ', urgent ? 3 : 10, 2000), cat, c.lat, c.lng,
     str(b.area, 'พื้นที่', 3, 160), str(b.address, 'ที่อยู่', 4, 500), phone(b.phone, 'เบอร์โทร'),
-    str(b.requestedTime, 'วันและเวลา', 2, 160), b.mode === 'shop' ? 'shop' : 'mobile', urgent, ts, ts, noteIn(b)).run();
+    str(b.requestedTime, 'วันและเวลา', 2, 160), b.mode === 'shop' ? 'shop' : 'mobile', urgent, ts, ts, noteIn(b), budget, b.usedOk === true ? 1 : 0).run();
   await saveMedia(env, id, me.uid, photos);
   /* บอกลูกค้าตามจริงว่ามีช่างกี่ร้านเห็นประกาศนี้ · งานด่วน = แจ้งทาง LINE ทันทีทุกร้านในรัศมี (ไม่ต้องรอช่างเปิดแอปเอง) */
   const near = await postAudience(env, { customer_uid: me.uid, test, urgent, cat, lat: c.lat, lng: c.lng });
@@ -2098,12 +2365,9 @@ async function offer(env, me, postId, b) {
   if (!t || t.suspended) fail(403, 'ต้องเป็นช่างในระบบก่อน');
   if (p.test && !t.test) fail(404, 'ไม่พบประกาศ');
   if (p.customer_uid === me.uid) fail(400, 'เสนอราคาให้ประกาศของตัวเองไม่ได้');
-  const labor = num(b.labor, 'ค่าแรง', 0, 1000000), parts = num(b.parts, 'อะไหล่', 0, 1000000), travel = num(b.travel, 'ค่าเดินทาง', 0, 100000);
-  if (labor + parts + travel <= 0) fail(400, 'ราคารวมต้องมากกว่า 0');
+  await capCheck(env, t, null);
   const ts = now();
-  const quote = JSON.stringify({ labor, parts, travel, total: Math.round((labor + parts + travel) * 100) / 100,
-    scope: str(b.scope, 'ขอบเขตงาน', 10, 2000), appointment: str(b.appointment, 'วันเวลานัด', 4, 200),
-    warranty: num(b.warranty, 'รับประกัน', 0, 365), at: ts });
+  const quote = JSON.stringify(quoteIn(b, ts));
   const id = await offerId(p.id, t.id);
   const ex = await env.DB.prepare('SELECT status, history FROM tech_jobs WHERE id = ?').bind(id).first();
   if (ex) {
@@ -2549,6 +2813,8 @@ async function route(request, env, verifyToken) {
   if (shm && m === 'GET') return shareView(env, shm[1]);
   const psm = p.match(/^\/api\/tech\/passport\/([A-Za-z0-9_-]{20,64})$/);
   if (psm && m === 'GET') return passportView(env, psm[1]);
+  /* ผลงานบนหน้าร้าน: เฉพาะคลิปที่เจ้าของรถอนุญาต (ไม่ต้องล็อกอิน) */
+  if (p === '/api/tech/showcase' && m === 'GET') return showcaseList(env, String(url.searchParams.get('tech') || ''));
   if (p === '/api/tech/reviews' && m === 'GET') {
     let me = null;
     try { me = await who(request, env, false, verifyToken); } catch (e) {}
@@ -2572,6 +2838,10 @@ async function route(request, env, verifyToken) {
   if (p === '/api/tech/reviews/hide' && m === 'POST') return hideReview(env, me, await body());
   if (p === '/api/tech/rescreen' && m === 'POST') return rescreen(env, me, await body());
   if (p === '/api/tech/moderate' && m === 'POST') return moderate(env, me, await body());
+  if (p === '/api/tech/bays' && m === 'POST') return setBays(env, me, await body());
+  if (p === '/api/tech/report' && m === 'POST') return report(env, me, await body());
+  if (p === '/api/tech/reports' && m === 'GET') return reportsList(env, me);
+  if (p === '/api/tech/reports/decide' && m === 'POST') return reportDecide(env, me, await body());
   if (p === '/api/tech/jobs' && m === 'GET') {
     const all = url.searchParams.get('all') === '1';
     if (all) adminOnly(me);
@@ -2611,6 +2881,8 @@ async function route(request, env, verifyToken) {
   let mm = p.match(/^\/api\/tech\/jobs\/([0-9a-f-]{36})$/i);
   if (mm && m === 'GET') return getJob(env, me, mm[1]);
   if (mm && m === 'POST') return updateJob(env, me, mm[1], await body());
+  mm = p.match(/^\/api\/tech\/jobs\/([0-9a-f-]{36})\/proof$/i);
+  if (mm && m === 'POST') return saveProof(env, me, mm[1], await body());
   mm = p.match(/^\/api\/tech\/groups\/([0-9a-f-]{36})$/i);
   if (mm && m === 'GET') return groupOf(env, me, mm[1]);
   mm = p.match(/^\/api\/tech\/jobs\/([0-9a-f-]{36})\/messages$/i);
@@ -2632,7 +2904,12 @@ export async function handleTech(request, env, corsHeaders, options={}) {
     await ensureTech(env);
     const img = new URL(request.url).pathname.match(/^\/api\/tech\/img\/(\d+)$/);
     if (img) return await image(env, request, Number(img[1]));
-    const md = new URL(request.url).pathname.match(/^\/api\/tech\/media\/([^/]+)$/);
+    const path = new URL(request.url).pathname;
+    const pvm = request.method === 'GET' && path.match(/^\/api\/tech\/passport\/([A-Za-z0-9_-]{20,64})\/media\/([^/]+)$/);
+    if (pvm) return await passportMedia(env, pvm[1], pvm[2], h);
+    const scm = request.method === 'GET' && path.match(/^\/api\/tech\/showcase\/media\/([^/]+)$/);
+    if (scm) return await showcaseMedia(env, scm[1], h);
+    const md = path.match(/^\/api\/tech\/media\/([^/]+)$/);
     if (md) return await mediaRoute(env, request, md[1], h, options.verifyToken);
     return json(await route(request, env,options.verifyToken), 200, h);
   } catch (e) {
