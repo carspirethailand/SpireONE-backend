@@ -1,6 +1,7 @@
 /* Free, document-backed discovery. No search-service key, Bing RSS, Google
  * grounding tool, browser cookies or VIN is used. Only pages actually read
  * can become sources. Robots restrictions and access barriers are respected. */
+import {DETAIL_NUM,DETAIL_TEXT,DETAIL_FACTS,DETAIL_WORDS} from './spec-details.mjs';
 const WIKI='https://en.wikipedia.org/w/api.php';
 const UA='CendonSpecs/1.0 (+https://cendon-beta.pages.dev/)';
 const OEM=['mitsubishi-motors.com','mitsubishi-motors.co.th','mitsubishi-motors.co.jp','toyota.com','toyota.co.th','global.toyota','honda.com','honda.co.th','isuzu.co.th','nissan.com','nissan.co.th','mazda.com','mazda.co.th','ford.com','ford.co.th','bmw.com','bmw.co.th','mercedes-benz.com','mercedes-benz.co.th','hyundai.com','kia.com','suzuki.co.th','mgcars.com','byd.com','gwm-global.com','subaru.com','lexus.com','volvocars.com','porsche.com','astonmartin.com','tesla.com','ferrari.com','lamborghini.com'];
@@ -103,12 +104,12 @@ export async function collectSpecDocuments(q,log=[],signal){
   const localLinks=publisherLinks(q,log,signal);
   // Observe rejection even if required discovery exits before using links.
   localLinks.catch(()=>{});
-  const found=await wiki({action:'query',list:'search',srsearch:q.make+' '+q.model,srlimit:'3'},signal,deadline-Date.now());
-  const rows=found.query?.search||[],exact=rows.find(x=>normal(x.title)===normal(q.make+' '+q.model)),chosen=exact||rows.find(x=>relevant(textOf(x.title+' '+x.snippet),q));
-  if(!chosen?.pageid)throw Error('ไม่พบเอกสารอ้างอิงของรุ่นนี้จากแหล่งค้นข้อมูลเปิด');
-  // Wikitext avoids downloading hundreds of KB of generated table/layout HTML
-  // and retains the specification table. It is still untrusted document data.
-  const page=await wiki({action:'parse',pageid:String(chosen.pageid),prop:'wikitext|externallinks'},signal,deadline-Date.now()),rawWiki=page.parse?.wikitext?.['*'],plain=rawWiki?wikiPlain(rawWiki):textOf(page.parse?.text?.['*']||'');
+  let chosen=null,page={parse:{}},plain='',discoveryError=null;
+  try{
+    const found=await wiki({action:'query',list:'search',srsearch:q.make+' '+q.model,srlimit:'3'},signal,deadline-Date.now());
+    const rows=found.query?.search||[];chosen=rows.find(x=>normal(x.title)===normal(q.make+' '+q.model))||rows.find(x=>relevant(textOf(x.title+' '+x.snippet),q));
+    if(chosen?.pageid){page=await wiki({action:'parse',pageid:String(chosen.pageid),prop:'wikitext|externallinks'},signal,deadline-Date.now());const raw=page.parse?.wikitext?.['*'];plain=raw?wikiPlain(raw):textOf(page.parse?.text?.['*']||'');}
+  }catch(e){active(signal);discoveryError=e;log.push({step:'encyclopedia-discovery',ok:false,err:'Discovery unavailable; continue with readable publishers'});}
   let published=[];try{published=await localLinks}catch(e){active(signal)}
   const candidates=[...published.map(x=>x.url),...(page.parse?.externallinks||[])].filter(allowedSource).filter(u=>!/^https:\/\/en\.wikipedia/.test(u));
   const metadata=new Map(published.map(x=>[x.url,x]));
@@ -121,18 +122,25 @@ export async function collectSpecDocuments(q,log=[],signal){
     try{await timebox(own=>Promise.all(urls.slice(i,i+4).map(async u=>{const d=await readPage(u,q,log,own);active(own);if(d&&docs.length<6)docs.push(d)})),Math.min(7000,deadline-Date.now()),signal)}
     catch(e){active(signal);log.push({step:'documents-partial',ok:false,err:'บางเอกสารอ่านไม่ทัน ใช้เฉพาะเอกสารที่อ่านเสร็จแล้ว'})}
   }
-  if(!docs.length)throw Error('ไม่พบหน้าเอกสารที่เปิดอ่านและใช้อ้างอิงได้');return docs.map((d,id)=>({...d,id}));
+  if(!docs.length)throw discoveryError||Error('ไม่พบหน้าเอกสารที่เปิดอ่านและใช้อ้างอิงได้');return docs.map((d,id)=>({...d,id}));
 }
 const WORDS={seats:['seats','seating','passenger','ที่นั่ง'],doors:['doors','ประตู'],length_mm:['length','ยาว'],width_mm:['width','กว้าง'],height_mm:['height','สูง'],wheelbase_mm:['wheelbase','ฐานล้อ'],kerb_kg:['weight','kerb','curb','น้ำหนัก'],tank_l:['tank','fuel capacity','ถัง'],cc:['cc','displacement','cubic','ความจุ','ซีซี'],hp:['hp','bhp','horsepower','แรงม้า'],torque_nm:['torque','nm','แรงบิด'],l_per_100km:['l/100','litres per 100','ลิตร/100'],battery_kwh:['kwh','battery','แบตเตอรี่'],range_km:['range','driving distance','ระยะทาง']};
+Object.assign(WORDS,DETAIL_WORDS);
 const ENUM={coupe:['coupe','coupé','sports car','คูเป้','รถสปอร์ต'],sedan:['sedan','saloon','ซีดาน'],suv:['suv','sport utility','เอสยูวี'],hatchback:['hatchback','แฮทช์แบ็ก'],pickup:['pickup','pick-up','กระบะ'],mpv:['mpv','minivan','เอ็มพีวี'],van:['van','รถตู้'],ev:['electric','battery electric','ไฟฟ้า'],petrol:['petrol','gasoline','เบนซิน'],diesel:['diesel','ดีเซล'],hybrid:['hybrid','ไฮบริด'],phev:['plug-in','phev','ปลั๊กอิน'],lpg:['lpg','แก๊ส'],FWD:['fwd','front-wheel','front wheel','ขับหน้า'],RWD:['rwd','rear-wheel','rear wheel','ขับหลัง'],AWD:['awd','all-wheel','all wheel','ขับสี่'], '4WD':['4wd','four-wheel','4x4','ขับสี่']};
 const squash=s=>String(s||'').normalize('NFC').replace(/[–—−]/g,'-').replace(/[“”]/g,'"').replace(/[‘’]/g,"'").replace(/\s+/g,' ').trim().toLowerCase();
 const COUNTRY={TH:['thailand','thai market','ประเทศไทย','ตลาดไทย'],JP:['japan','japanese market','ญี่ปุ่น'],US:['united states','u.s. market','us market','สหรัฐ'],UK:['united kingdom','uk market','british market','สหราชอาณาจักร'],DE:['germany','german market','เยอรมนี'],AU:['australia','australian market','ออสเตรเลีย'],EU:['europe','european market','ยุโรป']};
 function coversYear(quote,year){
-  const s=squash(quote),y=Number(year);
+  let s=squash(quote);const y=Number(year);
+  s=s.replace(/((?:รุ่นปี|โมเดลปี|model year)\s*(?:พ\.?ศ\.?|b\.?e\.?)?\s*)(25\d{2})(?:\s*-\s*(25\d{2}))?/gi,(_m,label,a,b)=>label+(+a-543)+(b?'-'+(+b-543):''));
   for(const m of s.matchAll(/\b((?:19|20)\d{2})\s*(?:[-–—]|to|ถึง)\s*((?:19|20)\d{2}|present|ปัจจุบัน)\b/g))if(y>=Number(m[1])&&y<=(/present|ปัจจุบัน/.test(m[2])?new Date().getUTCFullYear():Number(m[2])))return true;
   return new RegExp('\\b'+y+'\\b').test(s);
 }
 function supports(k,value,quote){const s=squash(quote);if(value==null)return false;
+  if(k==='price_thb'&&(!/(?:฿|บาท|\bTHB\b|\bbaht\b)/i.test(quote)||/\b(?:USD|EUR|GBP)\b|[$€£]/i.test(quote)))return false;
+  if(k==='top_speed_kmh'&&!/km\/?h|km h|กม\.?\/ชม/i.test(quote))return false;
+  if(k==='zero100_s'&&!/\b(?:seconds?|secs?|s)\b|วินาที/i.test(quote))return false;
+  if(k==='power_ps'&&!/\bps\b/i.test(quote))return false;
+  if(k==='power_kw'&&!/\bkw\b/i.test(quote))return false;
   if(k==='hp'&&/\b(?:ps|kw)\b/.test(s)&&!/\b(?:hp|bhp|horsepower)\b/.test(s))return false;
   const contains=w=>/^[a-z0-9 ]+$/i.test(w)?new RegExp('\\b'+w+'\\b','i').test(s):s.includes(w);
   if(ENUM[value])return ENUM[value].some(contains);
@@ -173,12 +181,12 @@ export function cleanDocumentExtraction(raw,docs,q,{kind='spec'}={}){
     if(!good.length)return null;diagnostic.acceptedFields++;evidence[path]=[...new Set(good.map(e=>Number(e.source)))];positions[path]=good.map(e=>({id:Number(e.source),at:quoteAt(Number(e.source),e.quote)}));return v;
   }
   const out={found:true,variants:[],evidence};
-  for(const k of ['body','generation','market','seats','doors','length_mm','width_mm','height_mm','wheelbase_mm','kerb_kg','tank_l','tire'])out[k]=value('facts.'+k,k,raw[k]??raw.facts?.[k]);
+  for(const k of ['body','generation','market','seats','doors','length_mm','width_mm','height_mm','wheelbase_mm','kerb_kg','tank_l','tire',...Object.keys(DETAIL_FACTS)])out[k]=value('facts.'+k,k,raw[k]??raw.facts?.[k]);
   for(const [i,v] of (Array.isArray(raw.variants)?raw.variants:[]).slice(0,12).entries()){
     const next={},base='variants.'+i+'.';for(const k of ['name','engine'])next[k]=value(base+k,k,v?.[k]);
     const anchors=[...(positions[base+'name']||[]),...(positions[base+'engine']||[])];
     if(!anchors.length)continue;
-    for(const k of ['fuel','cc','hp','torque_nm','gearbox','drive','l_per_100km','battery_kwh','range_km'])next[k]=value(base+k,k,v?.[k],anchors);
+    for(const k of ['fuel','cc','hp','torque_nm','gearbox','drive','l_per_100km','battery_kwh','range_km',...Object.keys(DETAIL_NUM),...DETAIL_TEXT])next[k]=value(base+k,k,v?.[k],anchors);
     next._sources={};for(const k of Object.keys(next)){const refs=evidence[base+k];if(refs)next._sources[k]=refs}
     out.variants.push(next);
   }
