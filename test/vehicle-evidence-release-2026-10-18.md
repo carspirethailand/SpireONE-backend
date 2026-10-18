@@ -15,7 +15,7 @@ This release extends the feedback-stability release. It does not certify every v
 - Asset versions and service-worker cache updated.
 
 ## Verification and limits
-- Frontend regression suite: 428 tests. Backend regression suite: 421 tests.
+- Frontend regression suite: 441 tests. Backend regression suite: 425 tests (including newer main-branch regressions).
 - Isolated headless Edge QA at 1280px and 390px: Wrapped open/close/reopen and delayed-response race; form save/failure retention; stable chat nodes and no horizontal overflow.
 - Worker packaging dry run passed. Tests use synthetic documents, fake model responses and local data; they do not measure manufacturer-source coverage or real AI accuracy for every car.
 - Physical Android verification is still needed: open Wrapped repeatedly, change pages, edit a car color then refresh, start a foreground drive, hide/restore, explicitly resume and check that missing distance is marked incomplete.
@@ -25,4 +25,3 @@ This release extends the feedback-stability release. It does not certify every v
 
 ## Deploy order
 Publish backend first, then frontend. No new schema migration or secret is required. Keep existing production variables.
-

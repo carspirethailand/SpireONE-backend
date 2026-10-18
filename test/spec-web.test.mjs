@@ -193,3 +193,33 @@ test('equipment: one stalled extraction cannot discard a successful sourced pass
   const log=[],r=await research({GEMINI_KEY:'test-only-key'},q,log,{kind:'equipment',budgetMs:200});
   assert.equal(r.status,'ready');assert.equal(r.passes,1);assert.equal(r.data.equipment.length,3);assert.ok(r.data.equipment.every(x=>x.ok===null));assert.equal(r.data.score.confirmed,0);assert.equal(r.sources.length,1);assert.equal(stalled.length,1);assert.ok(stalled.every(s=>s.aborted));assert.ok(log.some(s=>s.step==='extraction-deadline'));assert.equal(calls.filter(c=>c.url.includes('generativelanguage')).length,1);
 });
+test('extraction: deeper fields (top speed, 0-100, ground clearance, turning radius, boot, suspension, brakes) need the right unit in the quote',()=>{
+  const text='Mitsubishi Pajero Sport 2020 Thailand specification. 2.4 GT diesel engine. Seats: 7. Top speed: 180 km/h. 0-100 km/h in 11.2 seconds. Ground clearance: 218 mm. Minimum turning radius: 5.6 m. Boot space: 131 litres. Front suspension: double wishbone. Rear suspension: 3-link coil spring. Front brakes: ventilated discs. '+'Public fixture descriptive text. '.repeat(10);
+  const d=[{...docs[0],text}];const raw=extraction();
+  Object.assign(raw,{ground_clearance_mm:218,turning_m:5.6,cargo_l:131,suspension_front:'double wishbone',suspension_rear:'3-link coil spring',brakes_front:'ventilated discs'});
+  Object.assign(raw.variants[0],{top_kmh:180,accel_s:11.2});
+  Object.assign(raw.evidence,{'facts.ground_clearance_mm':[{source:0,quote:'Ground clearance: 218 mm.'}],'facts.turning_m':[{source:0,quote:'Minimum turning radius: 5.6 m.'}],
+    'facts.cargo_l':[{source:0,quote:'Boot space: 131 litres.'}],'facts.suspension_front':[{source:0,quote:'Front suspension: double wishbone.'}],
+    'facts.suspension_rear':[{source:0,quote:'Rear suspension: 3-link coil spring.'}],'facts.brakes_front':[{source:0,quote:'Front brakes: ventilated discs.'}],
+    'variants.0.top_kmh':[{source:0,quote:'Top speed: 180 km/h.'}],'variants.0.accel_s':[{source:0,quote:'0-100 km/h in 11.2 seconds.'}]});
+  const out=cleanDocumentExtraction(raw,d,q);
+  assert.equal(out.ground_clearance_mm,218);assert.equal(out.turning_m,5.6);assert.equal(out.cargo_l,131);
+  assert.equal(out.suspension_front,'double wishbone');assert.equal(out.suspension_rear,'3-link coil spring');assert.equal(out.brakes_front,'ventilated discs');
+  assert.equal(out.variants[0].top_kmh,180);assert.equal(out.variants[0].accel_s,11.2);
+  /* mph อย่างเดียว · 0-60 mph · วงเลี้ยวแบบเส้นผ่านศูนย์กลาง · ค่าที่ไม่มีในเอกสาร = ไม่รับ */
+  const t2='Mitsubishi Pajero Sport 2020 Thailand specification. 2.4 GT diesel engine. Seats: 7. Top speed: 112 mph. 0-60 mph in 10.4 seconds. Turning circle: 11.2 m. '+'Public fixture descriptive text. '.repeat(10);
+  const r2=extraction();Object.assign(r2,{turning_m:11.2,brakes_rear:'drums'});Object.assign(r2.variants[0],{top_kmh:112,accel_s:10.4});
+  Object.assign(r2.evidence,{'variants.0.top_kmh':[{source:0,quote:'Top speed: 112 mph.'}],'variants.0.accel_s':[{source:0,quote:'0-60 mph in 10.4 seconds.'}],
+    'facts.turning_m':[{source:0,quote:'Turning circle: 11.2 m.'}],'facts.brakes_rear':[{source:0,quote:'Seats: 7.'}]});
+  const o2=cleanDocumentExtraction(r2,[{...docs[0],text:t2}],q);
+  assert.equal(o2.variants[0].top_kmh,null);assert.equal(o2.variants[0].accel_s,null);assert.equal(o2.turning_m,null);assert.equal(o2.brakes_rear,null);
+});
+test('merge: deeper fields are compared field by field and counted in the agreement score',()=>{
+  const A={variants:[{name:'2.4 GT',engine:'2.4 diesel',fuel:'diesel',cc:2442,top_kmh:180,accel_s:11.2}],ground_clearance_mm:218,suspension_front:'double wishbone',brakes_rear:'drums'};
+  const B={variants:[{name:'2.4 GT',engine:'2.4 diesel',fuel:'diesel',cc:2442,top_kmh:185,accel_s:11.2}],ground_clearance_mm:218,suspension_front:'Double wishbone',brakes_rear:null};
+  const m=merge(A,B);
+  assert.equal(m.facts.ground_clearance_mm.ok,true);assert.equal(m.facts.suspension_front.ok,true);assert.equal(m.facts.brakes_rear.ok,null);
+  assert.equal(m.variants[0].accel_s.ok,true);assert.equal(m.variants[0].top_kmh.ok,false);assert.equal(m.variants[0].top_kmh.alt,185);
+  assert.ok(m.score.cells>=6&&m.score.conflicts===1);
+  assert.equal(merge({turning_m:25,cargo_l:2},{}).facts.turning_m,null,'impossible values are dropped');
+});
