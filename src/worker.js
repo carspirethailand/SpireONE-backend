@@ -8,12 +8,13 @@ import { liveToken, cleanHandle } from './live-setup.mjs';
 import { valetPrompt } from './agent-prompt.mjs';
 import { garageCheckin, GARAGE_CARE_KEY } from './garage-care.mjs';
 import { garageRulesFor, validateGarageWrite, appendGarageLog } from './garage-state.mjs';
+import {anchorInput,anchorOrder} from './odo-validation.mjs';
 import { infoPatch, costReferences } from './garage-rules.mjs';
 import { handleTech, reconcileDiditIdentities, vaultSweep, expireStaleApplications, releaseWrongHolds, expireOpenJobs, verifiedFixes } from './techs.js';
 import { richMenuStatus, setupRichMenu, lineStatus, lineFixWebhook } from './line-menu.js';
 import { appUrl, card, notify } from './line-notify.js';
 import { refreshNews, newsStatus } from './news.js';
-import { ensureSpec, getSpec, specKey, equipmentKey, validQuery, reportSpec, listSpecs, verifySpec, specLogList, specAI } from './carspec.js';
+import { ensureSpec, getSpec, specKey, equipmentKey, detailsKey, validQuery, reportSpec, listSpecs, verifySpec, specLogList, specAI } from './carspec.js';
 import { wantsSpec, ownBlock, specBlock } from './chat-spec.mjs';
 import { KM_CRON, kmTable, thDay, thDayStart, parseKm, parseConfirm, SKIP_RE, OFF_RE, checkKm, askLine, pushText, replyFor, toAsk, setGarageKm, getPref, setPref, getPending, savePending } from './km-remind.mjs';
 import { decodeVin, vpic, cleanInfo } from './vin.js';
@@ -1427,7 +1428,7 @@ async function chatSpecContext(env, uid, carId, carInfo, question) {
       if (vs.length) {
         const keys = f => [...new Set(vs.map(v => f(v.make, v.model, v.year, v.market)))];
         const pick = async ks => { for (const k of ks) { const r = await getSpec(env, k); if (r && ['ready', 'verified'].includes(r.status)) return r; } return null; };
-        const [sp, eq] = await Promise.all([pick(keys(specKey)), pick(keys(equipmentKey))]);
+        const [sp, eq] = await Promise.all([pick([...keys(detailsKey),...keys(specKey)]), pick(keys(equipmentKey))]);
         spec = specBlock(sp, eq);
       }
     }
@@ -2707,7 +2708,8 @@ async function recomputeOdo(env, uid, carId, car) {
        sigma_km = excluded.sigma_km, anchor_km = excluded.anchor_km,
        anchor_at = excluded.anchor_at, n_anchor = excluded.n_anchor,
        rate_basis = excluded.rate_basis, rate_err = excluded.rate_err,
-       updated_at = excluded.updated_at`
+       updated_at = excluded.updated_at
+     WHERE excluded.anchor_at >= odo_state.anchor_at`
   ).bind(carId, uid, est.km, rate, est.sigma, last.km, last.observed_at,
     anchors.length, basis, state.rate_err, t).run();
 
@@ -2729,21 +2731,36 @@ async function addAnchor(env, uid, carId, km, source, observedAt, note) {
 
   /* ใบเสร็จใบเดิมสแกนซ้ำได้ — ดัชนี unique กันซ้ำไว้แล้ว ชนก็ข้ามไปเงียบ ๆ */
   try {
-    await env.DB.prepare(
+    const inserted=await env.DB.prepare(
       `INSERT INTO odo_anchor (id, uid, car_id, km, source, observed_at, note, t)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    ).bind('a' + when + Math.random().toString(36).slice(2, 8), uid, carId, v,
-      String(source || 'manual').slice(0, 20), when, String(note || '').slice(0, 200), nowMs()).run();
+       SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (
+         SELECT 1 FROM odo_anchor WHERE uid=? AND car_id=? AND
+         ((observed_at<=? AND km>?) OR (observed_at>=? AND km<?)))`
+    ).bind(crypto.randomUUID(), uid, carId, v,
+      String(source || 'manual').slice(0, 20), when, String(note || '').slice(0, 200), nowMs(),
+      uid,carId,when,v,when,v).run();
+    if(inserted.meta?.changes===0)throw new Error('odo_conflict');
   } catch (e) {
     if (!String(e && e.message || '').includes('UNIQUE')) throw e;
   }
 
   /* เลขไมล์บนการ์ดรถต้องขยับตามด้วย ไม่งั้นผู้ใช้เห็นเลขเก่าค้างอยู่ */
-  const cur = parseInt(String(car.mileage || '').replace(/[^0-9]/g, ''), 10);
-  if (!isFinite(cur) || v > cur) {
-    await env.DB.prepare('UPDATE cars SET mileage = ? WHERE id = ?').bind(String(v), carId).run();
+  const state=await recomputeOdo(env,uid,carId,car);
+  if(state){
+    await env.DB.prepare('UPDATE cars SET mileage=(SELECT CAST(km AS TEXT) FROM odo_anchor WHERE car_id=? AND uid=? ORDER BY observed_at DESC LIMIT 1) WHERE id=? AND uid=?').bind(carId,uid,carId,uid).run();
+    // Mirror only mileage with compare-and-swap; never overwrite a concurrent color/detail edit.
+    for(let i=0;i<3;i++){
+      const old=await env.DB.prepare('SELECT v,t FROM user_state WHERE uid=? AND k=?').bind(uid,'garage').first();
+      const latest=await env.DB.prepare('SELECT km FROM odo_anchor WHERE uid=? AND car_id=? ORDER BY observed_at DESC LIMIT 1').bind(uid,carId).first();
+      if(!latest)break;const actual=String(latest.km);
+      let g;try{g=JSON.parse(old?.v||'null')}catch{break}
+      if(!Array.isArray(g)||!g.some(c=>c?.id===carId))break;
+      const next=g.map(c=>c?.id===carId?{...c,mileage:actual}:c);
+      const saved=await env.DB.prepare('UPDATE user_state SET v=?,t=? WHERE uid=? AND k=? AND t=? RETURNING t').bind(JSON.stringify(next),Math.max(Date.now(),Number(old.t)+1),uid,'garage',old.t).first();
+      if(saved)break;
+    }
   }
-  return await recomputeOdo(env, uid, carId, car);
+  return state;
 }
 
 /* ══════════════ รายการบำรุงรักษา ══════════════ */
@@ -4228,16 +4245,24 @@ export default {
         return await guarded('user', async (actor) => {
           const b = await readBody();
           if (!b || !b.carId) return deny('carId required', 400);
+          const own=await env.DB.prepare('SELECT id FROM cars WHERE id=? AND uid=?').bind(String(b.carId),actor.payload.sub).first();if(!own)return deny('Car not found',404);
+          let reading;try{
+            reading=anchorInput(b);
+            const before=await env.DB.prepare('SELECT km,observed_at FROM odo_anchor WHERE uid=? AND car_id=? AND observed_at<=? ORDER BY observed_at DESC LIMIT 1').bind(actor.payload.sub,String(b.carId),reading.at).first();
+            const after=await env.DB.prepare('SELECT km,observed_at FROM odo_anchor WHERE uid=? AND car_id=? AND observed_at>? ORDER BY observed_at ASC LIMIT 1').bind(actor.payload.sub,String(b.carId),reading.at).first();
+            anchorOrder(reading,before,after,b.confirmJump===true);
+          }catch(e){return json({error:e.message,code:e.code||'bad_reading'},e.status||400)}
           const OK = ['receipt', 'confirm', 'fuel', 'obd', 'signup', 'manual'];
           const src = OK.includes(b.source) ? b.source : 'manual';
           let st;
           try {
-            st = await addAnchor(env, actor.payload.sub, String(b.carId), b.km, src,
-              b.observedAt, b.note);
+            st = await addAnchor(env, actor.payload.sub, String(b.carId), reading.km, src,
+              reading.at, b.note);
           } catch (e) {
             const m = e && e.message;
             if (m === 'no_car') return deny('Car not found', 404);
             if (m === 'bad_km') return deny('Mileage out of range', 400);
+            if (m === 'odo_conflict') return json({error:'A newer reading conflicts with this entry. Check the reading and date before resubmitting.',code:'mileage_order'},409);
             throw e;
           }
           /* รถที่ยังไม่มีรายการบำรุงรักษาให้ตั้งชุดเริ่มต้นให้เลย
@@ -5393,7 +5418,7 @@ ${convo}`;
 
       /* ===== คลังสเปกรถ (carspec.js) =====
        * ไม่ต้องล็อกอินก็ดึงได้ (คนเพิ่มรถได้โดยไม่ล็อกอิน) — การค้นรุ่นใหม่ด้วย AI มีโควตาต่อคน/ต่อ IP */
-      if (url.pathname === '/api/car-spec' || url.pathname === '/api/car-spec/equipment' || url.pathname === '/api/car-spec/report' || url.pathname.startsWith('/api/vin/')) {
+      if (url.pathname === '/api/car-spec' || url.pathname === '/api/car-spec/equipment' || url.pathname === '/api/car-spec/details' || url.pathname === '/api/car-spec/report' || url.pathname.startsWith('/api/vin/')) {
         let actor = null;
         if (request.headers.get('Authorization')) {
           try { actor = await getActor(request, env); } catch (e) { return json({error:'Could not confirm your signed-in session',code:'auth_required'},401); }
@@ -5401,17 +5426,17 @@ ${convo}`;
         if (actor && actor.banned) return deny('Account suspended', 403);
         const who = actor ? 'u:' + actor.payload.sub : 'ip:' + (request.headers.get('CF-Connecting-IP') || 'unknown');
         try {
-          const equipment=url.pathname==='/api/car-spec/equipment';
-          if ((url.pathname === '/api/car-spec'||equipment) && request.method === 'GET') {
+          const equipment=url.pathname==='/api/car-spec/equipment',details=url.pathname==='/api/car-spec/details';
+          if ((url.pathname === '/api/car-spec'||equipment||details) && request.method === 'GET') {
             const v = validQuery(Object.fromEntries(url.searchParams));
             if (!v) return deny('ชื่อรถหรือปีไม่ถูกต้อง', 400);
-            return json((await getSpec(env, (equipment?equipmentKey:specKey)(v.make, v.model, v.year,v.market))) || { status: 'none' });
+            return json((await getSpec(env, (equipment?equipmentKey:details?detailsKey:specKey)(v.make, v.model, v.year,v.market))) || { status: 'none' });
           }
-          if ((url.pathname === '/api/car-spec'||equipment) && request.method === 'POST') {
+          if ((url.pathname === '/api/car-spec'||equipment||details) && request.method === 'POST') {
             const b = await readBody();
             const staff = !!actor && rank(actor.role) >= rank('admin');
             /* แอดมินกด "ทดสอบค้นสเปก" จากแผงลอย = ค้นใหม่ทับ (force) และได้ขั้นตอนทั้งหมดกลับไปดู */
-            return json(await ensureSpec(env, b || {}, { who, user: !!actor, staff, retry: !!(b && b.retry), force: staff && !!(b && b.force), defer: (p) => ctx.waitUntil(p),kind:equipment?'equipment':'spec' }));
+            return json(await ensureSpec(env, b || {}, { who, user: !!actor, staff, retry: !!(b && b.retry), force: staff && !!(b && b.force), defer: (p) => ctx.waitUntil(p),kind:equipment?'equipment':details?'details':'spec' }));
           }
           if (url.pathname === '/api/car-spec/report' && request.method === 'POST') {
             const b = await readBody() || {};
@@ -5439,7 +5464,7 @@ ${convo}`;
           /* ค้นใหม่ทับ แล้วล้างรายงานเดิม (รายงานเป็นของข้อมูลชุดเก่า) */
           const marketPart=r.key.split('|')[3]?.toUpperCase(),market=r.data?.query?.market||(marketPart&&marketPart!=='EQUIPMENT'?marketPart:'TH');
           const out = await ensureSpec(env, { make: r.make || make, model: r.model || model, year: r.year || year,market },
-            { who: 'u:' + actor.payload.sub, staff: true, force: true,kind:r.key.endsWith('|equipment')?'equipment':'spec' });
+            { who: 'u:' + actor.payload.sub, staff: true, force: true,kind:r.key.endsWith('|equipment')?'equipment':r.key.endsWith('|details')?'details':'spec' });
           await env.DB.batch([
             env.DB.prepare('DELETE FROM car_spec_reports WHERE k = ?').bind(r.key),
             env.DB.prepare('UPDATE car_specs SET reports = 0 WHERE k = ?').bind(r.key),
@@ -5509,6 +5534,8 @@ ${convo}`;
           if (!make || !model) return deny('Missing required fields: make, model', 400);
           const carId = (typeof id === 'string' && id.length < 60 ? id : '') || 'c' + Date.now();
           const now = Date.now();
+          let exactMileage=String(mileage||'');
+          try{const a=await env.DB.prepare('SELECT km FROM odo_anchor WHERE uid=? AND car_id=? ORDER BY observed_at DESC LIMIT 1').bind(actor.payload.sub,carId).first();if(a)exactMileage=String(a.km)}catch(e){if(!/no such table/i.test(e.message||''))throw e}
           /* สีกับประเภทตัวถังไม่บังคับ — ไม่ส่งมาก็คงค่าเดิมไว้ (ส่งรถคันเดิมซ้ำเพื่อเปลี่ยนสีได้) */
           const color = /^#[0-9a-f]{6}$/i.test(String(bodyData.color || '')) ? String(bodyData.color).toUpperCase() : null;
           const body = CAR_BODIES.includes(bodyData.body) ? bodyData.body : null;
@@ -5530,7 +5557,7 @@ ${convo}`;
               info = COALESCE(excluded.info, cars.info)
             WHERE cars.uid = excluded.uid
           `).bind(carId, actor.payload.sub, String(make).slice(0, 60), String(model).slice(0, 60),
-            String(year || '').slice(0, 8), String(mileage || '').slice(0, 12), color, body, info, now,
+            String(year || '').slice(0, 8), exactMileage.slice(0, 12), color, body, info, now,
             actor.payload.sub, CAR_DELETED_PREFIX + carId).run();
           if (result.meta && result.meta.changes === 0) {
             const marker = await env.DB.prepare('SELECT t FROM user_state WHERE uid = ? AND k = ?')
@@ -5538,7 +5565,7 @@ ${convo}`;
             if (marker) return deny('Car was deleted; add it again with a new ID', 410);
             return deny('Car ID is unavailable', 409);
           }
-          return json({ id: carId, uid: actor.payload.sub, make, model, year: year || '', mileage: mileage || '', color, body, info, created_at: now });
+          return json({ id: carId, uid: actor.payload.sub, make, model, year: year || '', mileage: exactMileage, color, body, info, created_at: now });
         })();
       }
 

@@ -67,6 +67,18 @@ test('reader: deadline bounds stalled network and response bodies and cancels do
   globalThis.fetch=async()=>new Response(new ReadableStream({start(){}}));let downstream=0;
   await assert.rejects(timebox(s=>collectSpecDocuments(q,[],s).then(()=>downstream++),20),e=>e.name==='AbortError');assert.equal(downstream,0);
 });
+
+test('reader: an encyclopedia outage does not block a readable publisher document',async()=>{
+  const url='https://www.autodeft.com/fixture-pajero-sport-2020';
+  globalThis.fetch=async raw=>{const u=String(raw);
+    if(u.includes('/w/api.php'))return new Response('Unavailable',{status:503});
+    if(u.endsWith('/robots.txt'))return new Response('User-agent: *\nAllow: /');
+    if(u.includes('/wp-json/'))return Response.json(u.includes('autodeft.com')?[{link:url,title:{rendered:'2020 Mitsubishi Pajero Sport'},date:'2020-01-01'}]:[]);
+    if(u===url)return new Response('<title>2020 Mitsubishi Pajero Sport</title><p>'+paragraph+'</p>',{headers:{'content-type':'text/html'}});
+    throw Error('Unexpected fixture request');
+  };
+  const result=await collectSpecDocuments(q);assert.equal(result.length,1);assert.equal(result[0].url,url);
+});
 test('extraction: every value needs an exact verified quotation; invented quotes, numbers and sources vanish',()=>{
   const raw=extraction();raw.length_mm=4825;raw.evidence['facts.length_mm']=[{source:0,quote:'Length: 4825 mm.'}];raw.tank_l=68;raw.evidence['facts.tank_l']=[{source:99,quote:'Tank: 68 litres.'}];raw.variants[0].hp=999;
   const out=cleanDocumentExtraction(raw,docs,q);assert.equal(out.seats,7);assert.equal(out.length_mm,null);assert.equal(out.tank_l,null);assert.equal(out.variants[0].hp,null);assert.equal(out.variants[0].cc,2442);assert.equal(out.body,null);
