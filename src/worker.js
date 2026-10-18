@@ -3,6 +3,8 @@ import { EMAIL_AUTH_SQL, handleEmailAuth, deleteFirebaseUser } from './email-aut
 import { exportAccount, resetAccount, deleteAccount, deleteBlockers } from './account-data.js';
 import { ONBOARDING_SQL, handleOnboarding, onboardingName, sanitizeSetupState } from './onboarding.js';
 import { buildFeatureRequest, cleanFeatureJson, featureCap } from './features-ai.mjs';
+import { soundText, legacySound, audioIdentity, VEHICLE_AUDIO_RULES } from './vehicle-audio.mjs';
+import {publicResearch, publicQuery, soundResearchQuery, researchBlock} from './vehicle-research.mjs';
 import { engineScanFailure } from './engine-scan-errors.mjs';
 import { liveToken, cleanHandle } from './live-setup.mjs';
 import { valetPrompt } from './agent-prompt.mjs';
@@ -761,6 +763,8 @@ async function tokensToday(env, uid) {
 
 /* ===== Gemini (server-side only — key never leaves the Worker) ===== */
 async function callGemini(env, { contents, system, search, temp, json: wantJson, maxTokens, meter, prefer, schema, timeoutMs }) {
+  const hasAudio=(contents||[]).some(m=>(m.parts||[]).some(p=>/^audio\//i.test((p.inlineData||p.inline_data)?.mimeType||(p.inline_data||{}).mime_type||'')));
+  if(hasAudio&&!String(system||'').includes(VEHICLE_AUDIO_RULES))system=VEHICLE_AUDIO_RULES+'\n'+String(system||'');
   const geminiKey = env.GEMINI_KEY;
   if (!geminiKey) throw new Error('AI is not configured');
   const models = [
@@ -1547,6 +1551,7 @@ function needsFresh(q) {
   const t = String(q || '').toLowerCase();
   if (!t) return false;
   if (FRESH_WORDS.some(w => t.includes(w))) return true;
+  if (/อาการประจำ|ปัญหาประจำ|โรคประจำ|เรียกคืน|เสียงผิดปกติ|known (?:fault|issue|problem)|common (?:fault|issue|problem)|service bulletin|engine noise|recall/i.test(t)) return true;
   /* มีปี พ.ศ. หรือ ค.ศ. ล่าสุดอยู่ในคำถาม */
   if (/\b(20[2-9]\d|25[6-9]\d)\b/.test(t)) return true;
   return false;
@@ -1991,6 +1996,7 @@ async function executeDescribeMediaTool(env, messages, prompt) {
     contents: [{ parts }],
     generationConfig: { temperature: 0.4 }
   };
+  if(parts.some(p=>/^audio\//i.test(p.inlineData?.mimeType||'')))body.systemInstruction={parts:[{text:VEHICLE_AUDIO_RULES}]};
 
   let lastErr = null;
   for (const mName of [...new Set(modelsToTry)]) {
@@ -2024,7 +2030,7 @@ async function executeDescribeMediaTool(env, messages, prompt) {
 
 /* ── ค้นข้อมูลอินเทอร์เน็ต (DuckDuckGo -> Gemini 3.1 -> Gemini 3.5 -> WebSearch) ── */
 async function executeGoogleSearchTool(env, query) {
-  return await executeSearchInternal(env, query);
+  try{return researchBlock(await publicResearch(query))}catch{return 'Public web search requires a short topic without private details. Do not invent current facts or sources.'}
 }
 
 function parseJsonLoose(text) {
@@ -2187,74 +2193,6 @@ async function getSpares(env, { car, apps, needs, lang }) {
   })).filter(x => x.title);
 }
 
-const LISTEN_TAKES = {
-  cold:  'ตอนสตาร์ทเครื่องเย็น',
-  idle:  'ตอนเดินเบาอยู่กับที่',
-  rev:   'ตอนเร่งเครื่องอยู่กับที่',
-  brake: 'ตอนเหยียบเบรก',
-  drive: 'ตอนขับอยู่',
-};
-
-/* ฟังเสียงเครื่องยนต์ — เจ้าของรถเลียนเสียงให้ช่างฟังไม่เคยเหมือน
-   จึงให้อัดเสียงจริงส่งมาแทน แล้วให้โมเดลบอกว่าน่าจะมาจากอะไร */
-async function listenEngine(env, { audio, mime, take, car, note, lang }) {
-  const carLine = [car.year, car.make, car.model].filter(Boolean).join(' ');
-  const when = LISTEN_TAKES[take] || 'ระหว่างใช้งาน';
-
-  const prompt = `ฟังคลิปเสียงรถคันนี้แล้ววิเคราะห์ให้เจ้าของรถเข้าใจ
-
-รถ: ${carLine || 'ไม่ทราบรุ่น'}${car.mileage ? ` เลขไมล์ประมาณ ${car.mileage} กม.` : ''}
-คลิปนี้อัด: ${when}${note ? `\nเจ้าของบอกเพิ่มว่า: ${String(note).slice(0, 200)}` : ''}
-
-ตอบเป็น JSON object เท่านั้น ห้ามมีคำนำหรือ markdown
-{
- "heard": สิ่งที่ได้ยินจริงในคลิป อธิบายเป็นคำที่คนทั่วไปเข้าใจ 1-2 ประโยค,
- "quality": "clear" ถ้าเสียงชัดพอวิเคราะห์ได้ | "noisy" ถ้าพอได้แต่มีเสียงรบกวนมาก | "unusable" ถ้าฟังไม่ได้เลย,
- "normal": true ถ้าฟังแล้วเป็นเสียงปกติของรถทั่วไป, false ถ้ามีอะไรน่าสงสัย,
- "urgency": "now" ถ้าควรหยุดใช้รถและตรวจทันที | "soon" ถ้าควรตรวจภายในสัปดาห์สองสัปดาห์ | "watch" ถ้าแค่เฝ้าดูอาการ | "fine" ถ้าไม่ต้องทำอะไร,
- "causes": [ { "what": ชิ้นส่วนหรือระบบที่น่าจะเป็นต้นเหตุ,
-               "chance": ความน่าจะเป็นเป็นเปอร์เซ็นต์ 0-100 เป็นตัวเลข,
-               "why": เหตุผลที่คิดแบบนั้นจากเสียงที่ได้ยิน 1 ประโยค,
-               "check": วิธีตรวจยืนยันแบบที่เจ้าของหรือช่างทำได้ 1 ประโยค } ],
- "doNow": [ สิ่งที่ควรทำต่อ 2-4 ข้อ เรียงจากสำคัญที่สุด ],
- "tellShop": ประโยคเดียวที่เอาไปบอกช่างได้ตรง ๆ ว่าให้ตรวจอะไร
-}
-
-กติกา
-- ถ้าคลิปไม่มีเสียงเครื่องยนต์เลย หรือสั้นเกินจนฟังไม่ออก ให้ตอบ {"error":"unusable"}
-- causes ให้ 2-4 ข้อ เรียงจากน่าจะเป็นมากไปน้อย รวมกันไม่ต้องเท่ากับ 100
-- ห้ามฟันธงว่าเสียเป็นอะไรแน่นอนจากเสียงอย่างเดียว ให้พูดในเชิงความน่าจะเป็นเสมอ
-- ถ้าฟังแล้วปกติดี ให้บอกตรง ๆ ว่าปกติ อย่าหาเรื่องให้ซ่อม`;
-
-  const parts = [
-    { inlineData: { mimeType: mime || 'audio/webm', data: audio } },
-    { text: prompt },
-  ];
-  const text = await callGemini(env, {
-    contents: [{ role: 'user', parts }],
-    temp: 0.25, maxTokens: 3072, json: true,
-  });
-  const parsed = parseJsonObject(text);
-  if (!parsed) throw new Error('listen_ai: model did not return a usable result');
-  if (parsed.error === 'unusable' || parsed.quality === 'unusable') throw new Error('listen_unusable');
-
-  const pct = (v) => { const x = Number(v); return Number.isFinite(x) ? Math.min(100, Math.max(0, Math.round(x))) : null; };
-  parsed.heard = String(parsed.heard || '').slice(0, 400);
-  parsed.quality = ['clear', 'noisy'].includes(parsed.quality) ? parsed.quality : 'noisy';
-  parsed.normal = parsed.normal === true;
-  parsed.urgency = ['now', 'soon', 'watch', 'fine'].includes(parsed.urgency) ? parsed.urgency : 'watch';
-  parsed.causes = Array.isArray(parsed.causes) ? parsed.causes.slice(0, 4).map((x) => ({
-    what: String(x.what || '').slice(0, 100),
-    chance: pct(x.chance),
-    why: String(x.why || '').slice(0, 240),
-    check: String(x.check || '').slice(0, 240),
-  })).filter((x) => x.what) : [];
-  parsed.doNow = Array.isArray(parsed.doNow)
-    ? parsed.doNow.slice(0, 4).map((x) => String(x).slice(0, 160)).filter(Boolean) : [];
-  parsed.tellShop = String(parsed.tellShop || '').slice(0, 300);
-  parsed.take = take || '';
-  return parsed;
-}
 
 /* ══════════════════════════════════════════════════════════════════
    WEB PUSH — VAPID + aes128gcm (RFC 8291 / RFC 8292)
@@ -3879,7 +3817,7 @@ export default {
     if (!env.DB) return deny('Database is not configured', 500);
 
     /* Do not run account migrations for unauthenticated private requests. */
-    if ((url.pathname === '/api/features/analyze' || /^\/api\/onboarding(?:\/|$)/.test(url.pathname))
+    if ((url.pathname === '/api/features/analyze' || url.pathname === '/api/ai/research' || /^\/api\/onboarding(?:\/|$)/.test(url.pathname))
         && !/^Bearer \S+/.test(request.headers.get('Authorization') || '')) {
       return deny('Invalid authentication token', 401);
     }
@@ -5012,7 +4950,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                   question,
                   hasMedia,
                   carInfo,
-                  search: fresh,
+                  search: fresh, externalSearch: true,
                   executeSearch: async (q) => await executeGoogleSearchTool(env, q),
                   executeMedia: async (p) => await executeDescribeMediaTool(env, msgs, p),
                   executeKb: async (q) => await kbFor(env, carInfo, q),
@@ -5201,7 +5139,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                 question,
                 hasMedia,
                 carInfo,
-                search: fresh,
+                search: fresh, externalSearch: true,
                 executeSearch: async (q) => await executeGoogleSearchTool(env, q),
                 executeMedia: async (p) => await executeDescribeMediaTool(env, body.contents, p),
                 executeKb: async (q) => await kbFor(env, carInfo, q),
@@ -5286,7 +5224,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
 
           const withTools = b.tools === true, withAgent = b.agent === true;
           const handle = cleanHandle(b.handle);
-          const mk = (liveModel, tools, resume, agent=withAgent) => liveToken({ model: liveModel, system: b.system, tools, agent, garageCare:b.garageCare===true&&agent, garageAssist:b.garageAssist===true&&agent, handle, resume, now });
+          const mk = (liveModel, tools, resume, agent=withAgent) => liveToken({ model: liveModel, system: b.system, tools, agent, webResearch:b.webResearch===true&&agent, garageCare:b.garageCare===true&&agent, garageAssist:b.garageAssist===true&&agent, handle, resume, now });
 
           let lastErr = '';
           for (const liveModel of candidates) {
@@ -5307,7 +5245,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
             }
             if (res.ok) {
               const tok = await res.json();
-              return json({ token: tok.name, model: liveModel, tools, agent, resume, garageCare:b.garageCare===true&&agent, resumed: resume && !!handle });
+              return json({ token: tok.name, model: liveModel, tools, agent, resume, webResearch:b.webResearch===true&&agent, garageCare:b.garageCare===true&&agent, resumed: resume && !!handle });
             }
             lastErr = `${liveModel} ${res.status}: ${(await res.text()).slice(0, 200)}`;
             /* รุ่นนี้ใช้ไม่ได้ (ไม่มี/ไม่มีสิทธิ์) → ลองรุ่นถัดไป · คีย์ผิดหรือโควตาหมด → ลองต่อก็ไม่ช่วย */
@@ -6165,6 +6103,21 @@ ${convo}`;
         })();
       }
 
+      // Read-only internet tool for calls and chat; no arbitrary URL fetching or private data.
+      if (url.pathname === '/api/ai/research' && request.method === 'POST') {
+        return await guarded('user',async actor=>{
+          const maintenance=await getConfig(env,'maintenance',{enabled:false});
+          if(maintenance.enabled&&rank(actor.role)<rank('moderator'))return deny('maintenance',503);
+          const body=await readBody();let query;
+          try{query=publicQuery(body?.query)}catch{return deny('Use a short public topic without personal details',400)}
+          const uid='web:'+actor.payload.sub,day=new Date().toISOString().slice(0,10);
+          // Atomically reserve before outbound requests, including owner accounts.
+          const used=await env.DB.prepare(`INSERT INTO usage (uid,day,count) VALUES (?,?,1)
+            ON CONFLICT(uid,day) DO UPDATE SET count=count+1 WHERE count<60 RETURNING count`).bind(uid,day).first();
+          if(!used)return deny('research_quota',429);
+          return json(await publicResearch(query,{signal:request.signal}));
+        })();
+      }
       /* Feature tools share the authenticated AI pipeline; never return demo results. */
       if (url.pathname === '/api/features/analyze' && request.method === 'POST') {
         return await guarded('user', async (actor) => {
@@ -6193,6 +6146,12 @@ ${convo}`;
             }
           }
           const meter = newMeter();
+          let research;
+          if(body.tool==='ear'||body.tool==='listen'){
+            const q=soundResearchQuery(audioIdentity(body.context));
+            research=q?await publicResearch(q,{signal:request.signal,vehicle:audioIdentity(body.context).vehicle}):{status:'needs_vehicle',sources:[],verifiedModelFaults:[]};
+            input.contents[0].parts[0].text+=researchBlock(research);
+          }
           const prefer = (body.tool === 'bay' || body.tool === 'baylive') && env.GEMINI_VISION_MODEL ? [env.GEMINI_VISION_MODEL] : undefined;
           let text;
           const engineScan = (body.tool === 'bay' || body.tool === 'baylive') && body.scanVersion === 2;
@@ -6205,7 +6164,7 @@ ${convo}`;
           }
           let data = null;
           if (input.json) {
-            try { data = cleanFeatureJson(body.tool, text, {scanVersion:body.scanVersion,lang:body.lang}); }
+            try { data = cleanFeatureJson(body.tool, text, {scanVersion:body.scanVersion,lang:body.lang,context:body.context}); if(research)data.research=research; }
             catch (e) {
               await meterTokens(env, uid, meter);
               if (!engineScan) return deny('AI ตอบกลับไม่สมบูรณ์ ลองใหม่อีกครั้ง', 502);
@@ -6221,7 +6180,7 @@ ${convo}`;
             ON CONFLICT(uid, day) DO UPDATE SET count = count + 2`).bind(uid, day).run(), null);
           if (cap) await safe(env, warnings, 'usage.feature', () => env.DB.prepare(`INSERT INTO usage (uid, day, count) VALUES (?, ?, 1)
             ON CONFLICT(uid, day) DO UPDATE SET count = count + 1`).bind(capKey, day).run(), null);
-          return json(data ? { data, tool: body.tool, source: 'ai', limit: cap || undefined, warnings } : { text, tool: body.tool, source: 'ai', warnings });
+          return json(data ? { data, ...(body.tool==='listen'?{text:soundText(data,body.lang)}:{}),tool: body.tool, source: 'ai', limit: cap || undefined, warnings } : { text, tool: body.tool, source: 'ai', warnings });
         })();
       }
 
@@ -6230,7 +6189,7 @@ ${convo}`;
         return await guarded('user', async (actor) => {
           const b = (await readBody()) || {};
           let audio = String(b.audio || '');
-          const m = audio.match(/^data:([^;,]+);base64,(.*)$/);
+          const m = audio.match(/^data:(audio\/[^,]+);base64,([A-Za-z0-9+/=\r\n]+)$/);
           let mime = String(b.mime || '');
           if (m) { mime = mime || m[1]; audio = m[2]; }
           if (!audio) return deny('Missing audio', 400);
@@ -6249,13 +6208,20 @@ ${convo}`;
             if (used && used.count >= limit) return deny('quota', 429);
           }
 
-          const result = await listenEngine(env, {
-            audio, mime: mime || 'audio/webm', take: String(b.take || '').slice(0, 20),
-            car: b.car || {}, note: b.note || '', lang: b.lang || 'th',
-          });
+          let input;
+          const soundBody={tool:'listen',attachments:[{mime:mime||'audio/webm',b64:audio}],context:{car:b.car||{},audioVehicle:b.audioVehicle,recording:b.recording,recordingCondition:String(b.take||'').slice(0,20)},question:String(b.note||'').slice(0,500),lang:b.lang};
+          try{input=buildFeatureRequest(soundBody)}catch(e){return deny(e.message,400)}
+          const meter=newMeter();
+          const q=soundResearchQuery(audioIdentity(soundBody.context));
+          const research=q?await publicResearch(q,{signal:request.signal,vehicle:audioIdentity(soundBody.context).vehicle}):{status:'needs_vehicle',sources:[],verifiedModelFaults:[]};
+          input.contents[0].parts[0].text+=researchBlock(research);
+          const cleaned=cleanFeatureJson('listen',await callGemini(env,{...input,meter}),{context:soundBody.context,lang:b.lang});
+          cleaned.research=research;
+          const result=legacySound(cleaned,String(b.take||'').slice(0,20));
+          await meterTokens(env,uid,meter);
           await safe(env, w, 'usage.write', () => env.DB.prepare(`
-            INSERT INTO usage (uid, day, count) VALUES (?, ?, 3)
-            ON CONFLICT(uid, day) DO UPDATE SET count = count + 3
+            INSERT INTO usage (uid, day, count) VALUES (?, ?, 2)
+            ON CONFLICT(uid, day) DO UPDATE SET count = count + 2
           `).bind(uid, day).run(), null);
 
           return json({ ...result, warnings: w });
