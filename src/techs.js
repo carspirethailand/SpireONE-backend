@@ -2093,7 +2093,8 @@ async function liveSet(env, me, id, b) {
   if (j.status !== 'enroute') fail(409, 'ส่งตำแหน่งได้เฉพาะตอนกำลังเดินทางไปหาลูกค้า');
   const lat = Number(b.lat), lng = Number(b.lng);
   if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180 || (!lat && !lng)) fail(400, 'ตำแหน่งไม่ถูกต้อง');
-  await limit(env, 'live', me.uid, 4000);
+  /* แอปช่างส่งทุก ~4 วินาทีระหว่างเดินทาง (แผนที่ 3 มิติฝั่งลูกค้าไหลลื่น) → ขับทั้งวัน 8 ชม. ≈ 7,200 ครั้ง · เผื่อไว้ 20,000 */
+  await limit(env, 'live', me.uid, 20000);
   const v = { lat: Math.round(lat * 1e5) / 1e5, lng: Math.round(lng * 1e5) / 1e5, acc: clampN(b.acc, 0, 5000), heading: clampN(b.heading, 0, 359), speed: clampN(b.speed, 0, 90), at: now() };
   /* ไม่แตะ updated_at — ตำแหน่งขยับบ่อย ไม่ควรทำให้รายการงานทั้งหมดของทั้งสองฝั่งโหลดใหม่ทุกครั้ง */
   await env.DB.prepare("UPDATE tech_jobs SET live = ? WHERE id = ? AND status = 'enroute'").bind(JSON.stringify(v), j.id).run();

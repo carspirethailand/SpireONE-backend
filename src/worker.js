@@ -37,6 +37,15 @@ const ROLE_RANK = { owner: 4, admin: 3, moderator: 2, user: 1 };
 
 /* เจ้าของบริษัท — อยู่ในรายการเจ้าของเสมอ แม้ตั้ง OWNERS บน Cloudflare แล้วลืมใส่ (เจ้าของต้องไม่หลุดสิทธิ์ของตัวเอง) */
 const FOUNDERS = ['anapatmaliwong@gmail.com', 'carspirethailand@gmail.com'];
+/* นับถอยหลังเปิดตัว: enabled + at (เวลาเปิด ms) · ข้อความบนหน้า · ปุ่มจองสิทธิ์สมัครช่าง */
+const LAUNCH_OFF = { enabled: false, at: 0, title: '', message: '', join: true };
+function launchIn(x) {
+  const at = Number(x.at), enabled = !!x.enabled;
+  if (enabled && (!Number.isFinite(at) || at < Date.now() - 60000 || at > Date.now() + 366 * 86400000))
+    throw new Error('เวลาเปิดตัวต้องเป็นเวลาในอนาคต และไม่เกิน 1 ปีจากวันนี้');
+  return { enabled, at: Number.isFinite(at) && at > 0 ? Math.round(at) : 0,
+    title: String(x.title || '').trim().slice(0, 80), message: String(x.message || '').trim().slice(0, 240), join: x.join !== false };
+}
 function owners(env) {
   return [...new Set([...FOUNDERS, ...String(env.OWNERS || '').toLowerCase().split(',').map(s => s.trim()).filter(Boolean)])];
 }
@@ -3866,7 +3875,9 @@ export default {
           aiDaily: parseInt(env.AI_DAILY_LIMIT || '60', 10),
           anonDaily: parseInt(env.AI_ANON_DAILY_LIMIT || '15', 10),
         });
-        return json({ announcement, maintenance, features, limits });
+        /* หน้านับถอยหลังก่อนเปิดตัว: แอปอ่านค่านี้แล้วพาคนทั่วไปไปหน้า /launch จนถึงเวลา (ทีมงานเข้าแอปได้ตามปกติ) */
+        const launch = await getConfig(env, 'launch', LAUNCH_OFF);
+        return json({ announcement, maintenance, features, limits, launch, now: Date.now() });
       }
 
       /* ===== LOGIN ===== */
@@ -5951,6 +5962,13 @@ ${convo}`;
             const m = { enabled: !!b.maintenance.enabled, message: String(b.maintenance.message || '').slice(0, 300) };
             await setConfig(env, 'maintenance', m);
             await logAudit(env, actor.email, 'config.maintenance', '', m.enabled ? 'ON' : 'OFF');
+          }
+          if (b.launch) {
+            /* เปิดตัวแอปเปลี่ยนสิ่งที่ทุกคนเห็นทั้งแอป — เจ้าของระบบเท่านั้น */
+            if (rank(actor.role) < rank('owner')) return deny('Only owners can change the launch countdown', 403);
+            let l; try { l = launchIn(b.launch); } catch (e) { return deny(e.message, 400); }
+            await setConfig(env, 'launch', l);
+            await logAudit(env, actor.email, 'config.launch', '', l.enabled ? 'ON ' + new Date(l.at).toISOString() : 'OFF');
           }
           if (b.limits) {
             const l = {
