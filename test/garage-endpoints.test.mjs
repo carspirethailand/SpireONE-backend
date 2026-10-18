@@ -56,3 +56,24 @@ test('model-year references are admin-only, source-bearing, exact-matching and a
   assert.equal((await f.call('POST','/api/admin/config',{garageCostReferences:[...rows,...rows]},'admin')).status,400);
   assert.equal(f.db.prepare("SELECT COUNT(*) n FROM audit WHERE action='config.garage_cost_reference'").get().n,1);
 });
+
+test('canonical mileage is anchored first, mirrored to the right car, and cannot be rolled back by stale car/color sync',async()=>{
+  const f=await fixture();
+  await f.call('PUT','/api/state',{state:{garage:{v:[{id:'car-1',make:'Honda',model:'Civic',mileage:'50000',color:'#123456'}],t:1}}});
+  const first=await f.call('POST','/api/odo/anchor',{carId:'car-1',km:51000,source:'manual'});assert.equal(first.status,200);
+  assert.equal(JSON.parse(f.db.prepare("SELECT v FROM user_state WHERE uid='me' AND k='garage'").get().v)[0].mileage,'51000');
+  const lower=await f.call('POST','/api/odo/anchor',{carId:'car-1',km:50000,source:'manual'});assert.equal(lower.status,409);assert.equal(lower.json.code,'mileage_order');
+  const jump=await f.call('POST','/api/odo/anchor',{carId:'car-1',km:100000,source:'manual'});assert.equal(jump.status,409);assert.equal(jump.json.code,'mileage_jump');
+  assert.equal((await f.call('POST','/api/odo/anchor',{carId:'car-1',km:100000,confirmJump:true,source:'manual'})).status,200);
+  const stale=await f.call('POST','/api/cars',{id:'car-1',make:'Honda',model:'Civic',mileage:'50000',color:'#AA1122'});assert.equal(stale.status,200);assert.equal(stale.json.mileage,'100000');
+  assert.equal(f.db.prepare("SELECT mileage FROM cars WHERE id='car-1'").get().mileage,'100000');
+  assert.equal((await f.call('POST','/api/odo/anchor',{carId:'car-1',km:100001},'other')).status,404);
+});
+
+test('simultaneous contradictory readings cannot create a reversed odometer history',async()=>{
+  const f=await fixture(),at=Date.now()-1000;
+  const results=await Promise.all([51000,50000].map(km=>f.call('POST','/api/odo/anchor',{carId:'car-1',km,observedAt:at,confirmJump:true})));
+  assert.equal(results.filter(r=>r.status===200).length,1);
+  assert.equal(results.filter(r=>r.status===409).length,1);
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM odo_anchor WHERE observed_at=?').get(at).n,1);
+});

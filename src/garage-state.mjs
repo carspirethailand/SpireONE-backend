@@ -1,4 +1,6 @@
 import rules from './garage-rules.mjs';
+import {specKey,detailsKey} from './carspec.js';
+import {documentedPrice} from './spec-details.mjs';
 const parse=v=>{try{return JSON.parse(v)}catch{return null}};
 export async function garageRulesFor(env,uid,id,incomingGarage){
   if(typeof id!=='string'||!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,59}$/.test(id))return null;
@@ -10,7 +12,10 @@ export async function garageRulesFor(env,uid,id,incomingGarage){
   const saved=Array.isArray(list)?list.find(c=>c?.id===id):null;
   const car=canonical||saved;if(!car)return null;
   const row=await env.DB.prepare('SELECT value FROM config WHERE key=?').bind('garage_cost_reference').first();
-  const ref=rules.reference(car,parse(row?.value));
+  let ref=rules.reference(car,parse(row?.value));
+  if(!ref){
+    try{const keys=[detailsKey(car.make,car.model,car.year,'TH'),detailsKey(car.make,car.model,car.year,'GLOBAL'),specKey(car.make,car.model,car.year,'TH'),specKey(car.make,car.model,car.year,'GLOBAL')];const rows=await env.DB.prepare('SELECT * FROM car_specs WHERE k IN (?,?,?,?)').bind(...keys).all();const records=(rows.results||[]).map(r=>({...r,data:parse(r.data),sources:parse(r.sources)}));const found=documentedPrice(car,records);ref=rules.reference(car,found?[found]:[])}catch{}
+  }
   return {car,ref,policy:rules.costPolicy(car,ref)};
 }
 export async function validateGarageWrite(env,uid,key,value,incomingGarage){
