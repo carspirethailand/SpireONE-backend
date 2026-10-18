@@ -343,3 +343,27 @@ test('car spec: three required fields are sufficient and explicit Thai requests 
   const {call}=setup();const general=await call('POST','/api/car-spec',pajero,CUST),thai=await call('POST','/api/car-spec',{...pajero,market:'TH'},CUST);
   assert.equal(general.json.status,'ready');assert.equal(general.json.key,'mitsubishi|pajero sport|2020|global');assert.equal(general.json.data.query.market,'GLOBAL');assert.equal(thai.json.key,'mitsubishi|pajero sport|2020');assert.notEqual(thai.json.key,general.json.key);
 });
+
+test('car spec: a model saved before the deeper fields shows at once, is topped up once in the background, and a failed top-up keeps the old data',async()=>{
+  const k='mitsubishi|pajero sport|2020|global',old={schema:2,body:'suv',facts:{seats:{v:7,ok:true}},variants:[],score:{cells:1,confirmed:1,conflicts:0}};
+  const run=async({fail=false,status='ready'}={})=>{
+    const s=setup({fail});
+    s.f.sqlite.prepare('INSERT INTO car_specs (k,make,model,year,status,body,data,sources,models,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+      .run(k,'Mitsubishi','Pajero Sport','2020',status,'suv',JSON.stringify(old),JSON.stringify([{url:'https://www.mitsubishi-motors.co.th/x',title:'x'}]),'[]',1,1);
+    const bg=[],post=async()=>{const r=await worker.fetch(new Request('https://api.unit.test/api/car-spec',{method:'POST',
+      headers:{'Content-Type':'application/json','CF-Connecting-IP':'203.0.113.9',Authorization:'Bearer '+CUST},body:JSON.stringify(pajero)}),s.f.env,{waitUntil(p){bg.push(p)}});
+      const j=await r.json();await Promise.all(bg.splice(0));return j};
+    return {...s,post,row:()=>{const r=s.f.sqlite.prepare('SELECT status,data FROM car_specs WHERE k=?').get(k);return {...r,data:JSON.parse(r.data)}}};
+  };
+  {const {ai,post,row,f}=await run();
+    const r=await post();assert.equal(r.status,'ready');assert.equal(r.data.score.cells,1,'the saved data answers immediately');
+    assert.equal(ai.length,2,'one background top-up (two passes)');
+    const now=row();assert.equal(now.status,'ready');assert.equal(now.data.depth,2);assert.ok(now.data.score.cells>1);
+    assert.equal(f.sqlite.prepare("SELECT n FROM spec_quota WHERE who='u:cust'").get(),undefined,'the user\'s own lookup allowance is not used');
+    await post();assert.equal(ai.length,2,'never topped up twice');}
+  {const {post,row,f}=await run({fail:true});
+    await post();const now=row();assert.equal(now.status,'ready');assert.deepEqual(now.data,old,'a failed top-up never replaces or hides the old data');
+    assert.equal(f.sqlite.prepare("SELECT n FROM spec_quota WHERE who='*'").get().n,0,'system allowance refunded');}
+  {const {ai,post,row}=await run({status:'verified'});
+    await post();assert.equal(ai.length,0,'team-verified records are locked');assert.deepEqual(row().data,old);}
+});

@@ -4,7 +4,7 @@
    ข้อมูลที่เจ้าของรถบันทึกเอง (รุ่นย่อย เครื่อง เกียร์ ยาง ...) ใส่ทุกครั้งที่มี เพราะสั้นและช่วยเลือกรุ่นย่อยถูก
    ไม่ส่ง VIN ทะเบียน หรือจังหวัด ให้ผู้ให้บริการ AI — AI ไม่ต้องใช้ตอบเรื่องสเปก และระบุตัวรถ/เจ้าของได้ */
 
-const SPEC_WORDS = /สเปก|สเปค|แรงม้า|แรงบิด|ซีซี|\bcc\b|เครื่องยนต์|เครื่อง|เกียร์|ยาง|ล้อ|แม็ก|ถังน้ำมัน|น้ำมัน|กี่ลิตร|ลิตร|กินน้ำมัน|สิ้นเปลือง|ประหยัด|ขนาด|ความยาว|ความกว้าง|ความสูง|ฐานล้อ|น้ำหนัก|ที่นั่ง|แบต|แบตเตอรี่|ชาร์จ|วิ่งได้กี่|ระยะทาง|ขับเคลื่อน|ขับหน้า|ขับหลัง|4wd|awd|ไฮบริด|ดีเซล|เบนซิน|อุปกรณ์|ถุงลม|ระบบช่วย|ความปลอดภัย|ออปชั่น|ออฟชั่น|รุ่นย่อย|เจเนอเรชัน|โฉม|ไซส์|เปลี่ยน|รอบ|ดูแล|บำรุง|อะไหล่|\bhp\b|\bps\b|horsepower|torque|spec|engine|gear|transmission|tyre|tire|wheel|fuel|tank|economy|mpg|battery|range|charge|weight|seat|dimension|safety|airbag|adas|trim|variant|oil|service|maintenance/i;
+const SPEC_WORDS = /สเปก|ความเร็วสูงสุด|อัตราเร่ง|0-100|ใต้ท้อง|ต่ำสุดจากพื้น|วงเลี้ยว|ช่วงล่าง|โช้ค|เบรก|ท้ายรถ|สัมภาระ|top speed|acceleration|clearance|turning|suspension|brake|boot|trunk|สเปค|แรงม้า|แรงบิด|ซีซี|\bcc\b|เครื่องยนต์|เครื่อง|เกียร์|ยาง|ล้อ|แม็ก|ถังน้ำมัน|น้ำมัน|กี่ลิตร|ลิตร|กินน้ำมัน|สิ้นเปลือง|ประหยัด|ขนาด|ความยาว|ความกว้าง|ความสูง|ฐานล้อ|น้ำหนัก|ที่นั่ง|แบต|แบตเตอรี่|ชาร์จ|วิ่งได้กี่|ระยะทาง|ขับเคลื่อน|ขับหน้า|ขับหลัง|4wd|awd|ไฮบริด|ดีเซล|เบนซิน|อุปกรณ์|ถุงลม|ระบบช่วย|ความปลอดภัย|ออปชั่น|ออฟชั่น|รุ่นย่อย|เจเนอเรชัน|โฉม|ไซส์|เปลี่ยน|รอบ|ดูแล|บำรุง|อะไหล่|\bhp\b|\bps\b|horsepower|torque|spec|engine|gear|transmission|tyre|tire|wheel|fuel|tank|economy|mpg|battery|range|charge|weight|seat|dimension|safety|airbag|adas|trim|variant|oil|service|maintenance/i;
 export const wantsSpec = q => SPEC_WORDS.test(String(q || ''));
 
 /* ช่องที่ผู้ใช้บันทึกเองผ่านการ์ด car_info / ฟอร์มข้อมูลรถ — ไม่มี vin/plate/province โดยตั้งใจ */
@@ -20,9 +20,12 @@ export function ownBlock(info) {
 
 const FUEL = { petrol: 'เบนซิน', diesel: 'ดีเซล', hybrid: 'ไฮบริด', phev: 'ปลั๊กอินไฮบริด', ev: 'ไฟฟ้า', lpg: 'LPG' };
 const UNIT = { cc: ' cc', hp: ' แรงม้า', torque_nm: ' Nm', l_per_100km: ' ลิตร/100 กม.', battery_kwh: ' kWh', range_km: ' กม.',
-  seats: ' ที่นั่ง', doors: ' ประตู', length_mm: ' มม.', width_mm: ' มม.', height_mm: ' มม.', wheelbase_mm: ' มม.', kerb_kg: ' กก.', tank_l: ' ลิตร' };
+  seats: ' ที่นั่ง', doors: ' ประตู', length_mm: ' มม.', width_mm: ' มม.', height_mm: ' มม.', wheelbase_mm: ' มม.', kerb_kg: ' กก.', tank_l: ' ลิตร',
+  top_kmh: ' กม./ชม.', accel_s: ' วินาที', ground_clearance_mm: ' มม.', turning_m: ' ม.', cargo_l: ' ลิตร' };
 const LBL = { cc: 'ความจุ', hp: 'กำลัง', torque_nm: 'แรงบิด', l_per_100km: 'อัตราสิ้นเปลือง', battery_kwh: 'แบตเตอรี่', range_km: 'วิ่งได้',
-  seats: 'ที่นั่ง', doors: 'ประตู', length_mm: 'ยาว', width_mm: 'กว้าง', height_mm: 'สูง', wheelbase_mm: 'ฐานล้อ', kerb_kg: 'น้ำหนักรถเปล่า', tank_l: 'ถังน้ำมัน', tire: 'ยาง' };
+  seats: 'ที่นั่ง', doors: 'ประตู', length_mm: 'ยาว', width_mm: 'กว้าง', height_mm: 'สูง', wheelbase_mm: 'ฐานล้อ', kerb_kg: 'น้ำหนักรถเปล่า', tank_l: 'ถังน้ำมัน', tire: 'ยาง',
+  top_kmh: 'ความเร็วสูงสุด', accel_s: '0-100 กม./ชม.', ground_clearance_mm: 'ต่ำสุดจากพื้น', turning_m: 'รัศมีวงเลี้ยว', cargo_l: 'ที่เก็บของท้าย',
+  suspension_front: 'ช่วงล่างหน้า', suspension_rear: 'ช่วงล่างหลัง', brakes_front: 'เบรกหน้า', brakes_rear: 'เบรกหลัง' };
 const num = v => typeof v === 'number' ? v.toLocaleString('en-US') : clip(v, 40);
 /* ✓ = สองรอบตรงกัน · (แหล่งเดียว) · ⚠ ขัดกันให้บอกทั้งสองค่า */
 function cell(c, unit = '') {
@@ -43,13 +46,15 @@ export function specBlock(spec, equip) {
     lines.push(`${clip(spec.make, 40)} ${clip(spec.model, 40)} ปี ${clip(spec.year, 4)}${head ? ' · ' + head : ''} · ${spec.verified ? 'ทีมงานตรวจแล้ว' : 'ยังไม่ผ่านการตรวจโดยทีมงาน'}`);
     const vs = (Array.isArray(d.variants) ? d.variants : []).slice(0, 8).map(v => {
       const bits = [cell(v.engine), ...['cc', 'hp', 'torque_nm'].map(k => cell(v[k], UNIT[k])), cell(v.gearbox) && 'เกียร์ ' + cell(v.gearbox),
-        cell(v.drive), FUEL[v.fuel] || '', cell(v.l_per_100km, UNIT.l_per_100km), cell(v.battery_kwh, UNIT.battery_kwh), cell(v.range_km) && 'วิ่งได้ ' + cell(v.range_km, UNIT.range_km)]
+        cell(v.drive), FUEL[v.fuel] || '', cell(v.l_per_100km, UNIT.l_per_100km), cell(v.battery_kwh, UNIT.battery_kwh), cell(v.range_km) && 'วิ่งได้ ' + cell(v.range_km, UNIT.range_km),
+        ...['top_kmh', 'accel_s'].map(k => cell(v[k], UNIT[k]) && LBL[k] + ' ' + cell(v[k], UNIT[k]))]
         .filter(Boolean);
       return bits.length ? `- ${clip(v.name, 60) || 'รุ่นย่อย'}: ${bits.join(' · ')}` : '';
     }).filter(Boolean);
     if (vs.length) lines.push('รุ่นย่อย/เครื่องยนต์:\n' + vs.join('\n'));
     const f = d.facts || {};
-    const fs = ['tank_l', 'tire', 'kerb_kg', 'seats', 'doors', 'length_mm', 'width_mm', 'height_mm', 'wheelbase_mm']
+    const fs = ['tank_l', 'tire', 'kerb_kg', 'seats', 'doors', 'length_mm', 'width_mm', 'height_mm', 'wheelbase_mm', 'ground_clearance_mm', 'turning_m', 'cargo_l',
+      'suspension_front', 'suspension_rear', 'brakes_front', 'brakes_rear']
       .map(k => { const c = cell(f[k], UNIT[k] || ''); return c ? `${LBL[k]} ${c}` : ''; }).filter(Boolean);
     if (fs.length) lines.push('ข้อมูลตัวรถ: ' + fs.join(' · '));
   }

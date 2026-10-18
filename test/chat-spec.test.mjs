@@ -62,3 +62,13 @@ test('chat, streaming chat and LINE chat all include it — read-only, never a n
   assert.equal((worker.match(/\[รถที่กำลังคุยถึง\]\$\{carContext\}\$\{specCtx\}/g) || []).length, 2);
   assert.match(worker, /\$\{LINE_TALK\}\$\{carContext\}\$\{carContext \? specCtx : ''\}/);
 });
+
+test('chat spec: deeper fields (top speed, 0-100, clearance, turning radius, boot, suspension, brakes) reach the AI with their markers',()=>{
+  const spec={status:'ready',make:'Toyota',model:'Fortuner',year:'2020',sources:[],data:{facts:{ground_clearance_mm:{v:279,ok:true},turning_m:{v:5.8,ok:null},cargo_l:{v:296,ok:true},
+    suspension_front:{v:'double wishbone',ok:true},brakes_rear:{v:'drums',ok:false,alt:'discs'}},
+    variants:[{name:'2.8 Legender',top_kmh:{v:180,ok:true},accel_s:{v:10.8,ok:null}}]}};
+  const b=specBlock(spec,null);
+  for(const s of ['ต่ำสุดจากพื้น 279 มม. ✓','รัศมีวงเลี้ยว 5.8 ม. (แหล่งเดียว)','ที่เก็บของท้าย 296 ลิตร ✓','ช่วงล่างหน้า double wishbone ✓','เบรกหลัง drums ⚠ หรือ discs',
+    'ความเร็วสูงสุด 180 กม./ชม. ✓','0-100 กม./ชม. 10.8 วินาที (แหล่งเดียว)'])assert.ok(b.includes(s),s);
+  for(const q of ['0-100 กี่วิ','ช่วงล่างเป็นแบบไหน','ใต้ท้องสูงเท่าไหร่','top speed?'])assert.ok(wantsSpec(q),q);
+});

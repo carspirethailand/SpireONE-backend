@@ -123,7 +123,9 @@ export async function collectSpecDocuments(q,log=[],signal){
   }
   if(!docs.length)throw Error('ไม่พบหน้าเอกสารที่เปิดอ่านและใช้อ้างอิงได้');return docs.map((d,id)=>({...d,id}));
 }
-const WORDS={seats:['seats','seating','passenger','ที่นั่ง'],doors:['doors','ประตู'],length_mm:['length','ยาว'],width_mm:['width','กว้าง'],height_mm:['height','สูง'],wheelbase_mm:['wheelbase','ฐานล้อ'],kerb_kg:['weight','kerb','curb','น้ำหนัก'],tank_l:['tank','fuel capacity','ถัง'],cc:['cc','displacement','cubic','ความจุ','ซีซี'],hp:['hp','bhp','horsepower','แรงม้า'],torque_nm:['torque','nm','แรงบิด'],l_per_100km:['l/100','litres per 100','ลิตร/100'],battery_kwh:['kwh','battery','แบตเตอรี่'],range_km:['range','driving distance','ระยะทาง']};
+const WORDS={seats:['seats','seating','passenger','ที่นั่ง'],doors:['doors','ประตู'],length_mm:['length','ยาว'],width_mm:['width','กว้าง'],height_mm:['height','สูง'],wheelbase_mm:['wheelbase','ฐานล้อ'],kerb_kg:['weight','kerb','curb','น้ำหนัก'],tank_l:['tank','fuel capacity','ถัง'],cc:['cc','displacement','cubic','ความจุ','ซีซี'],hp:['hp','bhp','horsepower','แรงม้า'],torque_nm:['torque','nm','แรงบิด'],l_per_100km:['l/100','litres per 100','ลิตร/100'],battery_kwh:['kwh','battery','แบตเตอรี่'],range_km:['range','driving distance','ระยะทาง'],
+  ground_clearance_mm:['ground clearance','clearance','ต่ำสุดจากพื้น','ใต้ท้อง'],turning_m:['turning radius','radius','รัศมี','วงเลี้ยว'],cargo_l:['cargo','boot','trunk','luggage','สัมภาระ','เก็บของ'],
+  top_kmh:['top speed','maximum speed','max speed','ความเร็วสูงสุด'],accel_s:['0-100','0 to 100','0-62','0 to 62','acceleration','อัตราเร่ง']};
 const ENUM={coupe:['coupe','coupé','sports car','คูเป้','รถสปอร์ต'],sedan:['sedan','saloon','ซีดาน'],suv:['suv','sport utility','เอสยูวี'],hatchback:['hatchback','แฮทช์แบ็ก'],pickup:['pickup','pick-up','กระบะ'],mpv:['mpv','minivan','เอ็มพีวี'],van:['van','รถตู้'],ev:['electric','battery electric','ไฟฟ้า'],petrol:['petrol','gasoline','เบนซิน'],diesel:['diesel','ดีเซล'],hybrid:['hybrid','ไฮบริด'],phev:['plug-in','phev','ปลั๊กอิน'],lpg:['lpg','แก๊ส'],FWD:['fwd','front-wheel','front wheel','ขับหน้า'],RWD:['rwd','rear-wheel','rear wheel','ขับหลัง'],AWD:['awd','all-wheel','all wheel','ขับสี่'], '4WD':['4wd','four-wheel','4x4','ขับสี่']};
 const squash=s=>String(s||'').normalize('NFC').replace(/[–—−]/g,'-').replace(/[“”]/g,'"').replace(/[‘’]/g,"'").replace(/\s+/g,' ').trim().toLowerCase();
 const COUNTRY={TH:['thailand','thai market','ประเทศไทย','ตลาดไทย'],JP:['japan','japanese market','ญี่ปุ่น'],US:['united states','u.s. market','us market','สหรัฐ'],UK:['united kingdom','uk market','british market','สหราชอาณาจักร'],DE:['germany','german market','เยอรมนี'],AU:['australia','australian market','ออสเตรเลีย'],EU:['europe','european market','ยุโรป']};
@@ -134,6 +136,10 @@ function coversYear(quote,year){
 }
 function supports(k,value,quote){const s=squash(quote);if(value==null)return false;
   if(k==='hp'&&/\b(?:ps|kw)\b/.test(s)&&!/\b(?:hp|bhp|horsepower)\b/.test(s))return false;
+  // ช่องเชิงลึก: หน่วยต้องตรงตามที่เอกสารเขียน ไม่รับค่าที่ต้องแปลงหน่วยหรือคนละมาตรวัด
+  if(k==='top_kmh'&&!/km\/h|kph|กม\.?\s*\/\s*ชม|กิโลเมตรต่อชั่วโมง/.test(s))return false;
+  if(k==='accel_s'&&!/0\s*-\s*(?:100|62)\b|0 to (?:100|62)\b/.test(s))return false;
+  if(k==='turning_m'&&/turning circle|kerb.to.kerb|wall.to.wall/.test(s)&&!/radius|รัศมี/.test(s))return false;
   const contains=w=>/^[a-z0-9 ]+$/i.test(w)?new RegExp('\\b'+w+'\\b','i').test(s):s.includes(w);
   if(ENUM[value])return ENUM[value].some(contains);
   if(typeof value==='number'){const n=String(value),flat=s.replace(/,(?=\d{3}\b)/g,'');let at=-1;while((at=flat.indexOf(n,at+1))>=0){const end=at+n.length;if(/\d/.test(flat[at-1]||'')||/\d/.test(flat[end]||'')||flat[at-1]==='.'&&/\d/.test(flat[at-2]||'')||flat[end]==='.'&&/\d/.test(flat[end+1]||''))continue;const near=flat.slice(Math.max(0,at-25),end+25);if((WORDS[k]||[]).some(w=>/^[a-z]+$/.test(w)?new RegExp('\\b'+w+'\\b').test(near):near.includes(w)))return true}return false}
@@ -173,12 +179,12 @@ export function cleanDocumentExtraction(raw,docs,q,{kind='spec'}={}){
     if(!good.length)return null;diagnostic.acceptedFields++;evidence[path]=[...new Set(good.map(e=>Number(e.source)))];positions[path]=good.map(e=>({id:Number(e.source),at:quoteAt(Number(e.source),e.quote)}));return v;
   }
   const out={found:true,variants:[],evidence};
-  for(const k of ['body','generation','market','seats','doors','length_mm','width_mm','height_mm','wheelbase_mm','kerb_kg','tank_l','tire'])out[k]=value('facts.'+k,k,raw[k]??raw.facts?.[k]);
+  for(const k of ['body','generation','market','seats','doors','length_mm','width_mm','height_mm','wheelbase_mm','kerb_kg','tank_l','tire','ground_clearance_mm','turning_m','cargo_l','suspension_front','suspension_rear','brakes_front','brakes_rear'])out[k]=value('facts.'+k,k,raw[k]??raw.facts?.[k]);
   for(const [i,v] of (Array.isArray(raw.variants)?raw.variants:[]).slice(0,12).entries()){
     const next={},base='variants.'+i+'.';for(const k of ['name','engine'])next[k]=value(base+k,k,v?.[k]);
     const anchors=[...(positions[base+'name']||[]),...(positions[base+'engine']||[])];
     if(!anchors.length)continue;
-    for(const k of ['fuel','cc','hp','torque_nm','gearbox','drive','l_per_100km','battery_kwh','range_km'])next[k]=value(base+k,k,v?.[k],anchors);
+    for(const k of ['fuel','cc','hp','torque_nm','gearbox','drive','l_per_100km','battery_kwh','range_km','top_kmh','accel_s'])next[k]=value(base+k,k,v?.[k],anchors);
     next._sources={};for(const k of Object.keys(next)){const refs=evidence[base+k];if(refs)next._sources[k]=refs}
     out.variants.push(next);
   }
