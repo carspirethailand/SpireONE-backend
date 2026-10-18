@@ -1,10 +1,11 @@
 // Audio observations cannot authenticate a vehicle or certify that it is safe to drive.
 // No recordings, transcripts, VINs, plates or personal identifiers are retained here.
+import { modelIssueKnowledge } from './vehicle-issues.mjs';
 const text = (v, n = 100) => typeof v === 'string' || typeof v === 'number' ? String(v).replace(/[\u0000-\u001f<>]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, n) : '';
 export function audioCar(raw = {}) {
   if (!raw || typeof raw !== 'object') return {};
   const name = text(raw.name), words = name.split(/\s+/);
-  return Object.fromEntries(Object.entries({make:text(raw.make || words[0]),model:text(raw.model || words.slice(1).join(' ')),year:text(raw.model_year || raw.year, 4),engine:text(raw.engine,80),engine_code:text(raw.engine_code,24),fuel:text(raw.fuel || raw.fuelType,30),mileage:text(raw.mileage,12)}).filter(([,v])=>v));
+  return Object.fromEntries(Object.entries({make:text(raw.make || words[0]),model:text(raw.model || words.slice(1).join(' ')),year:text(raw.model_year || raw.year, 4),engine:text(raw.engine,80),engine_code:text(raw.engine_code,24),fuel:text(raw.fuel || raw.fuelType,30),mileage:text(raw.mileage,12),market:text(raw.market||raw.country,40),kind:text(raw.kind||raw.vehicle_type,20)}).filter(([,v])=>v));
 }
 export function audioIdentity(context = {}) {
   const v = context?.audioVehicle;
@@ -21,6 +22,7 @@ export const VEHICLE_AUDIO_RULES = [
   'MOTORCYCLES: Distinguish manual/semi-automatic chain drive, CVT scooters and electric drivetrains only when confirmed by vehicle details or applicable documents. Do not transplant car radiator-fan/diesel advice to a Wave, CVT advice to a geared bike, or combustion/idle/injector advice to an electric bike. Single-cylinder pulses alone do not establish a fault. Chain, valve train, exhaust leaks, bodywork, CVT and motor/bearing noise are possibilities only with an audible clue and compatible drivetrain, never universal model diseases.',
   'Separate observations, possible explanations and confirmation checks. Airflow/roaring alone cannot distinguish radiator fan, intake, AC or recording wind. Regular diesel ticking alone does not prove either healthy injectors or faulty injectors. Check changes with RPM, cold/warm, AC setting, duration, location, dashboard warnings, smoke and vibration; do not invent any of them. Ask at most two useful missing questions at a time.',
   'Model-year problems need an applicable manufacturer document with matching market, engine and production range. One online repair video is an individual case, not prevalence, recall applicability, a diagnosis, an acoustic template or proof that another car has the same defect. Do not invent known problems or generalise one engine/year to all cars of that badge.',
+  'CURATED DOCUMENTS: manufacturerEvidence contains bounded factual summaries, not acoustic training examples. scope_check_required means applicability is missing: state the source market and unresolved scope, never say the user has that problem. documented_candidate still requires technician confirmation. soundEvidence=false means the document provides NO acoustic diagnostic clue. Match an actual audible clue before mentioning any documented explanation; otherwise keep the sound assessment separate. Do not add vehicle names to sound prose. Do not force optional engine/market details before describing a usable recording, and do not ask for a VIN in chat.',
   'SAFETY: A short recording cannot certify roadworthiness. Do not say safe to drive / fine to drive / ขับต่อได้. Stop safely and arrange professional help for oil-pressure warning, overheating/steam, fuel smell, heavy metallic knock, grinding brakes or severe shaking. Never instruct revving a suspect engine, touching running parts, disconnecting injector lines, removing covers, spraying belts or opening a hot cooling cap. Record only while safely parked in P/N with parking brake, outdoors, at a safe distance from moving/hot parts; idle only, no forced revs.'
 ].join(' ');
 
@@ -30,7 +32,7 @@ export const SOUND_REFERENCES = Object.freeze([
 ]);
 export function soundGrounding(context) {
   const identity = audioIdentity(context);
-  return {audioIdentity:identity,recording:captureInfo(context),referenceNotes:SOUND_REFERENCES.map(({id,note,scope})=>({id,note,scope})),modelYearFaults:[],limitation:'No validated vehicle-specific audio classifier or model-year fault corpus. Do not claim otherwise.'};
+  return {audioIdentity:identity,recording:captureInfo(context),referenceNotes:SOUND_REFERENCES.map(({id,note,scope})=>({id,note,scope})),modelYearFaults:[],manufacturerEvidence:modelIssueKnowledge(identity.vehicle),limitation:'No validated vehicle-specific audio classifier. Curated documents are not acoustic training or proof of a fault in this vehicle. Do not claim otherwise.'};
 }
 export function captureInfo(context={}){
   const r=context.recording||{},out={source:['dedicated_microphone','uploaded_file'].includes(r.source)?r.source:'unknown',processing:{}};

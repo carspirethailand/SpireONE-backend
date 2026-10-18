@@ -6149,7 +6149,7 @@ ${convo}`;
           let research;
           if(body.tool==='ear'||body.tool==='listen'){
             const q=soundResearchQuery(audioIdentity(body.context));
-            research=q?await publicResearch(q,{signal:request.signal}):{status:'needs_vehicle',sources:[],verifiedModelFaults:[]};
+            research=q?await publicResearch(q,{signal:request.signal,vehicle:audioIdentity(body.context).vehicle}):{status:'needs_vehicle',sources:[],verifiedModelFaults:[]};
             input.contents[0].parts[0].text+=researchBlock(research);
           }
           const prefer = (body.tool === 'bay' || body.tool === 'baylive') && env.GEMINI_VISION_MODEL ? [env.GEMINI_VISION_MODEL] : undefined;
@@ -6213,7 +6213,7 @@ ${convo}`;
           try{input=buildFeatureRequest(soundBody)}catch(e){return deny(e.message,400)}
           const meter=newMeter();
           const q=soundResearchQuery(audioIdentity(soundBody.context));
-          const research=q?await publicResearch(q,{signal:request.signal}):{status:'needs_vehicle',sources:[],verifiedModelFaults:[]};
+          const research=q?await publicResearch(q,{signal:request.signal,vehicle:audioIdentity(soundBody.context).vehicle}):{status:'needs_vehicle',sources:[],verifiedModelFaults:[]};
           input.contents[0].parts[0].text+=researchBlock(research);
           const cleaned=cleanFeatureJson('listen',await callGemini(env,{...input,meter}),{context:soundBody.context,lang:b.lang});
           cleaned.research=research;

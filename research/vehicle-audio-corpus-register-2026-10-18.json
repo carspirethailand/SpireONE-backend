@@ -1,0 +1,40 @@
+{
+  "checkedAt": "2026-10-18",
+  "purpose": "Dataset admission audit; not a training result",
+  "trainingStarted": false,
+  "audioDownloaded": false,
+  "weightsTrained": false,
+  "admittedAudioFiles": 0,
+  "validatedAcousticModels": 0,
+  "requestedCars": ["Isuzu", "Mitsubishi", "Toyota", "Honda", "Ford", "Mazda", "Mercedes", "BMW", "Audi", "Porsche"],
+  "requestedMotorcycles": ["Honda", "Yamaha", "Suzuki", "Vespa", "Lambretta", "GPX", "Deco", "EM", "Lion"],
+  "admissionRequirements": [
+    "Original real-vehicle audio accessible through the publisher's permitted download method",
+    "Explicit audio rights permitting the intended training and commercial app use",
+    "Per-example mechanical inspection, repair outcome or controlled-fault evidence; no AI self-label or video-title diagnosis",
+    "Vehicle, source-recording and session grouping to prevent split leakage",
+    "Model/year/engine/market scope and recording conditions documented",
+    "Independent held-out evaluation; no claim of real-world accuracy from training scores or unit fixtures"
+  ],
+  "sources": [
+    {"id":"akbalik-2024","url":"https://www.mdpi.com/2076-3417/14/15/6532","evidence":"Workshop diagnoses reported for selected Ford/Toyota gasoline vehicles","status":"not_admitted","reason":"Publisher says recordings are not public due to confidentiality; no files or dataset permission obtained. Article licence is not an audio-data licence."},
+    {"id":"acv-2024","url":"https://arxiv.org/html/2403.11037v1","evidence":"Expert-labelled automobile fault events; 232 models reported","status":"not_admitted","reason":"No publicly licensed audio download established in inspected paper; no files obtained."},
+    {"id":"sensors-2024","url":"https://www.mdpi.com/1424-8220/24/22/7316","evidence":"Real diesel vehicles and controlled operating/fault conditions reported","status":"not_admitted","reason":"Data available on request; no permission or files obtained. Unsafe fault injection must not be repeated by users."},
+    {"id":"vafd-2025","url":"https://github.com/amrrashed/Beyond-Sensors-Audio-Based-ML-for-Real-Time-Vehicle-Fault-Emergency-Classification","evidence":"Expert listening/majority review reported","status":"not_admitted","reason":"Original recording licences and per-clip mechanical confirmation not established. Public repository is not sufficient training permission."},
+    {"id":"kaggle-car-diagnostics","url":"https://www.kaggle.com/datasets/malakragaie/car-diagnostics-dataset","evidence":"Dataset title alone is not a confirmed diagnosis","status":"not_admitted","reason":"Public Kaggle metadata returned licenseName=Unknown; label provenance unverified."},
+    {"id":"hl-cead","url":"https://github.com/MachineLearningVisionRG/machine_biometrics","evidence":"Real engine recordings by make/model/RPM; same vehicle appears across RPM folders","status":"not_admitted","reason":"No explicit audio licence established; no mechanical health labels; many model classes have a single physical vehicle. Cannot measure unseen-vehicle recognition from random clip splits."},
+    {"id":"visc8","url":"https://zenodo.org/records/5606504","evidence":"Broad vehicle-interior sound classes from online POV recordings","status":"not_admitted","reason":"Not diagnosed fault labels or exact model identity; underlying recording rights not established for intended use."},
+    {"id":"carzam","url":"https://github.com/jiogallardy/carzam","evidence":"Code for video-derived vehicle sound recognition","status":"not_admitted","reason":"MIT code licence does not license third-party recordings. Automated labels are not confirmed mechanical diagnoses."},
+    {"id":"fsd50k","url":"https://zenodo.org/records/4060432","evidence":"Human-labelled sound events, not physical vehicle inspection labels","status":"not_admitted","reason":"Mixed per-clip licences and commercial-use contact instruction. No licence clearance sought. Event labels cannot train normal/fault or exact-model judgments."},
+    {"id":"ieee-2025","url":"https://doi.org/10.21227/1nyq-gb28","evidence":"Controlled engine-fault dataset title located","status":"not_admitted","reason":"Primary download and permitted audio licence not established; no files obtained. Secondary catalogue metadata is not admission evidence."},
+    {"id":"toyadmos","url":"https://dcase.community/challenge2023/task-first-shot-unsupervised-anomalous-sound-detection-for-machine-condition-monitoring","evidence":"Toy/industrial machine anomaly datasets","status":"excluded","reason":"Domain does not establish diagnosis accuracy on real cars or motorcycles."}
+  ],
+  "manufacturerKnowledge": {
+    "module": "src/vehicle-issues.mjs",
+    "documents": 11,
+    "meaning": "Narrow factual manufacturer bulletin/recall summaries with model/year/engine/market gates, not an exhaustive common-fault database",
+    "markets": ["US"],
+    "audioTrainingLabels": 0,
+    "doesNotCover": ["Honda Wave 110i 2023 verified acoustic diagnosis", "Toyota Fortuner 2013 3.0 D-4D verified acoustic diagnosis", "Every model of each requested make", "Thai recall eligibility inferred from US documents"]
+  }
+}
