@@ -137,3 +137,30 @@ test('applicant can cancel a pending, needs-fix or trial application — not a d
   g.sqlite.prepare('INSERT INTO tech_profiles (id,uid,phone,data,verified,test,suspended,created_at,updated_at) VALUES (?,?,?,?,1,0,0,1,1)').run('t_real','applicant','0811111111','{}');
   assert.equal((await g.call(USER,'/api/tech/apply/withdraw',{})).status,409);
 });
+
+test('owner can switch a shop between test and real; nobody else can, and the shop gets no fake check badges',async()=>{
+  const f=fixture();fakeVision();await f.call('', '/api/tech/ping');team(f);
+  const a=await pending(f,{},{idcheck:false});
+  assert.equal((await f.call(ADMIN,'/api/tech/review',{uid:a.uid,revision:a.revision,decision:'approve_test'})).status,200);
+  const id=f.sqlite.prepare('SELECT id FROM tech_profiles WHERE uid=?').get(a.uid).id;
+  /* admin ที่ไม่ใช่เจ้าของ ทีมงาน และตัวช่างเอง ทำไม่ได้ */
+  for(const who of [ADMIN2,MOD,USER])assert.equal((await f.call(who,'/api/tech/shop-mode',{id,test:false})).status,403);
+  assert.equal((await f.call(ADMIN,'/api/tech/shop-mode',{id})).status,400,'mode must be explicit');
+  const r=await f.call(ADMIN,'/api/tech/shop-mode',{id,test:false,note:'รู้จักช่างคนนี้ ดูงานจริงแล้ว'});
+  assert.equal(r.status,200);assert.equal(r.test,false);
+  assert.deepEqual({...f.sqlite.prepare('SELECT verified,test,suspended FROM tech_profiles WHERE id=?').get(id)},{verified:1,test:0,suspended:0});
+  assert.equal(f.sqlite.prepare('SELECT test FROM tech_applications WHERE uid=?').get(a.uid).test,0);
+  /* ลูกค้าเห็นร้านแล้ว แต่ไม่มีป้ายยืนยันตัวตน/ตรวจทักษะ (ไม่ได้ผ่านด่านตรวจ) */
+  const pub=(await f.call(USER.replace('applicant','someone'),'/api/tech')).techs.find(t=>t.id===id);
+  assert.ok(pub,'visible to customers now');assert.equal(pub.vetting,null);
+  assert.equal(audits(f,'shop_to_real').length,1);assert.match(audits(f,'shop_to_real')[0].detail,/รู้จักช่าง/);
+  /* ร้านจริงลงบริการได้และลูกค้าเห็น */
+  assert.equal((await f.call(USER,'/api/tech/gig',{title:'ล้างแอร์ครบชุด',price:1200,cats:['eng']})).status,200);
+  assert.equal((await f.call('', '/api/tech/gigs')).gigs.length,1);
+  /* สลับกลับเป็นร้านทดสอบ = ลูกค้าไม่เห็นทันที */
+  assert.equal((await f.call(ADMIN,'/api/tech/shop-mode',{id,test:true})).status,200);
+  assert.equal((await f.call('someone|s@unit.test','/api/tech')).techs.some(t=>t.id===id),false);
+  assert.equal((await f.call('', '/api/tech/gigs')).gigs.length,0);
+  assert.equal(audits(f,'shop_to_test').length,1);
+  assert.equal((await f.call(ADMIN,'/api/tech/shop-mode',{id:'t_nope',test:false})).status,404);
+});

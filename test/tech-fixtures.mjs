@@ -53,7 +53,7 @@ export function fixture(extra={}){
   const sqlite=new DatabaseSync(':memory:');sqlite.exec('CREATE TABLE users(uid TEXT PRIMARY KEY,role TEXT,banned INTEGER)');let queue=Promise.resolve();
   const DB={prepare(sql){let values=[];return {bind(...v){values=v;return this;},async first(){return sqlite.prepare(sql).get(...values)||null;},async all(){return {results:sqlite.prepare(sql).all(...values)};},async run(){const r=sqlite.prepare(sql).run(...values);return {meta:{changes:Number(r.changes)}};}};},batch(list){const task=queue.then(async()=>{sqlite.exec('BEGIN');try{const out=[];for(const st of list)out.push(await st.run());sqlite.exec('COMMIT');return out;}catch(e){sqlite.exec('ROLLBACK');throw e;}});queue=task.catch(()=>{});return task;}};
   /* กุญแจทดสอบเท่านั้น — ของจริงตั้งด้วย wrangler secret put (ดู DEPLOY.md) */
-  const env={DB,AI,OWNERS:'boss@unit.test',APP_DATA_KEY:TEST_DATA_KEY,ID_HASH_KEY:'test-only-id-hash-key',...extra};
+  const env={DB,AI,PIN_WATER_OFF:'1',OWNERS:'boss@unit.test',APP_DATA_KEY:TEST_DATA_KEY,ID_HASH_KEY:'test-only-id-hash-key',...extra};
   const verifyToken=async token=>{const [uid,email,verified]=token.split('|');if(!uid)throw Error('invalid');return {sub:uid,email,email_verified:verified!=='unverified'};};
   /* อัปโหลดไฟล์ดิบ (คลิป/รูป) ผ่าน /api/tech/media แบบเดียวกับหน้าเว็บ */
   const put=async(token,id,bytes,mime,scope='draft')=>{const r=await handleTech(new Request(`https://unit.test/api/tech/media/${id}?scope=${scope}`,{method:'PUT',headers:{Authorization:'Bearer '+token,'Content-Type':mime},body:bytes}),env,undefined,{verifyToken});return {...await r.json(),status:r.status};};

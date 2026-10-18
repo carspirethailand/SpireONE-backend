@@ -20,6 +20,7 @@ import { MEDIA_SQL, MEDIA_ID, MediaError, putMedia, getMedia, sendMedia, deleteM
 import { PROOF_SQL, PROOF_ALTER, ALL_SHOTS, SHOT_TH, MAX_TRIES, proofPlan, proofLevel, partMatch, OPEN_STATES, capOf, NOREPLY_AFTER, NOREPLY_TEXT,
   STRIKE_LIMIT, STRIKE_WINDOW, checkShot, symptomWords, fixesBlock, scrub } from './proof.js';
 import { seal, open, vaultReady, needsReseal, currentKeyId, CTX } from './vault.js';
+import { pinCheck } from './geo-guard.js';
 const CATS = ['body', 'ev', 'tyre', 'air', 'eng'];
 const CAT_TH = { body: 'ตัวถัง & สี', ev: 'ไฟฟ้า & EV', tyre: 'ยาง & ช่วงล่าง', air: 'แอร์รถยนต์', eng: 'เครื่องยนต์' };
 /* ด่านที่ทีมงานต้องตรวจเองก่อนอนุมัติ — ชื่อต้องตรงกับหน้าเว็บ (tech.html) */
@@ -1118,6 +1119,28 @@ async function testApprove(env, me, b) {
   return { ok: true, testOnly: true };
 }
 
+/* ── สลับร้านทดสอบ ⇄ ร้านจริง (เจ้าของระบบเท่านั้น) ──
+   ใช้เมื่อเจ้าของระบบรู้จักและรับรองช่างเอง เช่น อนุมัติทดสอบไว้ก่อน แล้วต้องการเปิดให้ลูกค้าเห็นจริง หรือพักร้านจริงไว้เป็นร้านทดสอบ
+   ร้านจริงจากทางนี้ไม่ได้รับป้าย "ยืนยันตัวตน/ตรวจทักษะ" เพิ่ม (ไม่ได้ผ่านด่านตรวจ) — ป้ายบนหน้าร้านต้องตรงความจริง · บันทึกทุกครั้ง */
+async function shopMode(env, me, b) {
+  if (!me.owner) fail(403, 'สลับร้านทดสอบ/ร้านจริงได้เฉพาะเจ้าของระบบ');
+  const t = await techById(env, String(b.id || ''));
+  if (!t) fail(404, 'ไม่พบร้าน');
+  if (typeof b.test !== 'boolean') fail(400, 'เลือกโหมดร้าน: ทดสอบ หรือ จริง');
+  const test = b.test;
+  if (!!t.test === test && (test ? !t.verified : t.verified)) return { ok: true, test, verified: !!t.verified };
+  const ts = now();
+  await env.DB.batch([
+    /* ร้านทดสอบ = verified 0 เหมือนร้านจากการอนุมัติทดสอบ (ข้อมูลการตรวจเดิมยังเก็บไว้ กลับเป็นร้านจริงแล้วป้ายเดิมกลับมา) */
+    env.DB.prepare('UPDATE tech_profiles SET test = ?, verified = ?, suspended = 0, updated_at = ? WHERE id = ?').bind(test ? 1 : 0, test ? 0 : 1, ts, t.id),
+    env.DB.prepare("UPDATE tech_applications SET test = ?, updated_at = ? WHERE uid = ? AND status = 'approved'").bind(test ? 1 : 0, ts, t.uid)]);
+  await audit(env, me, test ? 'shop_to_test' : 'shop_to_real', t.id, String(b.note || '').trim().slice(0, 200) || (test ? 'เจ้าของระบบเปลี่ยนเป็นร้านทดสอบ' : 'เจ้าของระบบรับรองเป็นร้านจริง'));
+  tell(env, t.uid, () => test
+    ? card({ tag: 'ร้านทดสอบ', title: 'ร้านของคุณถูกพักไว้เป็นร้านทดสอบ', url: appUrl(env, '/studio'), label: 'เปิด Studio', lines: ['ลูกค้าทั่วไปจะยังไม่เห็นร้านนี้ชั่วคราว', 'สงสัยติดต่อทีมงานได้'] })
+    : card({ tag: 'เปิดร้านแล้ว', title: 'ร้านของคุณเปิดให้ลูกค้าเห็นแล้ว', url: appUrl(env, '/studio'), label: 'เปิด Studio', lines: ['ลงบริการพร้อมราคา แล้วเปิดรับงานได้เลย'] }));
+  return { ok: true, test, verified: !test };
+}
+
 async function moderate(env, me, b) {
   adminOnly(me);
   const r = await env.DB.prepare('UPDATE tech_profiles SET suspended=?, id_hold=0, updated_at=? WHERE id=?')
@@ -1484,6 +1507,9 @@ async function createJob(env, me, b) {
   const vac = vacationOf(d);
   if (vac) fail(409, 'ร้านนี้ปิดชั่วคราว' + (vac.note ? ' — ' + vac.note : '') + ' ลองร้านอื่นก่อนนะ');
   const mode = b.mode === 'mobile' && d.mobile ? 'mobile' : 'shop';
+  /* หมุดรถ (ถ้าส่งมา) ต้องอยู่บนบกและใกล้เครื่องคนกรอก — เหมือนประกาศหาช่าง */
+  const la = Number(b.lat), ln = Number(b.lng);
+  if (Number.isFinite(la) && Number.isFinite(ln) && Math.abs(la) <= 90 && Math.abs(ln) <= 180) await pinCheck(env, fail, { lat: la, lng: ln }, b.gps, !!b.urgent);
 
   if (!t.test) {
     /* กันสแปมคำขอ — ลูกค้าจริงไม่มีใครต้องขอราคาเกินสิบครั้งในวันเดียว */
@@ -2267,6 +2293,7 @@ async function createPost(env, me, b) {
   const dup = await env.DB.prepare('SELECT customer_uid FROM tech_posts WHERE id = ?').bind(id).first();
   if (dup) { if (dup.customer_uid !== me.uid) fail(409, 'รหัสคำขอซ้ำ'); return { id }; }
   const c = coord(b);
+  await pinCheck(env, fail, c, b.gps, !!b.urgent);
   const cat = CATS.includes(b.cat) ? b.cat : '';
   const open = await env.DB.prepare("SELECT COUNT(*) AS n FROM tech_posts WHERE customer_uid = ? AND status = 'open' AND created_at > ?")
     .bind(me.uid, now() - POST_TTL).first();
@@ -2567,7 +2594,7 @@ async function listGigs(env, me, url) {
   const ids = [...new Set(rows.map(r => r.tech_id))];
   const techs = await inAll(env, 'SELECT * FROM tech_profiles WHERE id IN ({IN}) AND suspended = 0', ids);
   const by = Object.fromEntries((await withPhotos(env, techs)).map(t => [t.id, t]));
-  const ok = t => t && (t.verified || (t.test && me && me.staff) || (mine && t.uid === me.uid));
+  const ok = t => t && ((t.verified && !t.test) || (t.test && me && me.staff) || (mine && t.uid === me.uid));
   const sp = await sponsorMap(env, rows.map(r => r.id));
   return { gigs: rows.filter(r => ok(by[r.tech_id])).map(r => gigOut(r, by[r.tech_id], sp[r.id], me && r.uid === me.uid)) };
 }
@@ -2612,7 +2639,8 @@ async function saveGig(env, me, b) {
   }
   for (const x of add) {
     const m = imgClean(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(x && x.data || '')));
-    if (!m || m[2].length > 1400000) fail(400, 'ไฟล์ต้องเป็นรูปภาพ');
+    if (!m) fail(400, 'ไฟล์ต้องเป็นรูปภาพ (JPG, PNG หรือ WebP)');
+    if (m[2].length > 1400000) fail(400, 'รูปใหญ่เกินไป (เกิน 1 MB) — อัปเดตแอปแล้วลองใหม่ แอปจะย่อรูปให้เอง');
     /* รูปเป็นของร้านนั้นเสมอ (uid เจ้าของร้าน) — /api/tech/img เปิดรูปตามร้าน */
     const r = await env.DB.prepare('INSERT INTO tech_docs (uid, kind, mime, data, created_at) VALUES (?,?,?,?,?)').bind(t.uid, 'gig', m[1], m[2], now()).run();
     photos.push(r.meta && r.meta.last_row_id);
@@ -2839,6 +2867,7 @@ async function route(request, env, verifyToken) {
   if (p === '/api/tech/rescreen' && m === 'POST') return rescreen(env, me, await body());
   if (p === '/api/tech/moderate' && m === 'POST') return moderate(env, me, await body());
   if (p === '/api/tech/bays' && m === 'POST') return setBays(env, me, await body());
+  if (p === '/api/tech/shop-mode' && m === 'POST') return shopMode(env, me, await body());
   if (p === '/api/tech/report' && m === 'POST') return report(env, me, await body());
   if (p === '/api/tech/reports' && m === 'GET') return reportsList(env, me);
   if (p === '/api/tech/reports/decide' && m === 'POST') return reportDecide(env, me, await body());
