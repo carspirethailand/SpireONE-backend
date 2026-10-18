@@ -56,10 +56,11 @@ test('server-owned live rules apply even with voice-only fallback and tools disa
 function env(){return {DEV_AUTH:'1',FIREBASE_PROJECT_ID:'audio-test',GEMINI_KEY:'unit-test-not-real',ALLOWED_ORIGINS:'*',DB:{prepare(sql){return {bind(){return this},async first(){return sql.includes('schema_version')?{value:'24'}:sql.includes('RETURNING count')?{count:1,in_tok:1,out_tok:1}:null},async run(){return {}},async all(){return {results:[]}}}}}};}
 test('actual ear, feature listen and legacy listen routes keep confirmed identity and raw audio across provider boundary',async t=>{
   const sent=[];t.mock.method(globalThis,'fetch',async(url,init)=>{sent.push(JSON.parse(init.body));assert.equal(init.headers['x-goog-api-key'],'unit-test-not-real');return Response.json({candidates:[{content:{parts:[{text:JSON.stringify({...good,hear:'normal Honda HR-V engine'})}]}}]});});
-  for(const tool of ['ear','listen','legacy']){
-    const body=tool==='legacy'?{audio:'UklGRg==',mime:'audio/wav',car:fortuner,audioVehicle:confirmed.audioVehicle,take:'idle'}:{tool,context:confirmed,attachments:[{mime:'audio/wav',b64:'UklGRg=='}]};
-    const r=await worker.fetch(new Request('https://unit.test/api/'+(tool==='legacy'?'listen':'features/analyze'),{method:'POST',headers:{Authorization:'Bearer dev:audio:audio@unit.test','Content-Type':'application/json'},body:JSON.stringify(body)}),env(),{waitUntil(){}});
-    const result=await r.json();assert.equal(r.status,200,JSON.stringify(result));const d=tool==='legacy'?result:result.data;
+  for(const tool of ['ear','listen','legacy','legacy-data-uri']){
+    const legacy=tool.startsWith('legacy');
+    const body=legacy?{audio:tool==='legacy-data-uri'?'data:audio/webm;codecs=opus;base64,UklGRg==':'UklGRg==',mime:tool==='legacy-data-uri'?'audio/webm;codecs=opus':'audio/wav',car:fortuner,audioVehicle:confirmed.audioVehicle,take:'idle'}:{tool,context:confirmed,attachments:[{mime:'audio/wav',b64:'UklGRg=='}]};
+    const r=await worker.fetch(new Request('https://unit.test/api/'+(legacy?'listen':'features/analyze'),{method:'POST',headers:{Authorization:'Bearer dev:audio:audio@unit.test','Content-Type':'application/json'},body:JSON.stringify(body)}),env(),{waitUntil(){}});
+    const result=await r.json();assert.equal(r.status,200,JSON.stringify(result));const d=legacy?result:result.data;
     assert.equal(d.identity.vehicle.model,'Fortuner');assert.equal(d.audioVersion,2);assert.ok(!JSON.stringify(result).includes('HR-V'));assert.deepEqual(d.causes,[]);
     assert.equal(sent.at(-1).contents[0].parts[1].inlineData.data,'UklGRg==');assert.match(sent.at(-1).contents[0].parts[0].text,/3.0L D-4D/);
   }

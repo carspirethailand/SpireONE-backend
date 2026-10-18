@@ -6166,7 +6166,7 @@ ${convo}`;
         return await guarded('user', async (actor) => {
           const b = (await readBody()) || {};
           let audio = String(b.audio || '');
-          const m = audio.match(/^data:([^;,]+);base64,(.*)$/);
+          const m = audio.match(/^data:(audio\/[^,]+);base64,([A-Za-z0-9+/=\r\n]+)$/);
           let mime = String(b.mime || '');
           if (m) { mime = mime || m[1]; audio = m[2]; }
           if (!audio) return deny('Missing audio', 400);
