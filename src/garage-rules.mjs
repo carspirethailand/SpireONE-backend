@@ -37,12 +37,12 @@ function costPolicy(car,ref){
   else if(/porsche|maserati|land ?rover|range ?rover|lotus|alphard|vellfire|land ?cruiser|lexus ?l[mxc]\b|\bamg\b|\bg ?63\b|\bm[2-8]\b|\br8\b|\brs ?[3-7q]\b|gt-?r\b|lucid/.test(n)){cap=25000000;factor=5}
   else if(/bmw|mercedes|benz|audi|lexus|volvo|jaguar|tesla|mini|genesis|cadillac|lincoln|infiniti|acura|alfa|polestar|jeep|mustang|zeekr|denza|hongqi|lynk|supra|type ?r\b|nismo|corvette|camaro/.test(n)){cap=10000000;factor=2.5}
   const verified=ref&&Number.isFinite(ref.valueThb)&&ref.valueThb>0&&ref.valueThb<=1000000000;
-  return {basis:verified?'model-reference':'heuristic',cap:verified?ref.valueThb:cap,factor,source:verified?ref.source:null,asOf:verified?ref.asOf:null,
+  return {basis:verified?(ref.kind==='documented-new-price'?'documented-new-price':'model-reference'):'heuristic',cap:verified?ref.valueThb:cap,factor,source:verified?ref.source:null,asOf:verified?ref.asOf:null,
     maxByJob:verified&&plain(ref.maxByJob)?Object.fromEntries(Object.entries(ref.maxByJob).filter(([k,v])=>SERVICES.includes(k)&&Number.isFinite(v)&&v>0&&v<=ref.valueThb)):{}};
 }
 function money(v,car={},job='',ref=null){
-  const n=number(v,0,1000000000,'amount'),p=costPolicy(car,ref),limit=p.basis==='model-reference'?Math.min(p.cap,p.maxByJob[job]??p.cap):Math.min(p.cap,(JOB_CAP[job]||p.cap)*p.factor);
-  if(n>limit)fail('amount',p.basis==='model-reference'?'ยอดสูงกว่าเกณฑ์อ้างอิงรถรุ่น/ปีนี้ / Above this model-year reference limit':'ยอดสูงกว่าเกณฑ์ตรวจสอบเบื้องต้น กรุณาตรวจเลข / Above the preliminary validation limit');
+  const n=number(v,0,1000000000,'amount'),p=costPolicy(car,ref),limit=p.basis!=='heuristic'?Math.min(p.cap,p.maxByJob[job]??(JOB_CAP[job]||p.cap)*p.factor):Math.min(p.cap,(JOB_CAP[job]||p.cap)*p.factor);
+  if(n>limit)fail('amount',p.basis!=='heuristic'?'ยอดสูงกว่าเกณฑ์อ้างอิงรถรุ่น/ปีนี้ / Above this model-year reference limit':'ยอดสูงกว่าเกณฑ์ตรวจสอบเบื้องต้น กรุณาตรวจเลข / Above the preliminary validation limit');
   return n;
 }
 function record(kind,e,car,ref,now=Date.now()){

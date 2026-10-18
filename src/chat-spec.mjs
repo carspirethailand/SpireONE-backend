@@ -26,6 +26,7 @@ const LBL = { cc: 'ความจุ', hp: 'กำลัง', torque_nm: 'แ�
   seats: 'ที่นั่ง', doors: 'ประตู', length_mm: 'ยาว', width_mm: 'กว้าง', height_mm: 'สูง', wheelbase_mm: 'ฐานล้อ', kerb_kg: 'น้ำหนักรถเปล่า', tank_l: 'ถังน้ำมัน', tire: 'ยาง',
   top_kmh: 'ความเร็วสูงสุด', accel_s: '0-100 กม./ชม.', ground_clearance_mm: 'ต่ำสุดจากพื้น', turning_m: 'รัศมีวงเลี้ยว', cargo_l: 'ที่เก็บของท้าย',
   suspension_front: 'ช่วงล่างหน้า', suspension_rear: 'ช่วงล่างหลัง', brakes_front: 'เบรกหน้า', brakes_rear: 'เบรกหลัง' };
+Object.assign(UNIT,{boot_l:' L',turning_radius_m:' m',towing_braked_kg:' kg',top_speed_kmh:' กม./ชม.',zero100_s:' วินาที'});Object.assign(LBL,{boot_l:'สัมภาระ',turning_radius_m:'รัศมีวงเลี้ยว',towing_braked_kg:'ลากจูงแบบมีเบรก',top_speed_kmh:'ความเร็วสูงสุด',zero100_s:'0-100 กม./ชม.'});
 const num = v => typeof v === 'number' ? v.toLocaleString('en-US') : clip(v, 40);
 /* ✓ = สองรอบตรงกัน · (แหล่งเดียว) · ⚠ ขัดกันให้บอกทั้งสองค่า */
 function cell(c, unit = '') {
@@ -46,14 +47,13 @@ export function specBlock(spec, equip) {
     lines.push(`${clip(spec.make, 40)} ${clip(spec.model, 40)} ปี ${clip(spec.year, 4)}${head ? ' · ' + head : ''} · ${spec.verified ? 'ทีมงานตรวจแล้ว' : 'ยังไม่ผ่านการตรวจโดยทีมงาน'}`);
     const vs = (Array.isArray(d.variants) ? d.variants : []).slice(0, 8).map(v => {
       const bits = [cell(v.engine), ...['cc', 'hp', 'torque_nm'].map(k => cell(v[k], UNIT[k])), cell(v.gearbox) && 'เกียร์ ' + cell(v.gearbox),
-        cell(v.drive), FUEL[v.fuel] || '', cell(v.l_per_100km, UNIT.l_per_100km), cell(v.battery_kwh, UNIT.battery_kwh), cell(v.range_km) && 'วิ่งได้ ' + cell(v.range_km, UNIT.range_km),
-        ...['top_kmh', 'accel_s'].map(k => cell(v[k], UNIT[k]) && LBL[k] + ' ' + cell(v[k], UNIT[k]))]
+        cell(v.drive), FUEL[v.fuel] || '',cell(v.power_ps)&&'กำลัง PS: '+cell(v.power_ps,' PS'),cell(v.power_kw)&&'กำลัง kW: '+cell(v.power_kw,' kW'),...['engine_code','cylinders','valves','gears','induction','front_suspension','rear_suspension','front_brakes','rear_brakes','front_tire','rear_tire'].map(k=>cell(v[k])&&k+': '+cell(v[k])),cell(v.price_thb)&&'ราคาจำหน่ายเดิมตามเอกสาร ไม่ใช่มูลค่าปัจจุบัน: '+cell(v.price_thb,' THB'), cell(v.l_per_100km, UNIT.l_per_100km), cell(v.battery_kwh, UNIT.battery_kwh), cell(v.range_km) && 'วิ่งได้ ' + cell(v.range_km, UNIT.range_km),...['top_kmh','accel_s','top_speed_kmh','zero100_s'].map(k=>cell(v[k],UNIT[k])&&LBL[k]+' '+cell(v[k],UNIT[k]))]
         .filter(Boolean);
       return bits.length ? `- ${clip(v.name, 60) || 'รุ่นย่อย'}: ${bits.join(' · ')}` : '';
     }).filter(Boolean);
     if (vs.length) lines.push('รุ่นย่อย/เครื่องยนต์:\n' + vs.join('\n'));
     const f = d.facts || {};
-    const fs = ['tank_l', 'tire', 'kerb_kg', 'seats', 'doors', 'length_mm', 'width_mm', 'height_mm', 'wheelbase_mm', 'ground_clearance_mm', 'turning_m', 'cargo_l',
+    const fs = ['tank_l', 'tire', 'kerb_kg', 'seats', 'doors', 'length_mm', 'width_mm', 'height_mm', 'wheelbase_mm','boot_l','turning_radius_m','towing_braked_kg', 'ground_clearance_mm', 'turning_m', 'cargo_l',
       'suspension_front', 'suspension_rear', 'brakes_front', 'brakes_rear']
       .map(k => { const c = cell(f[k], UNIT[k] || ''); return c ? `${LBL[k]} ${c}` : ''; }).filter(Boolean);
     if (fs.length) lines.push('ข้อมูลตัวรถ: ' + fs.join(' · '));
