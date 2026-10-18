@@ -3,7 +3,8 @@ import { EMAIL_AUTH_SQL, handleEmailAuth, deleteFirebaseUser } from './email-aut
 import { exportAccount, resetAccount, deleteAccount, deleteBlockers } from './account-data.js';
 import { ONBOARDING_SQL, handleOnboarding, onboardingName, sanitizeSetupState } from './onboarding.js';
 import { buildFeatureRequest, cleanFeatureJson, featureCap } from './features-ai.mjs';
-import { soundText, legacySound, VEHICLE_AUDIO_RULES } from './vehicle-audio.mjs';
+import { soundText, legacySound, audioIdentity, VEHICLE_AUDIO_RULES } from './vehicle-audio.mjs';
+import {publicResearch, publicQuery, soundResearchQuery, researchBlock} from './vehicle-research.mjs';
 import { engineScanFailure } from './engine-scan-errors.mjs';
 import { liveToken, cleanHandle } from './live-setup.mjs';
 import { valetPrompt } from './agent-prompt.mjs';
@@ -1550,6 +1551,7 @@ function needsFresh(q) {
   const t = String(q || '').toLowerCase();
   if (!t) return false;
   if (FRESH_WORDS.some(w => t.includes(w))) return true;
+  if (/อาการประจำ|ปัญหาประจำ|โรคประจำ|เรียกคืน|เสียงผิดปกติ|known (?:fault|issue|problem)|common (?:fault|issue|problem)|service bulletin|engine noise|recall/i.test(t)) return true;
   /* มีปี พ.ศ. หรือ ค.ศ. ล่าสุดอยู่ในคำถาม */
   if (/\b(20[2-9]\d|25[6-9]\d)\b/.test(t)) return true;
   return false;
@@ -2028,7 +2030,7 @@ async function executeDescribeMediaTool(env, messages, prompt) {
 
 /* ── ค้นข้อมูลอินเทอร์เน็ต (DuckDuckGo -> Gemini 3.1 -> Gemini 3.5 -> WebSearch) ── */
 async function executeGoogleSearchTool(env, query) {
-  return await executeSearchInternal(env, query);
+  try{return researchBlock(await publicResearch(query))}catch{return 'Public web search requires a short topic without private details. Do not invent current facts or sources.'}
 }
 
 function parseJsonLoose(text) {
@@ -3815,7 +3817,7 @@ export default {
     if (!env.DB) return deny('Database is not configured', 500);
 
     /* Do not run account migrations for unauthenticated private requests. */
-    if ((url.pathname === '/api/features/analyze' || /^\/api\/onboarding(?:\/|$)/.test(url.pathname))
+    if ((url.pathname === '/api/features/analyze' || url.pathname === '/api/ai/research' || /^\/api\/onboarding(?:\/|$)/.test(url.pathname))
         && !/^Bearer \S+/.test(request.headers.get('Authorization') || '')) {
       return deny('Invalid authentication token', 401);
     }
@@ -4948,7 +4950,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                   question,
                   hasMedia,
                   carInfo,
-                  search: fresh,
+                  search: fresh, externalSearch: true,
                   executeSearch: async (q) => await executeGoogleSearchTool(env, q),
                   executeMedia: async (p) => await executeDescribeMediaTool(env, msgs, p),
                   executeKb: async (q) => await kbFor(env, carInfo, q),
@@ -5137,7 +5139,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                 question,
                 hasMedia,
                 carInfo,
-                search: fresh,
+                search: fresh, externalSearch: true,
                 executeSearch: async (q) => await executeGoogleSearchTool(env, q),
                 executeMedia: async (p) => await executeDescribeMediaTool(env, body.contents, p),
                 executeKb: async (q) => await kbFor(env, carInfo, q),
@@ -5222,7 +5224,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
 
           const withTools = b.tools === true, withAgent = b.agent === true;
           const handle = cleanHandle(b.handle);
-          const mk = (liveModel, tools, resume, agent=withAgent) => liveToken({ model: liveModel, system: b.system, tools, agent, garageCare:b.garageCare===true&&agent, garageAssist:b.garageAssist===true&&agent, handle, resume, now });
+          const mk = (liveModel, tools, resume, agent=withAgent) => liveToken({ model: liveModel, system: b.system, tools, agent, webResearch:b.webResearch===true&&agent, garageCare:b.garageCare===true&&agent, garageAssist:b.garageAssist===true&&agent, handle, resume, now });
 
           let lastErr = '';
           for (const liveModel of candidates) {
@@ -5243,7 +5245,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
             }
             if (res.ok) {
               const tok = await res.json();
-              return json({ token: tok.name, model: liveModel, tools, agent, resume, garageCare:b.garageCare===true&&agent, resumed: resume && !!handle });
+              return json({ token: tok.name, model: liveModel, tools, agent, resume, webResearch:b.webResearch===true&&agent, garageCare:b.garageCare===true&&agent, resumed: resume && !!handle });
             }
             lastErr = `${liveModel} ${res.status}: ${(await res.text()).slice(0, 200)}`;
             /* รุ่นนี้ใช้ไม่ได้ (ไม่มี/ไม่มีสิทธิ์) → ลองรุ่นถัดไป · คีย์ผิดหรือโควตาหมด → ลองต่อก็ไม่ช่วย */
@@ -6101,6 +6103,21 @@ ${convo}`;
         })();
       }
 
+      // Read-only internet tool for calls and chat; no arbitrary URL fetching or private data.
+      if (url.pathname === '/api/ai/research' && request.method === 'POST') {
+        return await guarded('user',async actor=>{
+          const maintenance=await getConfig(env,'maintenance',{enabled:false});
+          if(maintenance.enabled&&rank(actor.role)<rank('moderator'))return deny('maintenance',503);
+          const body=await readBody();let query;
+          try{query=publicQuery(body?.query)}catch{return deny('Use a short public topic without personal details',400)}
+          const uid='web:'+actor.payload.sub,day=new Date().toISOString().slice(0,10);
+          // Atomically reserve before outbound requests, including owner accounts.
+          const used=await env.DB.prepare(`INSERT INTO usage (uid,day,count) VALUES (?,?,1)
+            ON CONFLICT(uid,day) DO UPDATE SET count=count+1 WHERE count<60 RETURNING count`).bind(uid,day).first();
+          if(!used)return deny('research_quota',429);
+          return json(await publicResearch(query,{signal:request.signal}));
+        })();
+      }
       /* Feature tools share the authenticated AI pipeline; never return demo results. */
       if (url.pathname === '/api/features/analyze' && request.method === 'POST') {
         return await guarded('user', async (actor) => {
@@ -6129,6 +6146,12 @@ ${convo}`;
             }
           }
           const meter = newMeter();
+          let research;
+          if(body.tool==='ear'||body.tool==='listen'){
+            const q=soundResearchQuery(audioIdentity(body.context));
+            research=q?await publicResearch(q,{signal:request.signal}):{status:'needs_vehicle',sources:[],verifiedModelFaults:[]};
+            input.contents[0].parts[0].text+=researchBlock(research);
+          }
           const prefer = (body.tool === 'bay' || body.tool === 'baylive') && env.GEMINI_VISION_MODEL ? [env.GEMINI_VISION_MODEL] : undefined;
           let text;
           const engineScan = (body.tool === 'bay' || body.tool === 'baylive') && body.scanVersion === 2;
@@ -6141,7 +6164,7 @@ ${convo}`;
           }
           let data = null;
           if (input.json) {
-            try { data = cleanFeatureJson(body.tool, text, {scanVersion:body.scanVersion,lang:body.lang,context:body.context}); }
+            try { data = cleanFeatureJson(body.tool, text, {scanVersion:body.scanVersion,lang:body.lang,context:body.context}); if(research)data.research=research; }
             catch (e) {
               await meterTokens(env, uid, meter);
               if (!engineScan) return deny('AI ตอบกลับไม่สมบูรณ์ ลองใหม่อีกครั้ง', 502);
@@ -6186,10 +6209,15 @@ ${convo}`;
           }
 
           let input;
-          const soundBody={tool:'listen',attachments:[{mime:mime||'audio/webm',b64:audio}],context:{car:b.car||{},audioVehicle:b.audioVehicle,recordingCondition:String(b.take||'').slice(0,20)},question:String(b.note||'').slice(0,500),lang:b.lang};
+          const soundBody={tool:'listen',attachments:[{mime:mime||'audio/webm',b64:audio}],context:{car:b.car||{},audioVehicle:b.audioVehicle,recording:b.recording,recordingCondition:String(b.take||'').slice(0,20)},question:String(b.note||'').slice(0,500),lang:b.lang};
           try{input=buildFeatureRequest(soundBody)}catch(e){return deny(e.message,400)}
           const meter=newMeter();
-          const result=legacySound(cleanFeatureJson('listen',await callGemini(env,{...input,meter}),{context:soundBody.context,lang:b.lang}),String(b.take||'').slice(0,20));
+          const q=soundResearchQuery(audioIdentity(soundBody.context));
+          const research=q?await publicResearch(q,{signal:request.signal}):{status:'needs_vehicle',sources:[],verifiedModelFaults:[]};
+          input.contents[0].parts[0].text+=researchBlock(research);
+          const cleaned=cleanFeatureJson('listen',await callGemini(env,{...input,meter}),{context:soundBody.context,lang:b.lang});
+          cleaned.research=research;
+          const result=legacySound(cleaned,String(b.take||'').slice(0,20));
           await meterTokens(env,uid,meter);
           await safe(env, w, 'usage.write', () => env.DB.prepare(`
             INSERT INTO usage (uid, day, count) VALUES (?, ?, 2)

@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "checkedAt": "2026-10-18",
+  "purpose": "Public source discovery and evaluation backlog. NOT a trained sound corpus.",
+  "weightsTrained": false,
+  "audioDownloaded": false,
+  "userAudioProvided": false,
+  "validatedAcousticModels": 0,
+  "requestedCars": ["Isuzu", "Mitsubishi", "Toyota", "Honda", "Ford", "Mazda", "Mercedes", "BMW", "Audi", "Porsche"],
+  "requestedMotorcycles": ["Honda", "Yamaha", "Suzuki", "Vespa", "Lambretta", "GPX", "Deco", "EM", "Lion"],
+  "regressionVehicle": {"make": "Honda", "model": "Wave 110i", "year": 2023, "origin": "User statement, not audio identification"},
+  "cataloguesAndManuals": [
+    {"url": "https://www.yamaha-motor.co.th/dealer-services/owners-manual", "scope": "Yamaha official manual directory; not fault prevalence or audio labels"},
+    {"url": "https://www.vespa.com/en_EN/customer-care/", "scope": "Vespa official manual entry point; no VIN collected"},
+    {"url": "https://ownersmanual.audi.com/home/en_US", "scope": "Audi official manual entry point; market applicability unconfirmed"},
+    {"url": "https://www.suzukimotosales.co.th/motorcycle/", "scope": "Suzuki Thailand official catalogue"},
+    {"url": "https://gpxthailand.com/", "scope": "GPX official catalogue"},
+    {"url": "https://lambretta.co.th/", "scope": "Lambretta Thailand official catalogue"},
+    {"url": "https://decogreenenergy.com/index.php/th/", "scope": "Deco official electric motorcycle catalogue"},
+    {"url": "https://www.em-motor.co.th/th", "scope": "EM Thailand, not the similarly named French Electric Motion"},
+    {"url": "https://www.lion-ev.com/electric-bike", "scope": "Lion EV official electric bicycle catalogue; do not assume motorcycle certification or engine"},
+    {"url": "https://www.hondamotopub.com/om/NCXCAE/WAVE110/2023", "scope": "Live search found Wave 110 2023 manual link; content not read; Thai market applicability NOT established"},
+    {"url": "https://2rom-prd-data.hondamotopub.com/om/NCXCAE/WAVE110/2023/23WAVE110_4PK89D10_EN.pdf", "scope": "Unread PDF link only; not used as a diagnostic template"}
+  ],
+  "repairVideoCandidates": [
+    {"url": "https://www.youtube.com/watch?v=QF9nJEhz06U", "publisher": "ช่างเหลี่ยม เชียงราย", "vehicleClaim": "Wave 110i 2021", "status": "Discovery only; not watched, downloaded, labelled or validated; NOT evidence for a 2023 model"},
+    {"url": "https://www.youtube.com/watch?v=6Ys1t0nNoPI", "publisher": "ช่างชา (โคราช)", "vehicleClaim": "Wave 110i 2021", "status": "Discovery only; not watched, downloaded, labelled or validated; NOT evidence for a 2023 model"}
+  ],
+  "admissionRequirements": [
+    "Permission or suitable licence for any audio retained for training",
+    "Confirmed model year, engine/powertrain variant, market and recording conditions",
+    "Real normal controls and independently workshop-confirmed fault labels with repair outcome",
+    "Split evaluation by physical vehicle and recording device, not by neighbouring excerpts",
+    "Measure false negatives, false alarms and calibrated abstention before claiming diagnostic accuracy",
+    "A repair video is a single case, not evidence of a recurring model-wide defect"
+  ]
+}

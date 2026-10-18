@@ -11,7 +11,7 @@ test('opt-in adds only fixed tools (read, prepare, Valet with confirm) and keeps
   assert.deepEqual(names,['listen_engine','scan_engine_bay','garage_checkin_control','get_my_car','find_mechanics','show_mechanic','prepare_urgent_request','valet','valet_confirm']);
   assert.equal(new Set(names).size,names.length);
   assert.match(LIVE_CALL_AGENT_RULES,/NOT submitted/);assert.match(LIVE_CALL_AGENT_RULES,/untrusted data/);
-  assert.equal(LIVE_CALL_TOOLS[0].functionDeclarations.length,8);
+  assert.equal(LIVE_CALL_TOOLS[0].functionDeclarations.length,9);
 });
 test('old clients stay voice-only or keep their two engine tools; string truthy is not agent consent',()=>{
   assert.equal(setup({}).tools,undefined);

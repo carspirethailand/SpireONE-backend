@@ -502,9 +502,9 @@ export async function fastAnswer(env, opts) {
     for (const model of models) {
       const scoped = key => scope + '|' + key;
       if (bad(scoped(model))) continue;
-      let search=opts.search===true&&!bad(scoped(model+'|grounding'));
+      let search=opts.search===true&&opts.externalSearch!==true&&!bad(scoped(model+'|grounding'));
       let system=opts.system,level=opts.level||'minimal';
-      if(opts.search===true&&!search&&opts.question)system=await freshSystem();
+      if(opts.search===true&&!search&&opts.question){if(opts.onSearch)await opts.onSearch(opts.question);system=await freshSystem();}
       for (let attempt=0;attempt<3;attempt++) {
         try {
           const t0=Date.now();
