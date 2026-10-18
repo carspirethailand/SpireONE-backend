@@ -4,6 +4,7 @@ import {readFile} from 'node:fs/promises';
 import {liveToken} from '../src/live-setup.mjs';
 import {LIVE_CALL_TOOLS,LIVE_CALL_AGENT_RULES} from '../src/live-call-tools.mjs';
 import {GARAGE_CARE_RULES} from '../src/garage-care.mjs';
+import {VEHICLE_AUDIO_RULES} from '../src/vehicle-audio.mjs';
 const setup=o=>liveToken({model:'unit-live',now:0,...o}).bidiGenerateContentSetup;
 test('opt-in adds only fixed tools (read, prepare, Valet with confirm) and keeps existing engine tools',()=>{
   const names=setup({tools:true,agent:true,garageCare:true}).tools[0].functionDeclarations.map(t=>t.name);
@@ -23,9 +24,8 @@ test('agent rules are server-owned and resumption and safe speech detection are 
   const s=setup({agent:true,handle:'resume_12345',system:'x'.repeat(10000)});
   assert.equal(s.sessionResumption.handle,'resume_12345');
   assert.equal(s.realtimeInputConfig.automaticActivityDetection.startOfSpeechSensitivity,'START_SENSITIVITY_LOW');
-  assert.ok(s.systemInstruction.parts[0].text.startsWith(LIVE_CALL_AGENT_RULES+'\n'));
-  assert.ok(s.systemInstruction.parts[0].text.startsWith(LIVE_CALL_AGENT_RULES+'\n'+GARAGE_CARE_RULES+'\n'));
-  assert.ok(s.systemInstruction.parts[0].text.length<=LIVE_CALL_AGENT_RULES.length+GARAGE_CARE_RULES.length+4802);
+  assert.ok(s.systemInstruction.parts[0].text.startsWith(VEHICLE_AUDIO_RULES+'\n'+LIVE_CALL_AGENT_RULES+'\n'+GARAGE_CARE_RULES+'\n'));
+  assert.ok(s.systemInstruction.parts[0].text.length<=VEHICLE_AUDIO_RULES.length+LIVE_CALL_AGENT_RULES.length+GARAGE_CARE_RULES.length+4803);
   assert.equal(setup({resume:false}).sessionResumption,undefined);
 });
 test('token fallback honestly removes both tool groups and never accepts a client schema',async()=>{
