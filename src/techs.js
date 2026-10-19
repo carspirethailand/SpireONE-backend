@@ -450,8 +450,10 @@ function appOut(a, staff = false, ident = null) {
   if (!a) return null;
   /* ใบสมัครเก่าที่ยังมีเลขบัตรเต็มค้าง (ก่อนรอบเก็บกวาด) ไม่ส่งออกไปให้ใครเห็น เหลือแค่ 3 หลักท้าย */
   const d = scrubIdNo(parse(a.data) || {}), ai = parse(a.ai);
+  /* ผู้สมัครเห็นแค่ผล ข้อความถึงผู้สมัคร และเวลาตัดสิน — ไม่เห็นอีเมลคนตรวจ หลักฐาน หรือผลตรวจภายใน */
+  const rv = parse(a.review), review = staff || !rv ? rv : { decision: rv.decision, note: rv.note || '', at: rv.at, ...(rv.auto ? { auto: true, reasons: rv.reasons || [] } : {}) };
   return { ...d, uid: a.uid, email: a.email, status: a.status, test: !!a.test,
-    review: parse(a.review), revision: a.revision, createdAt: a.created_at, ai: staff ? ai : ai ? { status: ai.status } : null,
+    review, revision: a.revision, createdAt: a.created_at, ai: staff ? ai : ai ? { status: ai.status } : null,
     identity: identityOut(d, ident, staff) };
 }
 /* สถานะยืนยันตัวตน · ผู้สมัครเห็นแค่สถานะ · ทีมงานเห็นชื่อ/วันเกิดตามบัตร เลข 3 หลักท้าย และข้อสงสัย */
@@ -1050,14 +1052,9 @@ async function review(env, me, b) {
   if(decision==='reject')stmts.push(env.DB.prepare('DELETE FROM tech_identity_claims WHERE uid=? AND EXISTS(SELECT 1 FROM tech_applications WHERE uid=? AND review=?)').bind(a.uid,a.uid,rv));
   const result=await env.DB.batch(stmts);if(!result[0].meta.changes)fail(409,'ใบสมัครเปลี่ยนแล้ว กรุณาโหลดใหม่');
   await audit(env, me, decision, a.uid, decision === 'approve' ? 'ผ่านการตรวจครบทุกข้อ' : note.slice(0, 200));
-  tell(env, a.uid, () => decision === 'approve'
-    ? card({ tag: 'ผ่านการตรวจ', title: 'ร้านของคุณเปิดใน Cendon แล้ว', url: appUrl(env, '/?studio=1'), label: 'เปิด Studio',
-        lines: ['ตั้งค่าร้าน ลงบริการพร้อมราคา แล้วเริ่มรับงานได้เลย'] })
-    : decision === 'decline'
-    ? card({ tag: 'ใบสมัครช่าง', title: 'ใบสมัครไม่ผ่านการคัดเลือก', url: appUrl(env, '/?join=1'), label: 'ดูรายละเอียด',
-        lines: [note, 'ถ้าคิดว่าผิดพลาด ติดต่อทีมงานได้'] })
-    : card({ tag: 'ใบสมัครช่าง', title: 'ใบสมัครต้องแก้ไข', url: appUrl(env, '/?join=1'), label: 'ดูสิ่งที่ต้องแก้',
-        lines: [note, 'แก้ไขแล้วส่งใหม่ได้ในแอป'] }));
+  /* ทุกผลใช้ข้อความเดียวกัน — ผู้สมัครเปิดดูผลในแอปด้วยการ์ดขูด (ไม่บอกผลก่อนทาง LINE/แจ้งเตือน) */
+  tell(env, a.uid, () => card({ tag: 'ใบสมัครช่าง', title: 'ผลการพิจารณาใบสมัครของคุณมาแล้ว', url: appUrl(env, '/join'), label: 'เปิดดูผล',
+    lines: ['ขูดการ์ดในแอปเพื่อเปิดดูผล', 'ไม่ว่าผลจะเป็นแบบไหน เรามีทางไปต่อให้คุณเสมอ'] }));
   return { ok: true };
 }
 
