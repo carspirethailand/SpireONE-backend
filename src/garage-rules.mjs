@@ -5,7 +5,7 @@ const plain=x=>!!x&&typeof x==='object'&&!Array.isArray(x);
 function number(v,min,max,field='number',integer=false){
   if(typeof v!=='number'&&(typeof v!=='string'||!/^(\d{1,3}(,\d{3})+|\d+)(\.\d{1,2})?$/.test(v.trim())))fail(field,'กรอกตัวเลขที่ชัดเจน / Enter a valid number');
   const n=typeof v==='number'?v:Number(v.trim().replace(/,/g,''));
-  if(!Number.isFinite(n)||n<min||n>max||(integer&&!Number.isInteger(n)))fail(field,'ตัวเลขเกินช่วงที่รองรับ / Number out of range');
+  if(!Number.isFinite(n)||n<min||n>max||(integer&&!Number.isInteger(n))||(!integer&&Math.abs(n*100-Math.round(n*100))>0.00001))fail(field,'ตัวเลขเกินช่วงที่รองรับ / Number out of range');
   return n;
 }
 function label(v,max=80,min=2){
@@ -14,9 +14,9 @@ function label(v,max=80,min=2){
   if(Array.from(s).length<min||Array.from(s).length>max||/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u202a-\u202e\u2066-\u2069]/.test(s))fail('text','ความยาวหรือรูปแบบข้อความไม่ถูกต้อง / Invalid text length or format');
   if(!s&&min===0)return s;
   const letters=s.toLowerCase().replace(/[^\p{L}]/gu,'');
-  if(!letters||/^(.)\1{3,}$/u.test(letters)||/(.{2,5})\1{3,}/u.test(letters)||/[bcdfghjklmnpqrstvwxz]{6,}/.test(letters))fail('text','ช่วยใช้ข้อความที่อ่านได้ / Please use readable words');
+  if(!letters||/^(.)\1{3,}$/u.test(letters)||/(.{2,5})\1{2,}/u.test(letters)||(letters.length>=6&&new Set(letters).size<=2)||/[bcdfghjklmnpqrstvwxz]{6,}/.test(letters)||/[a-z]{25,}/.test(letters))fail('text','ช่วยใช้ข้อความที่อ่านได้ / Please use readable words');
   const rows=['qwertyuiop','asdfghjkl','zxcvbnm','ฟหกดเ้่าสวง','ๆไำพะัีรนยบลฃ','ผปแอิืทมใฝ'];
-  for(const r of rows){const width=/[a-z]/.test(r)?5:4;for(let i=0;i<=r.length-width;i++)if(s.toLowerCase().includes(r.slice(i,i+width)))fail('text','ช่วยใช้ข้อความที่อ่านได้ / Please use readable words')}
+  for(const row of rows)for(const r of [row,Array.from(row).reverse().join('')]){const width=/[a-z]/.test(r)?5:4;for(let i=0;i<=r.length-width;i++)if(s.toLowerCase().includes(r.slice(i,i+width)))fail('text','ช่วยใช้ข้อความที่อ่านได้ / Please use readable words')}
   return s;
 }
 function date(v,past=false,now=Date.now()){
@@ -41,7 +41,7 @@ function costPolicy(car,ref){
     maxByJob:verified&&plain(ref.maxByJob)?Object.fromEntries(Object.entries(ref.maxByJob).filter(([k,v])=>SERVICES.includes(k)&&Number.isFinite(v)&&v>0&&v<=ref.valueThb)):{}};
 }
 function money(v,car={},job='',ref=null){
-  const n=number(v,0,1000000000,'amount'),p=costPolicy(car,ref),limit=p.basis!=='heuristic'?Math.min(p.cap,p.maxByJob[job]??(JOB_CAP[job]||p.cap)*p.factor):Math.min(p.cap,(JOB_CAP[job]||p.cap)*p.factor);
+  const n=number(v,0,1000000000,'amount'),p=costPolicy(car,ref),limit=Math.min(p.cap,p.maxByJob[job]??(JOB_CAP[job]||500000)*p.factor);
   if(n>limit)fail('amount',p.basis!=='heuristic'?'ยอดสูงกว่าเกณฑ์อ้างอิงรถรุ่น/ปีนี้ / Above this model-year reference limit':'ยอดสูงกว่าเกณฑ์ตรวจสอบเบื้องต้น กรุณาตรวจเลข / Above the preliminary validation limit');
   return n;
 }
