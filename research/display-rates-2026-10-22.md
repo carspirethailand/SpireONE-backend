@@ -4,6 +4,8 @@
 
 The upstream request has an 8-second deadline, no redirects, a 32 KiB response limit and a maximum of 18 rows. Base, quote, rate and date are validated. Errors return a generic 503 with `no-store`; successful public data can be cached for one hour. Rates up to seven days old permit weekends/holidays; the frontend labels foreign-currency values approximate and displays the reference date in Settings. These are not transaction or payment rates.
 
+Production validation caught a Workers-specific incompatibility that Node's Fetch accepts: `redirect:error`. The implementation uses Workers-supported `manual` and rejects all non-2xx responses, including redirects. A fixed error-phase code is safe to expose without raw provider errors. Regression tests cover redirect rejection. Runtime reference: https://developers.cloudflare.com/workers/runtime-apis/request/#parameters .
+
 Primary documentation: https://frankfurter.dev/ . Read-only upstream and public deployment checks do not submit user amounts or personal data.
 
 This release also tests that repeated mechanic status/schema checks preserve shop ID, UID and moderation flags, that suspended/trial owners retain their own shop, and that another UID cannot inherit it. It does not change public listing filters, unsuspend shops, or approve applications.

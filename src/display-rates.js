@@ -5,7 +5,9 @@ export async function displayRates(request,cors={}){
   if(request.method!=='GET')return Response.json({error:'Method not allowed'},{status:405,headers:{...headers,Allow:'GET'}});
   let stage='fetch';
   try{
-    const r=await fetch('https://api.frankfurter.dev/v2/rates?base=THB&quotes='+currencies.join(','),{headers:{Accept:'application/json'},redirect:'error',signal:AbortSignal.timeout(8000),cf:{cacheEverything:true,cacheTtl:3600}});
+    // Workers supports manual/follow, not the Fetch standard's "error" mode.
+    // Manual plus the !ok check below refuses redirects without following them.
+    const r=await fetch('https://api.frankfurter.dev/v2/rates?base=THB&quotes='+currencies.join(','),{headers:{Accept:'application/json'},redirect:'manual',signal:AbortSignal.timeout(8000),cf:{cacheEverything:true,cacheTtl:3600}});
     stage='upstream_'+r.status;
     if(!r.ok)throw Error('upstream');
     stage='body';
