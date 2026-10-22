@@ -82,3 +82,22 @@ test('hidden shop photos load only for their owner through an authenticated no-s
     assert.equal((await raw(f,'/api/tech/img/'+(i+10)+'?owner=1')).status,404);
   }
 });
+
+test('current cold starts do not replay ALTER statements and owner-image reads do not initialize schema',async()=>{
+  const f=await seed(),db=f.env.DB,seen=[];f.env.DB={...db,prepare:sql=>{seen.push(sql);return db.prepare(sql)}};
+  const before=snapshot(f),fresh=await import('../src/techs.js?persistence=fast-current-schema');
+  assert.equal((await raw(f,'/api/tech/me',OWNER,fresh.handleTech)).status,200);
+  assert.equal(seen.filter(sql=>/^ALTER TABLE/.test(sql)).length,0);assert.ok(seen.filter(sql=>/^PRAGMA table_info/.test(sql)).length>0);
+  assert.deepEqual(snapshot(f),before);seen.length=0;
+  assert.equal((await raw(f,'/api/tech/img/1?owner=1',OWNER,fresh.handleTech)).status,200);
+  assert.equal(seen.filter(sql=>/^(CREATE|ALTER|PRAGMA)/.test(sql)).length,0);
+});
+
+test('older schemas still receive only the missing columns, in order, without changing mechanic records',async()=>{
+  const f=await seed();f.sqlite.exec('ALTER TABLE tech_posts DROP COLUMN note; ALTER TABLE tech_jobs DROP COLUMN urgent');
+  const before=snapshot(f),fresh=await import('../src/techs.js?persistence=older-additive-schema');
+  assert.equal((await raw(f,'/api/tech/ping','',fresh.handleTech)).status,200);
+  assert.ok(f.sqlite.prepare('PRAGMA table_info(tech_posts)').all().some(c=>c.name==='note'));
+  assert.ok(f.sqlite.prepare('PRAGMA table_info(tech_jobs)').all().some(c=>c.name==='urgent'));
+  assert.deepEqual(snapshot(f),before);
+});

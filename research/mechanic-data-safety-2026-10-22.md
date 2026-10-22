@@ -9,6 +9,7 @@ Read-only production inspection of the reported shop found two active package se
 - Authenticated `gigs?mine=1` is scoped to the verified token's UID and returns the owner's active inventory even for a suspended/trial shop. It supplies quota and visibility separately, never reviewer details or another account's services. Unlinked legacy rows remain visible to their owner rather than silently disappearing.
 - Public listings retain all moderation filters. Saving a service does not approve a shop. A full quota returns 409/SERVICE_LIMIT rather than a malformed-form 400.
 - Hidden shop/work/service images can be fetched with a bearer token and `owner=1` only by their owner. Responses are private/no-store. ID/selfie/certificate kinds are excluded, and no token goes into a URL.
+- Production checks also caught an 18.5-second cold image request caused by schema initialization. Existing image reads now skip migrations; cold initialization batches idempotent creates and checks column metadata rather than replaying duplicate ALTER errors. Missing-column migrations retain their original order and are covered by older-schema and unchanged-row tests.
 - Frontend owner inventory is independent of the public feed, scoped to the live UID/shop, and reset on account changes. Failed or malformed responses cannot become a fake empty inventory. Original service IDs and photos survive edits and reloads.
 
 ## Release protection

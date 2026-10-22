@@ -189,9 +189,19 @@ const TECH_ALTER = [
 const techReady = new WeakMap();
 async function ensureTech(env) {
   if (!techReady.has(env.DB)) {
-    const task=(async()=>{for(const sql of [...TECH_SQL,...MEDIA_SQL,...PROOF_SQL])await env.DB.prepare(sql).run();
+    const task=(async()=>{await env.DB.batch([...TECH_SQL,...MEDIA_SQL,...PROOF_SQL].map(sql=>env.DB.prepare(sql)));
       let holdAdded=false;
-      for(const sql of [...TECH_ALTER,...PROOF_ALTER])try{await env.DB.prepare(sql).run();if(/ADD COLUMN id_hold/.test(sql))holdAdded=true}catch(e){if(!/duplicate column|already exists/i.test(e.message||''))throw e;}
+      const changes=[...TECH_ALTER,...PROOF_ALTER],columns=new Map();
+      // A current database needs reads, not dozens of failing ALTER round trips.
+      // Keep migration order for old databases and tolerate concurrent cold boots.
+      const tables=[...new Set(changes.map(sql=>sql.match(/^ALTER TABLE (\w+) ADD COLUMN (\w+)/)?.[1]).filter(Boolean))];
+      await Promise.all(tables.map(async table=>{const r=await env.DB.prepare('PRAGMA table_info('+table+')').all();columns.set(table,new Set(r.results.map(c=>c.name)))}));
+      let pending=[];const flush=async()=>{if(pending.length){const list=pending;pending=[];await env.DB.batch(list.map(sql=>env.DB.prepare(sql)))}};
+      for(const sql of changes){const add=sql.match(/^ALTER TABLE (\w+) ADD COLUMN (\w+)/);
+        if(!add){pending.push(sql);continue}if(columns.get(add[1]).has(add[2]))continue;
+        await flush();try{await env.DB.prepare(sql).run();if(add[2]==='id_hold')holdAdded=true}catch(e){if(!/duplicate column|already exists/i.test(e.message||''))throw e;}
+        columns.get(add[1]).add(add[2]);
+      }await flush();
       /* เพิ่งเพิ่มคอลัมน์ครั้งแรก: ร้านที่ถูกพักอยู่และตัวตนยังไม่ผ่าน = ถูกพักเพราะตัวตน (พฤติกรรมเดิมก่อนแยกสถานะ) */
       if(holdAdded)await env.DB.prepare("UPDATE tech_profiles SET id_hold=1 WHERE test=0 AND suspended=1 AND uid IN (SELECT uid FROM tech_identity WHERE status!='approved')").run();
       if(env.ID_HASH_KEY)await upgradeIdHashes(env);})();
@@ -2947,9 +2957,10 @@ export async function handleTech(request, env, corsHeaders, options={}) {
   const ctx = options.ctx;
   env = Object.create(env, { bg: { value: (p) => { const q = Promise.resolve(p).catch(() => {}); if (ctx && ctx.waitUntil) ctx.waitUntil(q); return q; } } });
   try {
-    await ensureTech(env);
     const img = new URL(request.url).pathname.match(/^\/api\/tech\/img\/(\d+)$/);
+    // Existing image reads cannot require a schema migration or table rebuild.
     if (img) return await image(env, request, Number(img[1]), options.verifyToken, h);
+    await ensureTech(env);
     const path = new URL(request.url).pathname;
     const pvm = request.method === 'GET' && path.match(/^\/api\/tech\/passport\/([A-Za-z0-9_-]{20,64})\/media\/([^/]+)$/);
     if (pvm) return await passportMedia(env, pvm[1], pvm[2], h);
