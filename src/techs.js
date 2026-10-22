@@ -936,7 +936,14 @@ async function mediaRoute(env, request, id, h, verifyToken) {
   fail(405, 'ไม่รองรับคำขอนี้');
 }
 
-async function image(env, request, id) {
+async function image(env, request, id, verifyToken, h) {
+  if(new URL(request.url).searchParams.get('owner')==='1'){
+    const me=await who(request,env,true,verifyToken);
+    const own=await env.DB.prepare("SELECT mime,data FROM tech_docs WHERE id=? AND uid=? AND kind IN ('shop','work','gig','review')").bind(id,me.uid).first();
+    if(!own)fail(404,'ไม่พบรูป');
+    const bin=Uint8Array.from(atob(own.data),c=>c.charCodeAt(0));
+    return new Response(bin,{headers:{...h,'Content-Type':own.mime,'Content-Length':String(bin.byteLength),'Cache-Control':'private, no-store','Vary':'Authorization, Origin','X-Content-Type-Options':'nosniff'}});
+  }
   const d = await env.DB.prepare(
     `SELECT d.mime, d.data, p.verified, p.test FROM tech_docs d JOIN tech_profiles p ON p.uid = d.uid
      WHERE d.id = ? AND d.kind IN ('shop','work','gig','review') AND p.suspended = 0`).bind(id).first();
@@ -2582,6 +2589,18 @@ async function listGigs(env, me, url) {
   if (mine) {
     if (!me) fail(401, 'ต้องเข้าสู่ระบบ');
     rows = (await env.DB.prepare("SELECT * FROM tech_gigs WHERE uid = ? AND active = 1 AND kind = 'package' ORDER BY created_at DESC LIMIT 100").bind(me.uid).all()).results;
+    // Management inventory is private and UID-scoped, not the public directory.
+    // Suspension/trial status must never hide services that still consume quota.
+    const [shop,count] = await Promise.all([
+      env.DB.prepare('SELECT * FROM tech_profiles WHERE uid = ?').bind(me.uid).first(),
+      env.DB.prepare("SELECT COUNT(*) AS n FROM tech_gigs WHERE uid = ? AND active = 1 AND kind = 'package'").bind(me.uid).first(),
+    ]);
+    const t=shop?(await withPhotos(env,[shop]))[0]:null;
+    const visibility=!t?'unlinked':t.suspended?'suspended':t.test?'trial':t.verified?'public':'review';
+    const sp=await sponsorMap(env,rows.map(r=>r.id));
+    return {gigs:rows.map(r=>({...gigOut(r,t&&r.tech_id===t.id?t:null,sp[r.id],true),managed:true,
+      visibility:t&&r.tech_id===t.id?visibility:'unlinked'})),
+      quota:{used:count.n,limit:GIG_MAX,remaining:Math.max(0,GIG_MAX-count.n)},visibility};
   } else {
     rows = (await env.DB.prepare("SELECT * FROM tech_gigs WHERE active = 1 AND kind = 'package' ORDER BY created_at DESC LIMIT 600").all()).results;
     /* ร้านที่โพสต์ไว้ก่อนมีเพดาน — ลูกค้าเห็นแค่ 2 รายการล่าสุดของแต่ละร้าน */
@@ -2633,7 +2652,7 @@ async function saveGig(env, me, b) {
   if (photos.length + add.length > 300) fail(400, 'รูปในโพสต์เดียวเยอะเกินไป');
   if (!b.id && !me.owner) {
     const c = await env.DB.prepare("SELECT COUNT(*) AS n FROM tech_gigs WHERE uid = ? AND active = 1 AND kind = 'package'").bind(t.uid).first();
-    if (c.n >= GIG_MAX) fail(400, `โพสต์บริการได้สูงสุด ${GIG_MAX} รายการ ลบหรือแก้รายการเดิมแทน`);
+    if (c.n >= GIG_MAX) throw Object.assign(new HttpError(409, `มีบริการเดิมครบ ${GIG_MAX} รายการแล้ว — เปิด Studio > บริการ เพื่อแก้ไขรายการเดิม ข้อมูลไม่ได้ถูกลบ`),{serviceQuota:{used:c.n,limit:GIG_MAX,remaining:0}});
   }
   for (const x of add) {
     const m = imgClean(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(x && x.data || '')));
@@ -2930,7 +2949,7 @@ export async function handleTech(request, env, corsHeaders, options={}) {
   try {
     await ensureTech(env);
     const img = new URL(request.url).pathname.match(/^\/api\/tech\/img\/(\d+)$/);
-    if (img) return await image(env, request, Number(img[1]));
+    if (img) return await image(env, request, Number(img[1]), options.verifyToken, h);
     const path = new URL(request.url).pathname;
     const pvm = request.method === 'GET' && path.match(/^\/api\/tech\/passport\/([A-Za-z0-9_-]{20,64})\/media\/([^/]+)$/);
     if (pvm) return await passportMedia(env, pvm[1], pvm[2], h);
@@ -2938,9 +2957,11 @@ export async function handleTech(request, env, corsHeaders, options={}) {
     if (scm) return await showcaseMedia(env, scm[1], h);
     const md = path.match(/^\/api\/tech\/media\/([^/]+)$/);
     if (md) return await mediaRoute(env, request, md[1], h, options.verifyToken);
-    return json(await route(request, env,options.verifyToken), 200, h);
+    const data=await route(request, env,options.verifyToken);
+    const privateRead=path==='/api/tech/me'||(path==='/api/tech/gigs'&&new URL(request.url).searchParams.get('mine')==='1');
+    return json(data, 200, privateRead?{...h,'Cache-Control':'private, no-store','Vary':'Authorization, Origin'}:h);
   } catch (e) {
-    if (e instanceof HttpError || e instanceof MediaError) return json({ error: e.message }, e.status, h);
+    if (e instanceof HttpError || e instanceof MediaError) return json({ error: e.message,...(e.serviceQuota?{code:'SERVICE_LIMIT',quota:e.serviceQuota}:{}) }, e.status, {...h,'Cache-Control':'no-store'});
     console.error(e);
     return json({ error: 'ระบบขัดข้องชั่วคราว กรุณาลองใหม่' }, 500, h);
   }
