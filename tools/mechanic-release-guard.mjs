@@ -17,7 +17,7 @@ export function compareSnapshots(before,after){
   }return problems;
 }
 const queries={
-  profiles:'SELECT id,uid,phone,data,verified,test,suspended,jobs,rating_sum,review_count,created_at FROM tech_profiles ORDER BY id LIMIT 10001',
+  profiles:'SELECT id,uid,phone,data,verified,test,suspended,id_hold,jobs,rating_sum,review_count,created_at FROM tech_profiles ORDER BY id LIMIT 10001',
   services:'SELECT id,uid,tech_id,kind,title,body,price,cats,brands,photos,active,created_at FROM tech_gigs ORDER BY id LIMIT 10001',
   applications:'SELECT uid,status,test,revision,created_at FROM tech_applications ORDER BY uid LIMIT 10001',
   photos:"SELECT id,uid,kind,mime,length(data) AS bytes,created_at FROM tech_docs WHERE kind IN ('shop','work','gig','review') ORDER BY id LIMIT 10001",

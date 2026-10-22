@@ -30,7 +30,7 @@ const CHECKS = ['identity', 'phone', 'work', 'skills', 'shop', 'terms'];
    ใบรับรองฝีมือไม่บังคับ — ช่างเก่งจำนวนมากไม่มีใบ ทีมงานสัมภาษณ์ทักษะแทนได้ */
 const DOCS = [['id', 1, 1], ['selfie', 1, 1], ['shop', 1, 3], ['work', 3, 6], ['cert', 0, 2]];
 const PRIVATE_DOCS = ['id', 'selfie', 'cert'];
-const API_VERSION = 13;
+const API_VERSION = 14;
 const PHONE = /^0\d{8,9}$/;
 const now = () => Date.now();
 
@@ -185,6 +185,14 @@ const TECH_ALTER = [
   `CREATE TABLE IF NOT EXISTS car_passports (token TEXT PRIMARY KEY, uid TEXT NOT NULL, car_key TEXT NOT NULL, data TEXT NOT NULL, jobs TEXT,
     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, views INTEGER NOT NULL DEFAULT 0)`,
   `CREATE INDEX IF NOT EXISTS car_passports_uid ON car_passports(uid, car_key)`,
+  /* Every actual publication-state change is recorded by the database, even if
+     a future code path forgets its actor audit. No names/documents are copied. */
+  `CREATE TRIGGER IF NOT EXISTS tech_profile_state_audit AFTER UPDATE OF test,verified,suspended,id_hold ON tech_profiles
+    WHEN OLD.test IS NOT NEW.test OR OLD.verified IS NOT NEW.verified OR OLD.suspended IS NOT NEW.suspended OR OLD.id_hold IS NOT NEW.id_hold
+    BEGIN INSERT INTO tech_audit(at,actor,action,target,detail)
+      VALUES(CAST(strftime('%s','now') AS INTEGER)*1000,'system:profile-state','profile_state_change',NEW.id,
+      json_object('from',json_object('test',OLD.test,'verified',OLD.verified,'suspended',OLD.suspended,'identityHold',OLD.id_hold),
+                  'to',json_object('test',NEW.test,'verified',NEW.verified,'suspended',NEW.suspended,'identityHold',NEW.id_hold))); END`,
 ];
 const techReady = new WeakMap();
 async function ensureTech(env) {
@@ -439,6 +447,12 @@ async function techById(env, id) {
   return env.DB.prepare('SELECT * FROM tech_profiles WHERE id = ?').bind(id).first();
 }
 
+/* One publication rule for shops and services. This never changes moderation. */
+const directoryWhere = staff => `p.suspended = 0 AND ${staff ? '(p.verified = 1 OR p.test = 1)' : 'p.test = 0 AND p.verified = 1'}`;
+function listingOf(t) {
+  const blockers = !t ? ['unlinked'] : [t.suspended && 'suspended', t.test && 'trial', !t.test && !t.verified && 'review'].filter(Boolean);
+  return { public: !blockers.length, status: blockers[0] || 'public', blockers };
+}
 async function listTechs(env, me, url) {
   if (url.searchParams.get('test') === '1') {
     adminOnly(me);
@@ -448,9 +462,7 @@ async function listTechs(env, me, url) {
   }
   /* ทีมงานเห็นช่างทดสอบปนอยู่ในรายชื่อจริงด้วย (มีป้ายบอก) — ทดสอบได้เหมือนลูกค้าจริงทุกขั้น
      คนทั่วไปไม่เห็นช่างทดสอบเลย */
-  const q = me && me.staff
-    ? 'SELECT * FROM tech_profiles WHERE suspended = 0 AND (verified = 1 OR test = 1) ORDER BY test DESC, online DESC, created_at DESC LIMIT 500'
-    : 'SELECT * FROM tech_profiles WHERE test = 0 AND suspended = 0 AND verified = 1 ORDER BY online DESC, created_at DESC LIMIT 500';
+  const q = `SELECT p.* FROM tech_profiles p WHERE ${directoryWhere(me?.staff)} ORDER BY ${me?.staff ? 'p.test DESC, ' : ''}p.online DESC, p.created_at DESC, p.id DESC LIMIT 500`;
   const { results } = await env.DB.prepare(q).all();
   return { techs: (await withTrust(env, await withPhotos(env, results))).map(publicTech) };
 }
@@ -516,7 +528,7 @@ async function meInfo(env, me) {
   return {
     uid: me.uid, email: me.email, admin: me.admin, staff: me.staff, owner: !!me.owner, version: API_VERSION,
     application: appOut(await openApp(env, a), false, ident),
-    technician: t ? { ...publicTech((await withTrust(env, await withPhotos(env, [t])))[0]), suspended: !!t.suspended,
+    technician: t ? { ...publicTech((await withTrust(env, await withPhotos(env, [t])))[0]), suspended: !!t.suspended, listing: listingOf(t),
       /* งานค้าง/เพดาน (Studio บอกช่างก่อนเสนอราคา) */
       capacity: { open: jobs.filter(x => x.side === 'technician' && OPEN_STATES.includes(x.status)).length, cap: capOf(parse(t.data) || {}) },
       identityHold: !!(!t.test && t.suspended && t.id_hold),
@@ -579,6 +591,7 @@ async function apply(env, me, b) {
        เห็นได้เฉพาะทีมงาน คนทั่วไปไม่เห็น รีวิวไม่ถูกนับ */
     adminOnly(me);
     if(!me.admin)fail(403,'โหมดข้ามเกณฑ์ใช้ได้เฉพาะ admin');
+    if(await env.DB.prepare('SELECT id FROM tech_profiles WHERE uid=?').bind(me.uid).first())fail(409,'บัญชีนี้มีร้านอยู่แล้ว กรุณาเข้า Studio เพื่อจัดการร้านเดิม');
     const real=await env.DB.prepare('SELECT status,test FROM tech_applications WHERE uid=?').bind(me.uid).first();
     if(real&&!real.test&&real.status!=='rejected')fail(409,'บัญชีนี้มีใบสมัครจริง ใช้บัญชี admin แยกสำหรับทดสอบ');
     /* ทีมงานกด "ข้าม" ได้โดยไม่ส่งตำแหน่ง — ใช้ตำแหน่งเดิมของร้านทีมงาน ถ้าไม่มีใช้กลางกรุงเทพฯ แก้ทีหลังในแท็บร้าน */
@@ -600,12 +613,12 @@ async function apply(env, me, b) {
     await env.DB.batch([
       env.DB.prepare(`INSERT INTO tech_applications (uid,email,data,status,test,review,revision,created_at,updated_at)
         VALUES (?,?,?,'approved',1,NULL,1,?,?)
-        ON CONFLICT(uid) DO UPDATE SET data=excluded.data,status='approved',test=1,revision=revision+1,updated_at=excluded.updated_at`)
+        ON CONFLICT(uid) DO NOTHING`)
         .bind(me.uid, me.email, await vaultReady(env) ? await sealApp(env, me.uid, d) : JSON.stringify(d), t, t),
       /* ร้านเดิมที่แก้ไว้แล้วต้องไม่ถูกค่าเริ่มต้นเขียนทับ (บั๊ก "บันทึกแล้วกลับเป็นค่าเดิม") */
       env.DB.prepare(`INSERT INTO tech_profiles (id,uid,phone,data,verified,test,suspended,created_at,updated_at)
         VALUES (?,?,?,?,0,1,0,?,?)
-        ON CONFLICT(uid) DO UPDATE SET data=CASE WHEN tech_profiles.data IS NULL OR tech_profiles.data='' OR tech_profiles.data='{}' THEN excluded.data ELSE tech_profiles.data END,test=1,suspended=0,updated_at=excluded.updated_at`)
+        ON CONFLICT(uid) DO NOTHING`)
         .bind(id, me.uid, d.phone, JSON.stringify(d), t, t),
     ]);
     return { ok: true, id };
@@ -1157,10 +1170,14 @@ async function shopMode(env, me, b) {
 
 async function moderate(env, me, b) {
   adminOnly(me);
-  const r = await env.DB.prepare('UPDATE tech_profiles SET suspended=?, id_hold=0, updated_at=? WHERE id=?')
-    .bind(b.suspend === false ? 0 : 1, now(), String(b.id || '')).run();
+  if(typeof b.suspend!=='boolean')fail(400,'ต้องระบุระงับหรือปลดระงับอย่างชัดเจน');
+  const id=String(b.id||''),at=now();
+  const [r] = await env.DB.batch([
+    env.DB.prepare('UPDATE tech_profiles SET suspended=?, id_hold=0, updated_at=? WHERE id=?').bind(b.suspend?1:0,at,id),
+    env.DB.prepare('INSERT INTO tech_audit(at,actor,action,target,detail) SELECT ?,?,?,?,? WHERE EXISTS(SELECT 1 FROM tech_profiles WHERE id=?)')
+      .bind(at,String(me.email||me.uid),b.suspend?'suspend':'unsuspend',id,'explicit moderation decision',id),
+  ]);
   if (!r.meta.changes) fail(404, 'ไม่พบช่าง');
-  await audit(env, me, b.suspend === false ? 'unsuspend' : 'suspend', b.id);
   return { ok: true };
 }
 
@@ -2606,22 +2623,26 @@ async function listGigs(env, me, url) {
       env.DB.prepare("SELECT COUNT(*) AS n FROM tech_gigs WHERE uid = ? AND active = 1 AND kind = 'package'").bind(me.uid).first(),
     ]);
     const t=shop?(await withPhotos(env,[shop]))[0]:null;
-    const visibility=!t?'unlinked':t.suspended?'suspended':t.test?'trial':t.verified?'public':'review';
+    const listing=listingOf(t),visibility=listing.status;
     const sp=await sponsorMap(env,rows.map(r=>r.id));
     return {gigs:rows.map(r=>({...gigOut(r,t&&r.tech_id===t.id?t:null,sp[r.id],true),managed:true,
       visibility:t&&r.tech_id===t.id?visibility:'unlinked'})),
-      quota:{used:count.n,limit:GIG_MAX,remaining:Math.max(0,GIG_MAX-count.n)},visibility};
+      quota:{used:count.n,limit:GIG_MAX,remaining:Math.max(0,GIG_MAX-count.n)},visibility,listing};
   } else {
-    rows = (await env.DB.prepare("SELECT * FROM tech_gigs WHERE active = 1 AND kind = 'package' ORDER BY created_at DESC LIMIT 600").all()).results;
-    /* ร้านที่โพสต์ไว้ก่อนมีเพดาน — ลูกค้าเห็นแค่ 2 รายการล่าสุดของแต่ละร้าน */
-    const per = {};
-    rows = rows.filter(r => (per[r.tech_id] = (per[r.tech_id] || 0) + 1) <= GIG_MAX).slice(0, 300);
+    /* Filter eligibility and cap each shop BEFORE the global limit. Hidden shops
+       and legacy inventories must not push eligible shops out of the feed.
+       A stale/mismatched ownership link is not public evidence of ownership. */
+    rows = (await env.DB.prepare(`WITH eligible AS (
+      SELECT g.*, ROW_NUMBER() OVER (PARTITION BY g.tech_id ORDER BY g.created_at DESC, g.id DESC) AS directory_rank
+      FROM tech_gigs g JOIN tech_profiles p ON p.id = g.tech_id AND p.uid = g.uid
+      WHERE g.active = 1 AND g.kind = 'package' AND ${directoryWhere(me?.staff)}
+    ) SELECT * FROM eligible WHERE directory_rank <= ? ORDER BY created_at DESC, id DESC LIMIT 300`).bind(GIG_MAX).all()).results;
   }
   if (!rows.length) return { gigs: [] };
   const ids = [...new Set(rows.map(r => r.tech_id))];
   const techs = await inAll(env, 'SELECT * FROM tech_profiles WHERE id IN ({IN}) AND suspended = 0', ids);
   const by = Object.fromEntries((await withPhotos(env, techs)).map(t => [t.id, t]));
-  const ok = t => t && ((t.verified && !t.test) || (t.test && me && me.staff) || (mine && t.uid === me.uid));
+  const ok = t => t && !t.suspended && ((t.verified && !t.test) || (t.test && me && me.staff));
   const sp = await sponsorMap(env, rows.map(r => r.id));
   return { gigs: rows.filter(r => ok(by[r.tech_id])).map(r => gigOut(r, by[r.tech_id], sp[r.id], me && r.uid === me.uid)) };
 }
