@@ -1,5 +1,6 @@
 import { verifyFirebaseToken, firebaseProjects } from './auth.js';
 import { EMAIL_AUTH_SQL, handleEmailAuth, deleteFirebaseUser } from './email-auth.js';
+import { displayRates } from './display-rates.js';
 import { exportAccount, resetAccount, deleteAccount, deleteBlockers } from './account-data.js';
 import { ONBOARDING_SQL, handleOnboarding, onboardingName, sanitizeSetupState } from './onboarding.js';
 import { buildFeatureRequest, cleanFeatureJson, featureCap } from './features-ai.mjs';
@@ -3817,6 +3818,7 @@ export default {
     const cors = corsHeaders(env, request);
 
     if (request.method === 'OPTIONS') return new Response(null, { headers: cors });
+    if (url.pathname === '/api/display-rates') return displayRates(request,cors);
 
     const json = (data, status = 200) => new Response(JSON.stringify(data), {
       status, headers: { ...cors, 'Content-Type': 'application/json' },

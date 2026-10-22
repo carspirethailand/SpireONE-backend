@@ -19,6 +19,24 @@ const ADMIN2='adm2|adm2@unit.test',MOD='mod|mod@unit.test';
 function team(f){f.sqlite.prepare("INSERT INTO users(uid,role,banned) VALUES ('adm2','admin',0),('mod','moderator',0)").run();}
 const audits=(f,action)=>f.sqlite.prepare('SELECT * FROM tech_audit WHERE action=?').all(action);
 
+test('membership: own shop survives repeated status reads and schema checks even when hidden from the public directory',async()=>{
+  const f=fixture();await withMechanic(f);
+  for(const flags of [{test:0,verified:1,suspended:0},{test:1,verified:0,suspended:1}]){
+    f.sqlite.prepare('UPDATE tech_profiles SET test=?,verified=?,suspended=?,id_hold=0 WHERE uid=?').run(flags.test,flags.verified,flags.suspended,'mech');
+    for(let i=0;i<3;i++){
+      await f.call('', '/api/tech/ping');
+      const me=await f.call(MECH,'/api/tech/me');assert.equal(me.status,200);assert.equal(me.uid,'mech');
+      assert.equal(me.technician.id,'t_mech');assert.equal(me.technician.suspended,!!flags.suspended);assert.equal(me.technician.test,!!flags.test);
+      const other=await f.call(USER,'/api/tech/me');assert.equal(other.technician,null,'another UID cannot inherit the shop');
+      const publicRows=(await f.call(USER,'/api/tech')).techs;
+      assert.equal(publicRows.some(t=>t.id==='t_mech'),!flags.suspended&&!flags.test);
+      const stored=f.sqlite.prepare('SELECT id,uid,test,verified,suspended FROM tech_profiles WHERE uid=?').get('mech');
+      assert.deepEqual({...stored},{id:'t_mech',uid:'mech',...flags});
+    }
+  }
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) n FROM tech_profiles WHERE uid=?').get('mech').n,1);
+});
+
 test('owner: test-approve skips every check but only ever creates a staff-only test shop',async()=>{
   const f=fixture();fakeVision();await f.call('', '/api/tech/ping');team(f);
   const a=await pending(f,{},{idcheck:false});
