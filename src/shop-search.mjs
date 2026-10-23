@@ -18,7 +18,7 @@ export function shopInput(b){
   return {query:q,providers,location,lang:b.lang==='en'?'en':'th'};
 }
 async function jsonFetch(fetcher,url,options={}){
-  const r=await fetcher(url,{...options,redirect:'manual',signal:AbortSignal.timeout(9000)});if(!r.ok)throw Error('upstream unavailable');
+  const r=await fetcher(url,{...options,redirect:'manual',signal:AbortSignal.timeout(9000)});if(!r.ok){const why=await r.text().then(t=>t.replace(/\s+/g,' ').slice(0,300)).catch(()=>'');throw Error('upstream unavailable HTTP '+r.status+(why?' '+why:''))}
   const reader=r.body?.getReader();if(!reader)throw Error('upstream unavailable');let size=0,all=[];
   try{while(true){const {value,done}=await reader.read();if(done)break;size+=value.byteLength;if(size>1500000)throw Error('upstream oversized');all.push(value)}}finally{await reader.cancel().catch(()=>{})}
   const buffer=new Uint8Array(size);let at=0;for(const x of all){buffer.set(x,at);at+=x.length}return JSON.parse(new TextDecoder().decode(buffer));
@@ -73,7 +73,7 @@ export async function searchShop(env,body,{fetcher=fetch}={}){
   const input=shopInput(body),providers=await Promise.all(input.providers.map(async id=>{
     if(!ready(env,id))return {id,name:NAMES[id],state:'setup_required',items:[]};
     try{return {id,name:NAMES[id],state:'ready',...(id==='maps'?{places:await maps(env,input,fetcher)}:{items:await adapters[id](env,input.query,fetcher)})}}
-    catch{return {id,name:NAMES[id],state:'unavailable',items:[]}}
+    catch(e){console.error('shop provider failed',id,String(e&&e.message||e).slice(0,400));return {id,name:NAMES[id],state:'unavailable',items:[]}}
   }));return {query:input.query,providers,items:providers.flatMap(p=>p.items||[]),places:providers.flatMap(p=>p.places||[]),observedAt:Date.now(),fitmentRequiresVerification:true};
 }
 const schemas=new WeakMap();

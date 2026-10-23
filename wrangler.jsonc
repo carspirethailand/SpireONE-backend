@@ -38,6 +38,8 @@
     "AI_DAILY_LIMIT": "60",
     "AI_ANON_DAILY_LIMIT": "15",
     "ALLOWED_ORIGINS": "*",
+    // เปิดค้นหาร้านอะไหล่ใกล้ฉันผ่าน Google Places (ต้องมี secret GOOGLE_MAPS_API_KEY ด้วย) — ตั้ง "0" เพื่อปิด
+    "SHOP_GOOGLE_MAPS_ENABLED": "1",
     "CEREBRAS_MODEL": "gpt-oss-120b",
     "CEREBRAS_BASE_URL": "https://api.cerebras.ai/v1",
     "GROQ_MODEL": "openai/gpt-oss-120b",

@@ -68,3 +68,10 @@ test('nearby shops: store term added, coordinates coarsened, nearest first with 
   const r2=await searchShop(env,{...body(['maps']),query:'ผ้าเบรก'},{fetcher:f});assert.ok(r2.places.every(x=>x.distanceM===null),'no distance without a location');
   assert.equal(distanceM({lat:13.75,lng:100.5},{lat:13.75,lng:100.5}),0);
 });
+test('provider failure is logged for the owner with HTTP status and reason, but the client only sees "unavailable"',async()=>{
+  const logged=[],orig=console.error;console.error=(...a)=>logged.push(a.join(' '));
+  try{const r=await searchShop(env,{...body(['maps']),query:'brake pads'},{fetcher:async()=>new Response(JSON.stringify({error:{status:'PERMISSION_DENIED',message:'Places API (New) has not been used in project 1 before.'}}),{status:403})});
+    assert.equal(r.providers[0].state,'unavailable');assert.ok(!JSON.stringify(r).includes('PERMISSION_DENIED'));}
+  finally{console.error=orig}
+  assert.ok(logged.some(l=>/shop provider failed maps .*HTTP 403.*PERMISSION_DENIED/.test(l)));assert.ok(!logged.join(' ').includes('fixture-maps'),'the key is never logged');
+});
