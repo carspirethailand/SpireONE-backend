@@ -3966,7 +3966,7 @@ export default {
     const json = (data, status = 200) => new Response(JSON.stringify(data), {
       status, headers: { ...cors, 'Content-Type': 'application/json' },
     });
-    const deny = (msg, status) => json({ error: msg }, status);
+    const deny = (msg, status) => {const r=json({error:msg},status);r.headers.set('Cache-Control','private, no-store');r.headers.set('Vary','Authorization, Origin');return r};
 
     if (!env.DB) return deny('Database is not configured', 500);
 

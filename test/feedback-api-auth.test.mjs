@@ -24,7 +24,7 @@ async function fixture(){
 }
 test('new job and shop routes require authentication, preserve no-store, and never trust body UID',async()=>{
   const f=await fixture();try{
-    for(const path of ['/api/ai/jobs','/api/shop/status','/api/shop/search'])assert.equal((await f.call(path.endsWith('search')?'POST':'GET',path,{query:'pads'},null)).status,401,path);
+    for(const path of ['/api/ai/jobs','/api/shop/status','/api/shop/search']){const r=await f.call(path.endsWith('search')?'POST':'GET',path,{query:'pads'},null);assert.equal(r.status,401,path);assert.equal(r.headers.get('Cache-Control'),'private, no-store',path)}
     const id=crypto.randomUUID(),b={jobId:id,sessionId:'s1792720000000',carId:'car-1',uid:'someone-else',contents:[{role:'user',parts:[{text:'Synthetic'}]}]};
     for(const [method,path,body]of [['POST','/api/ai/jobs',b],['GET','/api/ai/jobs'],['GET','/api/ai/jobs/'+id],['POST','/api/ai/jobs/'+id+'/cancel',{}]]){const r=await f.call(method,path,body);assert.equal(r.status,200);assert.equal(r.headers.get('Cache-Control'),'private, no-store')}
     assert.ok(f.calls.length===4&&f.calls.every(c=>c.name==='user:one'&&c.uid==='one'));
