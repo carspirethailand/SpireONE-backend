@@ -53,10 +53,20 @@ async function aliexpress(env,q,fetcher){
   if(!result||(!Array.isArray(result.result?.products?.product)&&result.result?.current_record_count!==0))throw Error('invalid upstream response');
   return (result?.result?.products?.product||[]).map(x=>item('aliexpress',{id:x.product_id,title:x.product_title,url:x.promotion_link||x.product_detail_url,image:x.product_main_image_url,price:x.target_sale_price,currency:x.target_sale_price_currency,seller:x.shop_name})).filter(Boolean);
 }
+/* ร้านอะไหล่ใกล้ตำแหน่งผู้ใช้ที่ "น่าจะมี" สินค้านี้ — Google ค้นจากชื่อสินค้า + ประเภทร้านในแผนที่ ไม่ได้รู้สต็อกจริง
+   พิกัดที่ผู้ใช้ยินยอมถูกปัดเหลือ ~100 ม. ก่อนส่งให้ Google และไม่เก็บไว้ที่เรา */
+const STORE_TERM={th:'ร้านอะไหล่รถยนต์',en:'auto parts store'},STORE_WORDS=/ร้าน|อู่|ศูนย์|shop|store|parts|garage|dealer/i;
+const MAPS_RADIUS=15000,MAPS_FETCH=20,MAPS_SHOW=12,coarse=n=>Math.round(n*1000)/1000;
+export function distanceM(a,b){const r=x=>x*Math.PI/180,h=Math.sin(r(b.lat-a.lat)/2)**2+Math.cos(r(a.lat))*Math.cos(r(b.lat))*Math.sin(r(b.lng-a.lng)/2)**2;return Math.round(12742000*Math.asin(Math.min(1,Math.sqrt(h))))}
 async function maps(env,input,fetcher){
-  const d=await jsonFetch(fetcher,'https://places.googleapis.com/v1/places:searchText',{method:'POST',headers:{'Content-Type':'application/json','X-Goog-Api-Key':env.GOOGLE_MAPS_API_KEY,'X-Goog-FieldMask':'places.id,places.displayName,places.formattedAddress,places.location,places.googleMapsUri,places.attributions'},body:JSON.stringify({textQuery:input.query,languageCode:input.lang,pageSize:10,...(input.location?{locationBias:{circle:{center:{latitude:input.location.lat,longitude:input.location.lng},radius:20000}}}:{})})});
+  const here=input.location?{lat:coarse(input.location.lat),lng:coarse(input.location.lng)}:null;
+  const textQuery=STORE_WORDS.test(input.query)?input.query:input.query+' '+STORE_TERM[input.lang];
+  const d=await jsonFetch(fetcher,'https://places.googleapis.com/v1/places:searchText',{method:'POST',headers:{'Content-Type':'application/json','X-Goog-Api-Key':env.GOOGLE_MAPS_API_KEY,'X-Goog-FieldMask':'places.id,places.displayName,places.formattedAddress,places.location,places.googleMapsUri,places.attributions,places.primaryTypeDisplayName'},body:JSON.stringify({textQuery,languageCode:input.lang,regionCode:'TH',pageSize:MAPS_FETCH,...(here?{locationBias:{circle:{center:{latitude:here.lat,longitude:here.lng},radius:MAPS_RADIUS}}}:{})})});
   if(d.error||('places' in d&&!Array.isArray(d.places)))throw Error('invalid upstream response');
-  return (d.places||[]).slice(0,10).map(x=>({id:text(x.id,100),name:text(x.displayName?.text),address:text(x.formattedAddress,320),url:productUrl(x.googleMapsUri,'maps'),lat:Number(x.location?.latitude),lng:Number(x.location?.longitude),attributions:(x.attributions||[]).map(a=>({name:text(a.provider),uri:productUrl(a.providerUri,'maps')}))})).filter(x=>x.url);
+  const places=(d.places||[]).slice(0,MAPS_FETCH).map(x=>{const lat=Number(x.location?.latitude),lng=Number(x.location?.longitude),ok=x.location?.latitude!=null&&x.location?.longitude!=null&&Number.isFinite(lat)&&Number.isFinite(lng)&&Math.abs(lat)<=90&&Math.abs(lng)<=180;
+    return {id:text(x.id,100),name:text(x.displayName?.text),address:text(x.formattedAddress,320),type:text(x.primaryTypeDisplayName?.text,80),url:productUrl(x.googleMapsUri,'maps'),lat:ok?lat:null,lng:ok?lng:null,distanceM:here&&ok?distanceM(here,{lat,lng}):null,attributions:(x.attributions||[]).map(a=>({name:text(a.provider),uri:productUrl(a.providerUri,'maps')}))}}).filter(x=>x.url);
+  if(here)places.sort((a,b)=>(a.distanceM??Infinity)-(b.distanceM??Infinity));
+  return places.slice(0,MAPS_SHOW);
 }
 const adapters={shopee,amazon,aliexpress,ebay};
 export async function searchShop(env,body,{fetcher=fetch}={}){

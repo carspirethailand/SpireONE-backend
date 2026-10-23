@@ -1,7 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {DatabaseSync} from 'node:sqlite';
-import {shopStatus,shopInput,productUrl,searchShop,shopRateLimit} from '../src/shop-search.mjs';
+import {shopStatus,shopInput,productUrl,searchShop,shopRateLimit,distanceM} from '../src/shop-search.mjs';
 const env={SHOPEE_APP_ID:'fixture-id',SHOPEE_APP_SECRET:'fixture-shopee',AMAZON_CREATOR_ID:'fixture-amazon-id',AMAZON_CREATOR_SECRET:'fixture-amazon',AMAZON_PARTNER_TAG:'fixture-tag',ALIEXPRESS_APP_KEY:'fixture-ali-id',ALIEXPRESS_APP_SECRET:'fixture-ali',ALIEXPRESS_TRACKING_ID:'fixture-track',EBAY_CLIENT_ID:'fixture-ebay-id',EBAY_CLIENT_SECRET:'fixture-ebay',GOOGLE_MAPS_API_KEY:'fixture-maps',SHOP_GOOGLE_MAPS_ENABLED:'1'};
 const json=x=>new Response(JSON.stringify(x),{headers:{'Content-Type':'application/json'}});
 const body=providers=>({query:'brake pads',providers});
@@ -53,4 +53,18 @@ test('malformed/failed/redirected upstream responses remain unavailable, not emp
 test('rate limit is account-scoped and bounded atomically',async()=>{
   const db=new DatabaseSync(':memory:'),DB={prepare(sql){let args=[];return {bind(...a){args=a;return this},async first(){return db.prepare(sql).get(...args)||null},async run(){return db.prepare(sql).run(...args)}}}},e={DB};
   for(let i=0;i<5;i++)await shopRateLimit(e,'one',['maps']);await assert.rejects(shopRateLimit(e,'one',['maps']),{status:429});await shopRateLimit(e,'two',['maps']);db.close();
+});
+
+test('nearby shops: store term added, coordinates coarsened, nearest first with distance, bad coordinates tolerated',async()=>{
+  const place=(id,lat,lng)=>({id,displayName:{text:'Shop '+id},googleMapsUri:'https://maps.google.com/?cid='+id,formattedAddress:'Area',location:lat==null?undefined:{latitude:lat,longitude:lng},primaryTypeDisplayName:{text:'ร้านอะไหล่รถยนต์'}});
+  let sent;const f=async(u,o)=>{sent=JSON.parse(o.body);return json({places:[place('far',13.80,100.60),place('none'),place('near',13.7461,100.5352)]})};
+  const r=await searchShop(env,{...body(['maps']),query:'ผ้าเบรก Toyota',lat:13.74567,lng:100.53491,locationConsent:true},{fetcher:f});
+  assert.equal(sent.textQuery,'ผ้าเบรก Toyota ร้านอะไหล่รถยนต์');assert.equal(sent.regionCode,'TH');
+  assert.deepEqual(sent.locationBias.circle.center,{latitude:13.746,longitude:100.535},'~100 m precision only');
+  assert.deepEqual(r.places.map(x=>x.id),['near','far','none'],'nearest first, unknown distance last');
+  assert.ok(r.places[0].distanceM<200&&r.places[1].distanceM>5000);assert.equal(r.places[2].distanceM,null);assert.equal(r.places[2].lat,null);assert.equal(r.places[0].type,'ร้านอะไหล่รถยนต์');
+  await searchShop(env,{...body(['maps']),query:'auto parts shop near Siam',lang:'en',lat:13,lng:100,locationConsent:true},{fetcher:f});assert.equal(sent.textQuery,'auto parts shop near Siam','already names a store: not doubled');
+  await searchShop(env,{...body(['maps']),query:'brake pads',lang:'en'},{fetcher:f});assert.equal(sent.textQuery,'brake pads auto parts store');assert.equal(sent.locationBias,undefined,'no consent → no location');
+  const r2=await searchShop(env,{...body(['maps']),query:'ผ้าเบรก'},{fetcher:f});assert.ok(r2.places.every(x=>x.distanceM===null),'no distance without a location');
+  assert.equal(distanceM({lat:13.75,lng:100.5},{lat:13.75,lng:100.5}),0);
 });
