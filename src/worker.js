@@ -168,6 +168,67 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
 
 }
 
+/* Shared analysis executor: no browser connection is needed by a durable job. */
+export async function analyzeFeature(env, actor, body, {signal}={}) {
+  const input=buildFeatureRequest(body);
+  const json=(data,status=200)=>{if(status>=400)throw Object.assign(Error(data.error||'Analysis unavailable'),{status,featureFailure:data});return data};
+  const deny=(error,status)=>json({error},status);
+  const uid = actor.payload.sub;
+  const day = new Date().toISOString().slice(0, 10);
+  const warnings = [];
+  const limits = await getConfig(env, 'limits', {});
+  const limit = limits.aiDaily || parseInt(env.AI_DAILY_LIMIT || '60', 10);
+  /* เครื่องมือใหม่ที่ใช้ AI หนัก มีเพดานต่อคนต่อวันของตัวเอง (นับแยกในตาราง usage ด้วยคีย์ f:<tool>:<uid>) */
+  const cap = featureCap(limits, body.tool);
+  const capKey = cap ? `f:${body.tool}:${uid}` : '';
+  if (rank(actor.role) < rank('admin')) {
+    const used = await env.DB.prepare('SELECT count FROM usage WHERE uid = ? AND day = ?').bind(uid, day).first();
+    if (used && used.count >= limit) return deny('quota', 429);
+    const quota = await quotaState(env, uid, actor.role);
+    if (quota && quota.used >= quota.limit) return json({ error: 'quota', quota }, 429);
+    if (cap) {
+      const f = await env.DB.prepare('SELECT count FROM usage WHERE uid = ? AND day = ?').bind(capKey, day).first();
+      if (f && f.count >= cap) return json({ error: 'feature_quota', limit: cap }, 429);
+    }
+  }
+  const meter = newMeter();
+  let research;
+  if(body.tool==='ear'||body.tool==='listen'){
+    const q=soundResearchQuery(audioIdentity(body.context));
+    research=q?await publicResearch(q,{signal,vehicle:audioIdentity(body.context).vehicle}):{status:'needs_vehicle',sources:[],verifiedModelFaults:[]};
+    input.contents[0].parts[0].text+=researchBlock(research);
+  }
+  const prefer = (body.tool === 'bay' || body.tool === 'baylive') && env.GEMINI_VISION_MODEL ? [env.GEMINI_VISION_MODEL] : undefined;
+  let text;
+  const engineScan = (body.tool === 'bay' || body.tool === 'baylive') && body.scanVersion === 2;
+  try { text = await callGemini(env, { ...input, meter, prefer }); }
+  catch (e) {
+    if (!engineScan) throw e;
+    const {status,...failure}=engineScanFailure(e),requestId=crypto.randomUUID();
+    console.warn(JSON.stringify({event:'engine_scan_failed',code:failure.error,requestId}));
+    return json({...failure,requestId},status);
+  }
+  let data = null;
+  if (input.json) {
+    try { data = cleanFeatureJson(body.tool, text, {scanVersion:body.scanVersion,lang:body.lang,context:body.context}); if(research)data.research=research; }
+    catch (e) {
+      await meterTokens(env, uid, meter);
+      if (!engineScan) return deny('AI ตอบกลับไม่สมบูรณ์ ลองใหม่อีกครั้ง', 502);
+      const requestId=crypto.randomUUID();
+      console.warn(JSON.stringify({event:'engine_scan_failed',code:'scan_invalid_result',requestId}));
+      return json({error:'scan_invalid_result',requestId},502);
+    }
+  }
+  await meterTokens(env, uid, meter);
+  // meterTokens already counted one call; multimodal tools cost three calls total.
+  // สแกนสดส่งหลายเฟรมต่อการสแกนหนึ่งครั้ง — นับแค่เพดานของตัวเอง ไม่กินจำนวนครั้ง AI รายวันทั่วไป
+  if (body.tool !== 'baylive') await safe(env, warnings, 'usage.write', () => env.DB.prepare(`INSERT INTO usage (uid, day, count) VALUES (?, ?, 2)
+    ON CONFLICT(uid, day) DO UPDATE SET count = count + 2`).bind(uid, day).run(), null);
+  if (cap) await safe(env, warnings, 'usage.feature', () => env.DB.prepare(`INSERT INTO usage (uid, day, count) VALUES (?, ?, 1)
+    ON CONFLICT(uid, day) DO UPDATE SET count = count + 1`).bind(capKey, day).run(), null);
+  return json(data ? { data, ...(body.tool==='listen'?{text:soundText(data,body.lang)}:{}),tool: body.tool, source: 'ai', limit: cap || undefined, warnings } : { text, tool: body.tool, source: 'ai', warnings });
+}
+
 const ROLE_RANK = { owner: 4, admin: 3, moderator: 2, user: 1 };
 export async function executeChatJob(env,actor,body,send,lifecycle){
   const row=await env.DB.prepare('SELECT role,banned,email FROM users WHERE uid=?').bind(actor.payload.sub).first();
@@ -177,7 +238,22 @@ export async function executeChatJob(env,actor,body,send,lifecycle){
   const maintenance=await getConfig(env,'maintenance',{enabled:false});
   if(maintenance.enabled&&rank(actor.role)<rank('moderator'))throw Error('maintenance');
   if(rank(actor.role)<rank('admin')){const q=await quotaState(env,actor.payload.sub,actor.role);if(q.used>=q.limit)throw Error('quota')}
+  if(body.kind==='feature'){
+    const result=await analyzeFeature(env,actor,body.feature);
+    if(!await lifecycle.active())return;
+    if(!result.text||result.source!=='ai')throw Error('Analysis unavailable');
+    await send({type:'text_done',text:result.text});await send({type:'done'});return;
+  }
   return generateChatAnswer(env,actor,body,send,lifecycle);
+}
+
+/* The notification contains identifiers only, never the question, media or reply. */
+export async function completeChatJob(env,uid,job){
+  const user=await env.DB.prepare('SELECT banned FROM users WHERE uid=?').bind(uid).first();
+  if(!user||user.banned)return;
+  return pushToUid(env,uid,{title:job.status==='complete'?'Cendon AI ตอบแล้ว':'Cendon AI มีสถานะงานใหม่',
+    body:'เปิดแชตเพื่อดูผลของคุณ',tag:'cendon-ai-'+job.id,
+    url:'/chat?car='+encodeURIComponent(job.carId)+'&session='+encodeURIComponent(job.sessionId)+'&job='+encodeURIComponent(job.id)},true);
 }
 
 /* เจ้าของบริษัท — อยู่ในรายการเจ้าของเสมอ แม้ตั้ง OWNERS บน Cloudflare แล้วลืมใส่ (เจ้าของต้องไม่หลุดสิทธิ์ของตัวเอง) */
@@ -2470,18 +2546,20 @@ async function sendPush(env, sub, payloadObj, ttl = 86400) {
 
 
 /* ส่งแจ้งเตือนในเครื่องถึงทุกเครื่องของ uid (ตาราง push_subs) · เครื่องที่ยกเลิกไปแล้ว (404/410) ลบทิ้ง · ยังไม่ตั้ง VAPID = เงียบ */
-async function pushToUid(env, uid, payload) {
+async function pushToUid(env, uid, payload, retryDelivery=false) {
   if (!uid || !env.VAPID_PRIVATE || !env.VAPID_PUBLIC) return 0;
   let rows = [];
-  try { rows = (await env.DB.prepare('SELECT endpoint, p256dh, auth FROM push_subs WHERE uid = ? LIMIT 10').bind(uid).all()).results || []; } catch (e) { return 0; }
-  let n = 0;
+  try { rows = (await env.DB.prepare('SELECT endpoint, p256dh, auth FROM push_subs WHERE uid = ? LIMIT 10').bind(uid).all()).results || []; } catch (e) { if(retryDelivery)throw Error('Notification lookup temporarily unavailable');return 0; }
+  let n = 0,transient=false;
   for (const sub of rows) {
     try {
       const r = await sendPush(env, sub, payload, 6 * 3600);
       if (r.ok) n++;
       else if (r.status === 404 || r.status === 410) await env.DB.prepare('DELETE FROM push_subs WHERE endpoint = ?').bind(sub.endpoint).run();
-    } catch (e) {}
+      else if(r.status===429||r.status>=500)transient=true;
+    } catch (e) {transient=true}
   }
+  if(retryDelivery&&transient)throw Error('Notification delivery temporarily unavailable');
   return n;
 }
 
@@ -5048,7 +5126,13 @@ export default {
           if(request.method==='GET')result=parts[0]?await stub.read(uid,parts[0]):await stub.list(uid);
           else if(request.method==='POST'&&parts[1]==='cancel')result=await stub.cancel(uid,parts[0]);
           else if(request.method==='POST'&&!parts[0]){
-            const body=await readBody();try{validateContents(body?.contents)}catch{return reply({error:'Invalid chat request'},400)}
+            const body=await readBody();try{
+              validateContents(body?.contents);
+              if(body.kind==='feature'){
+                if(!['quote','listen','shake','park','own'].includes(body.feature?.tool))throw Error('Invalid background tool');
+                buildFeatureRequest(body.feature);
+              }else if(body.kind&&body.kind!=='chat')throw Error('Invalid job kind');
+            }catch{return reply({error:'Invalid chat request'},400)}
             const maintenance=await getConfig(env,'maintenance',{enabled:false});if(maintenance.enabled&&rank(actor.role)<rank('moderator'))return reply({error:'maintenance'},503);
             if(rank(actor.role)<rank('admin')){const quota=await quotaState(env,uid,actor.role);if(quota.used>=quota.limit)return reply({error:'quota',quota},429)}
             result=await stub.create(uid,actor,body);
@@ -6202,60 +6286,8 @@ ${convo}`;
           let input;
           try { input = buildFeatureRequest(body); }
           catch (e) { return deny(e.message, 400); }
-          const uid = actor.payload.sub;
-          const day = new Date().toISOString().slice(0, 10);
-          const warnings = [];
-          const limits = await getConfig(env, 'limits', {});
-          const limit = limits.aiDaily || parseInt(env.AI_DAILY_LIMIT || '60', 10);
-          /* เครื่องมือใหม่ที่ใช้ AI หนัก มีเพดานต่อคนต่อวันของตัวเอง (นับแยกในตาราง usage ด้วยคีย์ f:<tool>:<uid>) */
-          const cap = featureCap(limits, body.tool);
-          const capKey = cap ? `f:${body.tool}:${uid}` : '';
-          if (rank(actor.role) < rank('admin')) {
-            const used = await env.DB.prepare('SELECT count FROM usage WHERE uid = ? AND day = ?').bind(uid, day).first();
-            if (used && used.count >= limit) return deny('quota', 429);
-            const quota = await quotaState(env, uid, actor.role);
-            if (quota && quota.used >= quota.limit) return json({ error: 'quota', quota }, 429);
-            if (cap) {
-              const f = await env.DB.prepare('SELECT count FROM usage WHERE uid = ? AND day = ?').bind(capKey, day).first();
-              if (f && f.count >= cap) return json({ error: 'feature_quota', limit: cap }, 429);
-            }
-          }
-          const meter = newMeter();
-          let research;
-          if(body.tool==='ear'||body.tool==='listen'){
-            const q=soundResearchQuery(audioIdentity(body.context));
-            research=q?await publicResearch(q,{signal:request.signal,vehicle:audioIdentity(body.context).vehicle}):{status:'needs_vehicle',sources:[],verifiedModelFaults:[]};
-            input.contents[0].parts[0].text+=researchBlock(research);
-          }
-          const prefer = (body.tool === 'bay' || body.tool === 'baylive') && env.GEMINI_VISION_MODEL ? [env.GEMINI_VISION_MODEL] : undefined;
-          let text;
-          const engineScan = (body.tool === 'bay' || body.tool === 'baylive') && body.scanVersion === 2;
-          try { text = await callGemini(env, { ...input, meter, prefer }); }
-          catch (e) {
-            if (!engineScan) throw e;
-            const {status,...failure}=engineScanFailure(e),requestId=crypto.randomUUID();
-            console.warn(JSON.stringify({event:'engine_scan_failed',code:failure.error,requestId}));
-            return json({...failure,requestId},status);
-          }
-          let data = null;
-          if (input.json) {
-            try { data = cleanFeatureJson(body.tool, text, {scanVersion:body.scanVersion,lang:body.lang,context:body.context}); if(research)data.research=research; }
-            catch (e) {
-              await meterTokens(env, uid, meter);
-              if (!engineScan) return deny('AI ตอบกลับไม่สมบูรณ์ ลองใหม่อีกครั้ง', 502);
-              const requestId=crypto.randomUUID();
-              console.warn(JSON.stringify({event:'engine_scan_failed',code:'scan_invalid_result',requestId}));
-              return json({error:'scan_invalid_result',requestId},502);
-            }
-          }
-          await meterTokens(env, uid, meter);
-          // meterTokens already counted one call; multimodal tools cost three calls total.
-          // สแกนสดส่งหลายเฟรมต่อการสแกนหนึ่งครั้ง — นับแค่เพดานของตัวเอง ไม่กินจำนวนครั้ง AI รายวันทั่วไป
-          if (body.tool !== 'baylive') await safe(env, warnings, 'usage.write', () => env.DB.prepare(`INSERT INTO usage (uid, day, count) VALUES (?, ?, 2)
-            ON CONFLICT(uid, day) DO UPDATE SET count = count + 2`).bind(uid, day).run(), null);
-          if (cap) await safe(env, warnings, 'usage.feature', () => env.DB.prepare(`INSERT INTO usage (uid, day, count) VALUES (?, ?, 1)
-            ON CONFLICT(uid, day) DO UPDATE SET count = count + 1`).bind(capKey, day).run(), null);
-          return json(data ? { data, ...(body.tool==='listen'?{text:soundText(data,body.lang)}:{}),tool: body.tool, source: 'ai', limit: cap || undefined, warnings } : { text, tool: body.tool, source: 'ai', warnings });
+          try{return json(await analyzeFeature(env,actor,body,{signal:request.signal}))}
+          catch(e){if(e.status)return json(e.featureFailure||{error:'Analysis unavailable'},e.status);throw e}
         })();
       }
 

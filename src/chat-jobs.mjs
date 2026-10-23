@@ -7,7 +7,7 @@ const validId=x=>typeof x==='string'&&/^[a-f0-9-]{36}$/.test(x);
 const validCar=x=>typeof x==='string'&&/^[\w-]{1,100}$/.test(x);
 const clean=m=>({id:m.id,sessionId:m.sessionId,carId:m.carId,status:m.status,createdAt:m.createdAt,updatedAt:m.updatedAt,expiresAt:m.expiresAt});
 export class ChatJobEngine {
-  constructor(ctx,env,execute){this.ctx=ctx;this.env=env;this.execute=execute}
+  constructor(ctx,env,execute,notify){this.ctx=ctx;this.env=env;this.execute=execute;this.notify=notify}
   key(uid,id,kind){return 'cendon:chat-job:'+uid+':'+id+':'+kind}
   async owner(uid){return (await this.ctx.storage.get('owner'))===uid}
   async writeBlob(tx,id,kind,value){const chunks=Math.ceil(value.length/CHUNK);const entries={};for(let i=0;i<chunks;i++)entries[`${kind}:${id}:${i}`]=value.slice(i*CHUNK,(i+1)*CHUNK);await tx.put(entries);return chunks}
@@ -38,7 +38,7 @@ export class ChatJobEngine {
     const encrypted=await seal(this.env,JSON.stringify(result),this.key(uid,id,'result'));
     return this.ctx.storage.transaction(async tx=>{const m=await tx.get('m:'+id);if(!m||m.status!=='running')return false;
       await this.dropBlob(tx,m,'result');m.resultParts=await this.writeBlob(tx,id,'result',encrypted);m.updatedAt=Date.now();if(status)m.status=status;
-      if(done(m.status)){await this.dropBlob(tx,m,'input');m.inputParts=0}await tx.put('m:'+id,m);return true;
+      if(done(m.status)){await this.dropBlob(tx,m,'input');m.inputParts=0;if(this.notify){m.deliveryAt=Date.now();m.deliveryTries=0;await tx.setAlarm(Date.now()+1)}}await tx.put('m:'+id,m);return true;
     });
   }
   async alarm(){
@@ -66,8 +66,14 @@ export class ChatJobEngine {
         catch{await this.result(uid,m.id,{text:result.text||'ยังตอบไม่ได้ชั่วคราว กรุณาลองใหม่',retryable:true},'error')}
       }
     }
+    /* Retry delivery only; never repeat an inference because a push failed. Stable tags deduplicate notifications. */
+    if(this.notify)for(const row of (await this.ctx.storage.list({prefix:'m:'})).values()){
+      if(!['complete','error'].includes(row.status)||!row.deliveryAt||row.deliveryAt>Date.now()||row.deliveryTries>=3)continue;
+      let sent=false;try{await this.notify(uid,clean(row));sent=true}catch{}
+      await this.ctx.storage.transaction(async tx=>{const m=await tx.get('m:'+row.id);if(!m||m.status!==row.status)return;m.deliveryTries=(m.deliveryTries||0)+1;m.deliveryAt=sent||m.deliveryTries>=3?null:Date.now()+30000*m.deliveryTries;await tx.put('m:'+m.id,m)});
+    }
     const live=[...(await this.ctx.storage.list({prefix:'m:'})).values()];
-    if(live.length)await this.ctx.storage.setAlarm(live.some(x=>x.status==='queued')?Date.now()+1:Math.min(...live.map(x=>x.expiresAt)));
+    if(live.length)await this.ctx.storage.setAlarm(live.some(x=>x.status==='queued')?Date.now()+1:Math.min(...live.flatMap(x=>[x.expiresAt,...(x.deliveryAt?[x.deliveryAt]:[])])));
     else{await this.ctx.storage.deleteAll();await this.ctx.storage.deleteAlarm()}
   }
 }

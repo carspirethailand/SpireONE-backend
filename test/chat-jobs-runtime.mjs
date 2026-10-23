@@ -16,6 +16,9 @@ try{
   // No stream/subscriber remains open; the actual workerd alarm finishes the job.
   let r;for(let n=0;n<100;n++){r=await call('one',b.jobId);if(r.job?.status==='complete')break;await new Promise(r=>setTimeout(r,30))}
   assert.equal(r.job.status,'complete');assert.equal(r.job.text,'Runtime fixture answer');
+  let notification;for(let n=0;n<50;n++){notification=await(await mf.dispatchFetch('https://fixture.test/?uid=one&id='+b.jobId+'&notice=1')).json();if(notification.notice)break;await new Promise(r=>setTimeout(r,30))}
+  assert.deepEqual(notification.notice,{uid:'one',id:b.jobId,status:'complete'});
+  assert.equal((await(await mf.dispatchFetch('https://fixture.test/?uid=two&id='+b.jobId+'&notice=1')).json()).notice,null);
   assert.equal((await call('two',b.jobId)).status,404);
   await mf.dispose();mf=new Miniflare(options);
   assert.equal((await call('one',b.jobId)).job.text,'Runtime fixture answer','encrypted result survives runtime restart');

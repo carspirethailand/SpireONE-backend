@@ -52,3 +52,22 @@ test('invalid scope, oversized payload and missing encryption fail closed',async
   assert.equal((await f.create({...body(),contents:'x'.repeat(24*1024*1024)})).status,413);
   assert.equal((await new ChatJobEngine(f.ctx,{},()=>{}).create('one',{role:'user'},body())).status,503);
 });
+
+test('completion delivery is durable, private, and retries without rerunning inference',async()=>{
+  let calls=0,deliveries=0;const f=fixture(async(e,a,b,send)=>{calls++;await send({type:'text',delta:'private answer'})}),b=body();
+  f.engine.notify=async(uid,job)=>{assert.equal(uid,'one');assert.equal(job.id,b.jobId);assert.equal(job.text,undefined);assert.equal(job.contents,undefined);deliveries++;if(deliveries===1)throw Error('temporary delivery failure')};
+  await f.create(b);await f.engine.alarm();assert.equal(calls,1);assert.equal(deliveries,1);assert.equal((await f.engine.read('one',b.jobId)).job.status,'complete');
+  const m=await f.storage.get('m:'+b.jobId);assert.ok(m.deliveryAt>Date.now());m.deliveryAt=Date.now()-1;await f.storage.put('m:'+b.jobId,m);
+  const fresh=new ChatJobEngine(f.ctx,f.env,f.engine.execute,f.engine.notify);await fresh.alarm();assert.equal(calls,1);assert.equal(deliveries,2);
+  await fresh.alarm();assert.equal(deliveries,2);assert.equal((await f.storage.get('m:'+b.jobId)).deliveryAt,null);
+});
+
+test('explicit cancellation and purge never send completion notifications',async()=>{
+  for(const action of ['cancel','purge']){let n=0;const f=fixture(),b=body();f.engine.notify=async()=>{n++};await f.create(b);await f.engine[action]('one',b.jobId);await f.engine.alarm();assert.equal(n,0)}
+});
+
+test('failed delivery is bounded, but the completed answer remains readable',async()=>{
+  let n=0;const f=fixture(),b=body();f.engine.notify=async()=>{n++;throw Error('offline')};await f.create(b);
+  for(let i=0;i<5;i++){const m=await f.storage.get('m:'+b.jobId);m.deliveryAt=Date.now()-1;await f.storage.put('m:'+b.jobId,m);await f.engine.alarm()}
+  assert.equal(n,3);assert.equal((await f.engine.read('one',b.jobId)).job.text,'fixture answer');
+});

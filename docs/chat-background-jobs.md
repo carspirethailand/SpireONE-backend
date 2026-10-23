@@ -1,0 +1,11 @@
+# AI work and completion delivery
+
+- `/api/ai/jobs` accepts authenticated, UID-scoped work. An accepted request is encrypted in the existing `CHAT_JOBS` Durable Object before the receipt is returned. Its alarm owns the inference; closing a page is not cancellation.
+- Ordinary conversations and the Chat tools `quote`, `listen`, `shake`, `park`, and `own` use this queue. The tools share the existing analysis validator, provider, quota accounting and uncertainty safeguards. Camera/microphone capture and live calls are not background jobs.
+- A file must finish uploading before work can be accepted. The UI distinguishes sending from queued/running. A force-closed, incomplete upload cannot be promised to finish.
+- A completed answer is committed before notification. The outbox retries a temporary delivery failure up to three times without repeating inference. Notifications use a stable job tag and generic wording, not the question, answer or attachments. Only existing opted-in Web Push subscriptions are used; no new LINE messages or subscription prompts.
+- Every signed-in main app page collects terminal results into a bounded, account-scoped local inbox. Chat applies them only to the original car, session and job marker. It never navigates an unrelated conversation or silently executes an externally consequential Valet action.
+- Server payloads/results expire after 24 hours; uploaded input is removed upon a terminal state. The local delivery cache keeps at most 20 results for seven days and is wiped by the existing account scope on sign-out/account switch. Normal saved Chat history retains its existing policy.
+- Explicit Stop still cancels. Account deletion purges the object. Failed/interrupted inference reports an error rather than blindly replaying paid inference. Browser notification permission, OS delivery restrictions and provider availability remain external constraints.
+
+Verification: `test/chat-jobs.test.mjs`, `test/chat-job-features.test.mjs`, the actual workerd/SQLite runtime fixture `test/chat-jobs-runtime.mjs`, and frontend `test/chat-background-browser.mjs`. All use synthetic inputs; no real applicant records, real messages or paid inference are required.
