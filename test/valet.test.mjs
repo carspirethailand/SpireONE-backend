@@ -53,3 +53,12 @@ test('car_info: the AI can save car details the user states, never guessed ones'
   assert.match(p, /trim \(รุ่นย่อย\) · engine · engine_code · model_year · gear · fuel · drive \(FWD\|RWD\|AWD\|4WD\) · tire · vin · plate · province/);
   assert.match(p, /ห้ามเดาหรือเติมจากสเปกทั่วไป/);
 });
+
+test('private settings always require an action block and never grant admin, cross-account, code or arbitrary API powers',()=>{
+  const p=valetPrompt({agent:{v:1,mech:true,cars:[]}});
+  for(const name of ['distance (km|mi)','currency (THB|USD','primary (สีหลัก #RRGGBB','"do":"capabilities"','"do":"cars"','"do":"threads"','engine_scan','car_maintenance'])assert.ok(p.includes(name),name);
+  assert.match(p,/ต้องมีบล็อกคำสั่งด้วย/);assert.match(p,/หน้าเว็บจะตรวจผลก่อนขึ้นสำเร็จ/);
+  assert.match(p,/แม้ผู้ใช้เป็นเจ้าของแอปก็ห้ามใช้สิทธิ์แอดมิน/);
+  assert.match(p,/ห้ามข้ามบัญชี/);assert.match(p,/ไม่สร้างคำสั่ง API\/โค้ด\/URL เอง/);
+  for(const action of ['role','uid','admin','run_code','api','delete_account','pay'])assert.ok(!p.includes('"do":"'+action+'"'));
+});
