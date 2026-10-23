@@ -70,7 +70,7 @@ async function setup() {
     throw Error('unexpected fetch ' + u);};
   const call = async (method, path, body, uid = 'me') => {
     const r = await worker.fetch(new Request('https://w.unit.test' + path, {method, headers: {'Content-Type': 'application/json', Authorization: `Bearer dev:${uid}:${uid}@unit.test`}, ...(body === undefined ? {} : {body: JSON.stringify(body)})}), env, {waitUntil() {}});
-    return {status: r.status, json: await r.json().catch(() => null)};
+    return {status: r.status, headers: r.headers, json: await r.json().catch(() => null)};
   };
   const say = async text => {const n = replies.length, waits = [];
     const body = JSON.stringify({events: [{type: 'message', replyToken: 'rt', source: {type: 'user', userId: 'Ume'}, message: {type: 'text', id: '1', text}}]});
@@ -117,6 +117,12 @@ test('18:00 on LINE: one car at a time, typed numbers are saved, wrong numbers a
   const g = JSON.parse(sqlite.prepare("SELECT v FROM user_state WHERE uid='me' AND k='garage'").get().v);
   assert.equal(g[0].mileage, '50420', 'the app garage shows the new reading (same type as before)');
   assert.equal(g[1].mileage, 30000);
+  assert.equal(sqlite.prepare("SELECT mileage FROM cars WHERE id='v1' AND uid='me'").get().mileage, '50420');
+  const confirmed = await call('GET', '/api/odo/readings');
+  assert.equal(confirmed.json.cars.find(c => c.carId === 'v1').km, 50420);
+  assert.match(confirmed.headers.get('Cache-Control'), /private, no-store/);
+  assert.match(confirmed.headers.get('Vary'), /Authorization/);
+  assert.equal((await call('GET', '/api/state?keys=garage')).json.state.garage.v[0].mileage, '50420');
 
   assert.equal((await say('ข้ามคันนี้'))[0].text, 'ข้ามคันนี้ครับ\nครบทุกคันแล้ว ขอบคุณครับ');
   assert.equal(sqlite.prepare("SELECT COUNT(*) n FROM odo_anchor WHERE car_id='c2'").get().n, 0);
@@ -153,4 +159,44 @@ test('worker wiring: LINE checks the pending reading before link codes; 18:00 cr
   assert.ok(h.indexOf('kmLineReply(') < h.indexOf('lineCodeIn('));
   assert.match(w, /if \(event\.cron === KM_CRON\) \{ ctx\.waitUntil\(runKmRound\(env\)\); return; \}/);
   assert.doesNotMatch(w.slice(w.indexOf('async function runKmRound('), w.indexOf('/* ถามเลขไมล์ — ตอบด้วยค่าที่ระบบใช้จริง')), /addAnchor\(/, 'the cron never writes a reading by itself');
+});
+
+test('a stale garage upload cannot undo a LINE reading, even with a later client timestamp; details are preserved', async () => {
+  const {sqlite,call,say,cron}=await setup();
+  await call('POST','/api/km/remind',{on:true});await cron();await say('50420');
+  const old=[{id:'v1',name:'Vios',mileage:'50000',color:'blue',custom:{keep:'draft'}},{id:'c2',mileage:30000}];
+  const saved=await call('PUT','/api/state',{state:{garage:{v:old,t:Date.now()+10000}}});
+  assert.equal(saved.status,200);assert.deepEqual(saved.json.saved,['garage']);
+  const g=JSON.parse(sqlite.prepare("SELECT v FROM user_state WHERE uid='me' AND k='garage'").get().v);
+  assert.deepEqual(g,[{...old[0],mileage:'50420'},old[1]]);
+  // Simulate an older client/failed mirror leaving a stale cache. GET still projects the anchor.
+  sqlite.prepare("UPDATE user_state SET v=? WHERE uid='me' AND k='garage'").run(JSON.stringify(old));
+  const r=await call('GET','/api/state?keys=garage');
+  assert.equal(r.json.state.garage.v[0].mileage,'50420');
+  assert.equal(r.json.state.garage.v[0].color,'blue');
+  assert.deepEqual(r.json.state.garage.v[0].custom,{keep:'draft'});
+});
+
+test('confirmed mileage refresh is read-only, owner-scoped, excludes deleted cars and does not seed estimated readings', async () => {
+  const {sqlite,call,env}=await setup();const before=sqlite.prepare('SELECT count(*) n FROM odo_anchor').get().n;
+  const r=await call('GET','/api/odo/readings');
+  assert.equal(r.status,200);assert.equal(r.json.cars.length,1);
+  assert.equal(r.json.cars[0].carId,'v1');assert.equal(r.json.cars[0].km,50000);
+  assert.equal(sqlite.prepare('SELECT count(*) n FROM odo_anchor').get().n,before,'no anchor created for City');
+  const other=await call('GET','/api/odo/readings',undefined,'other');
+  assert.deepEqual(other.json.cars,[]);
+  const worker=(await import('../src/worker.js')).default;
+  const anon=await worker.fetch(new Request('https://w.unit.test/api/odo/readings'),env,{waitUntil(){}});
+  assert.equal(anon.status,401);assert.match(anon.headers.get('Cache-Control'),/no-store/);
+  sqlite.prepare("DELETE FROM cars WHERE id='v1' AND uid='me'").run();
+  assert.deepEqual((await call('GET','/api/odo/readings')).json.cars,[],'orphan anchors cannot resurrect a removed car');
+});
+
+test('LINE confirmation remains readable when the garage mirror is absent; refresh never invents cars',async()=>{
+  const {sqlite,call,say,cron}=await setup();
+  sqlite.prepare("DELETE FROM user_state WHERE uid='me' AND k='garage'").run();
+  await call('POST','/api/km/remind',{on:true});await cron();
+  assert.match((await say('50420'))[0].text,/บันทึกแล้ว/);
+  assert.equal((await call('GET','/api/odo/readings')).json.cars.find(c=>c.carId==='v1').km,50420);
+  assert.equal((await call('GET','/api/state?keys=garage')).json.state.garage,undefined);
 });

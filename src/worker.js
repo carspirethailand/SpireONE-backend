@@ -20,7 +20,8 @@ import { appUrl, card, notify } from './line-notify.js';
 import { refreshNews, newsStatus } from './news.js';
 import { ensureSpec, getSpec, specKey, equipmentKey, detailsKey, validQuery, reportSpec, listSpecs, verifySpec, specLogList, specAI } from './carspec.js';
 import { wantsSpec, ownBlock, specBlock } from './chat-spec.mjs';
-import { KM_CRON, kmTable, thDay, thDayStart, parseKm, parseConfirm, SKIP_RE, OFF_RE, checkKm, askLine, pushText, replyFor, toAsk, setGarageKm, getPref, setPref, getPending, savePending } from './km-remind.mjs';
+import { KM_CRON, kmTable, thDay, thDayStart, parseKm, parseConfirm, SKIP_RE, OFF_RE, checkKm, askLine, pushText, replyFor, toAsk, getPref, setPref, getPending, savePending } from './km-remind.mjs';
+import { confirmedMileage, applyConfirmedMileage } from './odo-sync.mjs';
 import { decodeVin, vpic, cleanInfo } from './vin.js';
 import { LINE_AI, LINE_TALK, LINE_MARK, linePlain, lineChunks, lineCodeIn } from './line-chat.js';
 import { handleVec, kbScores, refreshKb } from './vectors.js';
@@ -3399,7 +3400,6 @@ async function kmLineReply(env, link, t, now = Date.now()) {
     const chk = checkKm(v, last, now);
     if (!chk.ok && !(forced != null && chk.why === 'jump')) return txt(replyFor(chk, v));
     await addAnchor(env, link.uid, String(car.id), v, 'manual', now, 'line');
-    try { await setGarageKm(env, link.uid, String(car.id), v, now); } catch (e) {}
     said = `บันทึกแล้ว ✓ ${`${car.make || ''} ${car.model || ''}`.trim()} ${kmN(v)} กม.`;
   }
   /* คันถัดไปที่ยังไม่ได้ถาม (คันที่ถูกลบไประหว่างนั้นข้ามไป) */
@@ -3967,6 +3967,7 @@ export default {
       status, headers: { ...cors, 'Content-Type': 'application/json' },
     });
     const deny = (msg, status) => {const r=json({error:msg},status);r.headers.set('Cache-Control','private, no-store');r.headers.set('Vary','Authorization, Origin');return r};
+    const privateJson = data => {const r=json(data);r.headers.set('Cache-Control','private, no-store');r.headers.set('Vary','Authorization, Origin');return r};
 
     if (!env.DB) return deny('Database is not configured', 500);
 
@@ -4261,6 +4262,13 @@ export default {
       /* ══════════════ ODOMETER + MAINTENANCE ══════════════
          ระบบเดินเลขไมล์เองที่เซิร์ฟเวอร์ ดูคำอธิบายที่ odo engine ด้านบน */
 
+      // Lightweight, read-only refresh after LINE replies. No estimates or anchor seeding.
+      if (url.pathname === '/api/odo/readings' && request.method === 'GET') {
+        return await guarded('user', async actor => privateJson({
+          cars: await confirmedMileage(env, actor.payload.sub), at: Date.now(),
+        }))();
+      }
+
       // สถานะไมล์ + รายการที่ถึงคิว ของรถทุกคันของผู้ใช้
       if (url.pathname === '/api/odo/state' && request.method === 'GET') {
         return await guarded('user', async (actor) => {
@@ -4432,16 +4440,21 @@ export default {
           }
           const rs = await env.DB.prepare(sql).bind(...args).all();
           const deleted = await carDeletions(env, actor.payload.sub);
+          const readings = (rs.results || []).some(r => r.k === 'garage')
+            ? await confirmedMileage(env, actor.payload.sub) : [];
           const state = {};
           for (const r of rs.results || []) {
             if (r.k.startsWith(CAR_DELETED_PREFIX) || r.k === GARAGE_CARE_KEY) continue;
             let v = null;
             try { v = JSON.parse(r.v); } catch (e) { v = r.v; }
             if (r.k === 'setup') v = await sanitizeSetupState(env, actor.payload.sub, v);
+            if (r.k === 'garage') v = applyConfirmedMileage(v, readings);
             v = withoutDeletedCars(r.k, v, deleted);
-            state[r.k] = { v, t: (r.k === 'garage' || r.k === 'selCar') ? Math.max(Number(r.t) || 0, deleted.t) : r.t };
+            const mileageAt = r.k === 'garage' && Array.isArray(v)
+              ? readings.filter(a => v.some(c => String(c?.id) === String(a.carId))).reduce((t, a) => Math.max(t, Number(a.updatedAt) || 0), 0) : 0;
+            state[r.k] = { v, t: (r.k === 'garage' || r.k === 'selCar') ? Math.max(Number(r.t) || 0, deleted.t, mileageAt) : r.t };
           }
-          return json({ state, now: Date.now() });
+          return privateJson({ state, now: Date.now() });
         })();
       }
 
@@ -4455,6 +4468,7 @@ export default {
           const skipped = [], errors = {};
           const deleted = (Object.hasOwn(items, 'garage') || Object.hasOwn(items, 'selCar'))
             ? await carDeletions(env, uid) : { ids: new Set(), t: 0 };
+          const readings = Object.hasOwn(items, 'garage') ? await confirmedMileage(env, uid) : [];
           for (const k of Object.keys(items).slice(0, 40)) {
             if (k.startsWith(CAR_DELETED_PREFIX) || k === GARAGE_CARE_KEY || !/^[A-Za-z0-9_:.-]{1,64}$/.test(k)) { skipped.push(k); continue; }
             const item = items[k] || {};
@@ -4462,6 +4476,7 @@ export default {
             try { value = await validateGarageWrite(env, uid, k, value, items.garage?.v); }
             catch { skipped.push(k); errors[k] = 'ข้อมูลบันทึกไม่ผ่านการตรวจสอบ กรุณาตรวจชื่อ วันที่ และตัวเลข / Check the record text, dates and numbers'; continue; }
             if (k === 'setup') value = await sanitizeSetupState(env, uid, value);
+            if (k === 'garage') value = applyConfirmedMileage(value, readings);
             const raw = JSON.stringify(value);
             /* กันคนยัดข้อมูลก้อนใหญ่จนฐานข้อมูลบวม 256KB ต่อคีย์พอสำหรับบทสนทนาเป็นร้อย */
             if (raw.length > 256 * 1024) { skipped.push(k); continue; }
