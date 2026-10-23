@@ -18,7 +18,7 @@ export function shopInput(b){
   return {query:q,providers,location,lang:b.lang==='en'?'en':'th'};
 }
 async function jsonFetch(fetcher,url,options={}){
-  const r=await fetcher(url,{...options,redirect:'manual',signal:AbortSignal.timeout(9000)});if(!r.ok)throw Error('upstream unavailable');
+  const r=await fetcher(url,{...options,redirect:'manual',signal:AbortSignal.timeout(9000)});if(!r.ok){const why=await r.text().then(t=>t.replace(/\s+/g,' ').slice(0,300)).catch(()=>'');throw Error('upstream unavailable HTTP '+r.status+(why?' '+why:''))}
   const reader=r.body?.getReader();if(!reader)throw Error('upstream unavailable');let size=0,all=[];
   try{while(true){const {value,done}=await reader.read();if(done)break;size+=value.byteLength;if(size>1500000)throw Error('upstream oversized');all.push(value)}}finally{await reader.cancel().catch(()=>{})}
   const buffer=new Uint8Array(size);let at=0;for(const x of all){buffer.set(x,at);at+=x.length}return JSON.parse(new TextDecoder().decode(buffer));
@@ -53,17 +53,42 @@ async function aliexpress(env,q,fetcher){
   if(!result||(!Array.isArray(result.result?.products?.product)&&result.result?.current_record_count!==0))throw Error('invalid upstream response');
   return (result?.result?.products?.product||[]).map(x=>item('aliexpress',{id:x.product_id,title:x.product_title,url:x.promotion_link||x.product_detail_url,image:x.product_main_image_url,price:x.target_sale_price,currency:x.target_sale_price_currency,seller:x.shop_name})).filter(Boolean);
 }
-async function maps(env,input,fetcher){
-  const d=await jsonFetch(fetcher,'https://places.googleapis.com/v1/places:searchText',{method:'POST',headers:{'Content-Type':'application/json','X-Goog-Api-Key':env.GOOGLE_MAPS_API_KEY,'X-Goog-FieldMask':'places.id,places.displayName,places.formattedAddress,places.location,places.googleMapsUri,places.attributions'},body:JSON.stringify({textQuery:input.query,languageCode:input.lang,pageSize:10,...(input.location?{locationBias:{circle:{center:{latitude:input.location.lat,longitude:input.location.lng},radius:20000}}}:{})})});
+/* ร้านอะไหล่ใกล้ตำแหน่งผู้ใช้ที่ "น่าจะมี" สินค้านี้ — Google ค้นจากชื่อสินค้า + ประเภทร้านในแผนที่ ไม่ได้รู้สต็อกจริง
+   พิกัดที่ผู้ใช้ยินยอมถูกปัดเหลือ ~100 ม. ก่อนส่งให้ Google และไม่เก็บไว้ที่เรา */
+const STORE_TERM={th:'ร้านอะไหล่รถยนต์',en:'auto parts store'},STORE_WORDS=/ร้าน|อู่|ศูนย์|shop|store|parts|garage|dealer/i;
+const MAPS_RADIUS=15000,MAPS_FETCH=20,MAPS_SHOW=12,coarse=n=>Math.round(n*1000)/1000;
+export function distanceM(a,b){const r=x=>x*Math.PI/180,h=Math.sin(r(b.lat-a.lat)/2)**2+Math.cos(r(a.lat))*Math.cos(r(b.lat))*Math.sin(r(b.lng-a.lng)/2)**2;return Math.round(12742000*Math.asin(Math.min(1,Math.sqrt(h))))}
+const MAPS_MIN=5;
+const PLACE_MASK='places.id,places.displayName,places.formattedAddress,places.location,places.googleMapsUri,places.attributions,places.primaryTypeDisplayName';
+async function placesSearch(env,fetcher,textQuery,lang,here){
+  const d=await jsonFetch(fetcher,'https://places.googleapis.com/v1/places:searchText',{method:'POST',headers:{'Content-Type':'application/json','X-Goog-Api-Key':env.GOOGLE_MAPS_API_KEY,'X-Goog-FieldMask':PLACE_MASK},body:JSON.stringify({textQuery,languageCode:lang,regionCode:'TH',pageSize:MAPS_FETCH,...(here?{locationBias:{circle:{center:{latitude:here.lat,longitude:here.lng},radius:MAPS_RADIUS}}}:{})})});
   if(d.error||('places' in d&&!Array.isArray(d.places)))throw Error('invalid upstream response');
-  return (d.places||[]).slice(0,10).map(x=>({id:text(x.id,100),name:text(x.displayName?.text),address:text(x.formattedAddress,320),url:productUrl(x.googleMapsUri,'maps'),lat:Number(x.location?.latitude),lng:Number(x.location?.longitude),attributions:(x.attributions||[]).map(a=>({name:text(a.provider),uri:productUrl(a.providerUri,'maps')}))})).filter(x=>x.url);
+  return (d.places||[]).slice(0,MAPS_FETCH).map(x=>{const lat=Number(x.location?.latitude),lng=Number(x.location?.longitude),ok=x.location?.latitude!=null&&x.location?.longitude!=null&&Number.isFinite(lat)&&Number.isFinite(lng)&&Math.abs(lat)<=90&&Math.abs(lng)<=180;
+    return {id:text(x.id,100),name:text(x.displayName?.text),address:text(x.formattedAddress,320),type:text(x.primaryTypeDisplayName?.text,80),url:productUrl(x.googleMapsUri,'maps'),lat:ok?lat:null,lng:ok?lng:null,distanceM:here&&ok?distanceM(here,{lat,lng}):null,attributions:(x.attributions||[]).map(a=>({name:text(a.provider),uri:productUrl(a.providerUri,'maps')}))}}).filter(x=>x.url);
+}
+const byDistance=(a,b)=>(a.distanceM??Infinity)-(b.distanceM??Infinity);
+/* ขั้น 1: ร้านที่ค้นเจอด้วยชื่อสินค้า (น่าจะมีสินค้านี้) · ผลน้อยกว่า MAPS_MIN และรู้ตำแหน่งผู้ใช้ → ขั้น 2: ร้านอะไหล่ทั่วไปใกล้ ๆ
+   ติดป้าย broad ให้หน้าเว็บบอกผู้ใช้ว่าไม่ได้ตรงกับชื่อสินค้า ไม่แกล้งว่าเป็นผลตรง */
+async function maps(env,input,fetcher){
+  const here=input.location?{lat:coarse(input.location.lat),lng:coarse(input.location.lng)}:null;
+  const textQuery=STORE_WORDS.test(input.query)?input.query:input.query+' '+STORE_TERM[input.lang];
+  const exact=await placesSearch(env,fetcher,textQuery,input.lang,here);
+  if(here)exact.sort(byDistance);
+  let out=exact.slice(0,MAPS_SHOW).map(x=>({...x,broad:false}));
+  if(here&&out.length<MAPS_MIN){
+    try{const seen=new Set(out.map(x=>x.id)),more=(await placesSearch(env,fetcher,STORE_TERM[input.lang],input.lang,here)).filter(x=>!seen.has(x.id)).sort(byDistance);
+      out=[...out,...more.slice(0,MAPS_SHOW-out.length).map(x=>({...x,broad:true}))]}
+    catch(e){console.error('shop maps broad search failed',String(e&&e.message||e).slice(0,300))}
+  }
+  console.log('shop maps results',JSON.stringify({exact:exact.length,total:out.length,located:!!here}));
+  return out;
 }
 const adapters={shopee,amazon,aliexpress,ebay};
 export async function searchShop(env,body,{fetcher=fetch}={}){
   const input=shopInput(body),providers=await Promise.all(input.providers.map(async id=>{
     if(!ready(env,id))return {id,name:NAMES[id],state:'setup_required',items:[]};
     try{return {id,name:NAMES[id],state:'ready',...(id==='maps'?{places:await maps(env,input,fetcher)}:{items:await adapters[id](env,input.query,fetcher)})}}
-    catch{return {id,name:NAMES[id],state:'unavailable',items:[]}}
+    catch(e){console.error('shop provider failed',id,String(e&&e.message||e).slice(0,400));return {id,name:NAMES[id],state:'unavailable',items:[]}}
   }));return {query:input.query,providers,items:providers.flatMap(p=>p.items||[]),places:providers.flatMap(p=>p.places||[]),observedAt:Date.now(),fitmentRequiresVerification:true};
 }
 const schemas=new WeakMap();
