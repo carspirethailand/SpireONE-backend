@@ -58,15 +58,30 @@ async function aliexpress(env,q,fetcher){
 const STORE_TERM={th:'ร้านอะไหล่รถยนต์',en:'auto parts store'},STORE_WORDS=/ร้าน|อู่|ศูนย์|shop|store|parts|garage|dealer/i;
 const MAPS_RADIUS=15000,MAPS_FETCH=20,MAPS_SHOW=12,coarse=n=>Math.round(n*1000)/1000;
 export function distanceM(a,b){const r=x=>x*Math.PI/180,h=Math.sin(r(b.lat-a.lat)/2)**2+Math.cos(r(a.lat))*Math.cos(r(b.lat))*Math.sin(r(b.lng-a.lng)/2)**2;return Math.round(12742000*Math.asin(Math.min(1,Math.sqrt(h))))}
+const MAPS_MIN=5;
+const PLACE_MASK='places.id,places.displayName,places.formattedAddress,places.location,places.googleMapsUri,places.attributions,places.primaryTypeDisplayName';
+async function placesSearch(env,fetcher,textQuery,lang,here){
+  const d=await jsonFetch(fetcher,'https://places.googleapis.com/v1/places:searchText',{method:'POST',headers:{'Content-Type':'application/json','X-Goog-Api-Key':env.GOOGLE_MAPS_API_KEY,'X-Goog-FieldMask':PLACE_MASK},body:JSON.stringify({textQuery,languageCode:lang,regionCode:'TH',pageSize:MAPS_FETCH,...(here?{locationBias:{circle:{center:{latitude:here.lat,longitude:here.lng},radius:MAPS_RADIUS}}}:{})})});
+  if(d.error||('places' in d&&!Array.isArray(d.places)))throw Error('invalid upstream response');
+  return (d.places||[]).slice(0,MAPS_FETCH).map(x=>{const lat=Number(x.location?.latitude),lng=Number(x.location?.longitude),ok=x.location?.latitude!=null&&x.location?.longitude!=null&&Number.isFinite(lat)&&Number.isFinite(lng)&&Math.abs(lat)<=90&&Math.abs(lng)<=180;
+    return {id:text(x.id,100),name:text(x.displayName?.text),address:text(x.formattedAddress,320),type:text(x.primaryTypeDisplayName?.text,80),url:productUrl(x.googleMapsUri,'maps'),lat:ok?lat:null,lng:ok?lng:null,distanceM:here&&ok?distanceM(here,{lat,lng}):null,attributions:(x.attributions||[]).map(a=>({name:text(a.provider),uri:productUrl(a.providerUri,'maps')}))}}).filter(x=>x.url);
+}
+const byDistance=(a,b)=>(a.distanceM??Infinity)-(b.distanceM??Infinity);
+/* ขั้น 1: ร้านที่ค้นเจอด้วยชื่อสินค้า (น่าจะมีสินค้านี้) · ผลน้อยกว่า MAPS_MIN และรู้ตำแหน่งผู้ใช้ → ขั้น 2: ร้านอะไหล่ทั่วไปใกล้ ๆ
+   ติดป้าย broad ให้หน้าเว็บบอกผู้ใช้ว่าไม่ได้ตรงกับชื่อสินค้า ไม่แกล้งว่าเป็นผลตรง */
 async function maps(env,input,fetcher){
   const here=input.location?{lat:coarse(input.location.lat),lng:coarse(input.location.lng)}:null;
   const textQuery=STORE_WORDS.test(input.query)?input.query:input.query+' '+STORE_TERM[input.lang];
-  const d=await jsonFetch(fetcher,'https://places.googleapis.com/v1/places:searchText',{method:'POST',headers:{'Content-Type':'application/json','X-Goog-Api-Key':env.GOOGLE_MAPS_API_KEY,'X-Goog-FieldMask':'places.id,places.displayName,places.formattedAddress,places.location,places.googleMapsUri,places.attributions,places.primaryTypeDisplayName'},body:JSON.stringify({textQuery,languageCode:input.lang,regionCode:'TH',pageSize:MAPS_FETCH,...(here?{locationBias:{circle:{center:{latitude:here.lat,longitude:here.lng},radius:MAPS_RADIUS}}}:{})})});
-  if(d.error||('places' in d&&!Array.isArray(d.places)))throw Error('invalid upstream response');
-  const places=(d.places||[]).slice(0,MAPS_FETCH).map(x=>{const lat=Number(x.location?.latitude),lng=Number(x.location?.longitude),ok=x.location?.latitude!=null&&x.location?.longitude!=null&&Number.isFinite(lat)&&Number.isFinite(lng)&&Math.abs(lat)<=90&&Math.abs(lng)<=180;
-    return {id:text(x.id,100),name:text(x.displayName?.text),address:text(x.formattedAddress,320),type:text(x.primaryTypeDisplayName?.text,80),url:productUrl(x.googleMapsUri,'maps'),lat:ok?lat:null,lng:ok?lng:null,distanceM:here&&ok?distanceM(here,{lat,lng}):null,attributions:(x.attributions||[]).map(a=>({name:text(a.provider),uri:productUrl(a.providerUri,'maps')}))}}).filter(x=>x.url);
-  if(here)places.sort((a,b)=>(a.distanceM??Infinity)-(b.distanceM??Infinity));
-  return places.slice(0,MAPS_SHOW);
+  const exact=await placesSearch(env,fetcher,textQuery,input.lang,here);
+  if(here)exact.sort(byDistance);
+  let out=exact.slice(0,MAPS_SHOW).map(x=>({...x,broad:false}));
+  if(here&&out.length<MAPS_MIN){
+    try{const seen=new Set(out.map(x=>x.id)),more=(await placesSearch(env,fetcher,STORE_TERM[input.lang],input.lang,here)).filter(x=>!seen.has(x.id)).sort(byDistance);
+      out=[...out,...more.slice(0,MAPS_SHOW-out.length).map(x=>({...x,broad:true}))]}
+    catch(e){console.error('shop maps broad search failed',String(e&&e.message||e).slice(0,300))}
+  }
+  console.log('shop maps results',JSON.stringify({exact:exact.length,total:out.length,located:!!here}));
+  return out;
 }
 const adapters={shopee,amazon,aliexpress,ebay};
 export async function searchShop(env,body,{fetcher=fetch}={}){

@@ -57,14 +57,14 @@ test('rate limit is account-scoped and bounded atomically',async()=>{
 
 test('nearby shops: store term added, coordinates coarsened, nearest first with distance, bad coordinates tolerated',async()=>{
   const place=(id,lat,lng)=>({id,displayName:{text:'Shop '+id},googleMapsUri:'https://maps.google.com/?cid='+id,formattedAddress:'Area',location:lat==null?undefined:{latitude:lat,longitude:lng},primaryTypeDisplayName:{text:'ร้านอะไหล่รถยนต์'}});
-  let sent;const f=async(u,o)=>{sent=JSON.parse(o.body);return json({places:[place('far',13.80,100.60),place('none'),place('near',13.7461,100.5352)]})};
-  const r=await searchShop(env,{...body(['maps']),query:'ผ้าเบรก Toyota',lat:13.74567,lng:100.53491,locationConsent:true},{fetcher:f});
-  assert.equal(sent.textQuery,'ผ้าเบรก Toyota ร้านอะไหล่รถยนต์');assert.equal(sent.regionCode,'TH');
-  assert.deepEqual(sent.locationBias.circle.center,{latitude:13.746,longitude:100.535},'~100 m precision only');
+  let calls=[];const first=()=>calls[0],f=async(u,o)=>{calls.push(JSON.parse(o.body));return json({places:[place('far',13.80,100.60),place('none'),place('near',13.7461,100.5352)]})};
+  calls=[];const r=await searchShop(env,{...body(['maps']),query:'ผ้าเบรก Toyota',lat:13.74567,lng:100.53491,locationConsent:true},{fetcher:f});
+  assert.equal(first().textQuery,'ผ้าเบรก Toyota ร้านอะไหล่รถยนต์');assert.equal(first().regionCode,'TH');
+  assert.deepEqual(first().locationBias.circle.center,{latitude:13.746,longitude:100.535},'~100 m precision only');
   assert.deepEqual(r.places.map(x=>x.id),['near','far','none'],'nearest first, unknown distance last');
   assert.ok(r.places[0].distanceM<200&&r.places[1].distanceM>5000);assert.equal(r.places[2].distanceM,null);assert.equal(r.places[2].lat,null);assert.equal(r.places[0].type,'ร้านอะไหล่รถยนต์');
-  await searchShop(env,{...body(['maps']),query:'auto parts shop near Siam',lang:'en',lat:13,lng:100,locationConsent:true},{fetcher:f});assert.equal(sent.textQuery,'auto parts shop near Siam','already names a store: not doubled');
-  await searchShop(env,{...body(['maps']),query:'brake pads',lang:'en'},{fetcher:f});assert.equal(sent.textQuery,'brake pads auto parts store');assert.equal(sent.locationBias,undefined,'no consent → no location');
+  calls=[];await searchShop(env,{...body(['maps']),query:'auto parts shop near Siam',lang:'en',lat:13,lng:100,locationConsent:true},{fetcher:f});assert.equal(first().textQuery,'auto parts shop near Siam','already names a store: not doubled');
+  calls=[];await searchShop(env,{...body(['maps']),query:'brake pads',lang:'en'},{fetcher:f});assert.equal(first().textQuery,'brake pads auto parts store');assert.equal(first().locationBias,undefined,'no consent → no location');
   const r2=await searchShop(env,{...body(['maps']),query:'ผ้าเบรก'},{fetcher:f});assert.ok(r2.places.every(x=>x.distanceM===null),'no distance without a location');
   assert.equal(distanceM({lat:13.75,lng:100.5},{lat:13.75,lng:100.5}),0);
 });
@@ -74,4 +74,18 @@ test('provider failure is logged for the owner with HTTP status and reason, but 
     assert.equal(r.providers[0].state,'unavailable');assert.ok(!JSON.stringify(r).includes('PERMISSION_DENIED'));}
   finally{console.error=orig}
   assert.ok(logged.some(l=>/shop provider failed maps .*HTTP 403.*PERMISSION_DENIED/.test(l)));assert.ok(!logged.join(' ').includes('fixture-maps'),'the key is never logged');
+});
+
+test('nearby shops: few exact matches → nearby general parts shops are added and labelled broad; no location → no second search',async()=>{
+  const place=(id,lat)=>({id,displayName:{text:'Shop '+id},googleMapsUri:'https://maps.google.com/?cid='+id,formattedAddress:'Area',location:{latitude:lat,longitude:100.5}});
+  const queries=[];const f=async(u,o)=>{const q=JSON.parse(o.body);queries.push(q.textQuery);return json({places:q.textQuery.startsWith('ผ้าเบรก')?[place('exact',13.80)]:[place('exact',13.80),place('g1',13.751),place('g2',13.76),place('g3',13.9)]})};
+  const here={lat:13.75,lng:100.5,locationConsent:true};
+  const r=await searchShop(env,{...body(['maps']),query:'ผ้าเบรก',...here},{fetcher:f});
+  assert.deepEqual(queries,['ผ้าเบรก ร้านอะไหล่รถยนต์','ร้านอะไหล่รถยนต์']);
+  assert.deepEqual(r.places.map(x=>[x.id,x.broad]),[['exact',false],['g1',true],['g2',true],['g3',true]],'exact matches first, then nearest general shops; no duplicates');
+  queries.length=0;await searchShop(env,{...body(['maps']),query:'ผ้าเบรก'},{fetcher:f});assert.equal(queries.length,1,'without a location a general search would be meaningless');
+  queries.length=0;const many=async(u,o)=>{queries.push(1);return json({places:[1,2,3,4,5,6].map(i=>place('p'+i,13.7+i/100))})};
+  const r2=await searchShop(env,{...body(['maps']),query:'ผ้าเบรก',...here},{fetcher:many});assert.equal(queries.length,1,'enough exact matches: one request only');assert.ok(r2.places.every(x=>x.broad===false));
+  let n=0;const flaky=async(u,o)=>{if(n++)return new Response('{}',{status:500});return json({places:[place('exact',13.8)]})};
+  const orig=console.error;console.error=()=>{};try{const r3=await searchShop(env,{...body(['maps']),query:'ผ้าเบรก',...here},{fetcher:flaky});assert.equal(r3.providers[0].state,'ready');assert.deepEqual(r3.places.map(x=>x.id),['exact'],'a failed second search keeps the exact results')}finally{console.error=orig}
 });
