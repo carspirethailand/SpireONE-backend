@@ -1,4 +1,5 @@
 import { verifyFirebaseToken, firebaseProjects } from './auth.js';
+import {languageRule} from './ai-language.mjs';
 import { EMAIL_AUTH_SQL, handleEmailAuth, deleteFirebaseUser } from './email-auth.js';
 import { displayRates } from './display-rates.js';
 import {shopStatus,shopInput,searchShop,shopRateLimit} from './shop-search.mjs';
@@ -89,7 +90,7 @@ export async function generateChatAnswer(env, actor, body, send, lifecycle={}) {
               const sys = `${IDENTITY}
 
 ${STREAM_TALK}${featuresBlock()}${valetPrompt(body)}${smartBlock()}${stylePrompt(activeStyle, activeCustom)}${depthNote(body.depth)}
-${carContext ? `\n[รถที่กำลังคุยถึง]${carContext}${specCtx}` : ''}${userBlock}${kbBlock}${skillBlock}${fresh ? FORCE_SEARCH : ''}`;
+${carContext ? `\n[รถที่กำลังคุยถึง]${carContext}${specCtx}` : ''}${userBlock}${kbBlock}${skillBlock}${fresh ? FORCE_SEARCH : ''}${languageRule(body.lang)}`;
 
               await send({ type: 'status', key: fresh ? 'search' : (hasMedia ? 'media' : 'think'),
                 text: fresh ? 'กำลังค้นข้อมูลล่าสุด' : hasMedia ? 'กำลังดูไฟล์ที่แนบมา' : 'กำลังคิด' });
@@ -5281,7 +5282,7 @@ export default {
             const sys = `${IDENTITY}
 
 ${STREAM_TALK}${featuresBlock()}${valetPrompt(body)}${smartBlock()}${stylePrompt(activeStyle, activeCustomStyle)}${depthNote(body.depth)}
-${carContext ? `\n[รถที่กำลังคุยถึง]${carContext}${specCtx}` : ''}${userBlock}${kbBlock}${skillPrompt || ''}${fresh ? FORCE_SEARCH : ''}`;
+${carContext ? `\n[รถที่กำลังคุยถึง]${carContext}${specCtx}` : ''}${userBlock}${kbBlock}${skillPrompt || ''}${fresh ? FORCE_SEARCH : ''}${languageRule(body.lang)}`;
             try {
               const r = await fastAnswer(env, {
                 system: sys,
@@ -5376,7 +5377,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
 
           const withTools = b.tools === true, withAgent = b.agent === true;
           const handle = cleanHandle(b.handle);
-          const mk = (liveModel, tools, resume, agent=withAgent) => liveToken({ model: liveModel, system: b.system, tools, agent, webResearch:b.webResearch===true&&agent, garageCare:b.garageCare===true&&agent, garageAssist:b.garageAssist===true&&agent, handle, resume, now });
+          const mk = (liveModel, tools, resume, agent=withAgent) => liveToken({ model: liveModel, system: b.system, lang:b.lang, tools, agent, webResearch:b.webResearch===true&&agent, garageCare:b.garageCare===true&&agent, garageAssist:b.garageAssist===true&&agent, handle, resume, now });
 
           let lastErr = '';
           for (const liveModel of candidates) {

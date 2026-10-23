@@ -1,3 +1,4 @@
+import {jobActor,cancellationActor} from './job-actor.mjs';
 /*
  * Cendon Care — ระบบช่าง (ส่วนเสริมของ spireonebackend)
  *
@@ -1218,7 +1219,7 @@ function jobOut(j, t, role, messages) {
     techId: j.tech_id, techName: d.shop || d.name || 'ช่าง', group: j.group_id || null,
     car: j.car, symptom: j.symptom, area: j.area, requestedTime: j.requested_time, mode: j.mode,
     quote: parse(j.quote), completion: j.completion, dispute: j.dispute, resolution: j.resolution,
-    review: parse(j.review), history: parse(j.history) || [],
+    review: parse(j.review), history: parse(j.history) || [], cancelledBy:j.status==='cancelled'?cancellationActor(j.history):null,
     createdAt: j.created_at, acceptedAt: j.accepted_at,
     messages: messages || [], note: j.note || '',
     /* ลูกค้าใช้ตรวจว่าคนที่มาถึงคือช่างที่ตกลงไว้ — รูปโปรไฟล์และสิ่งที่ทีมงานตรวจแล้ว (ข้อมูลเดียวกับหน้าร้านสาธารณะ) */
@@ -1370,7 +1371,7 @@ async function myJobs(env, me, myTech, all) {
       group: j.group_id || null, total: q ? q.total : null,
       car: j.car, symptom: j.symptom, createdAt: j.created_at, updatedAt: j.updated_at, urgent: !!j.urgent,
       side: cust && tech ? 'both' : cust ? 'customer' : tech ? 'technician' : 'admin',
-      needsMe, unread: un[j.id] || 0, expiresAt: j.expires_at || null, expired: wasExpired(j) };
+      needsMe, unread: un[j.id] || 0, expiresAt: j.expires_at || null, expired: wasExpired(j),cancelledBy:j.status==='cancelled'?cancellationActor(j.history):null };
   });
 }
 
@@ -1739,8 +1740,7 @@ async function updateJob(env, me, id, b) {
   /* รูปก่อนเริ่ม/หลังเสร็จ (ไม่บังคับ) — เก็บกับใบงานไว้เป็นหลักฐานถ้ามีข้อพิพาท */
   const stagePhotos = action === 'start' || action === 'done' ? mediaIn(b) : [];
   let next = to;
-  const by = isTech && !isCustomer ? 'technician' : isCustomer && !isTech ? 'customer'
-    : who_ === 'tech' ? 'technician' : who_ === 'admin' ? 'admin' : 'customer';
+  let by;try{by=jobActor({isCustomer,isTech,staff:me.staff},who_,b.as)}catch(e){if(e.status===400)fail(400,e.message);throw e}
   const extra = [];
   let reviewPics = [];
 

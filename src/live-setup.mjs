@@ -2,6 +2,7 @@
 import { LIVE_CALL_TOOLS, LIVE_CALL_AGENT_RULES } from './live-call-tools.mjs';
 import { GARAGE_CARE_RULES } from './garage-care.mjs';
 import { VEHICLE_AUDIO_RULES } from './vehicle-audio.mjs';
+import {languageRule} from './ai-language.mjs';
 
 /* เครื่องมือที่ผู้ช่วยเสียงเรียกเองได้ระหว่างโทร: ผู้ใช้พูดว่า "ฟังเสียงเครื่องหน่อย" / "ดูห้องเครื่องให้หน่อย"
    หน้าเว็บเปิดโหมดฟังเสียงดิบ (ไม่กรองเสียงรบกวน) หรือสแกนกล้องแบบสด แล้วส่งผลกลับให้ AI พูดต่อ */
@@ -19,7 +20,8 @@ const thinking = m => /2\.5/.test(m) ? { thinkingConfig: { thinkingBudget: 0, in
 /* handle = รหัสต่อสายต่อที่ Google ให้มาในสายก่อนหน้า (sessionResumptionUpdate) — ต่อใหม่แล้วจำบทสนทนาเดิมได้ */
 export const cleanHandle = h => typeof h === 'string' && /^[\w\-.:/+=]{8,600}$/.test(h) ? h : '';
 
-export function liveToken({ model, system, tools, agent = false, webResearch = false, garageCare = false, garageAssist = false, handle, resume, now = Date.now() }) {
+export function liveToken({ model, system, lang, tools, agent = false, webResearch = false, garageCare = false, garageAssist = false, handle, resume, now = Date.now() }) {
+  const replyLanguage=languageRule(lang,{voice:true});
   const agentTools=structuredClone(LIVE_CALL_TOOLS[0].functionDeclarations).filter(t=>(t.name!=='web_search'||webResearch===true)&&(t.name!=='garage_checkin_control'||garageCare===true)&&(t.name!=='get_parking'||garageAssist===true));
   if(!garageAssist){const v=agentTools.find(t=>t.name==='valet');if(v)v.parameters.properties.do.enum=v.parameters.properties.do.enum.filter(d=>d!=='car_info');}
   const declarations=[...(tools ? LIVE_TOOLS[0].functionDeclarations : []),...(agent === true ? agentTools : [])];
@@ -39,7 +41,7 @@ export function liveToken({ model, system, tools, agent = false, webResearch = f
         startOfSpeechSensitivity: 'START_SENSITIVITY_LOW', prefixPaddingMs: 120, silenceDurationMs: 600 } },
       /* ต่อสายใหม่ (Google หมุนเวียนการเชื่อมต่อทุกราว 10 นาที / เน็ตสะดุด) โดยจำบทสนทนาเดิมได้ */
       ...(resume !== false ? { sessionResumption: cleanHandle(handle) ? { handle: cleanHandle(handle) } : {} } : {}),
-      systemInstruction: { parts: [{ text: VEHICLE_AUDIO_RULES+'\n'+(agent===true ? LIVE_CALL_AGENT_RULES+'\n' : '')+GARAGE_CARE_RULES+'\n'+String(system || '').slice(0, agent===true ? 4800 : 6000) }] },
+      systemInstruction: { parts: [{ text: VEHICLE_AUDIO_RULES+'\n'+(agent===true ? LIVE_CALL_AGENT_RULES+'\n' : '')+GARAGE_CARE_RULES+'\n'+String(system || '').slice(0, Math.max(0,(agent===true ? 4800 : 6000)-replyLanguage.length))+replyLanguage }] },
       ...(declarations.length ? { tools: [{functionDeclarations:declarations}] } : {}),
       inputAudioTranscription: {},
       outputAudioTranscription: {},
