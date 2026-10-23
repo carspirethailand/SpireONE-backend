@@ -1,6 +1,8 @@
 {
   "name": "spireonebackend",
-  "main": "src/worker.js",
+  "main": "src/entry.js",
+  "durable_objects": {"bindings":[{"name":"CHAT_JOBS","class_name":"CendonChatJobs"}]},
+  "migrations": [{"tag":"chat-jobs-v1","new_sqlite_classes":["CendonChatJobs"]}],
   "workers_dev": true,
   "preview_urls": false,
   "compatibility_date": "2026-06-27",

@@ -50,6 +50,7 @@ export const TABLES = [
   ['skills', MINE, []],
   ['skill_stars', MINE, []],
   ['spares_cache', MINE, ['payload']],
+  ['shop_search_rate', MINE, []],
   ['media', MINE, []],
   ['line_link', MINE, []],
   ['line_chat', MY_LINE, []],
@@ -120,6 +121,7 @@ export async function exportAccount(env, uid, { email = '' } = {}) {
     const key = table === 'tech_jobs' && where === MY_SHOP ? 'tech_jobs_as_mechanic' : table === 'tech_proofs' && where.includes('tech_profiles') ? 'tech_proofs_as_mechanic' : table;
     data[key] = (data[key] || []).concat(list);
   }
+  if(env.CHAT_JOBS){const stub=env.CHAT_JOBS.getByName('user:'+uid),list=await stub.list(uid);data.ai_background_answers=await Promise.all((list.jobs||[]).map(async m=>{const r=await stub.read(uid,m.id);if(r.error)throw Error('Background answers temporarily unavailable');return r.job}))}
   return {
     format: 'cendon-account-export', version: 1, exportedAt: new Date().toISOString(), uid, email,
     note: 'ข้อมูลทั้งหมดที่ Cendon เก็บเกี่ยวกับบัญชีนี้ (ไม่รวมความลับของระบบ เช่น กุญแจแจ้งเตือน รหัสชั่วคราว และค่าแฮชเลขบัตร) · ไฟล์แนบดาวน์โหลดทีละไฟล์ได้จากรหัสใน media',
@@ -129,8 +131,9 @@ export async function exportAccount(env, uid, { email = '' } = {}) {
 
 /* ล้างข้อมูลการใช้งาน แต่คงบัญชี ร้านช่าง และการเชื่อม LINE ไว้ (ปุ่ม "รีเซ็ตบัญชี") */
 export const RESET_TABLES = ['user_onboarding', 'cars', 'usage', 'usage_win', 'user_state', 'user_memory', 'push_subs', 'push_jobs', 'chat_prefs',
-  'odo_anchor', 'odo_state', 'maint_item', 'notify_state', 'km_remind', 'obd_device', 'spares_cache', 'ai_events', 'chat_logs'];
+  'odo_anchor', 'odo_state', 'maint_item', 'notify_state', 'km_remind', 'obd_device', 'spares_cache', 'ai_events', 'chat_logs', 'shop_search_rate'];
 export async function resetAccount(env, uid) {
+  if(env.CHAT_JOBS)await env.CHAT_JOBS.getByName('user:'+uid).purge(uid);
   const removed = {};
   for (const t of RESET_TABLES) {
     try { removed[t] = await run(env, `DELETE FROM ${t} WHERE uid = ?`, uid); }
@@ -166,6 +169,7 @@ export async function deleteBlockers(env, uid) {
 
 /* ลบบัญชีถาวร — คืนจำนวนแถวที่ลบ/ทำให้ระบุตัวไม่ได้ ต่อตาราง (ไม่มีข้อมูลส่วนตัวในผลลัพธ์) */
 export async function deleteAccount(env, uid, { email = '' } = {}) {
+  if(env.CHAT_JOBS)await env.CHAT_JOBS.getByName('user:'+uid).purge(uid);
   const at = Date.now(), done = {};
   const add = (k, n) => { done[k] = (done[k] || 0) + n; };
   const shop = await env.DB.prepare('SELECT id, suspended, id_hold FROM tech_profiles WHERE uid = ?').bind(uid).first().catch(e => { if (missing(e)) return null; throw e; });

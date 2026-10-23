@@ -1,6 +1,7 @@
 import { verifyFirebaseToken, firebaseProjects } from './auth.js';
 import { EMAIL_AUTH_SQL, handleEmailAuth, deleteFirebaseUser } from './email-auth.js';
 import { displayRates } from './display-rates.js';
+import {shopStatus,shopInput,searchShop,shopRateLimit} from './shop-search.mjs';
 import { exportAccount, resetAccount, deleteAccount, deleteBlockers } from './account-data.js';
 import { ONBOARDING_SQL, handleOnboarding, onboardingName, sanitizeSetupState } from './onboarding.js';
 import { buildFeatureRequest, cleanFeatureJson, featureCap } from './features-ai.mjs';
@@ -34,7 +35,149 @@ import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll
  * - Config (announcement / maintenance) + audit log stored in D1.
  */
 
+export async function generateChatAnswer(env, actor, body, send, lifecycle={}) {
+  const uid = actor.payload.sub;
+            const meter = newMeter();
+            const t0 = Date.now();
+            let text = '', question = '', hasMedia = false, carInfo = null;
+            try {
+              const msgs = body.contents || [];
+              const lastMsg = msgs.length ? msgs[msgs.length - 1] : null;
+              question = (lastMsg && lastMsg.parts) ? lastMsg.parts.map(x => x.text || '').join(' ').trim() : '';
+              hasMedia = msgs.some(m => m.parts && m.parts.some(x => x.inline_data || x.inlineData));
+              await send({ type: 'status', key: 'context', text: 'กำลังดูข้อมูลรถและประวัติของคุณ' });
+
+              /* ── รวบรวมบริบททั้งหมดพร้อมกัน ── (ของเดิมรอทีละคำสั่ง ราวสิบรอบก่อนเริ่มคิด) */
+              const carP = (async () => {
+                let ci = { make: '', model: '', year: '', mileage: '' };
+                if (body.carId) {
+                  try {
+                    const car = await env.DB.prepare('SELECT make, model, year, mileage FROM cars WHERE id = ? AND uid = ?')
+                      .bind(String(body.carId), uid).first();
+                    if (car) ci = car;
+                  } catch (e) {}
+                  if (!ci.make && !ci.model) {
+                    const gar = await stateOf(env, uid, 'garage');
+                    const c = Array.isArray(gar) ? gar.find(x => x && String(x.id) === String(body.carId)) : null;
+                    if (c) ci = { make: c.make || '', model: c.model || c.name || '',
+                                  year: c.year != null ? String(c.year) : '', mileage: c.mileage != null ? String(c.mileage) : '' };
+                  }
+                }
+                if (!ci.make && !ci.model) {
+                  ci = { make: String(body.make || '').slice(0, 60), model: String(body.model || '').slice(0, 60),
+                         year: String(body.year || '').slice(0, 8), mileage: String(body.mileage || '').slice(0, 12) };
+                }
+                return ci;
+              })();
+              const [ci, kbBlock, userBlock, prefs, skillBlock, specCtx] = await Promise.all([
+                carP,
+                carP.then(c => kbFor(env, c, question)),
+                userContext(env, uid, body.carId, { userName: body.userName }),
+                getChatPrefs(env, uid),
+                skillsPrompt(env, uid, body.skillIds),
+                carP.then(c => chatSpecContext(env, uid, body.carId, c, question)),
+              ]);
+              carInfo = ci;
+              const activeStyle = (body.style && (CHAT_STYLES[body.style] || body.style === 'custom')) ? body.style : prefs.style;
+              const activeCustom = body.customStyle !== undefined ? String(body.customStyle) : prefs.customStyle;
+
+              const fresh = !!question && needsFresh(question);
+              const carContext = (carInfo.make || carInfo.model)
+                ? `\nรถของผู้ใช้: ${carInfo.make || ''} ${carInfo.model || ''} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` : '';
+              /* ส่วนที่เหมือนกันทุกข้อความไว้หน้า ส่วนที่เปลี่ยนไว้หลัง — Gemini จำส่วนหน้าไว้ได้ ตอบรอบถัดไปเร็วขึ้น */
+              const sys = `${IDENTITY}
+
+${STREAM_TALK}${featuresBlock()}${valetPrompt(body)}${smartBlock()}${stylePrompt(activeStyle, activeCustom)}${depthNote(body.depth)}
+${carContext ? `\n[รถที่กำลังคุยถึง]${carContext}${specCtx}` : ''}${userBlock}${kbBlock}${skillBlock}${fresh ? FORCE_SEARCH : ''}`;
+
+              await send({ type: 'status', key: fresh ? 'search' : (hasMedia ? 'media' : 'think'),
+                text: fresh ? 'กำลังค้นข้อมูลล่าสุด' : hasMedia ? 'กำลังดูไฟล์ที่แนบมา' : 'กำลังคิด' });
+
+              /* ── คำตอบ: เรียก Gemini ครั้งเดียว ค้นเว็บ ดูรูป คิด และสตรีมออกมาในตัว ── */
+              let firstText = true;
+              try {
+                const r = await fastAnswer(env, {
+                  system: sys,
+                  contents: toGeminiContents(msgs),
+                  history: toChatHistory(msgs),
+                  messages: msgs,
+                  question,
+                  hasMedia,
+                  carInfo,
+                  search: fresh, externalSearch: true,
+                  executeSearch: async (q) => await executeGoogleSearchTool(env, q),
+                  executeMedia: async (p) => await executeDescribeMediaTool(env, msgs, p),
+                  executeKb: async (q) => await kbFor(env, carInfo, q),
+                  depth: body.depth, level: levelFor(body.depth, question, hasMedia, body.skillIds), meter,
+                  onSearch: async q => { await send({ type: 'research', q: String(q).slice(0, 120) }); await send({ type: 'status', key: 'search', text: 'กำลังค้น: ' + String(q).slice(0, 60) }) },
+                  onText: async d => {
+                    if (firstText) { firstText = false; await send({ type: 'status', key: 'write', text: 'กำลังเขียนคำตอบ' }); }
+                    await send({ type: 'text', delta: d });
+                  },
+                });
+                text = r.text;
+              } catch (e) {
+                console.error('[stream fast]', e.message);
+                noteAiError(env, e);
+                const errMsg = 'ขออภัยครับ ขณะนี้ระบบประมวลผล AI กำลังมีผู้ใช้งานหนาแน่น กรุณาลองใหม่อีกครั้งในอีกสักครู่ครับ';
+                if (firstText) {
+                  firstText = false;
+                  await send({ type: 'status', key: 'write', text: 'ระบบ AI ขัดข้องชั่วคราว' });
+                }
+                await send({ type: 'text', delta: errMsg });
+                text = errMsg;
+              }
+
+              /* ── ปิดสตรีมให้เร็วที่สุด แล้วค่อยเก็บบัญชี ── */
+              text = cleanReply(text);
+              await send({ type: 'text_done', text });
+              let usage = null;
+              try {
+                await meterTokens(env, uid, meter);
+                usage = Object.assign({ cost: meter.in + meter.out, in: meter.in, out: meter.out, src: meter.src, ms: Date.now() - t0 },
+                                      await quotaState(env, uid, actor.role));
+              } catch (e) {}
+              await send({ type: 'done', usage });
+              const okStep = (meter.trail || []).filter(x => x.ok).pop();
+              logAiEvent(env, { uid, ok: true, ms: Date.now() - t0, model: okStep ? okStep.model + (okStep.grounded ? ' +ค้นเว็บ' : '') : (meter.src || []).join(','),
+                trail: meter.trail, q: question, depth: body.depth, cost: meter.in + meter.out });
+            } catch (err) {
+              console.error('[stream]', err);
+              await send({ type: 'error', message: String((err && err.message) || err).slice(0, 200) });
+              logAiEvent(env, { uid, ok: false, ms: Date.now() - t0, model: '', trail: meter && meter.trail, err: String((err && err.message) || err), q: question, depth: body.depth });
+            }
+
+            /* งานเก็บกวาด — ผู้ใช้ได้คำตอบครบไปแล้ว ไม่ต้องรอส่วนนี้ */
+            if (text && carInfo && (!lifecycle.active || await lifecycle.active())) {
+              try {
+                const day = new Date().toISOString().slice(0, 10);
+                await Promise.all([
+                  (!hasMedia && !(body.skillIds && body.skillIds.length) && !needsFresh(question))
+                    ? cacheSave(env, carInfo, question, text, uid) : null,
+                  rememberTurn(env, uid, body.carId, question, text),
+                  env.DB.prepare(`
+                    INSERT INTO chat_logs (uid, car_id, prompt, response, in_tok, out_tok, total_tok, model, day, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  `).bind(uid, body.carId || null, '', '',
+                    meter.in, meter.out, meter.in + meter.out,
+                    (meter.src && meter.src.join(',')) || 'stream', day, Date.now()).run(),
+                ]);
+              } catch (e) { console.error('[stream save]', e) }
+            }
+
+}
+
 const ROLE_RANK = { owner: 4, admin: 3, moderator: 2, user: 1 };
+export async function executeChatJob(env,actor,body,send,lifecycle){
+  const row=await env.DB.prepare('SELECT role,banned,email FROM users WHERE uid=?').bind(actor.payload.sub).first();
+  if(!row||row.banned)throw Error('account unavailable');
+  const current=actor.role==='owner'&&owners(env).includes(String(row.email||'').toLowerCase())?'owner':row.role!=='owner'&&ROLE_RANK[row.role]?row.role:'user';
+  actor={...actor,role:rank(current)<rank(actor.role)?current:actor.role};
+  const maintenance=await getConfig(env,'maintenance',{enabled:false});
+  if(maintenance.enabled&&rank(actor.role)<rank('moderator'))throw Error('maintenance');
+  if(rank(actor.role)<rank('admin')){const q=await quotaState(env,actor.payload.sub,actor.role);if(q.used>=q.limit)throw Error('quota')}
+  return generateChatAnswer(env,actor,body,send,lifecycle);
+}
 
 /* เจ้าของบริษัท — อยู่ในรายการเจ้าของเสมอ แม้ตั้ง OWNERS บน Cloudflare แล้วลืมใส่ (เจ้าของต้องไม่หลุดสิทธิ์ของตัวเอง) */
 const FOUNDERS = ['anapatmaliwong@gmail.com', 'carspirethailand@gmail.com'];
@@ -4872,6 +5015,32 @@ export default {
          เรียกโมเดลรอบเดียวแบบสตรีม จึงได้ทั้งความคิดสด ๆ และเร็วขึ้นด้วย
          เพราะไม่ต้องวนเรียกโมเดลหลายรอบเหมือนลูป ReAct เดิม
          ═══════════════════════════════════════════════════════════════ */
+      if(url.pathname==='/api/shop/status'||url.pathname==='/api/shop/search'){
+        return await guarded('user',async actor=>{
+          const reply=(d,status=200)=>new Response(JSON.stringify(d),{status,headers:{...cors,'Content-Type':'application/json','Cache-Control':'private, no-store'}});
+          if(url.pathname.endsWith('/status')&&request.method==='GET')return reply(shopStatus(env));
+          if(url.pathname.endsWith('/search')&&request.method==='POST'){
+            const b=await readBody();try{const input=shopInput(b);await shopRateLimit(env,actor.payload.sub,input.providers);return reply(await searchShop(env,b))}catch(e){return reply({error:e.status?e.message:'Search unavailable'},e.status||503)}
+          }return reply({error:'Method not allowed'},405);
+        })();
+      }
+      if (/^\/api\/ai\/jobs(?:\/[a-f0-9-]{36}(?:\/cancel)?)?$/.test(url.pathname)) {
+        return await guarded('user',async actor=>{
+          const reply=(value,status=200)=>new Response(JSON.stringify(value),{status,headers:{...cors,'Content-Type':'application/json','Cache-Control':'private, no-store','Vary':'Authorization, Origin'}});
+          if(!env.CHAT_JOBS)return reply({error:'Background answers unavailable'},503);
+          const uid=actor.payload.sub,stub=env.CHAT_JOBS.getByName('user:'+uid),parts=url.pathname.split('/').slice(4);
+          let result;
+          if(request.method==='GET')result=parts[0]?await stub.read(uid,parts[0]):await stub.list(uid);
+          else if(request.method==='POST'&&parts[1]==='cancel')result=await stub.cancel(uid,parts[0]);
+          else if(request.method==='POST'&&!parts[0]){
+            const body=await readBody();try{validateContents(body?.contents)}catch{return reply({error:'Invalid chat request'},400)}
+            const maintenance=await getConfig(env,'maintenance',{enabled:false});if(maintenance.enabled&&rank(actor.role)<rank('moderator'))return reply({error:'maintenance'},503);
+            if(rank(actor.role)<rank('admin')){const quota=await quotaState(env,uid,actor.role);if(quota.used>=quota.limit)return reply({error:'quota',quota},429)}
+            result=await stub.create(uid,actor,body);
+          }else return reply({error:'Method not allowed'},405);
+          return reply(result,result.status||200);
+        })();
+      }
       if (url.pathname === '/api/ai/stream' && request.method === 'POST') {
         return await guarded('user', async (actor) => {
           const uid = actor.payload.sub;
@@ -4895,136 +5064,7 @@ export default {
           };
 
           /* งานหลักทำเบื้องหลัง ปล่อยให้ตอบกลับทันทีเพื่อให้สตรีมเริ่มไหลเลย */
-          const work = (async () => {
-            const meter = newMeter();
-            const t0 = Date.now();
-            let text = '', question = '', hasMedia = false, carInfo = null;
-            try {
-              const msgs = body.contents || [];
-              const lastMsg = msgs.length ? msgs[msgs.length - 1] : null;
-              question = (lastMsg && lastMsg.parts) ? lastMsg.parts.map(x => x.text || '').join(' ').trim() : '';
-              hasMedia = msgs.some(m => m.parts && m.parts.some(x => x.inline_data || x.inlineData));
-              await send({ type: 'status', key: 'context', text: 'กำลังดูข้อมูลรถและประวัติของคุณ' });
-
-              /* ── รวบรวมบริบททั้งหมดพร้อมกัน ── (ของเดิมรอทีละคำสั่ง ราวสิบรอบก่อนเริ่มคิด) */
-              const carP = (async () => {
-                let ci = { make: '', model: '', year: '', mileage: '' };
-                if (body.carId) {
-                  try {
-                    const car = await env.DB.prepare('SELECT make, model, year, mileage FROM cars WHERE id = ? AND uid = ?')
-                      .bind(String(body.carId), uid).first();
-                    if (car) ci = car;
-                  } catch (e) {}
-                  if (!ci.make && !ci.model) {
-                    const gar = await stateOf(env, uid, 'garage');
-                    const c = Array.isArray(gar) ? gar.find(x => x && String(x.id) === String(body.carId)) : null;
-                    if (c) ci = { make: c.make || '', model: c.model || c.name || '',
-                                  year: c.year != null ? String(c.year) : '', mileage: c.mileage != null ? String(c.mileage) : '' };
-                  }
-                }
-                if (!ci.make && !ci.model) {
-                  ci = { make: String(body.make || '').slice(0, 60), model: String(body.model || '').slice(0, 60),
-                         year: String(body.year || '').slice(0, 8), mileage: String(body.mileage || '').slice(0, 12) };
-                }
-                return ci;
-              })();
-              const [ci, kbBlock, userBlock, prefs, skillBlock, specCtx] = await Promise.all([
-                carP,
-                carP.then(c => kbFor(env, c, question)),
-                userContext(env, uid, body.carId, { userName: body.userName }),
-                getChatPrefs(env, uid),
-                skillsPrompt(env, uid, body.skillIds),
-                carP.then(c => chatSpecContext(env, uid, body.carId, c, question)),
-              ]);
-              carInfo = ci;
-              const activeStyle = (body.style && (CHAT_STYLES[body.style] || body.style === 'custom')) ? body.style : prefs.style;
-              const activeCustom = body.customStyle !== undefined ? String(body.customStyle) : prefs.customStyle;
-
-              const fresh = !!question && needsFresh(question);
-              const carContext = (carInfo.make || carInfo.model)
-                ? `\nรถของผู้ใช้: ${carInfo.make || ''} ${carInfo.model || ''} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` : '';
-              /* ส่วนที่เหมือนกันทุกข้อความไว้หน้า ส่วนที่เปลี่ยนไว้หลัง — Gemini จำส่วนหน้าไว้ได้ ตอบรอบถัดไปเร็วขึ้น */
-              const sys = `${IDENTITY}
-
-${STREAM_TALK}${featuresBlock()}${valetPrompt(body)}${smartBlock()}${stylePrompt(activeStyle, activeCustom)}${depthNote(body.depth)}
-${carContext ? `\n[รถที่กำลังคุยถึง]${carContext}${specCtx}` : ''}${userBlock}${kbBlock}${skillBlock}${fresh ? FORCE_SEARCH : ''}`;
-
-              await send({ type: 'status', key: fresh ? 'search' : (hasMedia ? 'media' : 'think'),
-                text: fresh ? 'กำลังค้นข้อมูลล่าสุด' : hasMedia ? 'กำลังดูไฟล์ที่แนบมา' : 'กำลังคิด' });
-
-              /* ── คำตอบ: เรียก Gemini ครั้งเดียว ค้นเว็บ ดูรูป คิด และสตรีมออกมาในตัว ── */
-              let firstText = true;
-              try {
-                const r = await fastAnswer(env, {
-                  system: sys,
-                  contents: toGeminiContents(msgs),
-                  history: toChatHistory(msgs),
-                  messages: msgs,
-                  question,
-                  hasMedia,
-                  carInfo,
-                  search: fresh, externalSearch: true,
-                  executeSearch: async (q) => await executeGoogleSearchTool(env, q),
-                  executeMedia: async (p) => await executeDescribeMediaTool(env, msgs, p),
-                  executeKb: async (q) => await kbFor(env, carInfo, q),
-                  depth: body.depth, level: levelFor(body.depth, question, hasMedia, body.skillIds), meter,
-                  onSearch: async q => { await send({ type: 'research', q: String(q).slice(0, 120) }); await send({ type: 'status', key: 'search', text: 'กำลังค้น: ' + String(q).slice(0, 60) }) },
-                  onText: async d => {
-                    if (firstText) { firstText = false; await send({ type: 'status', key: 'write', text: 'กำลังเขียนคำตอบ' }); }
-                    await send({ type: 'text', delta: d });
-                  },
-                });
-                text = r.text;
-              } catch (e) {
-                console.error('[stream fast]', e.message);
-                noteAiError(env, e);
-                const errMsg = 'ขออภัยครับ ขณะนี้ระบบประมวลผล AI กำลังมีผู้ใช้งานหนาแน่น กรุณาลองใหม่อีกครั้งในอีกสักครู่ครับ';
-                if (firstText) {
-                  firstText = false;
-                  await send({ type: 'status', key: 'write', text: 'ระบบ AI ขัดข้องชั่วคราว' });
-                }
-                await send({ type: 'text', delta: errMsg });
-                text = errMsg;
-              }
-
-              /* ── ปิดสตรีมให้เร็วที่สุด แล้วค่อยเก็บบัญชี ── */
-              text = cleanReply(text);
-              await send({ type: 'text_done', text });
-              let usage = null;
-              try {
-                await meterTokens(env, uid, meter);
-                usage = Object.assign({ cost: meter.in + meter.out, in: meter.in, out: meter.out, src: meter.src, ms: Date.now() - t0 },
-                                      await quotaState(env, uid, actor.role));
-              } catch (e) {}
-              await send({ type: 'done', usage });
-              const okStep = (meter.trail || []).filter(x => x.ok).pop();
-              logAiEvent(env, { uid, ok: true, ms: Date.now() - t0, model: okStep ? okStep.model + (okStep.grounded ? ' +ค้นเว็บ' : '') : (meter.src || []).join(','),
-                trail: meter.trail, q: question, depth: body.depth, cost: meter.in + meter.out });
-            } catch (err) {
-              console.error('[stream]', err);
-              await send({ type: 'error', message: String((err && err.message) || err).slice(0, 200) });
-              logAiEvent(env, { uid, ok: false, ms: Date.now() - t0, model: '', trail: meter && meter.trail, err: String((err && err.message) || err), q: question, depth: body.depth });
-            }
-            try { await writer.close() } catch (e) {}
-
-            /* งานเก็บกวาด — ผู้ใช้ได้คำตอบครบไปแล้ว ไม่ต้องรอส่วนนี้ */
-            if (text && carInfo) {
-              try {
-                const day = new Date().toISOString().slice(0, 10);
-                await Promise.all([
-                  (!hasMedia && !(body.skillIds && body.skillIds.length) && !needsFresh(question))
-                    ? cacheSave(env, carInfo, question, text, uid) : null,
-                  rememberTurn(env, uid, body.carId, question, text),
-                  env.DB.prepare(`
-                    INSERT INTO chat_logs (uid, car_id, prompt, response, in_tok, out_tok, total_tok, model, day, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                  `).bind(uid, body.carId || null, '', '',
-                    meter.in, meter.out, meter.in + meter.out,
-                    (meter.src && meter.src.join(',')) || 'stream', day, Date.now()).run(),
-                ]);
-              } catch (e) { console.error('[stream save]', e) }
-            }
-          })();
+          const work = generateChatAnswer(env, actor, body, send).finally(async () => { try { await writer.close() } catch {} });
           ctx.waitUntil(work);
 
           return new Response(readable, {
