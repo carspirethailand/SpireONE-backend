@@ -137,6 +137,8 @@ const TECH_ALTER = [
   `ALTER TABLE tech_messages ADD COLUMN edited_at INTEGER`,
   `ALTER TABLE tech_messages ADD COLUMN deleted_at INTEGER`,
   `ALTER TABLE tech_messages ADD COLUMN orig_text TEXT`,
+  /* ข้อความที่ระบบส่งแทนร้าน: greet = คำทักทายตอนลูกค้าเปิดแชต · auto = ตอบกลับอัตโนมัติ (ว่าง = คนพิมพ์เอง) */
+  `ALTER TABLE tech_messages ADD COLUMN kind TEXT`,
   /* รหัสเริ่มงาน (ลูกค้าบอกช่างเมื่อพบกันจริง) และงานเพิ่มที่ลูกค้าต้องกดยอมรับ */
   `ALTER TABLE tech_jobs ADD COLUMN start_code TEXT`,
   `ALTER TABLE tech_jobs ADD COLUMN start_exp INTEGER`,
@@ -1248,13 +1250,14 @@ function jobOut(j, t, role, messages) {
 }
 
 /* since = ข้อความที่ถูกแก้/ยกเลิกหลังเวลานี้ส่งมาด้วย (แม้ id เก่ากว่า after) อีกฝ่ายจะเห็นการแก้ภายในรอบดึงถัดไป */
-function msgOut({ media, edited_at, deleted_at, ...m }) {
+function msgOut({ media, edited_at, deleted_at, kind, ...m }) {
   if (deleted_at) return { id: m.id, role: m.role, text: '', at: m.at, deleted: true, editedAt: edited_at || deleted_at };
+  if (kind) m.kind = kind;
   const l = parse(media), o = l && l.length ? { ...m, media: l } : m;
   return edited_at ? { ...o, editedAt: edited_at } : o;
 }
 async function messagesOf(env, jobId, after, since) {
-  const cols = 'SELECT id, role, text, at, media, edited_at, deleted_at FROM tech_messages WHERE job_id = ?';
+  const cols = 'SELECT id, role, text, at, media, edited_at, deleted_at, kind FROM tech_messages WHERE job_id = ?';
   const { results } = await (since > 0
     ? env.DB.prepare(cols + ' AND (id > ? OR edited_at >= ?) ORDER BY id ASC LIMIT 500').bind(jobId, after || 0, since)
     : env.DB.prepare(cols + ' AND id > ? ORDER BY id ASC LIMIT 500').bind(jobId, after || 0)).all();
@@ -1288,7 +1291,7 @@ async function changeMessage(env, me, id, b, action) {
     if (age > UNSEND_MS) fail(409, 'ยกเลิกข้อความได้ภายใน 24 ชั่วโมงหลังส่ง');
     await env.DB.prepare("UPDATE tech_messages SET deleted_at = ?, edited_at = ?, orig_text = COALESCE(orig_text, text), text = '' WHERE id = ?").bind(ts, ts, msg.id).run();
   }
-  return { message: msgOut(await env.DB.prepare('SELECT id, role, text, at, media, edited_at, deleted_at FROM tech_messages WHERE id = ?').bind(msg.id).first()) };
+  return { message: msgOut(await env.DB.prepare('SELECT id, role, text, at, media, edited_at, deleted_at, kind FROM tech_messages WHERE id = ?').bind(msg.id).first()) };
 }
 async function markRead(env, jobId, uid, last) {
   if (!last) return;
@@ -1496,6 +1499,25 @@ async function postToThread(env, me, ctx, text, files) {
         lines: [text || mediaLabel(media)], url: appUrl(env, '/messages/' + th.id), label: 'ตอบกลับ' }) : null);
   return { id: r.id, role, text, at: ts, ...(media.length ? { media } : {}) };
 }
+/* ข้อความที่ระบบส่งแทนร้านในห้องทักช่าง (ตั้งใน Studio → ตั้งค่า)
+   - คำทักทาย: ข้อความแรกของห้องใหม่ — ลูกค้าเห็นตั้งแต่กดแชต (หน้าแอปแสดงก่อน) และเก็บไว้ในห้องให้ร้านเห็นตรงกัน
+   - ตอบกลับอัตโนมัติ: ลูกค้าทักมาแล้วร้านยังไม่ได้ตอบใน 12 ชม. ล่าสุด → ส่งหนึ่งครั้ง (คำทักทายไม่นับว่าร้านตอบแล้ว)
+     เดิมส่งเฉพาะตอนขอราคา ห้องทักช่างจึงไม่เคยได้ข้อความนี้เลย */
+const AUTO_GAP = 12 * 3600000;
+async function shopNote(env, th, t, kind, text, at) {
+  const r = await env.DB.prepare('INSERT INTO tech_messages (job_id, uid, role, text, at, kind) VALUES (?,?,?,?,?,?) RETURNING id')
+    .bind(th.id, t.uid, 'technician', text, at, kind).first();
+  await env.DB.prepare('UPDATE tech_threads SET updated_at = ? WHERE id = ?').bind(at, th.id).run();
+  return { id: r.id, role: 'technician', text, at, kind };
+}
+async function autoAnswer(env, th, t) {
+  const a = (parse(t && t.data) || {}).autoReply, text = String(a && a.on && a.text || '').trim();
+  if (!text) return null;
+  const at = now() + 1;
+  const last = await env.DB.prepare("SELECT MAX(at) AS at FROM tech_messages WHERE job_id = ? AND role = 'technician' AND COALESCE(kind,'') != 'greet' AND deleted_at IS NULL").bind(th.id).first();
+  if (last && last.at && at - last.at < AUTO_GAP) return null;
+  return shopNote(env, th, t, 'auto', text.slice(0, 500), at);
+}
 /* ทักร้าน: มีห้องอยู่แล้วคุยต่อ · ยังไม่มีเปิดห้องใหม่ (วันละไม่เกิน 20 ร้านใหม่ กันสแปม) */
 async function startThread(env, me, b) {
   const t = await techById(env, String(b.techId || ''));
@@ -1516,15 +1538,19 @@ async function startThread(env, me, b) {
     await env.DB.prepare('INSERT INTO tech_threads (id, tech_id, customer_uid, gig_id, test, created_at, updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(tech_id, customer_uid) DO NOTHING')
       .bind(id, t.id, me.uid, gig ? gig.id : null, t.test ? 1 : 0, ts, ts).run();
     th = await env.DB.prepare('SELECT * FROM tech_threads WHERE tech_id = ? AND customer_uid = ?').bind(t.id, me.uid).first();
+    /* ห้องเพิ่งเปิด (ไม่ใช่ห้องที่อีกเครื่องเปิดพร้อมกัน) → คำทักทายเป็นข้อความแรก */
+    const greet = String((parse(t.data) || {}).greet || '').trim();
+    if (greet && th.id === id) await shopNote(env, th, t, 'greet', greet.slice(0, 200), ts);
   } else if (gig && gig.id !== th.gig_id) {
     /* ถามเรื่องบริการใหม่ในห้องเดิม — จำบริการล่าสุดที่คุยถึง */
     await env.DB.prepare('UPDATE tech_threads SET gig_id = ? WHERE id = ?').bind(gig.id, th.id).run();
     th.gig_id = gig.id;
   }
   const message = await postToThread(env, me, { th, t, role: 'customer' }, text, b.media);
+  const auto = await autoAnswer(env, th, t);
   await bumpView(env, t.id, 'msg');
-  const [thread] = await threadsOut(env, me, [{ ...th, updated_at: message.at }], null);
-  return { thread, message };
+  const [thread] = await threadsOut(env, me, [{ ...th, updated_at: (auto || message).at }], null);
+  return { thread, message, ...(auto ? { auto } : {}) };
 }
 async function openThread(env, me, id, after, since) {
   const ctx = await threadCtx(env, me, id);
@@ -1537,7 +1563,9 @@ async function openThread(env, me, id, after, since) {
 async function replyThread(env, me, id, b) {
   const ctx = await threadCtx(env, me, id);
   const text = await threadText(env, me, ctx, b);
-  return { message: await postToThread(env, me, ctx, text, b.media) };
+  const message = await postToThread(env, me, ctx, text, b.media);
+  const auto = ctx.role === 'customer' ? await autoAnswer(env, ctx.th, ctx.t) : null;
+  return { message, ...(auto ? { auto } : {}) };
 }
 
 /* ══ รูปแนบกับคำขอ (เช่น รูปรถที่จอด รูปอาการ) ══
@@ -1616,8 +1644,8 @@ async function createJob(env, me, b) {
   await saveMedia(env, group || id, me.uid, photos);
   /* ตอบกลับอัตโนมัติของร้าน — ลูกค้ารู้ทันทีว่าร้านได้รับเรื่องแล้ว */
   if (d.autoReply && d.autoReply.on && d.autoReply.text) {
-    await env.DB.prepare('INSERT INTO tech_messages (job_id, uid, role, text, at) VALUES (?,?,?,?,?)')
-      .bind(id, t.uid, 'technician', d.autoReply.text, ts + 1).run();
+    await env.DB.prepare('INSERT INTO tech_messages (job_id, uid, role, text, at, kind) VALUES (?,?,?,?,?,?)')
+      .bind(id, t.uid, 'technician', d.autoReply.text, ts + 1, 'auto').run();
   }
   await bumpView(env, t.id, 'book');
   tell(env, t.uid, async () => jobCard(env, 'request', await env.DB.prepare('SELECT * FROM tech_jobs WHERE id = ?').bind(id).first(), shopOf(t)));
