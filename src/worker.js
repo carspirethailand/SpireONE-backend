@@ -15,6 +15,7 @@ import { garageCheckin, GARAGE_CARE_KEY } from './garage-care.mjs';
 import { garageRulesFor, validateGarageWrite, appendGarageLog } from './garage-state.mjs';
 import {anchorInput,anchorOrder} from './odo-validation.mjs';
 import { infoPatch, costReferences } from './garage-rules.mjs';
+import {pushSubscription} from './push-subscription.mjs';
 import { handleTech, reconcileDiditIdentities, vaultSweep, expireStaleApplications, releaseWrongHolds, expireOpenJobs, verifiedFixes } from './techs.js';
 import { richMenuStatus, setupRichMenu, lineStatus, lineFixWebhook } from './line-menu.js';
 import { appUrl, card, notify } from './line-notify.js';
@@ -5635,7 +5636,7 @@ ${convo}`;
           if(bodyData.info!==undefined){
             const old=await env.DB.prepare('SELECT info FROM cars WHERE id=? AND uid=?').bind(carId,actor.payload.sub).first();
             let previous={};try{previous=JSON.parse(old?.info||'{}')}catch{}
-            try{info=JSON.stringify(infoPatch(bodyData.info,previous))}catch{return deny('Invalid car details',400)}
+            try{info=JSON.stringify(infoPatch(bodyData.info,previous))}catch(e){return json({error:e.message||'Invalid car details',field:e.field||'info'},400)}
           }
           const result = await env.DB.prepare(`
             INSERT INTO cars (id, uid, make, model, year, mileage, color, body, info, created_at)
@@ -6159,8 +6160,8 @@ ${convo}`;
       if (url.pathname === '/api/push/subscribe' && request.method === 'POST') {
         return await guarded('user', async (actor) => {
           const b = (await readBody()) || {};
-          const sub = b.sub || {};
-          const keys = sub.keys || {};
+          let sub;try{sub=await pushSubscription(b.sub)}catch{return deny('Invalid browser push subscription',400)}
+          const keys = sub.keys;
           if (!sub.endpoint || !keys.p256dh || !keys.auth) return deny('Invalid subscription', 400);
           if (String(sub.endpoint).length > 800) return deny('Endpoint too long', 400);
           // วันครบกำหนดอยู่ในเครื่องผู้ใช้ ต้องซิงก์ขึ้นมาด้วย ไม่งั้นเซิร์ฟเวอร์เตือนอะไรไม่ได้

@@ -29,6 +29,19 @@ function lineSetup({token='test-only-token',link=true}={}){
 const words=p=>JSON.stringify(p.body.messages);
 const job=(tid,id)=>({id,techId:tid,car:'Honda City 2019',symptom:'แอร์ไม่เย็น มีลมออกแต่ไม่เย็น',area:'บางนา',address:'99/1 ซอยลับเฉพาะ',phone:'0812345678',requestedTime:'พรุ่งนี้เช้า',mode:'mobile'});
 
+test('a quote to a public request and a revised offer both notify the customer and change the polling revision',async()=>{
+  const {f,call,pushes}=lineSetup();await withMechanic(f);const id=crypto.randomUUID();
+  const p={id,lat:13.76,lng:100.51,cat:'air',car:'Honda City 2019',symptom:'แอร์ไม่เย็น มีลมออกแต่ไม่เย็น',area:'บางนา',address:'99/1 ซอยลับเฉพาะ',phone:'0812345678',requestedTime:'พรุ่งนี้เช้า',mode:'mobile'};
+  assert.equal((await call(USER,'/api/tech/posts',p)).status,200);
+  const quote={labor:800,parts:400,partsNote:'น้ำยาแอร์ R134a',travel:100,scope:'ตรวจระบบและเติมน้ำยาแอร์',appointment:'พรุ่งนี้ 9 โมง',warranty:30};
+  const before=(await call(USER,'/api/tech/pulse')).v,offer=await call(MECH,'/api/tech/posts/'+id+'/offer',quote);assert.equal(offer.status,200,offer.error);
+  assert.equal(pushes.at(-1).body.to,'Ucustomer');assert.match(words(pushes.at(-1)),/เสนอราคา/);assert.ok(!/0812345678|ซอยลับเฉพาะ/.test(words(pushes.at(-1))));
+  const first=(await call(USER,'/api/tech/pulse')).v;assert.notEqual(first,before);
+  const jobs=(await call(USER,'/api/tech/jobs')).jobs;assert.ok(jobs[0].quoteAt>0);assert.equal(jobs[0].revision,1);
+  const count=pushes.length;assert.equal((await call(MECH,'/api/tech/posts/'+id+'/offer',{...quote,labor:900})).status,200);assert.equal(pushes.length,count+1);
+  assert.notEqual((await call(USER,'/api/tech/pulse')).v,first);assert.equal((await call(USER,'/api/tech/jobs')).jobs[0].total,1400);
+});
+
 test('LINE: the mechanic hears about a new request, the customer about the quote — no address or phone in LINE',async()=>{
   const {f,call,pushes}=lineSetup();const tid=await withMechanic(f),id=crypto.randomUUID();
   assert.equal((await call(USER,'/api/tech/jobs',job(tid,id))).status,200);

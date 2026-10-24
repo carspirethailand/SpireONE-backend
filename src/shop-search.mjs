@@ -61,7 +61,7 @@ export function distanceM(a,b){const r=x=>x*Math.PI/180,h=Math.sin(r(b.lat-a.lat
 const MAPS_MIN=5;
 const PLACE_MASK='places.id,places.displayName,places.formattedAddress,places.location,places.googleMapsUri,places.attributions,places.primaryTypeDisplayName';
 async function placesSearch(env,fetcher,textQuery,lang,here){
-  const d=await jsonFetch(fetcher,'https://places.googleapis.com/v1/places:searchText',{method:'POST',headers:{'Content-Type':'application/json','X-Goog-Api-Key':env.GOOGLE_MAPS_API_KEY,'X-Goog-FieldMask':PLACE_MASK},body:JSON.stringify({textQuery,languageCode:lang,regionCode:'TH',pageSize:MAPS_FETCH,...(here?{locationBias:{circle:{center:{latitude:here.lat,longitude:here.lng},radius:MAPS_RADIUS}}}:{})})});
+  const d=await jsonFetch(fetcher,'https://places.googleapis.com/v1/places:searchText',{method:'POST',headers:{'Content-Type':'application/json','X-Goog-Api-Key':env.GOOGLE_MAPS_API_KEY,'X-Goog-FieldMask':PLACE_MASK},body:JSON.stringify({textQuery,languageCode:lang,regionCode:'TH',pageSize:MAPS_FETCH,...(here?{rankPreference:'DISTANCE',locationBias:{circle:{center:{latitude:here.lat,longitude:here.lng},radius:MAPS_RADIUS}}}:{})})});
   if(d.error||('places' in d&&!Array.isArray(d.places)))throw Error('invalid upstream response');
   return (d.places||[]).slice(0,MAPS_FETCH).map(x=>{const lat=Number(x.location?.latitude),lng=Number(x.location?.longitude),ok=x.location?.latitude!=null&&x.location?.longitude!=null&&Number.isFinite(lat)&&Number.isFinite(lng)&&Math.abs(lat)<=90&&Math.abs(lng)<=180;
     return {id:text(x.id,100),name:text(x.displayName?.text),address:text(x.formattedAddress,320),type:text(x.primaryTypeDisplayName?.text,80),url:productUrl(x.googleMapsUri,'maps'),lat:ok?lat:null,lng:ok?lng:null,distanceM:here&&ok?distanceM(here,{lat,lng}):null,attributions:(x.attributions||[]).map(a=>({name:text(a.provider),uri:productUrl(a.providerUri,'maps')}))}}).filter(x=>x.url);
@@ -73,10 +73,10 @@ async function maps(env,input,fetcher){
   const here=input.location?{lat:coarse(input.location.lat),lng:coarse(input.location.lng)}:null;
   const textQuery=STORE_WORDS.test(input.query)?input.query:input.query+' '+STORE_TERM[input.lang];
   const exact=await placesSearch(env,fetcher,textQuery,input.lang,here);
-  if(here)exact.sort(byDistance);
+  if(here){for(let i=exact.length-1;i>=0;i--)if(exact[i].distanceM==null||exact[i].distanceM>MAPS_RADIUS)exact.splice(i,1);exact.sort(byDistance);}
   let out=exact.slice(0,MAPS_SHOW).map(x=>({...x,broad:false}));
   if(here&&out.length<MAPS_MIN){
-    try{const seen=new Set(out.map(x=>x.id)),more=(await placesSearch(env,fetcher,STORE_TERM[input.lang],input.lang,here)).filter(x=>!seen.has(x.id)).sort(byDistance);
+    try{const seen=new Set(out.map(x=>x.id)),more=(await placesSearch(env,fetcher,STORE_TERM[input.lang],input.lang,here)).filter(x=>!seen.has(x.id)&&x.distanceM!=null&&x.distanceM<=MAPS_RADIUS).sort(byDistance);
       out=[...out,...more.slice(0,MAPS_SHOW-out.length).map(x=>({...x,broad:true}))]}
     catch(e){console.error('shop maps broad search failed',String(e&&e.message||e).slice(0,300))}
   }

@@ -44,7 +44,7 @@ test('AliExpress signs a POST form with no app key in URL',async()=>{
 });
 test('Google Places sends key in header, minimal fields, and only consented coordinates',async()=>{
   for(const consent of [false,true]){let sent;const r=await searchShop(env,{...body(['maps']),lat:13,lng:100,locationConsent:consent},{fetcher:async(u,o)=>{sent=o;return json({places:[{id:'p1',displayName:{text:'Parts shop'},googleMapsUri:'https://maps.google.com/?cid=1',formattedAddress:'Area'}]})}});
-    assert.equal(sent.headers['X-Goog-Api-Key'],'fixture-maps');assert.equal(!!JSON.parse(sent.body).locationBias,consent);assert.ok(!sent.headers['X-Goog-FieldMask'].includes('reviews'));assert.equal(r.places.length,1);
+    assert.equal(sent.headers['X-Goog-Api-Key'],'fixture-maps');assert.equal(!!JSON.parse(sent.body).locationBias,consent);assert.ok(!sent.headers['X-Goog-FieldMask'].includes('reviews'));assert.equal(r.places.length,consent?0:1);
   }
 });
 test('malformed/failed/redirected upstream responses remain unavailable, not empty-success',async()=>{
@@ -61,8 +61,8 @@ test('nearby shops: store term added, coordinates coarsened, nearest first with 
   calls=[];const r=await searchShop(env,{...body(['maps']),query:'ผ้าเบรก Toyota',lat:13.74567,lng:100.53491,locationConsent:true},{fetcher:f});
   assert.equal(first().textQuery,'ผ้าเบรก Toyota ร้านอะไหล่รถยนต์');assert.equal(first().regionCode,'TH');
   assert.deepEqual(first().locationBias.circle.center,{latitude:13.746,longitude:100.535},'~100 m precision only');
-  assert.deepEqual(r.places.map(x=>x.id),['near','far','none'],'nearest first, unknown distance last');
-  assert.ok(r.places[0].distanceM<200&&r.places[1].distanceM>5000);assert.equal(r.places[2].distanceM,null);assert.equal(r.places[2].lat,null);assert.equal(r.places[0].type,'ร้านอะไหล่รถยนต์');
+  assert.deepEqual(r.places.map(x=>x.id),['near','far'],'only located shops inside 15 km, nearest first');
+  assert.ok(r.places[0].distanceM<200&&r.places[1].distanceM>5000);assert.equal(first().rankPreference,'DISTANCE');assert.equal(r.places[0].type,'ร้านอะไหล่รถยนต์');
   calls=[];await searchShop(env,{...body(['maps']),query:'auto parts shop near Siam',lang:'en',lat:13,lng:100,locationConsent:true},{fetcher:f});assert.equal(first().textQuery,'auto parts shop near Siam','already names a store: not doubled');
   calls=[];await searchShop(env,{...body(['maps']),query:'brake pads',lang:'en'},{fetcher:f});assert.equal(first().textQuery,'brake pads auto parts store');assert.equal(first().locationBias,undefined,'no consent → no location');
   const r2=await searchShop(env,{...body(['maps']),query:'ผ้าเบรก'},{fetcher:f});assert.ok(r2.places.every(x=>x.distanceM===null),'no distance without a location');
@@ -82,7 +82,7 @@ test('nearby shops: few exact matches → nearby general parts shops are added a
   const here={lat:13.75,lng:100.5,locationConsent:true};
   const r=await searchShop(env,{...body(['maps']),query:'ผ้าเบรก',...here},{fetcher:f});
   assert.deepEqual(queries,['ผ้าเบรก ร้านอะไหล่รถยนต์','ร้านอะไหล่รถยนต์']);
-  assert.deepEqual(r.places.map(x=>[x.id,x.broad]),[['exact',false],['g1',true],['g2',true],['g3',true]],'exact matches first, then nearest general shops; no duplicates');
+  assert.deepEqual(r.places.map(x=>[x.id,x.broad]),[['exact',false],['g1',true],['g2',true]],'exact matches first, then nearest general shops; no duplicates');
   queries.length=0;await searchShop(env,{...body(['maps']),query:'ผ้าเบรก'},{fetcher:f});assert.equal(queries.length,1,'without a location a general search would be meaningless');
   queries.length=0;const many=async(u,o)=>{queries.push(1);return json({places:[1,2,3,4,5,6].map(i=>place('p'+i,13.7+i/100))})};
   const r2=await searchShop(env,{...body(['maps']),query:'ผ้าเบรก',...here},{fetcher:many});assert.equal(queries.length,1,'enough exact matches: one request only');assert.ok(r2.places.every(x=>x.broad===false));

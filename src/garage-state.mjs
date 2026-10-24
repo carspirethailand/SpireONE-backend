@@ -19,6 +19,18 @@ export async function garageRulesFor(env,uid,id,incomingGarage){
   return {car,ref,policy:rules.costPolicy(car,ref)};
 }
 export async function validateGarageWrite(env,uid,key,value,incomingGarage){
+  if(key==='garage'&&value!==null){
+    if(!Array.isArray(value))throw Object.assign(Error('Invalid Garage list'),{status:400});
+    const row=await env.DB.prepare('SELECT v FROM user_state WHERE uid=? AND k=?').bind(uid,key).first();
+    const old=parse(row?.v),seen=new Set();
+    if(value.length>Math.max(100,Array.isArray(old)?old.length:0))throw Object.assign(Error('Too many cars'),{status:400});
+    for(const car of value){
+      if(!car||typeof car.id!=='string'||seen.has(car.id))throw Object.assign(Error('Invalid car'),{status:400});seen.add(car.id);
+      const prev=Array.isArray(old)?old.find(x=>x?.id===car.id):null;
+      if(car.info!=null)rules.infoPatch(car.info,prev?.info||{});
+    }
+    return value;
+  }
   const m=/^(?:carlab_(?:log|todo|iv|sym)|cal_price)_([A-Za-z0-9_.:-]{1,60})$/.exec(key);
   if(!m||value===null)return value;
   const ctx=await garageRulesFor(env,uid,m[1],incomingGarage);

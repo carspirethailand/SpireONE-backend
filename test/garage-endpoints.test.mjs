@@ -22,6 +22,21 @@ async function fixture(){
   return {db,call};
 }
 
+test('car details are validated on direct car writes and Garage state sync; failures preserve existing account data',async()=>{
+  const f=await fixture(),base={id:'car-1',make:'Honda',model:'Civic',year:'2020',mileage:'50000'};
+  for(const info of [{model_year:'1234321'},{engine:'fsfastdsxz'},{engine_code:'qwdfwfwdsvew'},{plate:'wfweqqev'},{province:'svf'},{drive:'invalid'},{tire:'bad'}]){
+    const r=await f.call('POST','/api/cars',{...base,info});assert.equal(r.status,400,JSON.stringify(info));
+    const state=await f.call('PUT','/api/state',{state:{garage:{v:[{...base,info}]},theme:{v:'dark'}}});
+    assert.ok(state.json.skipped.includes('garage'));assert.ok(state.json.saved.includes('theme'));assert.equal(f.db.prepare("SELECT info FROM cars WHERE id='car-1'").get().info,null);
+  }
+  const info={engine:'2.0L',engine_code:'R20A',gear:'CVT',plate:'กข 1234',province:'กรุงเทพมหานคร',tire:'215/55 R16'};
+  assert.equal((await f.call('POST','/api/cars',{...base,info})).status,200);
+  const saved=JSON.parse(f.db.prepare("SELECT info FROM cars WHERE id='car-1'").get().info);assert.deepEqual(saved,info);
+  const old={engine:'legacy junk',model_year:'1234321'};f.db.prepare("UPDATE cars SET info=? WHERE id='car-1'").run(JSON.stringify(old));
+  assert.equal((await f.call('POST','/api/cars',{...base,color:'#123456',info:old})).status,200,'unchanged legacy details are not erased by unrelated colour updates');
+  assert.equal(f.db.prepare("SELECT info FROM cars WHERE id='car-1'").get().info,JSON.stringify(old));
+});
+
 test('Garage routes require auth and actual car ownership; generic state rejects bad records without corrupting preferences',async()=>{
   const f=await fixture();
   for(const [method,path,body] of [['GET','/api/garage/cost-policy?car=car-1'],['GET','/api/garage/context?car=car-1'],['POST','/api/garage/log',{}]])assert.equal((await f.call(method,path,body,null)).status,401);

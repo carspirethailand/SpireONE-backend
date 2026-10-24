@@ -1368,7 +1368,7 @@ async function myJobs(env, me, myTech, all) {
       || (cust && ['quoted', 'done'].includes(j.status));
     const q = parse(j.quote);
     return { id: j.id, status: j.status, test: !!j.test, techName: nm[j.tech_id] || 'ช่าง', techId: j.tech_id,
-      group: j.group_id || null, total: q ? q.total : null,
+      group: j.group_id || null, total: q ? q.total : null, quoteAt:q?.at||null,revision:j.revision||0,
       car: j.car, symptom: j.symptom, createdAt: j.created_at, updatedAt: j.updated_at, urgent: !!j.urgent,
       side: cust && tech ? 'both' : cust ? 'customer' : tech ? 'technician' : 'admin',
       needsMe, unread: un[j.id] || 0, expiresAt: j.expires_at || null, expired: wasExpired(j),cancelledBy:j.status==='cancelled'?cancellationActor(j.history):null };
@@ -2381,12 +2381,12 @@ async function pulse(env, me) {
   const shop = "(SELECT id FROM tech_profiles WHERE uid = ?)";
   /* สี่คำถามยิงพร้อมกัน — รอเท่ากับอันที่ช้าที่สุดอันเดียว */
   const r = await Promise.all([
-    env.DB.prepare(`SELECT COUNT(*) AS n, MAX(updated_at) AS m FROM tech_jobs WHERE tech_id = ${shop} OR customer_uid = ?`).bind(me.uid, me.uid).first(),
+    env.DB.prepare(`SELECT COUNT(*) AS n, MAX(updated_at) AS m, SUM(revision) AS r FROM tech_jobs WHERE tech_id = ${shop} OR customer_uid = ?`).bind(me.uid, me.uid).first(),
     env.DB.prepare(`SELECT MAX(id) AS m FROM tech_messages WHERE job_id IN (SELECT id FROM tech_jobs WHERE (tech_id = ${shop} OR customer_uid = ?) AND status NOT IN ('completed','cancelled'))`).bind(me.uid, me.uid).first(),
     env.DB.prepare(`SELECT MAX(updated_at) AS m FROM tech_threads WHERE tech_id = ${shop} OR customer_uid = ?`).bind(me.uid, me.uid).first(),
     env.DB.prepare("SELECT COUNT(*) AS n, MAX(updated_at) AS m FROM tech_posts WHERE status = 'open' AND created_at > ?").bind(now() - POST_TTL).first(),
   ]);
-  const v = r.map(o => { o = o || {}; return (o.n ?? '') + ':' + (o.m ?? ''); }).join('|');
+  const v = r.map(o => { o = o || {}; return (o.n ?? '') + ':' + (o.m ?? '') + ':' + (o.r ?? ''); }).join('|');
   return { v };
 }
 async function nearPosts(env, me) {
@@ -2433,6 +2433,7 @@ async function offer(env, me, postId, b) {
     if (!['requested', 'quoted'].includes(ex.status)) fail(409, 'ข้อเสนอนี้ถูกตอบรับหรือปิดไปแล้ว');
     const h = parse(ex.history) || []; h.push({ status: 'quoted', at: ts, by: 'technician' });
     await env.DB.prepare("UPDATE tech_jobs SET quote=?, status='quoted', history=?, updated_at=?, revision=revision+1 WHERE id=?").bind(quote, JSON.stringify(h), ts, id).run();
+    tell(env,p.customer_uid,async()=>jobCard(env,'quote',await env.DB.prepare('SELECT * FROM tech_jobs WHERE id = ?').bind(id).first(),shopOf(t)));
     return { id, updated: true };
   }
   const d = parse(t.data) || {};
@@ -2442,6 +2443,7 @@ async function offer(env, me, postId, b) {
     p.mode === 'mobile' && d.mobile ? 'mobile' : 'shop', quote,
     JSON.stringify([{ status: 'requested', at: p.created_at, by: 'customer' }, { status: 'quoted', at: ts, by: 'technician' }]), ts, ts, p.id, p.note || '', p.urgent ? 1 : 0).run();
   await env.DB.prepare('UPDATE tech_posts SET updated_at = ? WHERE id = ?').bind(ts, p.id).run();
+  tell(env,p.customer_uid,async()=>jobCard(env,'quote',await env.DB.prepare('SELECT * FROM tech_jobs WHERE id = ?').bind(id).first(),shopOf(t)));
   return { id };
 }
 
