@@ -40,6 +40,8 @@
     "ALLOWED_ORIGINS": "*",
     // เปิดค้นหาร้านอะไหล่ใกล้ฉันผ่าน Google Places (ต้องมี secret GOOGLE_MAPS_API_KEY ด้วย) — ตั้ง "0" เพื่อปิด
     "SHOP_GOOGLE_MAPS_ENABLED": "1",
+    // Routing raises the Google Places billing SKU. Keep OFF until owner approval.
+    "SHOP_GOOGLE_ROUTES_ENABLED": "0",
     "CEREBRAS_MODEL": "gpt-oss-120b",
     "CEREBRAS_BASE_URL": "https://api.cerebras.ai/v1",
     "GROQ_MODEL": "openai/gpt-oss-120b",

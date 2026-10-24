@@ -1,9 +1,10 @@
 /* Official APIs only. No scraping, generated listings, invented prices or keys in URLs. */
+import {routingEnabled,routingRequest,routeFor,routeOrder,routingState} from './shop-routing.mjs';
 const NAMES={shopee:'Shopee',amazon:'Amazon',aliexpress:'AliExpress',ebay:'eBay',maps:'Google Maps'};
 const REQUIRED={shopee:['SHOPEE_APP_ID','SHOPEE_APP_SECRET'],amazon:['AMAZON_CREATOR_ID','AMAZON_CREATOR_SECRET','AMAZON_PARTNER_TAG'],aliexpress:['ALIEXPRESS_APP_KEY','ALIEXPRESS_APP_SECRET','ALIEXPRESS_TRACKING_ID'],ebay:['EBAY_CLIENT_ID','EBAY_CLIENT_SECRET'],maps:['GOOGLE_MAPS_API_KEY']};
 const HOSTS={shopee:['shopee.co.th'],amazon:['amazon.com','amazon.co.uk','amazon.co.jp','amazon.sg','amazon.com.au'],aliexpress:['aliexpress.com'],ebay:['ebay.com','ebay.co.uk','ebay.de','ebay.com.au'],maps:['google.com','maps.google.com']};
 const ready=(env,id)=>REQUIRED[id].every(k=>typeof env[k]==='string'&&env[k].trim())&&(id!=='maps'||env.SHOP_GOOGLE_MAPS_ENABLED==='1');
-export function shopStatus(env){return {providers:Object.entries(NAMES).map(([id,name])=>({id,name,state:ready(env,id)?'ready':'setup_required'})),livePricesOnly:true,fitmentRequiresVerification:true}}
+export function shopStatus(env){return {providers:Object.entries(NAMES).map(([id,name])=>({id,name,state:ready(env,id)?'ready':'setup_required',...(id==='maps'?{routingEnabled:ready(env,id)&&routingEnabled(env)}:{})})),livePricesOnly:true,fitmentRequiresVerification:true}}
 export function productUrl(url,id){try{const u=new URL(url);return u.protocol==='https:'&&!u.username&&!u.password&&!u.port&&HOSTS[id]?.some(h=>u.hostname===h||u.hostname.endsWith('.'+h))?u.href:null}catch{return null}}
 function imageUrl(url){try{const u=new URL(url);return u.protocol==='https:'&&!u.username&&!u.password&&!u.port&&['ebayimg.com','media-amazon.com','ssl-images-amazon.com','susercontent.com','alicdn.com','aliexpress-media.com'].some(h=>u.hostname===h||u.hostname.endsWith('.'+h))?u.href:null}catch{return null}}
 const text=(s,n=220)=>String(s??'').replace(/[\u0000-\u001f]/g,' ').slice(0,n);
@@ -15,7 +16,7 @@ export function shopInput(b){
   const q=String(b?.query||'').trim();if(q.length<2||q.length>180||/[\u0000-\u001f]/.test(q)||/\b\d{13}\b|\b[A-HJ-NPR-Z0-9]{17}\b|\S+@\S+\.\S+/i.test(q))throw Object.assign(Error('Use a part name or part number, not private identifiers'),{status:400});
   const providers=[...new Set(Array.isArray(b.providers)?b.providers:['shopee','amazon','aliexpress','ebay'])];if(!providers.length||providers.length>5||providers.some(p=>!NAMES[p]))throw Object.assign(Error('Invalid platforms'),{status:400});
   const lat=Number(b.lat),lng=Number(b.lng),location=b.locationConsent===true&&b.lat!=null&&b.lng!=null&&Number.isFinite(lat)&&Math.abs(lat)<=90&&Number.isFinite(lng)&&Math.abs(lng)<=180?{lat,lng}:null;
-  return {query:q,providers,location,lang:b.lang==='en'?'en':'th'};
+  return {query:q,providers,location,routeLocationConsent:b.routeLocationConsent===true&&!!location,lang:b.lang==='en'?'en':'th'};
 }
 async function jsonFetch(fetcher,url,options={}){
   const r=await fetcher(url,{...options,redirect:'manual',signal:AbortSignal.timeout(9000)});if(!r.ok){const why=await r.text().then(t=>t.replace(/\s+/g,' ').slice(0,300)).catch(()=>'');throw Error('upstream unavailable HTTP '+r.status+(why?' '+why:''))}
@@ -60,35 +61,39 @@ const MAPS_RADIUS=15000,MAPS_FETCH=20,MAPS_SHOW=12,coarse=n=>Math.round(n*1000)/
 export function distanceM(a,b){const r=x=>x*Math.PI/180,h=Math.sin(r(b.lat-a.lat)/2)**2+Math.cos(r(a.lat))*Math.cos(r(b.lat))*Math.sin(r(b.lng-a.lng)/2)**2;return Math.round(12742000*Math.asin(Math.min(1,Math.sqrt(h))))}
 const MAPS_MIN=5;
 const PLACE_MASK='places.id,places.displayName,places.formattedAddress,places.location,places.googleMapsUri,places.attributions,places.primaryTypeDisplayName';
-async function placesSearch(env,fetcher,textQuery,lang,here){
-  const d=await jsonFetch(fetcher,'https://places.googleapis.com/v1/places:searchText',{method:'POST',headers:{'Content-Type':'application/json','X-Goog-Api-Key':env.GOOGLE_MAPS_API_KEY,'X-Goog-FieldMask':PLACE_MASK},body:JSON.stringify({textQuery,languageCode:lang,regionCode:'TH',pageSize:MAPS_FETCH,...(here?{rankPreference:'DISTANCE',locationBias:{circle:{center:{latitude:here.lat,longitude:here.lng},radius:MAPS_RADIUS}}}:{})})});
+async function placesSearch(env,fetcher,textQuery,lang,here,routing=null,origin=here){
+  const d=await jsonFetch(fetcher,'https://places.googleapis.com/v1/places:searchText',{method:'POST',headers:{'Content-Type':'application/json','X-Goog-Api-Key':env.GOOGLE_MAPS_API_KEY,'X-Goog-FieldMask':PLACE_MASK+(routing?',routingSummaries':'')},body:JSON.stringify({textQuery,languageCode:lang,regionCode:'TH',pageSize:MAPS_FETCH,...(here?{rankPreference:'DISTANCE',locationBias:{circle:{center:{latitude:here.lat,longitude:here.lng},radius:MAPS_RADIUS}}}:{}),...(routing?{routingParameters:routing}:{})})});
   if(d.error||('places' in d&&!Array.isArray(d.places)))throw Error('invalid upstream response');
-  return (d.places||[]).slice(0,MAPS_FETCH).map(x=>{const lat=Number(x.location?.latitude),lng=Number(x.location?.longitude),ok=x.location?.latitude!=null&&x.location?.longitude!=null&&Number.isFinite(lat)&&Number.isFinite(lng)&&Math.abs(lat)<=90&&Math.abs(lng)<=180;
-    return {id:text(x.id,100),name:text(x.displayName?.text),address:text(x.formattedAddress,320),type:text(x.primaryTypeDisplayName?.text,80),url:productUrl(x.googleMapsUri,'maps'),lat:ok?lat:null,lng:ok?lng:null,distanceM:here&&ok?distanceM(here,{lat,lng}):null,attributions:(x.attributions||[]).map(a=>({name:text(a.provider),uri:productUrl(a.providerUri,'maps')}))}}).filter(x=>x.url);
+  const summaries=routing&&Array.isArray(d.routingSummaries)&&d.routingSummaries.length===(d.places||[]).length?d.routingSummaries:[];
+  return (d.places||[]).slice(0,MAPS_FETCH).map((x,i)=>{const lat=Number(x.location?.latitude),lng=Number(x.location?.longitude),ok=x.location?.latitude!=null&&x.location?.longitude!=null&&Number.isFinite(lat)&&Number.isFinite(lng)&&Math.abs(lat)<=90&&Math.abs(lng)<=180;
+    const air=origin&&ok?distanceM(origin,{lat,lng}):null;
+    return {id:text(x.id,100),name:text(x.displayName?.text),address:text(x.formattedAddress,320),type:text(x.primaryTypeDisplayName?.text,80),url:productUrl(x.googleMapsUri,'maps'),lat:ok?lat:null,lng:ok?lng:null,distanceM:air,driving:ok&&routing?routeFor(summaries[i],air):null,attributions:(x.attributions||[]).map(a=>({name:text(a.provider),uri:productUrl(a.providerUri,'maps')}))}}).filter(x=>x.url);
 }
 const byDistance=(a,b)=>(a.distanceM??Infinity)-(b.distanceM??Infinity);
 /* ขั้น 1: ร้านที่ค้นเจอด้วยชื่อสินค้า (น่าจะมีสินค้านี้) · ผลน้อยกว่า MAPS_MIN และรู้ตำแหน่งผู้ใช้ → ขั้น 2: ร้านอะไหล่ทั่วไปใกล้ ๆ
    ติดป้าย broad ให้หน้าเว็บบอกผู้ใช้ว่าไม่ได้ตรงกับชื่อสินค้า ไม่แกล้งว่าเป็นผลตรง */
 async function maps(env,input,fetcher){
   const here=input.location?{lat:coarse(input.location.lat),lng:coarse(input.location.lng)}:null;
+  const routing=routingRequest(env,input),origin=routing?input.location:here;
   const textQuery=STORE_WORDS.test(input.query)?input.query:input.query+' '+STORE_TERM[input.lang];
-  const exact=await placesSearch(env,fetcher,textQuery,input.lang,here);
+  const exact=await placesSearch(env,fetcher,textQuery,input.lang,here,routing,origin);
   if(here){for(let i=exact.length-1;i>=0;i--)if(exact[i].distanceM==null||exact[i].distanceM>MAPS_RADIUS)exact.splice(i,1);exact.sort(byDistance);}
-  let out=exact.slice(0,MAPS_SHOW).map(x=>({...x,broad:false}));
+  let out=(routing?routeOrder(exact):exact).slice(0,MAPS_SHOW).map(x=>({...x,broad:false}));
   if(here&&out.length<MAPS_MIN){
-    try{const seen=new Set(out.map(x=>x.id)),more=(await placesSearch(env,fetcher,STORE_TERM[input.lang],input.lang,here)).filter(x=>!seen.has(x.id)&&x.distanceM!=null&&x.distanceM<=MAPS_RADIUS).sort(byDistance);
-      out=[...out,...more.slice(0,MAPS_SHOW-out.length).map(x=>({...x,broad:true}))]}
-    catch(e){console.error('shop maps broad search failed',String(e&&e.message||e).slice(0,300))}
+    try{const seen=new Set(out.map(x=>x.id)),more=(await placesSearch(env,fetcher,STORE_TERM[input.lang],input.lang,here,routing,origin)).filter(x=>!seen.has(x.id)&&x.distanceM!=null&&x.distanceM<=MAPS_RADIUS).sort(byDistance);
+      out=[...out,...(routing?routeOrder(more):more).slice(0,MAPS_SHOW-out.length).map(x=>({...x,broad:true}))]}
+    catch(e){console.error('shop maps broad search failed',String(e&&e.message||e).match(/HTTP \d{3}/)?.[0]||'unavailable')}
   }
   console.log('shop maps results',JSON.stringify({exact:exact.length,total:out.length,located:!!here}));
-  return out;
+  if(routing)out=routeOrder(out);
+  return {places:out,routing:routingState(out,!!routing,routingEnabled(env))};
 }
 const adapters={shopee,amazon,aliexpress,ebay};
 export async function searchShop(env,body,{fetcher=fetch}={}){
   const input=shopInput(body),providers=await Promise.all(input.providers.map(async id=>{
     if(!ready(env,id))return {id,name:NAMES[id],state:'setup_required',items:[]};
-    try{return {id,name:NAMES[id],state:'ready',...(id==='maps'?{places:await maps(env,input,fetcher)}:{items:await adapters[id](env,input.query,fetcher)})}}
-    catch(e){console.error('shop provider failed',id,String(e&&e.message||e).slice(0,400));return {id,name:NAMES[id],state:'unavailable',items:[]}}
+    try{return {id,name:NAMES[id],state:'ready',...(id==='maps'?await maps(env,input,fetcher):{items:await adapters[id](env,input.query,fetcher)})}}
+    catch(e){console.error('shop provider failed',id,String(e&&e.message||e).match(/HTTP \d{3}/)?.[0]||'unavailable');return {id,name:NAMES[id],state:'unavailable',items:[]}}
   }));return {query:input.query,providers,items:providers.flatMap(p=>p.items||[]),places:providers.flatMap(p=>p.places||[]),observedAt:Date.now(),fitmentRequiresVerification:true};
 }
 const schemas=new WeakMap();
