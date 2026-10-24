@@ -10,6 +10,7 @@ import { ONBOARDING_SQL, handleOnboarding, onboardingName, sanitizeSetupState } 
 import { buildFeatureRequest, cleanFeatureJson, featureCap } from './features-ai.mjs';
 import { soundText, legacySound, audioIdentity, VEHICLE_AUDIO_RULES } from './vehicle-audio.mjs';
 import {publicResearch, publicQuery, soundResearchQuery, researchBlock} from './vehicle-research.mjs';
+import { configuredProviders, providerOrder, benchSearch, searchWeb, sourceCards, BENCH_QUERIES } from './web-search.mjs';
 import { engineScanFailure } from './engine-scan-errors.mjs';
 import { liveToken, cleanHandle } from './live-setup.mjs';
 import { valetPrompt } from './agent-prompt.mjs';
@@ -5504,6 +5505,29 @@ ${convo}`;
       }
       if (url.pathname === '/api/admin/car-specs' && request.method === 'GET') {
         return await guarded('moderator', async () => json(await listSpecs(env)))();
+      }
+      /* ค้นเว็บของ AI: เจ้าที่ตั้งคีย์ไว้ (ไม่คืนคีย์) · ทดสอบเทียบเจ้าด้วยชุดคำค้นเรื่องรถในไทย (web-search.mjs) */
+      if (url.pathname === '/api/admin/search-status' && request.method === 'GET') {
+        return await guarded('admin', async () => json({ configured: configuredProviders(env), order: providerOrder(env), queries: BENCH_QUERIES.map(x => ({ q: x.q, kind: x.kind })) }))();
+      }
+      if (url.pathname === '/api/admin/search-bench' && request.method === 'POST') {
+        return await guarded('admin', async (actor) => {
+          const b = await readBody() || {};
+          if (!configuredProviders(env).length) return deny('ยังไม่ได้ตั้งคีย์ของผู้ให้บริการค้นเว็บ (TAVILY_API_KEY / EXA_API_KEY / FIRECRAWL_API_KEY)', 400);
+          const n = Math.min(BENCH_QUERIES.length, Math.max(1, +b.limit || BENCH_QUERIES.length));
+          const mode = b.mode === 'deep' ? 'deep' : 'balanced';
+          const providers = Array.isArray(b.providers) ? b.providers.map(String).slice(0, 3) : undefined;
+          const out = await benchSearch(env, { queries: BENCH_QUERIES.slice(0, n), providers, mode, signal: request.signal });
+          await logAudit(env, actor.email || actor.payload.sub, 'search_bench', out.providers.join(','), mode + ' ' + n + 'q $' + Object.values(out.summary).reduce((a, x) => a + x.totalUsd, 0).toFixed(3));
+          return json(out);
+        })();
+      }
+      if (url.pathname === '/api/admin/search-try' && request.method === 'POST') {
+        return await guarded('admin', async () => {
+          const b = await readBody() || {};
+          const r = await searchWeb(env, String(b.q || ''), { mode: ['fast', 'balanced', 'deep'].includes(b.mode) ? b.mode : 'balanced', topic: b.topic === 'news' ? 'news' : 'general', providers: Array.isArray(b.providers) ? b.providers.map(String) : undefined, signal: request.signal });
+          return json({ ...r, results: sourceCards(r) });
+        })();
       }
       if (url.pathname === '/api/admin/car-specs/redo' && request.method === 'POST') {
         return await guarded('admin', async (actor) => {
