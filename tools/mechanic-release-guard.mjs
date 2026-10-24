@@ -17,6 +17,8 @@ export function compareSnapshots(before,after){
   }return problems;
 }
 const queries={
+  jobs:'SELECT * FROM tech_jobs ORDER BY id LIMIT 10001',
+  messages:'SELECT * FROM tech_messages ORDER BY id LIMIT 10001',
   profiles:'SELECT id,uid,phone,data,verified,test,suspended,id_hold,jobs,rating_sum,review_count,created_at FROM tech_profiles ORDER BY id LIMIT 10001',
   services:'SELECT id,uid,tech_id,kind,title,body,price,cats,brands,photos,active,created_at FROM tech_gigs ORDER BY id LIMIT 10001',
   applications:'SELECT uid,status,test,revision,created_at FROM tech_applications ORDER BY uid LIMIT 10001',

@@ -74,6 +74,7 @@ export const TABLES = [
   /* ข้อความ: ส่งออกเฉพาะที่เราพิมพ์เอง ข้อความของอีกฝ่ายเป็นข้อมูลของเขา */
   ['tech_messages', MINE, []],
   ['tech_reads', MINE, []],
+  ['tech_job_archives', MINE, []],
   ['tech_shares', MINE, ['token']],
   ['tech_limits', MINE, []],
   /* Car Passport ที่เจ้าของเปิดไว้ (ลิงก์ไม่ส่งออก — เป็นกุญแจเปิดหน้า) */
@@ -197,6 +198,7 @@ export async function deleteAccount(env, uid, { email = '' } = {}) {
   /* ข้อความที่เราพิมพ์ในใบงาน: ลบเนื้อหา คงแถวไว้ให้ลำดับบทสนทนาอีกฝ่ายไม่พัง */
   add('tech_messages', await run(env, "UPDATE tech_messages SET uid = 'deleted', text = '', orig_text = NULL, media = NULL, deleted_at = ? WHERE uid = ?", at, uid));
   add('tech_reads', await run(env, 'DELETE FROM tech_reads WHERE uid = ?', uid));
+  add('tech_job_archives', await run(env, 'DELETE FROM tech_job_archives WHERE uid = ?', uid));
   add('tech_posts', await run(env, 'DELETE FROM tech_posts WHERE customer_uid = ?', uid));
 
   if (shop) {

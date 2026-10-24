@@ -31,7 +31,7 @@ const CHECKS = ['identity', 'phone', 'work', 'skills', 'shop', 'terms'];
    ใบรับรองฝีมือไม่บังคับ — ช่างเก่งจำนวนมากไม่มีใบ ทีมงานสัมภาษณ์ทักษะแทนได้ */
 const DOCS = [['id', 1, 1], ['selfie', 1, 1], ['shop', 1, 3], ['work', 3, 6], ['cert', 0, 2]];
 const PRIVATE_DOCS = ['id', 'selfie', 'cert'];
-const API_VERSION = 14;
+const API_VERSION = 15;
 const PHONE = /^0\d{8,9}$/;
 const now = () => Date.now();
 
@@ -120,6 +120,13 @@ const TECH_SQL = [
   uid    TEXT NOT NULL,
   last   INTEGER NOT NULL DEFAULT 0,   -- id ข้อความล่าสุดที่เห็น
   PRIMARY KEY (job_id, uid)
+)`,
+  /* Per-mechanic inbox preference only. Never delete or change the underlying job/evidence. */
+  `CREATE TABLE IF NOT EXISTS tech_job_archives (
+  uid TEXT NOT NULL, job_id TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0,
+  job_revision INTEGER NOT NULL, job_status TEXT NOT NULL,
+  changed_at INTEGER NOT NULL, generation INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY(uid, job_id)
 )`
 ];
 /* คอลัมน์ที่เพิ่มทีหลัง — ALTER ซ้ำจะ error ว่ามีอยู่แล้ว ซึ่งเป็นเรื่องปกติ ข้ามไปได้ */
@@ -1341,6 +1348,40 @@ export async function expireOpenJobs(env, max = 300) {
   return { expired: await expireJobs(env, results) };
 }
 
+const closedJob = j => j.status === 'completed' || j.status === 'cancelled';
+const jobArchived = (j, a) => !!(closedJob(j) && a?.archived && a.job_revision === j.revision && a.job_status === j.status);
+async function jobArchives(env, uid, ids) {
+  const rows = await inAll(env, 'SELECT job_id, archived, job_revision, job_status, generation FROM tech_job_archives WHERE uid = ? AND job_id IN ({IN})', ids, [uid]);
+  return Object.fromEntries(rows.map(a => [a.job_id, a]));
+}
+async function setJobArchive(env, me, b) {
+  if (!b || typeof b.archived !== 'boolean' || !Array.isArray(b.ids) || !b.ids.length || b.ids.length > 200 || b.ids.some(id => typeof id !== 'string' || !/^[0-9a-f-]{36}$/i.test(id))) fail(400, 'เลือกรายการงานให้ถูกต้อง ไม่เกิน 200 งาน');
+  const ids = [...new Set(b.ids)], archived = b.archived;
+  const owned = () => inAll(env, `SELECT j.id, j.status, j.revision FROM tech_jobs j JOIN tech_profiles p ON p.id = j.tech_id WHERE p.uid = ? AND j.id IN ({IN})`, ids, [me.uid]);
+  const rows = await owned();
+  // Staff/customer access to a job does not authorize changing its mechanic's inbox.
+  if (rows.length !== ids.length) fail(404, 'ไม่พบใบงาน');
+  if (archived && rows.some(j => !closedJob(j))) fail(409, 'ล้างได้เฉพาะงานที่เสร็จสมบูรณ์หรือยกเลิกแล้ว งานรอตรวจรับและข้อพิพาทยังล้างไม่ได้');
+  await limit(env, 'jobarchive', me.uid, 120);
+  const ts = now(), writes = [];
+  // Snapshot the selected revision/status; a concurrent reopen must not be hidden.
+  // 25 tuples plus four fixed values remain below D1's per-statement bind limit.
+  for (let i = 0; i < rows.length; i += 25) {
+    const part = rows.slice(i, i + 25);
+    writes.push(env.DB.prepare(`INSERT INTO tech_job_archives (uid, job_id, archived, job_revision, job_status, changed_at, generation)
+      SELECT ?, j.id, ?, j.revision, j.status, ?, 1 FROM tech_jobs j JOIN tech_profiles p ON p.id = j.tech_id
+      WHERE p.uid = ? AND (j.id, j.revision, j.status) IN (${part.map(() => '(?,?,?)').join(',')})
+      ON CONFLICT(uid, job_id) DO UPDATE SET archived = excluded.archived, job_revision = excluded.job_revision,
+        job_status = excluded.job_status, changed_at = excluded.changed_at, generation = tech_job_archives.generation + 1
+      WHERE tech_job_archives.archived != excluded.archived OR tech_job_archives.job_revision != excluded.job_revision OR tech_job_archives.job_status != excluded.job_status`)
+      .bind(me.uid, archived ? 1 : 0, ts, me.uid, ...part.flatMap(j => [j.id, j.revision, j.status])));
+  }
+  await env.DB.batch(writes);
+  const [current, state] = await Promise.all([owned(), jobArchives(env, me.uid, ids)]);
+  return { ok: true, jobs: current.map(j => ({ id: j.id, status: j.status, revision: j.revision,
+    archived: jobArchived(j, state[j.id]), archiveVersion: state[j.id]?.generation || 0 })) };
+}
+
 async function myJobs(env, me, myTech, all) {
   let q, args;
   if (all) { q = 'SELECT * FROM tech_jobs ORDER BY updated_at DESC LIMIT 200'; args = []; }
@@ -1353,11 +1394,12 @@ async function myJobs(env, me, myTech, all) {
   /* ถึงรอบตั้งเวลายังไม่กวาด คนที่เปิดรายการก็ต้องไม่เห็นคำขอ/ข้อเสนอที่หมดอายุค้างอยู่ */
   await expireJobs(env, results);
   const ids = results.map(r => r.id);
-  const [names, unread] = await Promise.all([
+  const [names, unread, archives] = await Promise.all([
     inAll(env, 'SELECT id, data FROM tech_profiles WHERE id IN ({IN})', [...new Set(results.map(r => r.tech_id))]),
     inAll(env, `SELECT m.job_id, COUNT(*) AS n FROM tech_messages m
       LEFT JOIN tech_reads r ON r.job_id = m.job_id AND r.uid = ?
       WHERE m.job_id IN ({IN}) AND m.uid != ? AND m.id > COALESCE(r.last, 0) GROUP BY m.job_id`, ids, [me.uid], [me.uid]),
+    myTech && !all ? jobArchives(env, me.uid, ids) : {},
   ]);
   const nm = Object.fromEntries(names.map(r => { const d = parse(r.data) || {}; return [r.id, d.shop || d.name]; }));
   const un = Object.fromEntries(unread.map(r => [r.job_id, r.n]));
@@ -1371,7 +1413,8 @@ async function myJobs(env, me, myTech, all) {
       group: j.group_id || null, total: q ? q.total : null, quoteAt:q?.at||null,revision:j.revision||0,
       car: j.car, symptom: j.symptom, createdAt: j.created_at, updatedAt: j.updated_at, urgent: !!j.urgent,
       side: cust && tech ? 'both' : cust ? 'customer' : tech ? 'technician' : 'admin',
-      needsMe, unread: un[j.id] || 0, expiresAt: j.expires_at || null, expired: wasExpired(j),cancelledBy:j.status==='cancelled'?cancellationActor(j.history):null };
+      needsMe, unread: un[j.id] || 0, expiresAt: j.expires_at || null, expired: wasExpired(j),cancelledBy:j.status==='cancelled'?cancellationActor(j.history):null,
+      archived: !!(tech && !all && jobArchived(j, archives[j.id])), archiveVersion: tech && !all ? archives[j.id]?.generation || 0 : 0 };
   });
 }
 
@@ -2379,12 +2422,13 @@ async function myPosts(env, me) {
    หน้า Studio ถามทุกไม่กี่วินาที (เบามาก) แล้วค่อยดึงรายการเต็มเฉพาะตอนมีอะไรใหม่ = เห็นงานเกือบทันที โดยไม่ยิงหนัก */
 async function pulse(env, me) {
   const shop = "(SELECT id FROM tech_profiles WHERE uid = ?)";
-  /* สี่คำถามยิงพร้อมกัน — รอเท่ากับอันที่ช้าที่สุดอันเดียว */
+  /* Queries run together; archive generations also update other signed-in devices. */
   const r = await Promise.all([
     env.DB.prepare(`SELECT COUNT(*) AS n, MAX(updated_at) AS m, SUM(revision) AS r FROM tech_jobs WHERE tech_id = ${shop} OR customer_uid = ?`).bind(me.uid, me.uid).first(),
     env.DB.prepare(`SELECT MAX(id) AS m FROM tech_messages WHERE job_id IN (SELECT id FROM tech_jobs WHERE (tech_id = ${shop} OR customer_uid = ?) AND status NOT IN ('completed','cancelled'))`).bind(me.uid, me.uid).first(),
     env.DB.prepare(`SELECT MAX(updated_at) AS m FROM tech_threads WHERE tech_id = ${shop} OR customer_uid = ?`).bind(me.uid, me.uid).first(),
     env.DB.prepare("SELECT COUNT(*) AS n, MAX(updated_at) AS m FROM tech_posts WHERE status = 'open' AND created_at > ?").bind(now() - POST_TTL).first(),
+    env.DB.prepare('SELECT SUM(generation) AS r FROM tech_job_archives WHERE uid = ?').bind(me.uid).first(),
   ]);
   const v = r.map(o => { o = o || {}; return (o.n ?? '') + ':' + (o.m ?? '') + ':' + (o.r ?? ''); }).join('|');
   return { v };
@@ -2930,6 +2974,7 @@ async function route(request, env, verifyToken) {
     return { jobs };
   }
   if (p === '/api/tech/jobs' && m === 'POST') return createJob(env, me, await body());
+  if (p === '/api/tech/jobs/archive' && m === 'POST') return setJobArchive(env, me, await body());
   if (p === '/api/tech/threads' && m === 'GET') return myThreads(env, me, url);
   if (p === '/api/tech/threads' && m === 'POST') return startThread(env, me, await body());
   const thm = p.match(/^\/api\/tech\/threads\/([0-9a-f-]{36})$/i);

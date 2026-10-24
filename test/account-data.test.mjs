@@ -32,6 +32,7 @@ function seed(db,uid,{shop=false,suspended=0}={}){
   const t=Date.now(),q=(sql,...a)=>db.prepare(sql).run(...a);
   q('INSERT INTO users (uid,name,email,role,last_login,created_at,banned) VALUES (?,?,?,?,?,?,0)',uid,'Name '+uid,uid+'@unit.test','user',t,t);
   q('INSERT INTO user_state VALUES (?,?,?,?)',uid,'chat','{"m":["hi"]}',t);
+  q('INSERT INTO tech_job_archives(uid,job_id,archived,job_revision,job_status,changed_at) VALUES (?,?,1,1,\'completed\',?)',uid,'archive-'+uid,t);
   q("INSERT INTO cars (id,uid,make,model,created_at) VALUES (?,?,'Honda','Civic',?)",'car-'+uid,uid,t);
   q("INSERT INTO odo_anchor (id,uid,car_id,km,source,observed_at,t) VALUES (?,?,?,1000,'manual',?,?)",'a-'+uid,uid,'car-'+uid,t,t);
   q("INSERT INTO maint_item (id,uid,car_id,part,t) VALUES (?,?,?,'oil',?)",'mi-'+uid,uid,'car-'+uid,t);
@@ -81,7 +82,7 @@ test('PDPA: ดาวน์โหลดข้อมูลของฉันไ�
   assert.equal(r.headers.get('Cache-Control'),'private, no-store');
   const d=r.json.data,raw=JSON.stringify(r.json);
   assert.equal(r.json.format,'cendon-account-export');
-  for(const t of ['users','user_state','cars','odo_anchor','maint_item','notify_state','obd_device','push_subs','feedback','line_link','line_chat','media','skills','tech_profiles','tech_applications','tech_docs','tech_gigs','tech_posts','car_spec_reports'])
+  for(const t of ['users','user_state','cars','odo_anchor','maint_item','notify_state','obd_device','push_subs','feedback','line_link','line_chat','media','skills','tech_profiles','tech_applications','tech_docs','tech_gigs','tech_posts','car_spec_reports','tech_job_archives'])
     assert.ok(d[t]&&d[t].length,'ต้องมีตาราง '+t);
   assert.deepEqual(d.user_state[0].v,{m:['hi']},'ค่า JSON แปลงกลับให้อ่านง่าย');
   assert.ok(!raw.includes('other@unit.test')&&!raw.includes('U-other'),'ไม่มีข้อมูลของคนอื่น');
@@ -149,7 +150,7 @@ test('PDPA: เจ้าของระบบลบบัญชีตัวเ�
   assert.equal(count(f.sqlite,"SELECT COUNT(*) n FROM line_chat WHERE line_uid='U-me'"),0);
   assert.equal(count(f.sqlite,"SELECT COUNT(*) n FROM media WHERE uid='me' AND scope='ai'"),0);
   assert.equal(count(f.sqlite,"SELECT COUNT(*) n FROM media WHERE uid='me' AND scope='thread:x'"),1,'ไฟล์ที่ส่งให้ช่างแล้วไม่ลบตอนรีเซ็ต');
-  for(const t of ['users','line_link','tech_profiles'])assert.equal(count(f.sqlite,`SELECT COUNT(*) n FROM ${t} WHERE uid='me'`),1,t);
+  for(const t of ['users','line_link','tech_profiles','tech_job_archives'])assert.equal(count(f.sqlite,`SELECT COUNT(*) n FROM ${t} WHERE uid='me'`),1,t);
 });
 
 test('PDPA: chat_logs ไม่เก็บข้อความแชต · คำตอบใช้ซ้ำไม่เก็บถ้ามีชื่อ/อีเมล/เบอร์ของคนถาม',async()=>{
