@@ -6,6 +6,8 @@
    โมเดลเลือกจาก GEMINI_SEARCH_MODEL (ค่าเริ่มต้น gemini-3.8-flash) แล้วถอยไป GEMINI_MODEL
    ถ้าชื่อโมเดลไหนใช้ไม่ได้ (404/400) จะรู้ภายในเสี้ยววินาทีแล้วข้ามไปตัวถัดไปเอง */
 
+import { configuredProviders, searchWeb, sourcesBlock, sourceCards } from './web-search.mjs';
+
 const DEFAULT_MODEL = 'gemini-3.1-flash-lite';
 
 /* โทเคนโดยประมาณของข้อความล่าสุดที่ผู้ใช้ส่ง (ตัวอักษร/3 + รูปละ 300) — ใช้คิดโควตา */
@@ -900,6 +902,14 @@ export async function executeSearchInternal(env, query) {
   const q = String(query || '').trim();
   if (!q) return '';
 
+  // 0. ตัวค้นแบบมีคีย์ (Tavily · Exa · Firecrawl — web-search.mjs) ถ้าตั้งไว้ ใช้ก่อน: ได้ผลพร้อมเลขอ้างอิง ไม่โดนบล็อกแบบ DuckDuckGo
+  if (configuredProviders(env).length) {
+    try {
+      const r = await searchWeb(env, q, { mode: 'fast' });
+      if (r.results.length) { console.log(`[search] สำเร็จด้วย ${r.providers.filter(p => p.ok).map(p => p.provider).join('+')}`); return sourcesBlock(r); }
+    } catch (e) { console.warn('[search] providers error:', e.message || e); }
+  }
+
   // 1. DuckDuckGo ค้นหาจริง
   try {
     const ddg = await fetchDuckDuckGoSearch(q);
@@ -967,7 +977,7 @@ export async function executeSearchInternal(env, query) {
 
 /* ══ ค้นเว็บแยกจาก Gemini ══
    Gemini Free Tier ใช้ Google Search ผ่าน API ไม่ได้ (429 ตั้งแต่ครั้งแรก) จึงค้นเองแล้วส่งผลให้โมเดลตอบ
-   ลำดับ: Tavily (ถ้ามี TAVILY_API_KEY) → Brave (BRAVE_API_KEY) → Google News RSS + Wikipedia (ฟรี ไม่ต้องมีคีย์) */
+   ลำดับ: ตัวค้นแบบมีคีย์ (Tavily/Exa/Firecrawl ใน web-search.mjs) → Brave (BRAVE_API_KEY) → Google News RSS + Wikipedia (ฟรี ไม่ต้องมีคีย์) */
 const WEB_CACHE = new Map();
 const unent = s => String(s || '').replace(/<!\[CDATA\[|\]\]>/g, '').replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&').replace(/&quot;/g, '"')
   .replace(/&#39;|&#x27;|&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
@@ -982,14 +992,13 @@ export async function webSearch(env, query, { max = 6, depth = 1 } = {}) {
   const hit = WEB_CACHE.get(ck); if (hit && hit.exp > Date.now()) return hit.v;
   const keep = v => { WEB_CACHE.set(ck, { v, exp: Date.now() + 600000 }); if (WEB_CACHE.size > 200) WEB_CACHE.delete(WEB_CACHE.keys().next().value); return v };
   const fmt = rows => rows.slice(0, max + 4).map(r => `- ${r.title}${r.date ? ' (' + r.date + ')' : ''}: ${r.snip} [${r.url}]`).join('\n');
-  try {
-    if (env.TAVILY_API_KEY) {
-      const r = await getT('https://api.tavily.com/search', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + env.TAVILY_API_KEY },
-        body: JSON.stringify({ query: q, max_results: max, include_answer: true, search_depth: 'basic' }) }, 8000);
-      if (r.ok) { const d = await r.json(); const rows = (d.results || []).map(x => ({ title: x.title, snip: String(x.content || '').slice(0, 300), url: x.url }));
-        if (rows.length) return keep({ text: (d.answer ? 'สรุป: ' + d.answer + '\n' : '') + fmt(rows), src: 'tavily' }); }
-    }
-  } catch (e) {}
+  /* ตัวค้นแบบมีคีย์ (web-search.mjs): depth 0 = เจ้าเดียวที่เร็วสุด · 1 = สองเจ้ารวมผล · 2 = ทุกเจ้าพร้อมเนื้อหาเต็มหน้า */
+  if (configuredProviders(env).length) {
+    try {
+      const r = await searchWeb(env, q, { mode: depth >= 2 ? 'deep' : depth <= 0 ? 'fast' : 'balanced', max });
+      if (r.results.length) return keep({ text: sourcesBlock(r), src: r.providers.filter(p => p.ok).map(p => p.provider).join('+'), sources: sourceCards(r), costUsd: r.costUsd });
+    } catch (e) {}
+  }
   try {
     if (env.BRAVE_API_KEY) {
       const r = await getT('https://api.search.brave.com/res/v1/web/search?count=' + max + '&q=' + encodeURIComponent(q), { headers: { Accept: 'application/json', 'X-Subscription-Token': env.BRAVE_API_KEY } });
