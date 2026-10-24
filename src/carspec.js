@@ -436,7 +436,7 @@ export async function logSpec(env, ev) {
     /* ตารางสร้างเองครั้งแรกที่ต้องใช้ ไม่ต้องรอเลื่อนรุ่นฐานข้อมูล */
     try { await ins(); } catch (e) { if (!/no such table/i.test(String(e && e.message))) throw e; await env.DB.prepare(LOG_TABLE).run(); await ins(); }
     if (Math.random() < 0.05) await env.DB.prepare('DELETE FROM spec_log WHERE id <= (SELECT MAX(id) - 300 FROM spec_log)').run();
-  } catch (e) { console.error('[spec_log]', e); }
+  } catch (e) { console.error('[spec_log]'); }
 }
 export async function specLogList(env, limit = 40) {
   try {
@@ -460,7 +460,7 @@ export async function ensureSpec(env, q, { who = 'ip:unknown', user = false, sta
       await env.DB.prepare('UPDATE car_specs SET hits = hits + 1 WHERE k = ?').bind(k).run();
       await note('cache', true, have.status);
       if (kind === 'spec' && defer && cached.status === 'ready' && cached.data && cached.data.depth !== DEPTH)
-        await deepen(env, k, v, have, defer, now).catch(e => console.error('[deepen]', e));
+        await deepen(env, k, v, have, defer, now).catch(e => console.error('[deepen]'));
       return cached;
     }
     if (have.status === 'pending' && now - have.updated_at < 180000) { await note('wait', true, 'pending', 'มีคนกำลังค้นรุ่นนี้อยู่ (เริ่ม ' + Math.round((now - have.updated_at) / 1000) + ' วิที่แล้ว)'); return row2out(have); }

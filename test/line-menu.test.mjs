@@ -43,7 +43,7 @@ test('LINE menu: admin sets six tiles (five open the app in the phone browser, o
 test('LINE menu: regular users cannot change it, and a LINE error sets nothing',async()=>{
   assert.equal((await setup().call('dev:u1:u1@unit.test','/api/admin/line/richmenu',{})).status,403);
   const {call,seen}=setup({failCreate:true});const r=await call(OWNER,'/api/admin/line/richmenu',{});
-  assert.equal(r.status,502);assert.match(r.error,/invalid area/);assert.ok(!seen.some(s=>s.u.includes('/user/all/richmenu')));
+  assert.equal(r.status,502);assert.match(r.error,/temporarily unavailable/);assert.doesNotMatch(r.error,/invalid area/,'raw provider replies stay private');assert.ok(!seen.some(s=>s.u.includes('/user/all/richmenu')));
 });
 
 test('LINE bot: a word like CENDON is not taken as a link code (it goes to the AI); new followers learn how to connect',async()=>{

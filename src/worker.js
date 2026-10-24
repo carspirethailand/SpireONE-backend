@@ -1,4 +1,6 @@
-import { verifyFirebaseToken, firebaseProjects } from './auth.js';
+import { verifyFirebaseToken, firebaseProjects, localTestIdentity } from './auth.js';
+import {workspacePolicy,WorkspaceError} from './workspace-policy.mjs';
+import {requestJson,requestText,RequestBodyError} from './request-json.mjs';
 import {languageRule} from './ai-language.mjs';
 import { EMAIL_AUTH_SQL, handleEmailAuth, deleteFirebaseUser } from './email-auth.js';
 import { displayRates } from './display-rates.js';
@@ -120,7 +122,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                 });
                 text = r.text;
               } catch (e) {
-                console.error('[stream fast]', e.message);
+                console.error('[stream fast] request_failed');
                 noteAiError(env, e);
                 const errMsg = 'ขออภัยครับ ขณะนี้ระบบประมวลผล AI กำลังมีผู้ใช้งานหนาแน่น กรุณาลองใหม่อีกครั้งในอีกสักครู่ครับ';
                 if (firstText) {
@@ -145,8 +147,8 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
               logAiEvent(env, { uid, ok: true, ms: Date.now() - t0, model: okStep ? okStep.model + (okStep.grounded ? ' +ค้นเว็บ' : '') : (meter.src || []).join(','),
                 trail: meter.trail, q: question, depth: body.depth, cost: meter.in + meter.out });
             } catch (err) {
-              console.error('[stream]', err);
-              await send({ type: 'error', message: String((err && err.message) || err).slice(0, 200) });
+              console.error('[stream] request_failed');
+              await send({ type: 'error', message: 'AI is temporarily unavailable. Please retry.' });
               logAiEvent(env, { uid, ok: false, ms: Date.now() - t0, model: '', trail: meter && meter.trail, err: String((err && err.message) || err), q: question, depth: body.depth });
             }
 
@@ -165,7 +167,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                     meter.in, meter.out, meter.in + meter.out,
                     (meter.src && meter.src.join(',')) || 'stream', day, Date.now()).run(),
                 ]);
-              } catch (e) { console.error('[stream save]', e) }
+              } catch (e) { console.error('[stream save]') }
             }
 
 }
@@ -300,10 +302,7 @@ async function getAuthenticatedUser(request, env) {
   const projects = firebaseProjects(env);
   if (!projects.length) throw new Error('FIREBASE_PROJECT_ID is not configured');
   /* ทดสอบในเครื่องเท่านั้น (DEV_AUTH ไม่มีในเซิร์ฟเวอร์จริง) — ใช้แบบเดียวกับ techs.js */
-  if (env.DEV_AUTH === '1' && token.startsWith('dev:')) {
-    const [, sub, email] = token.split(':');
-    return { sub, email, email_verified: true, name: email.split('@')[0] };
-  }
+  const local=localTestIdentity(request,env,token);if(local)return local;
   return await verifyFirebaseToken(token, projects);
 }
 
@@ -920,7 +919,7 @@ async function meterTokens(env, uid, meter) {
       ON CONFLICT(uid, win) DO UPDATE SET
         in_tok = in_tok + ?, out_tok = out_tok + ?
     `).bind(uid, winKey(), meter.in, meter.out, meter.in, meter.out).run();
-  } catch (e) { console.error('[usage_win] write failed', e); }
+  } catch (e) { console.error('[usage_win] write failed'); }
   return row || { count: 0, in_tok: 0, out_tok: 0 };
 }
 
@@ -1188,7 +1187,7 @@ async function callReasoningModel(env, messages, meter) {
         try {
           data = JSON.parse(resText);
         } catch (e) {
-          console.error(`[OpenRouter] Failed to parse JSON response: ${resText}`);
+          console.error('[OpenRouter] Invalid provider response');
           throw e;
         }
 
@@ -1240,16 +1239,16 @@ async function callReasoningModel(env, messages, meter) {
               const c2 = (typeof m2.content === 'string' ? m2.content : '').trim();
               if (c2) return { text: c2, reasoning };
             }
-          } catch (e) { console.error('[OpenRouter retry]', e) }
+          } catch (e) { console.error('[OpenRouter retry]') }
         }
-        console.warn(`[OpenRouter] Empty content & reasoning in choices payload:`, JSON.stringify(data));
+        console.warn('[OpenRouter] Empty response');
       } else {
-        console.error(`[OpenRouter Error ${res.status}]: ${resText}`);
+        console.error('[OpenRouter] provider_http_error',res.status);
       }
       
       console.warn(`[OpenRouter] Call failed (Status ${res.status}). Falling back to Cloudflare Workers AI...`);
     } catch (err) {
-      console.error(`[OpenRouter Exception]: ${err.message}`, err.stack);
+      console.error('[OpenRouter] request_failed');
       console.warn(`Falling back to Cloudflare Workers AI...`);
     }
   } else {
@@ -1260,7 +1259,7 @@ async function callReasoningModel(env, messages, meter) {
   try {
     return { text: await callWorkersAI(env, messages, meter), reasoning: '' };
   } catch (err) {
-    console.error(`[Cloudflare Workers AI Fallback Failed]: ${err.message}`);
+    console.error('[Cloudflare Workers AI] request_failed');
     throw new Error(`Reasoning failure (OpenRouter failed & Cloudflare Workers AI fallback failed: ${err.message})`);
   }
 }
@@ -1449,7 +1448,7 @@ async function skillsPrompt(env, uid, ids) {
         `SELECT name, body FROM skills WHERE id IN (${marks}) AND (uid = ? OR status = 'public')`
       ).bind(...custom, uid).all();
       (rs.results || []).forEach((r) => picked.push({ name: r.name, body: r.body }));
-    } catch (e) { console.error('[skillsPrompt] load failed', e); }
+    } catch (e) { console.error('[skillsPrompt] load failed'); }
   }
   if (!picked.length) return '';
   return '\n\n[สกิลที่ผู้ใช้เลือกใช้ในข้อความนี้ (สำคัญมาก ต้องทำตาม)]\n'
@@ -1516,65 +1515,18 @@ function hashOf(t) {
    ตรงเป๊ะใช้ได้เลย ใกล้เคียงมากกว่า 0.82 ก็ถือว่าเป็นคำถามเดียวกัน
    ผู้ใช้เคยกดว่าคำตอบไม่ดี (bad) จะไม่ถูกหยิบมาใช้ซ้ำอีก */
 async function cacheLookup(env, carInfo, question) {
-  const make = String(carInfo.make || '').toLowerCase();
-  const model = String(carInfo.model || '').toLowerCase();
-  if (!make && !model) return null;                 /* ไม่รู้รุ่นรถ ไม่กล้าใช้ซ้ำ */
-  const qn = normQ(question);
-  if (qn.length < 6) return null;
-  try {
-    const exact = await env.DB.prepare(
-      'SELECT * FROM qa_cache WHERE make = ? AND model = ? AND qhash = ? AND bad < 2'
-    ).bind(make, model, hashOf(qn)).first();
-    if (exact) return exact;
-    const rs = await env.DB.prepare(
-      'SELECT * FROM qa_cache WHERE make = ? AND model = ? AND bad < 2 ORDER BY used_at DESC LIMIT 60'
-    ).bind(make, model).all();
-    let best = null, bestScore = 0;
-    for (const r of (rs.results || [])) {
-      const sc = similar(qn, r.qnorm);
-      if (sc > bestScore) { bestScore = sc; best = r }
-    }
-    return bestScore >= 0.82 ? best : null;
-  } catch (e) { console.error('[cacheLookup]', e); return null }
+  // A generated answer may contain parking locations, symptoms or other private
+  // details even without names/numbers. Regex redaction cannot make it shareable.
+  // Keep legacy rows for the owner's review, but never serve them to another user.
+  return null;
 }
 
 /* คำตอบที่เก็บไว้ตอบซ้ำ "ใช้ร่วมกับทุกคนที่ใช้รถรุ่นเดียวกัน" — ห้ามมีอะไรระบุตัวคนถามติดไปเด็ดขาด
    มีเบอร์ อีเมล เลขบัตร/เลขยาว หรือชื่อ/อีเมลของเจ้าของบัญชี (AI ถูกบอกให้เรียกชื่อผู้ใช้) = ไม่เก็บ */
-const CACHE_PII = /(\+?\d[\d\s-]{7,}\d)|([\w.+-]+@[\w-]+\.[\w.]+)|(line\s*id|ไลน์ไอดี)/i;
 async function cacheSave(env, carInfo, question, answer, uid) {
-  const make = String(carInfo.make || '').toLowerCase();
-  const model = String(carInfo.model || '').toLowerCase();
-  if (!make && !model) return;
-  const qn = normQ(question);
-  if (qn.length < 6 || !answer || answer.length < 40) return;
-  /* คำตอบที่ยังถามข้อมูลเพิ่มอยู่ ไม่ใช่คำตอบจบ อย่าเก็บไว้ใช้ซ้ำ · คำสั่ง Valet เป็นของบัญชีนั้นคนเดียว */
-  if (/\[\[(ASK|ACT)\]\]/.test(answer)) return;
-  if (CACHE_PII.test(question) || CACHE_PII.test(answer)) return;
-  if (uid) {
-    try {
-      const [u, st] = await Promise.all([
-        env.DB.prepare('SELECT name, email FROM users WHERE uid = ?').bind(uid).first(),
-        env.DB.prepare("SELECT v FROM user_state WHERE uid = ? AND k = 'setup'").bind(uid).first(),
-      ]);
-      let nick = ''; try { nick = (JSON.parse((st && st.v) || '{}') || {}).name || ''; } catch {}
-      const marks = [u && u.name, u && u.email, u && String(u.email || '').split('@')[0], nick]
-        .flatMap(x => [String(x || '').trim(), ...String(x || '').trim().split(/\s+/)])
-        .filter(x => x.length >= 2).map(x => x.toLowerCase());
-      const hay = (String(question) + '\n' + String(answer)).toLowerCase();
-      if (marks.some(m => hay.includes(m))) return;
-    } catch (e) { return; }   /* ตรวจไม่ได้ = ไม่เสี่ยง ไม่เก็บ */
-  }
-  const now = Date.now();
-  try {
-    await env.DB.prepare(`
-      INSERT INTO qa_cache (id, make, model, qhash, qnorm, question, answer, hits, created_at, used_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
-      ON CONFLICT(make, model, qhash) DO UPDATE SET
-        answer = excluded.answer, used_at = excluded.used_at
-    `).bind('qa_' + now.toString(36) + Math.random().toString(36).slice(2, 6),
-      make, model, hashOf(qn), qn, String(question).slice(0, 500),
-      String(answer).slice(0, 6000), now, now).run();
-  } catch (e) { console.error('[cacheSave]', e) }
+  // Automatic conversations are account-private. Only explicitly curated kb
+  // records may become shared knowledge; do not collect a new global Q/A cache.
+  return;
 }
 
 /* ── ความรู้ที่ทีมงานสอนไว้ ──
@@ -1611,7 +1563,7 @@ async function kbFor(env, carInfo, question) {
     } catch (e) {}
     return '\n\n[ความรู้จากคลังของ Cendon (เชื่อถือได้ ใช้ก่อนความรู้ทั่วไปของคุณเสมอ)]\n'
       + top.map(([, r]) => `— ${r.title} —\n${String(r.body).slice(0, 2500)}`).join('\n\n');
-  } catch (e) { console.error('[kbFor]', e); return '' }
+  } catch (e) { console.error('[kbFor]'); return '' }
 }
 
 /* ── ข้อมูลผู้ใช้ทั้งหมดที่ AI ควรรู้ ──
@@ -1671,7 +1623,7 @@ async function chatSpecContext(env, uid, carId, carInfo, question) {
     /* งานซ่อมจริงใน Cendon ที่จบพร้อมหลักฐาน รุ่นเดียวกัน อาการคล้ายกัน (ไม่มีข้อมูลเจ้าของรถ) */
     const fixes = await verifiedFixes(env, carInfo, question);
     return (own ? '\n' + own : '') + spec + fixes;
-  } catch (e) { console.error('[chat spec]', e && e.message); return ''; }
+  } catch (e) { console.error('[chat spec]'); return ''; }
 }
 
 async function userContext(env, uid, carId, hint) {
@@ -1764,7 +1716,7 @@ async function rememberTurn(env, uid, carId, question, answer) {
       DELETE FROM user_memory WHERE uid = ? AND id NOT IN (
         SELECT id FROM user_memory WHERE uid = ? ORDER BY created_at DESC LIMIT 40)
     `).bind(uid, uid).run();
-  } catch (e) { console.error('[rememberTurn]', e) }
+  } catch (e) { console.error('[rememberTurn]') }
 }
 
 /* ── คำถามแบบไหนที่ห้ามตอบจากความจำของโมเดล ──
@@ -1850,7 +1802,7 @@ async function streamModel(env, messages, meter, send) {
   });
   if (!res.ok || !res.body) {
     const txt = await res.text().catch(() => '');
-    console.error('[stream model]', res.status, txt.slice(0, 200));
+    console.error('[stream model]', res.status);
     const r = await callReasoningModel(env, messages, meter);
     const t = (r && r.text) || '';
     if (r && r.reasoning) await send({ type: 'reasoning', delta: r.reasoning });
@@ -1895,7 +1847,7 @@ async function runReActAgent(env, carInfo, messages, meter, style, customStyle, 
     ? `\nรถของผู้ใช้: ${carInfo.make || ''} ${carInfo.model || ''} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` 
     : '';
 
-  console.log(`[ReAct Agent] Injected vehicle context: ${carContext ? carContext.trim() : '(None)'}`);
+  console.log('[ReAct Agent] vehicle_context_present',!!carContext);
 
   const appliedStylePrompt = stylePrompt(style, customStyle);
   /* สกิลที่ผู้ใช้เลือกด้วย / ในช่องพิมพ์ ต้องมาก่อนน้ำเสียง
@@ -2109,9 +2061,9 @@ async function logAiEvent(env, ev) {
     }
     await env.DB.prepare('INSERT INTO ai_events (at, uid, ok, ms, model, trail, err, q, depth, cost) VALUES (?,?,?,?,?,?,?,?,?,?)')
       .bind(Date.now(), String(ev.uid || '').slice(0, 10), ev.ok ? 1 : 0, ev.ms | 0, String(ev.model || '').slice(0, 80),
-        JSON.stringify(ev.trail || []).slice(0, 4000), String(ev.err || '').slice(0, 400), String(ev.q || '').slice(0, 80), ev.depth == null ? 1 : +ev.depth, ev.cost | 0).run();
+        JSON.stringify((ev.trail||[]).slice(0,20).map(x=>({model:String(x.model||'').replace(/[^a-z0-9_./ -]/gi,'').slice(0,80),ok:!!x.ok,status:Number(x.status)||null}))), ev.err?'provider_unavailable':'', '', ev.depth == null ? 1 : +ev.depth, ev.cost | 0).run();
     if (Math.random() < 0.05) await env.DB.prepare('DELETE FROM ai_events WHERE id <= (SELECT MAX(id) - 300 FROM ai_events)').run();
-  } catch (e) { console.error('[ai_events]', e) }
+  } catch (e) { console.error('[ai_events]') }
 }
 
 /* จดสาเหตุล่าสุดที่ Gemini ใช้ไม่ได้ — ให้เจ้าของเห็นในหน้าตรวจระบบ จะได้รู้ว่าติดคีย์ โควตา หรือชื่อรุ่น
@@ -3528,7 +3480,7 @@ async function runKmRound(env, now = Date.now()) {
         }
       }
       await env.DB.prepare('UPDATE km_remind SET sent_day = ? WHERE uid = ?').bind(day, uid).run();
-    } catch (e) { console.error('[km remind]', e && e.message); }
+    } catch (e) { console.error('[km remind]'); }
   }
 }
 
@@ -4044,9 +3996,9 @@ export default {
     if (url.pathname === '/api/display-rates') return displayRates(request,cors);
 
     const json = (data, status = 200) => new Response(JSON.stringify(data), {
-      status, headers: { ...cors, 'Content-Type': 'application/json' },
+      status, headers: { ...cors, 'Content-Type': 'application/json',...(request.headers.has('Authorization')?{'Cache-Control':'private, no-store','Vary':'Authorization, Origin'}:{}) },
     });
-    const deny = (msg, status) => {const r=json({error:msg},status);r.headers.set('Cache-Control','private, no-store');r.headers.set('Vary','Authorization, Origin');return r};
+    const deny = (msg, status) => {const safe=status===500||status===502?'The service is temporarily unavailable':msg;const r=json({error:safe},status);r.headers.set('Cache-Control','private, no-store');r.headers.set('Vary','Authorization, Origin');return r};
     const privateJson = data => {const r=json(data);r.headers.set('Cache-Control','private, no-store');r.headers.set('Vary','Authorization, Origin');return r};
 
     if (!env.DB) return deny('Database is not configured', 500);
@@ -4076,10 +4028,13 @@ export default {
       if (actor.banned) return deny('Account suspended', 403);
       if (rank(actor.role) < rank(minRole)) return deny('Forbidden: insufficient role', 403);
       try { return await handler(actor); }
-      catch (e) { return deny(e.message || 'Server error', 500); }
+      catch (e) {
+        if(e instanceof WorkspaceError||e instanceof RequestBodyError)return deny(e.message,e.status);
+        return deny('The service is temporarily unavailable', 500);
+      }
     };
 
-    const readBody = async () => { try { return await request.json(); } catch { return null; } };
+    const readBody = () => requestJson(request,/^\/api\/(ai|features|analyze)(\/|$)/.test(url.pathname)?20*1024*1024:4*1024*1024);
 
     try {
 
@@ -4180,7 +4135,7 @@ export default {
       /* webhook — ต้องไม่ผ่าน guarded เพราะ LINE ไม่มี token ของเรา
          มันพิสูจน์ตัวเองด้วยลายเซ็น HMAC ของ body ดิบแทน */
       if (url.pathname === '/api/line/webhook' && request.method === 'POST') {
-        const raw = await request.text();
+        const raw = await requestText(request,1024*1024);
         const sig = request.headers.get('X-Line-Signature') || '';
         /* บันทึกไว้ให้หน้าแอดมินบอกได้ว่า LINE ส่งมาถึงไหม และลายเซ็นผ่านไหม */
         if (!(await lineVerify(env, raw, sig))) {
@@ -4301,7 +4256,7 @@ export default {
       /* ทางเข้าข้อมูลจาก dongle — ไม่มี Firebase token เพราะไม่ใช่คน
          พิสูจน์ตัวด้วย HMAC ของ body ด้วย secret ที่ผูกไว้ตอน pair */
       if (url.pathname === '/api/obd/ingest' && request.method === 'POST') {
-        const raw = await request.text();
+        const raw = await requestText(request,64*1024);
         let b = null;
         try { b = JSON.parse(raw); } catch (e) { return deny('Bad JSON', 400); }
         if (!b || !b.deviceId) return deny('deviceId required', 400);
@@ -4613,40 +4568,43 @@ export default {
            nda_ / lgl_ = ลงนามได้เฉพาะชื่อตัวเอง · vc_ (อยู่ในห้องโทร) = ของตัวเองเท่านั้น */
       if ((url.pathname === '/api/ws' || url.pathname.startsWith('/api/ws/')) && ['GET', 'POST', 'DELETE'].includes(request.method)) {
         return await guarded('moderator', async (actor) => {
-          const uid = actor.payload.sub, admin = rank(actor.role) >= rank('admin');
-          const KIND = /^(pos|nda|lgl|vc|sig|mt|msg|ch|hb)_[A-Za-z0-9ก-๙:_.-]{1,160}$/;
-          const allowed = id => {
-            if (!KIND.test(id)) return false;
-            if (/^(pos|hb)_/.test(id)) return admin;
-            if (/^(nda|lgl)_/.test(id)) return admin || id.slice(4) === uid;
-            if (/^vc_/.test(id)) return admin || id.endsWith('__' + uid);
-            return true;
-          };
+          const all = await env.DB.prepare('SELECT * FROM ws_store ORDER BY updated_at DESC LIMIT 2000').all();
+          const context = await env.DB.prepare("SELECT * FROM ws_store WHERE substr(id,1,4) = 'pos_' OR substr(id,1,3) = 'ch_'").all();
+          const people = await env.DB.prepare("SELECT uid, name, email FROM users WHERE role IN ('moderator','admin','owner')").all();
+          // The owner may be configured by verified email without a users row yet.
+          if(!people.results.some(u=>u.uid===actor.payload.sub))people.results.push({uid:actor.payload.sub,name:actor.payload.name,email:actor.email});
+          const records=[...new Map([...(all.results||[]),...(context.results||[])].map(r=>[r.id,r])).values()];
+          const policy=workspacePolicy(actor,records,people.results);
           if (request.method === 'GET') {
             const pre = url.searchParams.get('prefix') || '';
-            const rs = /^[a-z]{2,3}_$/.test(pre)
-              ? await env.DB.prepare('SELECT * FROM ws_store WHERE id >= ? AND id < ? ORDER BY updated_at DESC LIMIT 2000').bind(pre, pre.slice(0, -1) + '`').all()
-              : await env.DB.prepare('SELECT * FROM ws_store ORDER BY updated_at DESC LIMIT 2000').all();
             /* คีย์ kb = รูปแบบเดียวกับ /api/kb หน้าแอดมิน/คู่มือใช้ตัวอ่านเดิมได้ */
-            return json({ kb: rs.results || [] });
+            return privateJson({ kb: records.filter(r=>(!pre||/^[a-z]{2,3}_$/.test(pre)&&r.id.startsWith(pre))&&policy.read(r)) });
           }
           if (request.method === 'DELETE') {
             const id = decodeURIComponent(url.pathname.slice('/api/ws/'.length));
-            /* แอดมินลบได้ทุกแถว (รวมของที่เคยนำเข้าผิดรหัส) · ที่เหลือลบได้ตามสิทธิ์เขียน */
-            if (!admin && !allowed(id)) return deny('Forbidden', 403);
+            const row=records.find(r=>r.id===id)||await env.DB.prepare('SELECT * FROM ws_store WHERE id = ?').bind(id).first();
+            if(!row)return privateJson({ok:true});
+            if (!policy.remove(row)) return deny('Forbidden', 403);
             await env.DB.prepare('DELETE FROM ws_store WHERE id = ?').bind(id).run();
             return json({ ok: true });
           }
-          const b = (await readBody()) || {};
+          const input = (await readBody()) || {};
+          if(input.id&&!records.some(r=>r.id===input.id)){
+            const existing=await env.DB.prepare('SELECT * FROM ws_store WHERE id = ?').bind(String(input.id)).first();
+            if(existing)records.push(existing);
+          }
+          const b = workspacePolicy(actor,records,people.results).write(input);
           const id = String(b.id || '');
-          if (!allowed(id)) return deny('Forbidden', 403);
+          const previous=records.find(r=>r.id===id);
           const now = Date.now();
-          await env.DB.prepare(`INSERT INTO ws_store (id, title, body, keywords, make, model, author, enabled, created_at, updated_at)
+          const saved=await env.DB.prepare(`INSERT INTO ws_store (id, title, body, keywords, make, model, author, enabled, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
             ON CONFLICT(id) DO UPDATE SET title = excluded.title, body = excluded.body, keywords = excluded.keywords,
-              make = excluded.make, model = excluded.model, updated_at = excluded.updated_at`)
+              make = excluded.make, model = excluded.model, updated_at = excluded.updated_at
+              WHERE ws_store.updated_at = ? AND ws_store.author = ?`)
             .bind(id, String(b.title || '').slice(0, 200), String(b.body || '').slice(0, 20000), String(b.keywords || '').slice(0, 4000),
-              String(b.make || '').slice(0, 60), String(b.model || '').slice(0, 60), actor.email || '', now, now).run();
+              String(b.make || '').slice(0, 60), String(b.model || '').slice(0, 60), actor.email || '', now, now,previous?.updated_at??null,previous?.author??null).run();
+          if(saved.meta?.changes===0)return deny('Workspace record changed; refresh and retry',409);
           /* สัญญาณโทร/สถานะในห้องโทรที่ค้างเกินวัน ทิ้งไปเอง ไม่ให้ตารางบวม */
           if (/^(sig|vc)_/.test(id)) await env.DB.prepare("DELETE FROM ws_store WHERE substr(id, 1, instr(id, '_')) IN ('sig_','vc_') AND updated_at < ?").bind(now - 86400000).run();
           if (/^(pos|hb|nda|lgl)_/.test(id)) await logAudit(env, actor.email, 'ws.save', id, String(b.title || '').slice(0, 60));
@@ -4724,7 +4682,7 @@ export default {
                 String(it.keywords || '').slice(0, 400), make, model,
                 actor.email || '', now, now).run();
               if (old) updated++; else added++;
-            } catch (e) { console.error('[kb bulk]', e); skipped++ }
+            } catch (e) { console.error('[kb bulk]'); skipped++ }
           }
           await logAudit(env, actor.email, 'kb.bulk', String(items.length), `+${added} ~${updated} x${skipped}`);
           return json({ ok: true, added, updated, skipped });
@@ -5195,15 +5153,15 @@ export default {
           if (quota0 && quota0.used >= quota0.limit) return json({ error: 'quota', quota: quota0 }, 429);
 
           let carInfo = { make: '', model: '', year: '', mileage: '' };
-          console.log(`[AI Chat] Received request with carId: ${body.carId || 'None'} for UID: ${actor.payload.sub}`);
+          console.log('[AI Chat] request_received');
           if (body.carId && actor.payload.sub && env.DB) {
             const car = await env.DB.prepare('SELECT make, model, year, mileage FROM cars WHERE id = ? AND uid = ?')
               .bind(String(body.carId), actor.payload.sub).first();
             if (car) {
               carInfo = car;
-              console.log(`[AI Chat] Car details found in D1:`, JSON.stringify(carInfo));
+              console.log('[AI Chat] saved_vehicle_found');
             } else {
-              console.warn(`[AI Chat] carId ${body.carId} requested but no matching record found in D1 for UID ${actor.payload.sub}`);
+              console.warn('[AI Chat] saved_vehicle_not_found');
             }
           }
           
@@ -5225,7 +5183,7 @@ export default {
               mileage: body.mileage != null ? String(body.mileage).slice(0, 12) : '',
             };
             if (carInfo.make || carInfo.model) {
-              console.log(`[AI Chat] Used fallback car details from request body:`, JSON.stringify(carInfo));
+              console.log('[AI Chat] request_vehicle_context_used');
             } else {
               console.log(`[AI Chat] No car details available from D1 or request body`);
             }
@@ -5302,7 +5260,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
               });
               agentOut = { text: cleanReply(r.text), reasoning: (r.thoughts || '').slice(0, 6000) };
             } catch (e) {
-              console.error('[chat fast]', e.message);
+              console.error('[chat fast] request_failed');
               noteAiError(env, e);
               agentOut = { text: 'ขออภัยครับ ขณะนี้ระบบประมวลผล AI กำลังมีผู้ใช้งานหนาแน่น กรุณาลองใหม่อีกครั้งในอีกสักครู่ครับ', reasoning: '' };
             }
@@ -5313,7 +5271,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
               if (!hasMedia && !(body.skillIds && body.skillIds.length) && !needsFresh(question))
                 await cacheSave(env, carInfo, question, text, actor.payload.sub);
               await rememberTurn(env, actor.payload.sub, body.carId, question, text);
-            } catch (e) { console.error('[learn]', e) }
+            } catch (e) { console.error('[learn]') }
             
             let usage = null;
             try {
@@ -5331,11 +5289,11 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                 INSERT INTO chat_logs (uid, car_id, prompt, response, in_tok, out_tok, total_tok, model, day, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
               `).bind(actor.payload.sub, body.carId || null, '', '', meter.in, meter.out, (meter.in + meter.out), modelName, day, now).run();
-            } catch (e) { console.error('[meter/chat_logs] write failed', e); }
+            } catch (e) { console.error('[meter/chat_logs] write failed'); }
             return json({ text, reasoning, usage });
           } catch (err) {
-            console.error('[AI Chat Route Error]:', err);
-            return deny(err.message || 'AI processing error', 500);
+            console.error('[AI Chat] request_failed');
+            return deny('AI is temporarily unavailable. Please retry.', 500);
           }
         })();
       }
@@ -5361,7 +5319,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
               || parseInt(env.AI_LIVE_CALL_TOKENS || '6000', 10);
             try {
               await meterTokens(env, actor.payload.sub, { in: 0, out: Math.round(est / OUT_WEIGHT), calls: 1, src: ['live'] });
-            } catch (e) { console.error('[meter] live write failed', e); }
+            } catch (e) { console.error('[meter] live write failed'); }
           }
 
           const geminiKey = env.GEMINI_KEY;
@@ -6517,6 +6475,7 @@ ${convo}`;
 
       return deny('Not Found', 404);
     } catch (err) {
+      if(err instanceof RequestBodyError)return deny(err.message,err.status);
       return deny('Server error', 500);
     }
   },
@@ -6530,11 +6489,11 @@ ${convo}`;
        hourly schedule (before the early return below) so a missed webhook cannot strand an applicant. */
     ctx.waitUntil(reconcileDiditIdentities(env).catch(() => {}));
     /* ตู้เซฟใบสมัคร: เข้ารหัสแถวรุ่นเก่าที่ยังอ่านออก / เข้ารหัสใหม่หลังเปลี่ยนกุญแจ (ทีละชุด ทุกชั่วโมง) */
-    ctx.waitUntil(vaultSweep(env).catch(e => console.error('vault sweep', e && e.message)));
+    ctx.waitUntil(vaultSweep(env).catch(e => console.error('vault sweep')));
     /* ร้านที่ถูกพักผิดเพราะ session Didit ค้าง → เปิดกลับ (ไม่แตะการพักของทีมงาน) */
-    ctx.waitUntil(releaseWrongHolds(env).catch(e => console.error('release holds', e && e.message)));
+    ctx.waitUntil(releaseWrongHolds(env).catch(e => console.error('release holds')));
     /* คำขอ/ข้อเสนอที่หมดอายุ (งานด่วน 3 ชม. · ไม่มีใครตอบ 48 ชม. · ใบเสนอราคา 7 วัน) → ระบบยกเลิกให้ ไม่ค้างในรายการของใคร */
-    ctx.waitUntil(expireOpenJobs(env).catch(e => console.error('expire jobs', e && e.message)));
+    ctx.waitUntil(expireOpenJobs(env).catch(e => console.error('expire jobs')));
     /* นิตยสาร: เช็กทุกชั่วโมง อัปเดตจริงทุก 5 ชั่วโมง (รอบของตัวเอง ไม่พ่วงงานหนักรายวัน) */
     if (event.cron === NEWS_CRON) { ctx.waitUntil(refreshNews(env)); return; }
     /* 18:00 เวลาไทย: เตือนจดเลขไมล์ (เฉพาะคนที่เปิดไว้) */
@@ -6544,7 +6503,7 @@ ${convo}`;
       ctx.waitUntil(runOdoRound(env));
       ctx.waitUntil(refreshKb(env).catch(() => {}));
       /* ใบสมัครช่างค้างรอตรวจเกิน 30 วัน: หมดอายุ ลบรูปบัตรทิ้ง แจ้งให้ส่งใหม่ */
-      ctx.waitUntil(expireStaleApplications(env).catch(e => console.error('expire apps', e && e.message)));
+      ctx.waitUntil(expireStaleApplications(env).catch(e => console.error('expire apps')));
     }
   }
 };

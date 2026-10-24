@@ -14,7 +14,7 @@ function setup(extra={}){
   const put=async(token,id,bytes,mime,scope)=>{const r=await handleTech(new Request(`https://unit.test/api/tech/media/${id}${scope?'?scope='+scope:''}`,{method:'PUT',headers:{Authorization:'Bearer '+token,'Content-Type':mime},body:bytes}),
     f.env,undefined,{verifyToken});return {...await r.json(),status:r.status};};
   const get=async(token,id)=>{const r=await handleTech(new Request('https://unit.test/api/tech/media/'+id,{headers:{Authorization:'Bearer '+token}}),f.env,undefined,{verifyToken});
-    return {status:r.status,type:r.headers.get('Content-Type'),bytes:r.status===200?new Uint8Array(await r.arrayBuffer()):null};};
+    return {status:r.status,type:r.headers.get('Content-Type'),headers:r.headers,bytes:r.status===200?new Uint8Array(await r.arrayBuffer()):null};};
   const del=async(token,id)=>{const r=await handleTech(new Request('https://unit.test/api/tech/media/'+id,{method:'DELETE',headers:{Authorization:'Bearer '+token}}),f.env,undefined,{verifyToken});return {...await r.json(),status:r.status};};
   return {f,call,put,get,del};
 }
@@ -32,6 +32,8 @@ test('media: AI chat files are stored for good and only the owner can open them'
   assert.equal(r.status,200);assert.equal(r.kind,'image');assert.equal(r.size,img.length);
   const back=await get(USER,'m_ai_photo_001');
   assert.equal(back.status,200);assert.equal(back.type,'image/png');assert.ok(same(back.bytes,img),'same bytes come back');
+  assert.match(back.headers.get('Cache-Control'),/no-store/);assert.match(back.headers.get('Vary'),/Authorization/);
+  assert.equal((await get(ADMIN_T,'m_ai_photo_001')).status,404,'staff cannot read owner-only AI files');
   assert.equal((await get(OTHER,'m_ai_photo_001')).status,404,'nobody else can open an AI chat file');
   assert.equal((await put(USER,'m_ai_photo_001',img,'image/png','ai')).existed,true,'retrying an upload does not duplicate it');
   assert.equal((await put(OTHER,'m_ai_photo_001',img,'image/png','ai')).status,409,'another account cannot overwrite it');
@@ -39,6 +41,19 @@ test('media: AI chat files are stored for good and only the owner can open them'
   assert.equal((await put(USER,'bad id',img,'image/png','ai')).status,400);
   assert.equal((await del(USER,'m_ai_photo_001')).status,200);
   assert.equal((await get(USER,'m_ai_photo_001')).status,404,'deleted for real');
+});
+
+test('media: simultaneous uploads cannot replace bytes across accounts, including R2 in-flight files',async()=>{
+  const store=new Map();let release,entered;
+  const started=new Promise(r=>entered=r);
+  const MEDIA={async put(k,v){entered();await new Promise(r=>release=r);store.set(k,new Uint8Array(v))},async get(k){return store.has(k)?{body:store.get(k)}:null},async delete(k){store.delete(k)}};
+  const {put,get,del}=setup({MEDIA}),id='m_race_private_01',a=new Uint8Array([1,2,3]);
+  const first=put(USER,id,a,'audio/webm','ai');await started;
+  assert.equal((await get(USER,id)).status,404,'partial files are never served');
+  assert.equal((await del(USER,id)).status,409,'reservation cannot be transferred mid-upload');
+  assert.equal((await put(OTHER,id,new Uint8Array([8,8]),'audio/webm','ai')).status,409);
+  release();assert.equal((await first).status,200);assert.deepEqual((await get(USER,id)).bytes,a);
+  assert.equal((await get(OTHER,id)).status,404);
 });
 
 test('media: big files are split across rows and come back whole; oversize is refused',async()=>{

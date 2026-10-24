@@ -138,13 +138,13 @@ export async function resetAccount(env, uid) {
   const removed = {};
   for (const t of RESET_TABLES) {
     try { removed[t] = await run(env, `DELETE FROM ${t} WHERE uid = ?`, uid); }
-    catch (e) { removed[t] = 'error: ' + String(e.message || e).slice(0, 80); }
+    catch (e) { removed[t] = 'error: temporarily_unavailable'; }
   }
   try { removed.line_chat = await run(env, `DELETE FROM line_chat WHERE ${MY_LINE}`, uid); }
-  catch (e) { removed.line_chat = 'error: ' + String(e.message || e).slice(0, 80); }
+  catch (e) { removed.line_chat = 'error: temporarily_unavailable'; }
   /* ไฟล์ในแชต AI และไฟล์ร่างที่ยังไม่ได้ส่งให้ใคร (ไฟล์ที่ส่งในห้องคุยกับช่างแล้วไม่ลบ อีกฝ่ายยังต้องเห็น) */
   try { removed.media = await dropMedia(env, "uid = ? AND scope IN ('ai','draft')", uid); }
-  catch (e) { removed.media = 'error: ' + String(e.message || e).slice(0, 80); }
+  catch (e) { removed.media = 'error: temporarily_unavailable'; }
   return removed;
 }
 

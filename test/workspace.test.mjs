@@ -42,17 +42,51 @@ test('ws: ของที่ทำงานเดิมใน kb ย้ายอ
 test('ws: ผู้ควบคุมคุย/ประชุมได้ แต่ตั้งตำแหน่ง แก้คู่มือ หรือลงชื่อแทนคนอื่นไม่ได้',async()=>{
   const f=await fixture();
   assert.equal((await f.call('POST','/api/ws',note('msg_2'),'mod')).status,200);
-  assert.equal((await f.call('POST','/api/ws',note('sig_x_mod_1'),'mod')).status,200);
+  assert.equal((await f.call('POST','/api/ws',note('sig_adm_mod_1',{keywords:JSON.stringify({k:'ice',r:'team',to:'adm'})}),'mod')).status,200);
   assert.equal((await f.call('POST','/api/ws',note('nda_mod'),'mod')).status,200,'ลงชื่อของตัวเองได้');
   assert.equal((await f.call('POST','/api/ws',note('nda_adm'),'mod')).status,403,'ลงชื่อแทนคนอื่นไม่ได้');
   assert.equal((await f.call('POST','/api/ws',note('vc_room__adm'),'mod')).status,403);
-  assert.equal((await f.call('POST','/api/ws',note('vc_room__mod'),'mod')).status,200);
+  assert.equal((await f.call('POST','/api/ws',note('vc_team__mod',{keywords:'{"r":"team","u":"mod"}'}),'mod')).status,200);
   assert.equal((await f.call('POST','/api/ws',note('pos_mod',{keywords:'{"p":"head_ai"}'}),'mod')).status,403,'ตั้งตำแหน่งตัวเองไม่ได้');
   assert.equal((await f.call('POST','/api/ws',note('hb_02'),'mod')).status,403);
   assert.equal((await f.call('POST','/api/ws',note('kb_x'),'adm')).status,403,'รหัสต้องเป็นชนิดของที่ทำงานเท่านั้น');
   assert.equal((await f.call('DELETE','/api/ws/pos_mod',null,'mod')).status,403);
   assert.equal((await f.call('DELETE','/api/ws/msg_2',null,'mod')).status,200);
   assert.equal(f.sqlite.prepare("SELECT COUNT(*) n FROM kb WHERE id LIKE 'msg_%' OR id LIKE 'sig_%'").get().n,0,'ไม่มีอะไรเข้าคลังความรู้ AI');
+});
+
+test('ws: server isolates private DMs, departments, invited rooms and signaling, not just the UI',async()=>{
+  const f=await fixture(),save=(id,m,uid='adm')=>f.call('POST','/api/ws',note(id,{keywords:JSON.stringify(m)}),uid);
+  assert.equal((await save('msg_secret',{r:'dm:adm|ai',u:'adm'})).status,200);
+  assert.equal((await save('msg_department',{r:'dept:ops',u:'adm'})).status,200);
+  assert.equal((await save('ch_private',{m:['adm','ai'],by:'adm'})).status,200);
+  assert.equal((await save('msg_invited',{r:'ch:private',u:'adm'})).status,200);
+  assert.equal((await save('sig_ai_adm_nonce',{r:'team',k:'offer',from:'adm',to:'ai'})).status,200);
+  for(const uid of ['mod','ai','adm']){
+    const r=await f.call('GET','/api/ws',null,uid),ids=r.json.kb.map(x=>x.id);
+    for(const id of ['msg_secret','msg_invited','sig_ai_adm_nonce'])assert.equal(ids.includes(id),uid!=='mod',uid+' '+id);
+    assert.equal(ids.includes('msg_department'),uid==='adm');
+  }
+  for(const id of ['msg_secret','msg_invited','msg_department']){
+    assert.equal((await save(id,{r:'team',u:'mod'},'mod')).status,403);
+    assert.equal((await f.call('DELETE','/api/ws/'+id,null,'mod')).status,403);
+  }
+  assert.equal((await save('msg_forged',{r:'team',u:'adm'},'mod')).status,403);
+  assert.equal((await save('sig_ai_adm_forged',{k:'offer',r:'team',to:'ai'},'mod')).status,403);
+  assert.equal((await save('msg_public',{r:'team',u:'mod',n:'Administrator'},'mod')).status,200);
+  assert.equal(JSON.parse(f.sqlite.prepare("SELECT keywords FROM ws_store WHERE id='msg_public'").get().keywords).n,'mod');
+  assert.equal((await save('msg_public',{r:'team',u:'ai'},'ai')).status,403,'another staff member cannot overwrite a message');
+});
+
+test('ws: meeting metadata cannot carry executable links and RSVP cannot impersonate someone else',async()=>{
+  const f=await fixture(),m={r:'team',t:Date.now()+60000,len:30,by:'adm',lk:'https://meet.example/room',at:['adm']};
+  const save=(meta,uid='adm')=>f.call('POST','/api/ws',note('mt_test',{keywords:JSON.stringify(meta)}),uid);
+  assert.equal((await save({...m,lk:'javascript:alert(1)'})).status,400);
+  assert.equal((await save(m)).status,200);
+  assert.equal((await save({...m,at:['adm','ai']},'mod')).status,403);
+  assert.equal((await save({...m,at:['adm','mod']},'mod')).status,200);
+  assert.equal((await save({...m,r:'dept:exec'},'mod')).status,403);
+  assert.equal((await f.call('POST','/api/ws',note('msg_broken',{keywords:'{"r":"dm:adm|ai"'}),'mod')).status,400,'invalid private metadata never falls back to public');
 });
 
 test('kb: แก้ความรู้ AI ได้เฉพาะแอดมิน หรือผู้ควบคุมที่แอดมินตั้งเป็นหัวหน้าฝ่าย AI',async()=>{

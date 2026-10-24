@@ -479,7 +479,7 @@ export async function reactAgent(env, opts) {
       }
     } catch (err) {
       lastErr = err;
-      console.warn(`[reactAgent] Provider ${p.src} failed:`, err.message || err);
+      console.warn('[reactAgent] provider_failed',p.src);
       if (/429|rate/i.test(err.message || '')) markBad('react|' + p.src, 30000);
       else if (/40[1234]:/i.test(err.message || '')) markBad('react|' + p.src, 3600000);
       else markBad('react|' + p.src, 15000);
@@ -904,11 +904,11 @@ export async function executeSearchInternal(env, query) {
   try {
     const ddg = await fetchDuckDuckGoSearch(q);
     if (ddg && ddg.trim()) {
-      console.log(`[search] สำเร็จด้วย DuckDuckGo: "${q.slice(0, 40)}"`);
+      console.log('[search] DuckDuckGo success');
       return ddg;
     }
   } catch (e) {
-    console.warn('[search] DuckDuckGo error:', e.message || e);
+    console.warn('[search] DuckDuckGo unavailable');
   }
 
   // 2. Gemini Google Search (gemini-3.1-flash-lite -> gemini-3.5-flash-lite)
@@ -946,7 +946,7 @@ export async function executeSearchInternal(env, query) {
           if (/location|region/i.test(errBody)) markBad('gemini|region', 300000);
         }
       } catch (e) {
-        console.warn(`[search] Gemini ${m} error:`, e.message || e);
+        console.warn('[search] Gemini unavailable');
       }
     }
   }
@@ -1057,6 +1057,30 @@ const TRUST = [
   /* ข่าวทั่วไป/ทางการ */ /(^|\.)(thairath\.co\.th|bangkokpost\.com|nationthailand\.com|matichon\.co\.th|prachachat\.net|thaipbs\.or\.th|reuters\.com|bbc\.com|apnews\.com|tmd\.go\.th|go\.th)$/i,
 ];
 const hostOf = u => { try { return new URL(u).hostname.replace(/^www\./, '') } catch (e) { return '' } };
+export function publicPageUrl(value){
+  try{const u=new URL(value);return u.protocol==='https:'&&!u.username&&!u.password&&!u.port&&TRUST.some(re=>re.test(u.hostname))?u.href:null;}catch{return null;}
+}
+async function readPublicPage(value,headers,ms){
+  let url=publicPageUrl(value);if(!url)return null;
+  const ctl=new AbortController(),timer=setTimeout(()=>ctl.abort(),ms);
+  try{
+    for(let hops=0;hops<4;hops++){
+      const response=await fetch(url,{headers,signal:ctl.signal,redirect:'manual'});
+      if(response.status>=300&&response.status<400){
+        const location=response.headers.get('location');await response.body?.cancel();
+        if(!location)return null;url=publicPageUrl(new URL(location,url).href);if(!url)return null;continue;
+      }
+      if(!response.ok||!/html/i.test(response.headers.get('content-type')||'')){await response.body?.cancel();return null;}
+      const reader=response.body?.getReader();if(!reader)return null;
+      const chunks=[];let size=0;
+      while(size<400000){const {done,value}=await reader.read();if(done)break;const chunk=value.subarray(0,400000-size);chunks.push(chunk);size+=chunk.length;}
+      await reader.cancel().catch(()=>{});
+      const bytes=new Uint8Array(size);let at=0;for(const chunk of chunks){bytes.set(chunk,at);at+=chunk.length;}
+      return new TextDecoder().decode(bytes);
+    }
+    return null;
+  }finally{clearTimeout(timer);}
+}
 /* ลิงก์ Bing News เป็นลิงก์ผ่าน (apiclick ...&url=) — ดึง url จริงออกมา · ลิงก์ Google News เปิดตรงไม่ได้ ข้าม */
 function realUrl(u) {
   try { const x = new URL(u); if (/bing\.com$/.test(x.hostname) && x.searchParams.get('url')) return x.searchParams.get('url');
@@ -1075,13 +1099,12 @@ function pageText(html, q) {
 }
 export async function readPages(rows, q, n, budgetMs) {
   const score = u => { const h = hostOf(u); const i = TRUST.findIndex(re => re.test(h)); return i < 0 ? 9 : i };
-  const cand = rows.map(r => ({ ...r, real: realUrl(r.url) })).filter(r => r.real && !/wikipedia\.org/.test(r.real))
+  const cand = rows.map(r => ({ ...r, real: publicPageUrl(realUrl(r.url)) })).filter(r => r.real && !/wikipedia\.org/.test(r.real))
     .sort((a, b) => score(a.real) - score(b.real)).slice(0, n);
   const UA = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36', 'Accept-Language': 'th,en;q=0.8', Accept: 'text/html' };
   const res = await Promise.all(cand.map(async r => {
-    try { const x = await getT(r.real, { headers: UA, redirect: 'follow' }, budgetMs);
-      if (!x.ok || !/html/i.test(x.headers.get('content-type') || '')) return '';
-      const body = (await x.text()).slice(0, 400000), txt = pageText(body, q);
+    try { const body=await readPublicPage(r.real,UA,budgetMs);if(!body)return '';
+      const txt = pageText(body, q);
       return txt.length > 200 ? `【${r.title}】 (${hostOf(r.real)}${r.date ? ', ' + r.date : ''})\n${txt}` : '';
     } catch (e) { return '' } }));
   const ok = res.filter(Boolean);

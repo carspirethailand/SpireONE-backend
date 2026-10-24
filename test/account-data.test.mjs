@@ -153,14 +153,16 @@ test('PDPA: เจ้าของระบบลบบัญชีตัวเ�
   for(const t of ['users','line_link','tech_profiles','tech_job_archives'])assert.equal(count(f.sqlite,`SELECT COUNT(*) n FROM ${t} WHERE uid='me'`),1,t);
 });
 
-test('PDPA: chat_logs ไม่เก็บข้อความแชต · คำตอบใช้ซ้ำไม่เก็บถ้ามีชื่อ/อีเมล/เบอร์ของคนถาม',async()=>{
+test('PDPA: chat_logs ไม่เก็บข้อความแชต · ไม่แชร์คำตอบส่วนตัวผ่าน global cache',async()=>{
   const src=readFileSync(new URL('../src/worker.js',import.meta.url),'utf8');
   for(const m of src.matchAll(/INSERT INTO chat_logs[\s\S]{0,400}?\.bind\(([^)]*)/g)){
     const args=m[1].split(',').map(x=>x.trim());
     assert.ok(/^'[^']*'$/.test(args[2])&&args[3]==="''",'chat_logs ต้องไม่เก็บ prompt/response: '+args.slice(0,4).join(', '));
   }
   assert.match(src,/async function cacheSave\(env, carInfo, question, answer, uid\)/);
-  assert.match(src,/CACHE_PII\.test\(question\) \|\| CACHE_PII\.test\(answer\)/);
+  const lookup=src.slice(src.indexOf('async function cacheLookup('),src.indexOf('async function kbFor('));
+  assert.doesNotMatch(lookup,/SELECT|INSERT|UPDATE/,'no account conversations may enter or leave the global cache');
+  assert.match(lookup,/return null/);
 });
 
 test('PDPA: บริบทที่ส่งให้ AI ไม่มีอีเมลของผู้ใช้ (ตรงกับหน้า /privacy)',()=>{

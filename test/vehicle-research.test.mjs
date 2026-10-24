@@ -52,7 +52,7 @@ test('only new capable call clients get web_search; legacy schemas stay compatib
   const names=o=>liveToken({model:'fixture',agent:true,...o}).bidiGenerateContentSetup.tools[0].functionDeclarations.map(x=>x.name);
   assert.ok(!names({}).includes('web_search'));assert.ok(names({webResearch:true}).includes('web_search'));assert.ok(!names({webResearch:'true'}).includes('web_search'));
 });
-function env(){return {DEV_AUTH:'1',FIREBASE_PROJECT_ID:'test-audio',DB:{prepare(sql){return {bind(){return this},async first(){return sql.includes('schema_version')?{value:'24'}:sql.includes('RETURNING count')?{count:1}:null},async run(){return {}},async all(){return {results:[]}}}}}};}
+function env(){return {DEV_AUTH:'1',FIREBASE_PROJECT_ID:'audio-test',DB:{prepare(sql){return {bind(){return this},async first(){return sql.includes('schema_version')?{value:'24'}:sql.includes('RETURNING count')?{count:1}:null},async run(){return {}},async all(){return {results:[]}}}}}};}
 test('research endpoint requires login, rejects private queries and never calls a paid AI provider',async t=>{
   const seen=[];t.mock.method(globalThis,'fetch',async url=>{seen.push(String(url));return new Response('',{status:503})});
   const req=(query,auth)=>new Request('https://unit.test/api/ai/research',{method:'POST',headers:{'Content-Type':'application/json',...(auth?{Authorization:'Bearer dev:reader:reader@unit.test'}:{})},body:JSON.stringify({query})});

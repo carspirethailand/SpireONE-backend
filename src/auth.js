@@ -37,9 +37,21 @@ export async function verifyFirebaseToken(token, firebaseProjectId) {
     project = aud;
   }
   const { payload } = await jose.jwtVerify(token, JWKS, {
+    algorithms: ['RS256'],
     issuer: `https://securetoken.google.com/${project}`,
     audience: project,
     clockTolerance: 120, // 2 minutes clock skew tolerance
   });
+  if(typeof payload.sub!=='string'||!payload.sub||payload.sub.length>128)throw new Error('Invalid subject');
   return payload;
+}
+
+// Local synthetic identities must remain impossible on production, even if a
+// DEV_AUTH variable is accidentally copied into the deployed environment.
+export function localTestIdentity(request,env,token){
+  const host=new URL(request.url).hostname;
+  const local=host==='test'||host.endsWith('.test')||['localhost','127.0.0.1','[::1]'].includes(host);
+  if(env.DEV_AUTH!=='1'||!local||!/(?:^|-)test$/.test(String(env.FIREBASE_PROJECT_ID))||!token.startsWith('dev:'))return null;
+  const match=/^dev:([^:]{1,128}):([^:\s]+@[^:\s]+)$/.exec(token);if(!match)throw new Error('Invalid test identity');
+  return {sub:match[1],email:match[2],email_verified:true,name:match[2].split('@')[0]};
 }

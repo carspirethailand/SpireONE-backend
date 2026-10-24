@@ -1,4 +1,5 @@
 import {jobActor,cancellationActor} from './job-actor.mjs';
+import {requestText,RequestBodyError} from './request-json.mjs';
 /*
  * Cendon Care — ระบบช่าง (ส่วนเสริมของ spireonebackend)
  *
@@ -508,7 +509,7 @@ async function needVault(env) { if (!(await vaultReady(env)) || !env.ID_HASH_KEY
 async function openField(env, row, field, ctx) {
   if (!row || row[field] == null) return row;
   try { return { ...row, [field]: await open(env, row[field], ctx) }; }
-  catch (e) { if (e && e.vault) { console.error('vault', e.message); vaultFail(); } throw e; }
+  catch (e) { if (e && e.vault) { console.error('vault'); vaultFail(); } throw e; }
 }
 const openApp = (env, row) => openField(env, row, 'data', row ? CTX.app(row.uid) : '');
 const openIdent = (env, row) => openField(env, row, 'data', row ? CTX.ident(row.uid) : '');
@@ -750,7 +751,7 @@ async function rescreen(env, me, b) {
   /* โหมด Didit: ดึงผลยืนยันตัวตนล่าสุดด้วย (เผื่อ webhook ไม่มา) */
   const app = await openApp(env, await env.DB.prepare('SELECT uid,data FROM tech_applications WHERE uid=?').bind(uid).first()), d = parse(app && app.data) || {};
   let row = await identityRow(env, uid);
-  if (d.idMode === 'didit' && diditReady(env) && row) { try { row = await syncIdentity(env, uid) || row; } catch (e) { console.error('didit decision', e && e.message); } }
+  if (d.idMode === 'didit' && diditReady(env) && row) { try { row = await syncIdentity(env, uid) || row; } catch (e) { console.error('didit decision'); } }
   return { ok: true, ai, identity: identityOut(d, row, true) };
 }
 
@@ -770,7 +771,7 @@ async function startIdentity(env, me) {
   const vendor = 'cendon-' + (await sha('didit:' + me.uid)).slice(0, 20);
   let s;
   try { s = await diditFetch(env, '/v3/session/', { workflow_id: env.DIDIT_WORKFLOW_ID, vendor_data: vendor, callback: String(env.APP_URL || 'https://cendon-beta.pages.dev').replace(/\/+$/, '') + '/join', language: 'th' }); }
-  catch (e) { console.error('didit session', e && e.message); fail(502, 'เปิดหน้ายืนยันตัวตนไม่สำเร็จ กรุณาลองใหม่'); }
+  catch (e) { console.error('didit session'); fail(502, 'เปิดหน้ายืนยันตัวตนไม่สำเร็จ กรุณาลองใหม่'); }
   const sid = String(s && s.session_id || ''), url = String(s && s.url || '');
   if (!/^[\w-]{8,80}$/.test(sid) || !/^https:\/\//.test(url)) fail(502, 'เปิดหน้ายืนยันตัวตนไม่สำเร็จ กรุณาลองใหม่');
   const t = now();
@@ -828,7 +829,7 @@ export async function releaseWrongHolds(env) {
       if (await holdable(env, r.uid, r.status || 'none')) continue;
       const u = await env.DB.prepare('UPDATE tech_profiles SET suspended=0,id_hold=0,updated_at=? WHERE uid=? AND id_hold=1').bind(now(), r.uid).run();
       n += u.meta.changes || 0;
-    } catch (e) { console.error('release hold', e && e.message); }
+    } catch (e) { console.error('release hold'); }
   }
   return { released: n };
 }
@@ -836,7 +837,7 @@ async function refreshIdentity(env, me) {
   if (!diditReady(env)) fail(409, 'ระบบยืนยันตัวตนออนไลน์ยังไม่เปิด');
   await limit(env, 'didit_check', me.uid, 30);
   let row;
-  try { row = await syncIdentity(env, me.uid); } catch (e) { if (e instanceof HttpError) throw e; console.error('didit decision', e && e.message); return { ok: true, identity: { mode: 'didit', status: 'service_unavailable' } }; }
+  try { row = await syncIdentity(env, me.uid); } catch (e) { if (e instanceof HttpError) throw e; console.error('didit decision'); return { ok: true, identity: { mode: 'didit', status: 'service_unavailable' } }; }
   return { ok: true, identity: { mode: 'didit', status: row ? row.status : 'not_started' } };
 }
 /* Webhooks are the fast path. This bounded sweep is the recovery path when a
@@ -847,7 +848,7 @@ export async function reconcileDiditIdentities(env, max = 50) {
   await ensureTech(env);
   const {results}=await env.DB.prepare("SELECT i.uid FROM tech_identity i JOIN tech_applications a ON a.uid=i.uid WHERE i.status IN ('pending','review') AND (a.status='pending' OR i.status='review') ORDER BY i.updated_at ASC LIMIT ?").bind(Math.max(1,Math.min(100,max))).all();
   let checked=0;
-  for(const row of results){ try { await syncIdentity(env,row.uid); checked++; } catch(e) { console.error('didit reconcile',e&&e.message); } }
+  for(const row of results){ try { await syncIdentity(env,row.uid); checked++; } catch(e) { console.error('didit reconcile'); } }
   return { checked };
 }
 /* ── รอบเก็บกวาดตู้เซฟ (cron ทุกชั่วโมง) ──
@@ -870,7 +871,7 @@ export async function vaultSweep(env, max = 20) {
       const resetAi = scrubbed && a.status === 'pending';
       const r = await env.DB.prepare(`UPDATE tech_applications SET data=?${resetAi ? ', ai=NULL' : ''} WHERE uid=? AND data=?`).bind(await sealApp(env, a.uid, d), a.uid, a.data).run();
       sealed += r.meta.changes || 0;
-    } catch (e) { console.error('vault sweep app', e && e.message); }
+    } catch (e) { console.error('vault sweep app'); }
   }
   const { results: ids } = await env.DB.prepare(`SELECT uid, data FROM tech_identity WHERE data IS NOT NULL AND data != '' AND ${stale} LIMIT ?`).bind(kid, max).all();
   for (const x of ids) {
@@ -879,7 +880,7 @@ export async function vaultSweep(env, max = 20) {
       if (!d) continue;
       const r = await env.DB.prepare('UPDATE tech_identity SET data=? WHERE uid=? AND data=?').bind(await sealIdent(env, x.uid, d), x.uid, x.data).run();
       sealed += r.meta.changes || 0;
-    } catch (e) { console.error('vault sweep identity', e && e.message); }
+    } catch (e) { console.error('vault sweep identity'); }
   }
   const { results: docs } = await env.DB.prepare(`SELECT id, uid, kind, data FROM tech_docs WHERE kind IN (${PRIVATE_DOCS.map(() => '?').join(',')}) AND ${stale} LIMIT ?`).bind(...PRIVATE_DOCS, kid, Math.min(max, 10)).all();
   for (const doc of docs) {
@@ -887,7 +888,7 @@ export async function vaultSweep(env, max = 20) {
       const plain = await open(env, doc.data, CTX.doc(doc.uid, doc.kind));
       const r = await env.DB.prepare('UPDATE tech_docs SET data=? WHERE id=? AND data=?').bind(await seal(env, plain, CTX.doc(doc.uid, doc.kind)), doc.id, doc.data).run();
       sealed += r.meta.changes || 0;
-    } catch (e) { console.error('vault sweep doc', e && e.message); }
+    } catch (e) { console.error('vault sweep doc'); }
   }
   return { sealed };
 }
@@ -921,8 +922,7 @@ export async function expireStaleApplications(env, max = 50) {
 /* webhook จาก Didit — ไม่ต้องล็อกอิน แต่ต้องมีลายเซ็นถูกต้อง · ตอบเหมือนกันทุกกรณีที่ลายเซ็นถูก ไม่บอกว่ามี session นี้ไหม */
 async function diditWebhook(env, request) {
   if (!env.DIDIT_WEBHOOK_SECRET || !diditReady(env)) fail(404, 'ไม่พบปลายทาง');
-  const raw = await request.text();
-  if (raw.length > 512000) fail(413, 'ข้อมูลใหญ่เกินไป');
+  const raw = await requestText(request,512000);
   if (!await verifyDidit(env.DIDIT_WEBHOOK_SECRET, raw, request.headers)) fail(401, 'invalid signature');
   let b; try { b = JSON.parse(raw); } catch { fail(400, 'ข้อมูลไม่ถูกต้อง'); }
   const sid = String(b && b.session_id || '');
@@ -1041,7 +1041,7 @@ async function review(env, me, b) {
     const appData=parse(a.data)||{};
     if(appData.idMode==='didit'){
       if(!diditReady(env)) fail(503,'ระบบยืนยันตัวตน Didit ยังไม่พร้อม');
-      try { await syncIdentity(env,a.uid); } catch(e) { console.error('didit approval refresh',e&&e.message); fail(502,'ยังตรวจผล Didit ล่าสุดไม่ได้ กรุณาลองใหม่'); }
+      try { await syncIdentity(env,a.uid); } catch(e) { console.error('didit approval refresh'); fail(502,'ยังตรวจผล Didit ล่าสุดไม่ได้ กรุณาลองใหม่'); }
     } else {
       /* โหมดทีมงานตรวจบัตรเอง: ต้องพิมพ์เลขที่เห็นบนรูปบัตร แล้วระบบเทียบแฮชว่าตรงกับที่ผู้สมัครกรอก (ใบสมัครรุ่นนี้) ก่อนเสมอ */
       const checked=await env.DB.prepare("SELECT 1 FROM tech_audit WHERE action='idcheck_match' AND target=? AND detail=? LIMIT 1").bind(a.uid,'rev:'+a.revision).first();
@@ -3037,11 +3037,11 @@ export async function handleTech(request, env, corsHeaders, options={}) {
     const md = path.match(/^\/api\/tech\/media\/([^/]+)$/);
     if (md) return await mediaRoute(env, request, md[1], h, options.verifyToken);
     const data=await route(request, env,options.verifyToken);
-    const privateRead=path==='/api/tech/me'||(path==='/api/tech/gigs'&&new URL(request.url).searchParams.get('mine')==='1');
+    const privateRead=request.headers.has('Authorization')||path==='/api/tech/me'||(path==='/api/tech/gigs'&&new URL(request.url).searchParams.get('mine')==='1');
     return json(data, 200, privateRead?{...h,'Cache-Control':'private, no-store','Vary':'Authorization, Origin'}:h);
   } catch (e) {
-    if (e instanceof HttpError || e instanceof MediaError) return json({ error: e.message,...(e.serviceQuota?{code:'SERVICE_LIMIT',quota:e.serviceQuota}:{}) }, e.status, {...h,'Cache-Control':'no-store'});
-    console.error(e);
+    if (e instanceof HttpError || e instanceof MediaError || e instanceof RequestBodyError) return json({ error: e.message,...(e.serviceQuota?{code:'SERVICE_LIMIT',quota:e.serviceQuota}:{}) }, e.status, {...h,'Cache-Control':'no-store'});
+    console.error('tech.request_failed',e?.name||'Error');
     return json({ error: 'ระบบขัดข้องชั่วคราว กรุณาลองใหม่' }, 500, h);
   }
 }

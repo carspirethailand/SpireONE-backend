@@ -84,10 +84,11 @@ export async function putMedia(env, me, id, request, limit) {
   if (!['ai', 'draft'].includes(scope)) fail(400, 'ที่เก็บไฟล์ไม่ถูกต้อง');
   const type = mediaKind(request.headers.get('Content-Type'));
   if (!type) fail(415, 'รองรับเฉพาะรูปภาพ วิดีโอ และไฟล์เสียง');
-  const have = await env.DB.prepare('SELECT uid, kind, mime, size FROM media WHERE id = ?').bind(id).first();
+  const have = await env.DB.prepare('SELECT uid, kind, mime, size, store FROM media WHERE id = ?').bind(id).first();
   if (have) {
     /* ส่งซ้ำ (เน็ตหลุดตอนรอคำตอบ) = สำเร็จ ไม่เก็บซ้ำ · รหัสของคนอื่นห้ามทับ */
     if (have.uid !== me.uid) fail(409, 'รหัสไฟล์ซ้ำ');
+    if(have.store==='pending')fail(409,'ไฟล์กำลังอัปโหลด กรุณาลองใหม่');
     return { id, kind: have.kind, mime: have.mime, size: have.size, existed: true };
   }
   const t = TYPES[type.kind], r2 = !!env.MEDIA;
@@ -96,22 +97,35 @@ export async function putMedia(env, me, id, request, limit) {
   if (limit) await limit(env, 'media', me.uid, 300);
   const used = await env.DB.prepare('SELECT COALESCE(SUM(size), 0) AS n FROM media WHERE uid = ?').bind(me.uid).first();
   if (Number(used && used.n || 0) + bytes.byteLength > QUOTA) fail(413, 'พื้นที่เก็บไฟล์ของบัญชีนี้เต็มแล้ว ลบแชตเก่าที่มีไฟล์ใหญ่ออกก่อน');
-  let parts = 0;
-  if (r2) {
-    await env.MEDIA.put('m/' + id, bytes, { httpMetadata: { contentType: type.mime } });
-  } else {
-    try {
-      for (let at = 0; at < bytes.byteLength; at += PART, parts++)
-        await env.DB.prepare('INSERT OR REPLACE INTO media_parts (id, n, data) VALUES (?,?,?)')
-          .bind(id, parts, b64(bytes.subarray(at, at + PART))).run();
-    } catch (e) {
-      await env.DB.prepare('DELETE FROM media_parts WHERE id = ?').bind(id).run().catch(() => {});
-      throw e;
-    }
+  // Reserve the ID atomically BEFORE touching bytes. Two users choosing the same ID
+  // must never overwrite each other's R2 object or D1 parts during simultaneous uploads.
+  try{
+    await env.DB.prepare('INSERT INTO media (id, uid, scope, kind, mime, size, parts, store, created_at) VALUES (?,?,?,?,?,?,0,?,?)')
+      .bind(id,me.uid,scope,type.kind,type.mime,bytes.byteLength,'pending',Date.now()).run();
+  }catch(e){
+    const competing=await env.DB.prepare('SELECT uid FROM media WHERE id = ?').bind(id).first();
+    if(competing)fail(409,'รหัสไฟล์ซ้ำหรือกำลังอัปโหลด');throw e;
   }
-  /* แถวหลักบันทึกเป็นอย่างสุดท้าย — อัปโหลดค้างกลางทางจะไม่มีไฟล์ครึ่ง ๆ ให้เปิด */
-  await env.DB.prepare('INSERT INTO media (id, uid, scope, kind, mime, size, parts, store, created_at) VALUES (?,?,?,?,?,?,?,?,?)')
-    .bind(id, me.uid, scope, type.kind, type.mime, bytes.byteLength, parts, r2 ? 'r2' : 'd1', Date.now()).run();
+  let parts = 0;
+  try{
+    if (r2) {
+      await env.MEDIA.put('m/' + id, bytes, { httpMetadata: { contentType: type.mime } });
+    } else {
+      for (let at = 0; at < bytes.byteLength; at += PART, parts++)
+        await env.DB.prepare('INSERT INTO media_parts (id, n, data) VALUES (?,?,?)')
+          .bind(id, parts, b64(bytes.subarray(at, at + PART))).run();
+    }
+    await env.DB.prepare("UPDATE media SET parts = ?, store = ? WHERE id = ? AND uid = ? AND store = 'pending'")
+      .bind(parts,r2?'r2':'d1',id,me.uid).run();
+  }catch(e){
+    // Do not release the reservation until every partial byte has been removed.
+    try{
+      if(r2)await env.MEDIA.delete('m/'+id);
+      await env.DB.prepare('DELETE FROM media_parts WHERE id = ?').bind(id).run();
+      await env.DB.prepare("DELETE FROM media WHERE id = ? AND uid = ? AND store = 'pending'").bind(id,me.uid).run();
+    }catch{} // failed cleanup stays unavailable, never transferable to a different owner
+    throw e;
+  }
   return { id, kind: type.kind, mime: type.mime, size: bytes.byteLength };
 }
 
@@ -120,17 +134,19 @@ export async function getMedia(env, me, id, inScope, headers) {
   if (!MEDIA_ID.test(id)) fail(404, 'ไม่พบไฟล์');
   const row = await env.DB.prepare('SELECT * FROM media WHERE id = ?').bind(id).first();
   /* ไม่มีสิทธิ์ตอบว่า "ไม่พบ" — ไม่บอกคนนอกว่ารหัสนี้มีไฟล์อยู่ */
-  if (!row) fail(404, 'ไม่พบไฟล์');
-  const ok = row.uid === me.uid || me.staff || (/^(thread|job|proof):/.test(row.scope) && await inScope(row.scope));
+  if (!row||row.store==='pending') fail(404, 'ไม่พบไฟล์');
+  const shared=/^(thread|job|proof):/.test(row.scope);
+  const ok = row.uid === me.uid || (shared && (me.staff || await inScope(row.scope)));
   if (!ok) fail(404, 'ไม่พบไฟล์');
   return sendMedia(env, row, headers);
 }
 
 /* ส่งไฟล์ออก (ตรวจสิทธิ์มาแล้วจากคนเรียก) — ลิงก์ Passport/ผลงานหน้าร้านใช้ cache สั้นกว่า */
-export async function sendMedia(env, row, headers, cache = 'private, max-age=31536000, immutable') {
+export async function sendMedia(env, row, headers, cache = 'private, no-store') {
   const h = new Headers(headers || {});
   h.set('Content-Type', row.mime);
   h.set('Cache-Control', cache);
+  h.set('Vary', 'Authorization, Origin');
   h.set('Content-Disposition', 'inline');
   h.set('X-Content-Type-Options', 'nosniff');
   if (row.store === 'r2') {
@@ -151,6 +167,7 @@ export async function sendMedia(env, row, headers, cache = 'private, max-age=315
 export async function deleteMedia(env, me, id) {
   const row = MEDIA_ID.test(id) && await env.DB.prepare('SELECT uid, scope, store FROM media WHERE id = ?').bind(id).first();
   if (!row || row.uid !== me.uid) fail(404, 'ไม่พบไฟล์');
+  if(row.store==='pending')fail(409,'ไฟล์กำลังอัปโหลด');
   if (!['ai', 'draft'].includes(row.scope)) fail(409, 'ไฟล์ที่ส่งในห้องคุยแล้วลบไม่ได้');
   if (row.store === 'r2' && env.MEDIA) await env.MEDIA.delete('m/' + id);
   await env.DB.prepare('DELETE FROM media_parts WHERE id = ?').bind(id).run();
@@ -168,8 +185,8 @@ export async function claimMedia(env, me, list, scope) {
   for (const x of list) {
     const id = String(x && typeof x === 'object' ? x.id : x || '');
     if (!MEDIA_ID.test(id) || out.some(o => o.id === id)) fail(400, 'ไฟล์แนบไม่ถูกต้อง');
-    const row = await env.DB.prepare('SELECT id, uid, scope, kind, mime, size FROM media WHERE id = ?').bind(id).first();
-    if (!row || row.uid !== me.uid || !(row.scope === 'draft' || row.scope === scope)) fail(400, 'ไม่พบไฟล์แนบ กรุณาแนบใหม่');
+    const row = await env.DB.prepare('SELECT id, uid, scope, kind, mime, size, store FROM media WHERE id = ?').bind(id).first();
+    if (!row || row.store==='pending' || row.uid !== me.uid || !(row.scope === 'draft' || row.scope === scope)) fail(400, 'ไม่พบไฟล์แนบ กรุณาแนบใหม่');
     if (row.scope === 'draft') await env.DB.prepare("UPDATE media SET scope = ? WHERE id = ? AND scope = 'draft'").bind(scope, id).run();
     out.push({ id, kind: row.kind, mime: row.mime, size: row.size });
   }
