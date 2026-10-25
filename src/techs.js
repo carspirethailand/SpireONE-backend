@@ -138,6 +138,8 @@ const TECH_ALTER = [
   `ALTER TABLE tech_messages ADD COLUMN edited_at INTEGER`,
   `ALTER TABLE tech_messages ADD COLUMN deleted_at INTEGER`,
   `ALTER TABLE tech_messages ADD COLUMN orig_text TEXT`,
+  /* ข้อความที่ระบบส่งแทนร้าน: greet = คำทักทายตอนลูกค้าเปิดแชต · auto = ตอบกลับอัตโนมัติ (ว่าง = คนพิมพ์เอง) */
+  `ALTER TABLE tech_messages ADD COLUMN kind TEXT`,
   /* รหัสเริ่มงาน (ลูกค้าบอกช่างเมื่อพบกันจริง) และงานเพิ่มที่ลูกค้าต้องกดยอมรับ */
   `ALTER TABLE tech_jobs ADD COLUMN start_code TEXT`,
   `ALTER TABLE tech_jobs ADD COLUMN start_exp INTEGER`,
@@ -202,6 +204,17 @@ const TECH_ALTER = [
       VALUES(CAST(strftime('%s','now') AS INTEGER)*1000,'system:profile-state','profile_state_change',NEW.id,
       json_object('from',json_object('test',OLD.test,'verified',OLD.verified,'suspended',OLD.suspended,'identityHold',OLD.id_hold),
                   'to',json_object('test',NEW.test,'verified',NEW.verified,'suspended',NEW.suspended,'identityHold',NEW.id_hold))); END`,
+  /* ชื่อลิงก์ร้าน: cendon…/tech/<handle> — ร้านละหนึ่งชื่อ ห้ามซ้ำกัน (NULL = ยังไม่ได้จอง ซ้ำกันได้) · handle_at = เวลาที่ตั้งล่าสุด (คุมความถี่การเปลี่ยน)
+     ชื่อเก่าที่เลิกใช้เก็บไว้ใน tech_handle_history: ลิงก์เดิมยังพาไปร้านเดิม และคนอื่นจองชื่อนั้นไม่ได้ระยะหนึ่ง */
+  `ALTER TABLE tech_profiles ADD COLUMN handle TEXT`,
+  `ALTER TABLE tech_profiles ADD COLUMN handle_at INTEGER`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS tech_profiles_handle ON tech_profiles(handle)`,
+  `CREATE TABLE IF NOT EXISTS tech_handle_history (handle TEXT PRIMARY KEY, tech_id TEXT NOT NULL, retired_at INTEGER NOT NULL)`,
+  /* ช่างเคลื่อนที่: จุดล่าสุดจากมือถือช่างจุดเดียว (ไม่เก็บเส้นทาง) — ส่งได้เฉพาะตอนเปิดรับงาน + เปิดโหมดช่างเคลื่อนที่
+     ปิดรับงาน/พักร้าน/ปิดโหมด = ลบทิ้ง · ลูกค้าเห็นแค่จุดปัดเข้าช่องตาราง ~280 ม. และเฉพาะจุดที่ไม่เก่าเกิน 10 นาที */
+  `ALTER TABLE tech_profiles ADD COLUMN live_lat REAL`,
+  `ALTER TABLE tech_profiles ADD COLUMN live_lng REAL`,
+  `ALTER TABLE tech_profiles ADD COLUMN live_at INTEGER`,
 ];
 const techReady = new WeakMap();
 async function ensureTech(env) {
@@ -393,6 +406,16 @@ function vacationOf(d) {
   if (!v || !v.on || (v.until && v.until < Date.now())) return null;
   return { until: v.until || null, note: v.note || '' };
 }
+/* ช่างเคลื่อนที่ = รับงานนอกสถานที่ + เปิดให้ตำแหน่งตามมือถือ · จุดสดใช้ได้เมื่อรับงานอยู่ ไม่พักร้าน และอัปเดตไม่เกิน 10 นาที */
+const LIVE_TTL = 10 * 60 * 1000, LIVE_GRID = 0.0025;
+const roamOn = d => !!(d.mobile && d.roam);
+const liveSnap = v => Math.round((Math.floor(v / LIVE_GRID) + 0.5) * LIVE_GRID * 1e5) / 1e5;
+function roamAt(r, d) {
+  if (!r.online || !roamOn(d) || vacationOf(d) || r.live_lat == null || !(r.live_at > now() - LIVE_TTL)) return null;
+  return { lat: r.live_lat, lng: r.live_lng, at: r.live_at };
+}
+/* จุดที่คนอื่นเห็น: ปัดเข้ากึ่งกลางช่อง (คงที่ ไม่สุ่ม) — เปิดดูกี่รอบก็เฉลี่ยหาจุดจริงไม่ได้ */
+const livePublic = l => l ? { lat: liveSnap(l.lat), lng: liveSnap(l.lng), at: l.at } : null;
 function publicTech(r) {
   const d = parse(r.data) || {};
   return {
@@ -401,7 +424,7 @@ function publicTech(r) {
     cats: d.cats || [], skills: (d.cats || []).map(c => CAT_TH[c]).filter(Boolean),
     about: d.about || '', years: d.years || 0, from: d.from || 0, to: 0,
     warranty: d.warranty || 0, radius: d.radius || 0,
-    mobile: !!d.mobile, urgent: !!d.urgent, brands: [],
+    mobile: !!d.mobile, urgent: !!d.urgent, brands: [], roam: roamOn(d), live: livePublic(roamAt(r, d)),
     /* ช่างที่ยังไม่มีรีวิวต้องได้ 0 ไม่ใช่ 5 — คะแนนเต็มที่ไม่มีใครให้ คือคะแนนปลอม */
     rating: r.review_count ? Math.round(r.rating_sum / r.review_count * 10) / 10 : 0,
     reviewCount: r.review_count, jobs: r.jobs,
@@ -415,7 +438,7 @@ function publicTech(r) {
     phone: d.showPhone ? String(d.phone || r.phone || '') : undefined, showPhone: !!d.showPhone,
     subs: d.subs || [], week: d.week || null, brands2: d.brands2 || [], line: d.line || '', facebook: d.facebook || '', address: d.address || '',
     /* โหมดพักร้อน: แสดงบนหน้าร้าน และงดรับคำขอใหม่จนกว่าจะถึงวันที่ตั้ง */
-    vacation: vacationOf(d), greet: d.greet || '', theme: d.theme || '',
+    vacation: vacationOf(d), greet: d.greet || '', theme: d.theme || '', handle: r.handle || '',
     /* งานที่ซ่อมจบพร้อมหลักฐานที่ AI ตรวจผ่าน (รวม + แยกหมวด) · full = งานค้างเต็ม เสนอราคางานใหม่ไม่ได้ชั่วคราว */
     proven: r.proven ? r.proven.n : 0, provenCats: r.proven ? r.proven.cats : {}, full: !r.test && (r.openJobs || 0) >= capOf(d),
     vetting: d.vetting && r.verified ? { at: d.vetting.at, identity: !!d.vetting.identity, phone: !!d.vetting.phone, shop: d.vetting.shop || '', skills: d.vetting.skills || '', cats: d.vetting.cats || [], mobile: !!d.vetting.mobile } : null,
@@ -538,6 +561,8 @@ async function meInfo(env, me) {
     uid: me.uid, email: me.email, admin: me.admin, staff: me.staff, owner: !!me.owner, version: API_VERSION,
     application: appOut(await openApp(env, a), false, ident),
     technician: t ? { ...publicTech((await withTrust(env, await withPhotos(env, [t])))[0]), suspended: !!t.suspended, listing: listingOf(t),
+      /* ชื่อลิงก์ร้าน: เปลี่ยนได้อีกครั้งเมื่อไหร่ (Studio บอกเจ้าของร้าน) */
+      handleNext: t.handle && t.handle_at ? t.handle_at + HANDLE_EVERY : null,
       /* งานค้าง/เพดาน (Studio บอกช่างก่อนเสนอราคา) */
       capacity: { open: jobs.filter(x => x.side === 'technician' && OPEN_STATES.includes(x.status)).length, cap: capOf(parse(t.data) || {}) },
       identityHold: !!(!t.test && t.suspended && t.id_hold),
@@ -807,7 +832,7 @@ async function syncIdentity(env, uid) {
      a suspension made by staff (suspended=1, id_hold=0) is never lifted by Didit. */
   /* ร้านที่อนุมัติแบบทีมงานตรวจบัตรเอง ไม่ผูกกับ Didit · ผลค้าง (ยังไม่เริ่ม/ทำไม่เสร็จ/หมดอายุ) ไม่ใช่เหตุพักร้าน
      เคยพักร้านที่อนุมัติแล้วทุกชั่วโมงเพราะ session ค้าง → ร้านหายจากลูกค้า งานด่วนไม่ถึง */
-  if (await holdable(env, uid, f.status)) await env.DB.prepare('UPDATE tech_profiles SET id_hold=CASE WHEN suspended=0 OR id_hold=1 THEN 1 ELSE 0 END,suspended=1,online=0,updated_at=? WHERE uid=? AND test=0')
+  if (await holdable(env, uid, f.status)) await env.DB.prepare('UPDATE tech_profiles SET id_hold=CASE WHEN suspended=0 OR id_hold=1 THEN 1 ELSE 0 END,suspended=1,online=0,live_lat=NULL,live_lng=NULL,live_at=NULL,updated_at=? WHERE uid=? AND test=0')
     .bind(t, uid).run();
   else if (f.status === 'approved') await env.DB.prepare('UPDATE tech_profiles SET suspended=0,id_hold=0,updated_at=? WHERE uid=? AND test=0 AND id_hold=1').bind(t, uid).run();
   return { ...cur, status: f.status, id_hash: idHash, data: JSON.stringify(next), updated_at: t };
@@ -1189,6 +1214,82 @@ async function moderate(env, me, b) {
   return { ok: true };
 }
 
+/* ══ ชื่อลิงก์ร้าน ══
+   ร้านที่ผ่านการตรวจจองชื่อสั้น ๆ ได้หนึ่งชื่อ เช่น /tech/nonair — จำง่าย พิมพ์ง่าย แชร์แล้วไม่เป็นรหัสยาว
+   - ตัวอังกฤษเล็ก ตัวเลข และขีด 3–30 ตัว (ภาษาไทยในลิงก์กลายเป็น %E0%B8… เมื่อคัดลอกไปวางใน LINE/Facebook)
+   - ชื่อเส้นทางของระบบ ชื่อ Cendon และชื่อยี่ห้อ/แบรนด์ดัง สงวนไว้ กันการแอบอ้างเป็นศูนย์บริการทางการ
+   - เปลี่ยนชื่อได้ทุก 30 วัน · ชื่อเก่าพาไปร้านเดิมและคนอื่นจองไม่ได้ 90 วัน — ลิงก์ที่แจกไปแล้วไม่ตาย และแย่งชื่อทันทีไม่ได้
+   - ร้านทดลอง/ยังไม่ผ่านการตรวจจองไม่ได้ (ไม่มีหน้าสาธารณะ และกันจองชื่อทิ้งไว้) · เจ้าของระบบ/admin ตั้งหรือถอนชื่อให้ร้านใดก็ได้ */
+const HANDLE_RE = /^(?=.{3,30}$)[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const HANDLE_HOLD = 90 * 86400000, HANDLE_EVERY = 30 * 86400000;
+const HANDLE_RESERVED = new Set(('admin api app about help terms privacy login logout signup register me my new edit settings setting studio shop shops store '
+  + 'tech techs service services category categories search map jobs job post posts quote quotes reviews review chat messages staff support team '
+  + 'official verified null undefined root www mail cendon spire spireone line facebook google tiktok youtube instagram grab lineman '
+  + 'toyota honda isuzu nissan mazda mitsubishi ford chevrolet suzuki hyundai kia bmw benz mercedes mercedes-benz audi volvo porsche lexus tesla byd mg gwm haval ora neta '
+  + 'ptt bangchak shell caltex esso cockpit bquik b-quik autobacs fitauto bridgestone michelin yokohama goodyear').split(' '));
+export function handleProblem(h) {
+  if (!HANDLE_RE.test(h)) return 'format';
+  if (HANDLE_RESERVED.has(h) || /^(cendon|spire|admin|official)/.test(h)) return 'reserved';
+  return null;
+}
+/* ใครถือชื่อนี้อยู่: ร้านที่ใช้ชื่อนี้ตอนนี้ หรือร้านที่เพิ่งเลิกใช้ (ยังอยู่ในช่วงกันไว้) */
+async function handleHolder(env, h) {
+  const cur = await env.DB.prepare('SELECT id FROM tech_profiles WHERE handle = ?').bind(h).first();
+  if (cur) return { techId: cur.id, current: true };
+  const old = await env.DB.prepare('SELECT tech_id, retired_at FROM tech_handle_history WHERE handle = ?').bind(h).first();
+  return old && now() - old.retired_at < HANDLE_HOLD ? { techId: old.tech_id, current: false } : null;
+}
+const handleIn = v => String(v || '').trim().toLowerCase();
+async function checkHandle(env, me, h) {
+  await limit(env, 'handle-check', me.uid, 300);
+  const mine = await env.DB.prepare('SELECT id, handle FROM tech_profiles WHERE uid = ?').bind(me.uid).first();
+  const bad = handleProblem(h);
+  if (bad) return { handle: h, ok: false, reason: bad };
+  const who = await handleHolder(env, h);
+  if (who && mine && who.techId === mine.id) return { handle: h, ok: true, reason: who.current ? 'current' : null };
+  return { handle: h, ok: !who, reason: who ? 'taken' : null };
+}
+async function setHandle(env, me, b) {
+  const boss = me.owner || me.admin;
+  const t = b.techId != null && boss ? await techById(env, String(b.techId))
+    : await env.DB.prepare('SELECT * FROM tech_profiles WHERE uid = ?').bind(me.uid).first();
+  if (!t) fail(404, 'ไม่พบร้าน');
+  const h = handleIn(b.handle), at = now();
+  if (!boss) {
+    if (!t.verified || t.test) fail(403, 'จองชื่อลิงก์ได้เมื่อร้านผ่านการตรวจแล้ว');
+    if (t.suspended) fail(403, 'ร้านพักใช้งานอยู่ เปิดร้านก่อนแล้วค่อยจองชื่อ');
+    if (!h) fail(400, 'กรอกชื่อลิงก์ร้าน');
+  }
+  if (h === (t.handle || '')) return { ok: true, handle: t.handle || '' };
+  if (!boss && t.handle && t.handle_at && at - t.handle_at < HANDLE_EVERY)
+    fail(429, 'เปลี่ยนชื่อลิงก์ได้อีกครั้งวันที่ ' + new Date(t.handle_at + HANDLE_EVERY).toLocaleDateString('th-TH', { day: 'numeric', month: 'short', year: 'numeric' }));
+  if (h) {
+    const bad = handleProblem(h);
+    if (bad === 'format') fail(400, 'ใช้ตัวอังกฤษเล็ก ตัวเลข และขีด (-) 3–30 ตัว เช่น nonair-bangna');
+    if (bad === 'reserved' && !boss) fail(409, 'ชื่อนี้สงวนไว้ เลือกชื่ออื่น');
+    const who = await handleHolder(env, h);
+    if (who && who.techId !== t.id) fail(409, 'ชื่อนี้มีร้านอื่นใช้แล้ว');
+  }
+  await limit(env, 'handle-set', t.uid, 5);
+  const stmts = [];
+  /* ชื่อเดิมไม่หายทันที: ลิงก์เก่ายังพาไปร้านนี้ และคนอื่นจองไม่ได้จนพ้นช่วงกันไว้ */
+  if (t.handle) stmts.push(env.DB.prepare(`INSERT INTO tech_handle_history (handle, tech_id, retired_at) VALUES (?,?,?)
+    ON CONFLICT(handle) DO UPDATE SET tech_id = excluded.tech_id, retired_at = excluded.retired_at`).bind(t.handle, t.id, at));
+  if (h) stmts.push(env.DB.prepare('DELETE FROM tech_handle_history WHERE handle = ? AND tech_id = ?').bind(h, t.id));
+  stmts.push(env.DB.prepare('UPDATE tech_profiles SET handle = ?, handle_at = ?, updated_at = ? WHERE id = ?').bind(h || null, at, at, t.id));
+  try { await env.DB.batch(stmts); }
+  catch (e) { if (/UNIQUE/i.test(String(e && e.message))) fail(409, 'ชื่อนี้มีร้านอื่นใช้แล้ว'); throw e; }
+  if (t.uid !== me.uid) await audit(env, me, 'handle.set', t.id, (t.handle || '-') + ' → ' + (h || '-'));
+  return { ok: true, handle: h, previous: t.handle || '' };
+}
+/* หน้าสาธารณะใช้หาร้านจากชื่อลิงก์ (รวมชื่อเก่าที่ยังอยู่ในช่วงพาไปร้านเดิม) — เฉพาะร้านที่เปิดให้คนทั่วไปเห็น */
+async function resolveHandle(env, h) {
+  const who = HANDLE_RE.test(h) ? await handleHolder(env, h) : null;
+  const t = who && await techById(env, who.techId);
+  if (!t || !t.verified || t.test || t.suspended) fail(404, 'ไม่พบร้าน');
+  return { techId: t.id, handle: t.handle || '', current: who.current };
+}
+
 /* ── ใบงาน ── */
 const NEXT = {
   /* action: [ใครทำได้, สถานะที่ต้องเป็นอยู่, สถานะถัดไป] */
@@ -1248,13 +1349,14 @@ function jobOut(j, t, role, messages) {
 }
 
 /* since = ข้อความที่ถูกแก้/ยกเลิกหลังเวลานี้ส่งมาด้วย (แม้ id เก่ากว่า after) อีกฝ่ายจะเห็นการแก้ภายในรอบดึงถัดไป */
-function msgOut({ media, edited_at, deleted_at, ...m }) {
+function msgOut({ media, edited_at, deleted_at, kind, ...m }) {
   if (deleted_at) return { id: m.id, role: m.role, text: '', at: m.at, deleted: true, editedAt: edited_at || deleted_at };
+  if (kind) m.kind = kind;
   const l = parse(media), o = l && l.length ? { ...m, media: l } : m;
   return edited_at ? { ...o, editedAt: edited_at } : o;
 }
 async function messagesOf(env, jobId, after, since) {
-  const cols = 'SELECT id, role, text, at, media, edited_at, deleted_at FROM tech_messages WHERE job_id = ?';
+  const cols = 'SELECT id, role, text, at, media, edited_at, deleted_at, kind FROM tech_messages WHERE job_id = ?';
   const { results } = await (since > 0
     ? env.DB.prepare(cols + ' AND (id > ? OR edited_at >= ?) ORDER BY id ASC LIMIT 500').bind(jobId, after || 0, since)
     : env.DB.prepare(cols + ' AND id > ? ORDER BY id ASC LIMIT 500').bind(jobId, after || 0)).all();
@@ -1288,7 +1390,7 @@ async function changeMessage(env, me, id, b, action) {
     if (age > UNSEND_MS) fail(409, 'ยกเลิกข้อความได้ภายใน 24 ชั่วโมงหลังส่ง');
     await env.DB.prepare("UPDATE tech_messages SET deleted_at = ?, edited_at = ?, orig_text = COALESCE(orig_text, text), text = '' WHERE id = ?").bind(ts, ts, msg.id).run();
   }
-  return { message: msgOut(await env.DB.prepare('SELECT id, role, text, at, media, edited_at, deleted_at FROM tech_messages WHERE id = ?').bind(msg.id).first()) };
+  return { message: msgOut(await env.DB.prepare('SELECT id, role, text, at, media, edited_at, deleted_at, kind FROM tech_messages WHERE id = ?').bind(msg.id).first()) };
 }
 async function markRead(env, jobId, uid, last) {
   if (!last) return;
@@ -1496,6 +1598,25 @@ async function postToThread(env, me, ctx, text, files) {
         lines: [text || mediaLabel(media)], url: appUrl(env, '/messages/' + th.id), label: 'ตอบกลับ' }) : null);
   return { id: r.id, role, text, at: ts, ...(media.length ? { media } : {}) };
 }
+/* ข้อความที่ระบบส่งแทนร้านในห้องทักช่าง (ตั้งใน Studio → ตั้งค่า)
+   - คำทักทาย: ข้อความแรกของห้องใหม่ — ลูกค้าเห็นตั้งแต่กดแชต (หน้าแอปแสดงก่อน) และเก็บไว้ในห้องให้ร้านเห็นตรงกัน
+   - ตอบกลับอัตโนมัติ: ลูกค้าทักมาแล้วร้านยังไม่ได้ตอบใน 12 ชม. ล่าสุด → ส่งหนึ่งครั้ง (คำทักทายไม่นับว่าร้านตอบแล้ว)
+     เดิมส่งเฉพาะตอนขอราคา ห้องทักช่างจึงไม่เคยได้ข้อความนี้เลย */
+const AUTO_GAP = 12 * 3600000;
+async function shopNote(env, th, t, kind, text, at) {
+  const r = await env.DB.prepare('INSERT INTO tech_messages (job_id, uid, role, text, at, kind) VALUES (?,?,?,?,?,?) RETURNING id')
+    .bind(th.id, t.uid, 'technician', text, at, kind).first();
+  await env.DB.prepare('UPDATE tech_threads SET updated_at = ? WHERE id = ?').bind(at, th.id).run();
+  return { id: r.id, role: 'technician', text, at, kind };
+}
+async function autoAnswer(env, th, t) {
+  const a = (parse(t && t.data) || {}).autoReply, text = String(a && a.on && a.text || '').trim();
+  if (!text) return null;
+  const at = now() + 1;
+  const last = await env.DB.prepare("SELECT MAX(at) AS at FROM tech_messages WHERE job_id = ? AND role = 'technician' AND COALESCE(kind,'') != 'greet' AND deleted_at IS NULL").bind(th.id).first();
+  if (last && last.at && at - last.at < AUTO_GAP) return null;
+  return shopNote(env, th, t, 'auto', text.slice(0, 500), at);
+}
 /* ทักร้าน: มีห้องอยู่แล้วคุยต่อ · ยังไม่มีเปิดห้องใหม่ (วันละไม่เกิน 20 ร้านใหม่ กันสแปม) */
 async function startThread(env, me, b) {
   const t = await techById(env, String(b.techId || ''));
@@ -1516,15 +1637,19 @@ async function startThread(env, me, b) {
     await env.DB.prepare('INSERT INTO tech_threads (id, tech_id, customer_uid, gig_id, test, created_at, updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(tech_id, customer_uid) DO NOTHING')
       .bind(id, t.id, me.uid, gig ? gig.id : null, t.test ? 1 : 0, ts, ts).run();
     th = await env.DB.prepare('SELECT * FROM tech_threads WHERE tech_id = ? AND customer_uid = ?').bind(t.id, me.uid).first();
+    /* ห้องเพิ่งเปิด (ไม่ใช่ห้องที่อีกเครื่องเปิดพร้อมกัน) → คำทักทายเป็นข้อความแรก */
+    const greet = String((parse(t.data) || {}).greet || '').trim();
+    if (greet && th.id === id) await shopNote(env, th, t, 'greet', greet.slice(0, 200), ts);
   } else if (gig && gig.id !== th.gig_id) {
     /* ถามเรื่องบริการใหม่ในห้องเดิม — จำบริการล่าสุดที่คุยถึง */
     await env.DB.prepare('UPDATE tech_threads SET gig_id = ? WHERE id = ?').bind(gig.id, th.id).run();
     th.gig_id = gig.id;
   }
   const message = await postToThread(env, me, { th, t, role: 'customer' }, text, b.media);
+  const auto = await autoAnswer(env, th, t);
   await bumpView(env, t.id, 'msg');
-  const [thread] = await threadsOut(env, me, [{ ...th, updated_at: message.at }], null);
-  return { thread, message };
+  const [thread] = await threadsOut(env, me, [{ ...th, updated_at: (auto || message).at }], null);
+  return { thread, message, ...(auto ? { auto } : {}) };
 }
 async function openThread(env, me, id, after, since) {
   const ctx = await threadCtx(env, me, id);
@@ -1537,7 +1662,9 @@ async function openThread(env, me, id, after, since) {
 async function replyThread(env, me, id, b) {
   const ctx = await threadCtx(env, me, id);
   const text = await threadText(env, me, ctx, b);
-  return { message: await postToThread(env, me, ctx, text, b.media) };
+  const message = await postToThread(env, me, ctx, text, b.media);
+  const auto = ctx.role === 'customer' ? await autoAnswer(env, ctx.th, ctx.t) : null;
+  return { message, ...(auto ? { auto } : {}) };
 }
 
 /* ══ รูปแนบกับคำขอ (เช่น รูปรถที่จอด รูปอาการ) ══
@@ -1616,8 +1743,8 @@ async function createJob(env, me, b) {
   await saveMedia(env, group || id, me.uid, photos);
   /* ตอบกลับอัตโนมัติของร้าน — ลูกค้ารู้ทันทีว่าร้านได้รับเรื่องแล้ว */
   if (d.autoReply && d.autoReply.on && d.autoReply.text) {
-    await env.DB.prepare('INSERT INTO tech_messages (job_id, uid, role, text, at) VALUES (?,?,?,?,?)')
-      .bind(id, t.uid, 'technician', d.autoReply.text, ts + 1).run();
+    await env.DB.prepare('INSERT INTO tech_messages (job_id, uid, role, text, at, kind) VALUES (?,?,?,?,?,?)')
+      .bind(id, t.uid, 'technician', d.autoReply.text, ts + 1, 'auto').run();
   }
   await bumpView(env, t.id, 'book');
   tell(env, t.uid, async () => jobCard(env, 'request', await env.DB.prepare('SELECT * FROM tech_jobs WHERE id = ?').bind(id).first(), shopOf(t)));
@@ -2356,9 +2483,11 @@ const roughKm = d => Math.max(1, Math.ceil(d));
    หมวดตรง (หรือประกาศไม่ระบุหมวด) · งานด่วนเห็นทุกร้านในรัศมีไม่ดูหมวด — รถเสียกลางทาง ใครใกล้ช่วยได้ก่อน */
 const postVisible = (p, t, d, dist) => dist <= Math.max(Number(d.radius) || 0, 30)
   && (!p.test || t.test) && (p.urgent || !p.cat || (d.cats || []).includes(p.cat) || t.test);
+/* ช่างเคลื่อนที่ที่ส่งตำแหน่งอยู่ วัดระยะจากตัวช่างตอนนี้ ไม่ใช่จากจุดที่ลงทะเบียนไว้ */
 async function postAudience(env, p) {
-  const { results } = await env.DB.prepare('SELECT id, uid, data, test FROM tech_profiles WHERE suspended = 0 AND uid != ?').bind(p.customer_uid).all();
-  return results.map(t => { const d = parse(t.data) || {}; return { t, d, dist: d.lat == null ? Infinity : km(d.lat, d.lng, p.lat, p.lng) }; })
+  const { results } = await env.DB.prepare('SELECT id, uid, data, test, online, live_lat, live_lng, live_at FROM tech_profiles WHERE suspended = 0 AND uid != ?').bind(p.customer_uid).all();
+  return results.map(t => { const d = parse(t.data) || {}, l = roamAt(t, d), at = l || d;
+    return { t, d, live: !!l, dist: at.lat == null ? Infinity : km(at.lat, at.lng, p.lat, p.lng) }; })
     .filter(x => postVisible(p, x.t, x.d, x.dist)).sort((a, b) => a.dist - b.dist);
 }
 
@@ -2387,11 +2516,13 @@ async function createPost(env, me, b) {
     str(b.area, 'พื้นที่', 3, 160), str(b.address, 'ที่อยู่', 4, 500), phone(b.phone, 'เบอร์โทร'),
     str(b.requestedTime, 'วันและเวลา', 2, 160), b.mode === 'shop' ? 'shop' : 'mobile', urgent, ts, ts, noteIn(b), budget, b.usedOk === true ? 1 : 0).run();
   await saveMedia(env, id, me.uid, photos);
-  /* บอกลูกค้าตามจริงว่ามีช่างกี่ร้านเห็นประกาศนี้ · งานด่วน = แจ้งทาง LINE ทันทีทุกร้านในรัศมี (ไม่ต้องรอช่างเปิดแอปเอง) */
+  /* บอกลูกค้าตามจริงว่ามีช่างกี่ร้านเห็นประกาศนี้ (reach) และกี่ร้านเปิดรับงานอยู่ตอนนี้ (taking)
+     งานด่วน = แจ้งทาง LINE ทันทีเฉพาะร้านที่เปิด "รับงาน" — ร้านที่เลือกรับงานไม่แจ้งเตือน หรือพักร้าน ไม่ถูกปลุก */
   const near = await postAudience(env, { customer_uid: me.uid, test, urgent, cat, lat: c.lat, lng: c.lng });
-  if (urgent) for (const x of near.slice(0, 25)) tell(env, x.t.uid, () => card({ tag: 'งานด่วน — รถเสียใกล้คุณ', title: String(b.car || '').slice(0, 60), url: appUrl(env, '/work'), label: 'ดูและเสนอราคา',
-    lines: [String(b.symptom || '').slice(0, 90), `ห่างร้านคุณประมาณ ${roughKm(x.dist)} กม.`, String(b.area || '').slice(0, 60)] }));
-  return { id, reach: near.length };
+  const taking = near.filter(x => x.t.online && !vacationOf(x.d));
+  if (urgent) for (const x of taking.slice(0, 25)) tell(env, x.t.uid, () => card({ tag: 'งานด่วน — รถเสียใกล้คุณ', title: String(b.car || '').slice(0, 60), url: appUrl(env, '/work'), label: 'ดูและเสนอราคา',
+    lines: [String(b.symptom || '').slice(0, 90), `${x.live ? 'ห่างจากคุณตอนนี้' : 'ห่างร้านคุณ'}ประมาณ ${roughKm(x.dist)} กม.`, String(b.area || '').slice(0, 60)] }));
+  return { id, reach: near.length, taking: taking.length };
 }
 
 /* รายละเอียดประกาศพร้อมรูป — เจ้าของประกาศ หรือช่างที่มองเห็นประกาศนี้ได้ */
@@ -2436,8 +2567,8 @@ async function pulse(env, me) {
 async function nearPosts(env, me) {
   const t = await env.DB.prepare('SELECT * FROM tech_profiles WHERE uid = ?').bind(me.uid).first();
   if (!t || t.suspended) fail(403, 'ต้องเป็นช่างในระบบก่อน');
-  const d = parse(t.data) || {};
-  if (d.lat == null) fail(400, 'ตั้งตำแหน่งร้านก่อน');
+  const d = parse(t.data) || {}, at = roamAt(t, d) || d;
+  if (at.lat == null) fail(400, 'ตั้งตำแหน่งร้านก่อน');
   const radius = Math.max(Number(d.radius) || 0, 30);
   const { results } = await env.DB.prepare(
     `SELECT * FROM tech_posts WHERE status = 'open' AND created_at > ? AND customer_uid != ? AND (test = 0 OR ? = 1) ORDER BY created_at DESC LIMIT 300`)
@@ -2453,11 +2584,11 @@ async function nearPosts(env, me) {
     const mc = await inAll(env, 'SELECT owner, COUNT(*) AS n FROM tech_media WHERE owner IN ({IN}) GROUP BY owner', results.map(p => p.id));
     mc.forEach(r => { pc[r.owner] = r.n; });
   }
-  const posts = results.map(p => ({ p, dist: km(d.lat, d.lng, p.lat, p.lng) }))
+  const posts = results.map(p => ({ p, dist: km(at.lat, at.lng, p.lat, p.lng) }))
     .filter(x => postLive(x.p) && postVisible(x.p, t, d, x.dist))
     .sort((a, b) => (b.p.urgent - a.p.urgent) || a.dist - b.dist)
     .map(x => postOut(x.p, { dist: roughKm(x.dist), mine: mine[x.p.id] || null, photos: pc[x.p.id] || 0 }));
-  return { posts, radius, center: { lat: d.lat, lng: d.lng } };
+  return { posts, radius, center: { lat: at.lat, lng: at.lng }, live: at !== d };
 }
 
 async function offer(env, me, postId, b) {
@@ -2525,8 +2656,32 @@ async function shopFor(env, me, b) {
 async function setOnline(env, me, b) {
   const t = await myShop(env, me);
   if(t.suspended && b.online) fail(403,'บัญชีช่างอยู่ระหว่างตรวจสอบ จึงเปิดรับงานไม่ได้ชั่วคราว');
-  await env.DB.prepare('UPDATE tech_profiles SET online = ?, last_seen = ? WHERE id = ?').bind(b.online ? 1 : 0, now(), t.id).run();
+  /* ปิดรับงาน = ลบตำแหน่งมือถือล่าสุดทิ้งทันที ไม่ค้างไว้ในระบบ */
+  await env.DB.prepare(`UPDATE tech_profiles SET online = ?, last_seen = ?${b.online ? '' : ', live_lat = NULL, live_lng = NULL, live_at = NULL'} WHERE id = ?`).bind(b.online ? 1 : 0, now(), t.id).run();
   return { ok: true, online: !!b.online };
+}
+/* ช่างเคลื่อนที่: มือถือช่างส่งจุดล่าสุดมาเรื่อย ๆ ระหว่างเปิดรับงาน (ทับจุดเดิม ไม่เก็บเส้นทาง) */
+async function setHere(env, me, b) {
+  const t = await myShop(env, me), d = parse(t.data) || {};
+  if (t.suspended) fail(403, 'บัญชีช่างอยู่ระหว่างตรวจสอบ จึงแชร์ตำแหน่งไม่ได้ชั่วคราว');
+  if (!roamOn(d)) fail(409, 'เปิดโหมดช่างเคลื่อนที่ในตั้งค่า Studio ก่อน');
+  if (!t.online || vacationOf(d)) fail(409, 'แชร์ตำแหน่งได้เฉพาะตอนเปิดรับงาน');
+  const lat = Number(b.lat), lng = Number(b.lng), acc = Number(b.acc);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng) || lat < 5 || lat > 21 || lng < 97 || lng > 106.5) fail(400, 'ตำแหน่งไม่ถูกต้อง');
+  if (Number.isFinite(acc) && acc > 3000) fail(400, 'ตำแหน่งยังไม่แม่นพอ ลองใหม่อีกครั้ง');
+  const ts = now();
+  /* ส่งถี่เกินไม่ต้องเขียนซ้ำ — จุดที่ลูกค้าเห็นปัดเป็นช่องอยู่แล้ว */
+  if (t.live_at && ts - t.live_at < 15000) return { ok: true, at: t.live_at };
+  await env.DB.prepare('UPDATE tech_profiles SET live_lat = ?, live_lng = ?, live_at = ?, last_seen = ? WHERE id = ?')
+    .bind(Math.round(lat * 1e5) / 1e5, Math.round(lng * 1e5) / 1e5, ts, ts, t.id).run();
+  return { ok: true, at: ts };
+}
+/* แผนที่ฝั่งลูกค้าถามทุกครึ่งนาที: ช่างเคลื่อนที่ที่รับงานอยู่ตอนนี้อยู่ตรงไหน (จุดปัดแล้วเท่านั้น) — ร้านเดียวกับที่รายชื่อแสดง */
+async function liveTechs(env, me) {
+  const { results } = await env.DB.prepare(`SELECT p.id, p.online, p.data, p.live_lat, p.live_lng, p.live_at FROM tech_profiles p
+    WHERE ${directoryWhere(me?.staff)} AND p.online = 1 AND p.live_at > ?`).bind(now() - LIVE_TTL).all();
+  const live = results.map(r => { const l = livePublic(roamAt(r, parse(r.data) || {})); return l && { id: r.id, ...l }; }).filter(Boolean);
+  return { live, ttl: LIVE_TTL };
 }
 async function editShop(env, me, b) {
   const t = await shopFor(env, me, b), other = t.uid !== me.uid;
@@ -2545,6 +2700,7 @@ async function editShop(env, me, b) {
   if (Array.isArray(b.cats)) { const c = [...new Set(b.cats.filter(x => CATS.includes(x)))]; if (!c.length) fail(400, 'เลือกงานที่รับอย่างน้อย 1 อย่าง'); d.cats = c; }
   if (b.mobile != null) d.mobile = !!b.mobile;
   if (b.urgent != null) d.urgent = !!b.urgent;
+  if (b.roam != null) d.roam = !!b.roam;
   if (b.lat != null || b.lng != null) Object.assign(d, coord(b));
   /* ตั้งรูปที่มีอยู่เป็นปก หรืออัปโหลดรูปปกใหม่ (นับรวมโควตา 12 รูป) */
   if (b.cover != null) {
@@ -2591,6 +2747,8 @@ async function editShop(env, me, b) {
     d.cover = r.meta && r.meta.last_row_id || null;
   }
   const stmts = [env.DB.prepare('UPDATE tech_profiles SET data = ?, updated_at = ? WHERE id = ?').bind(JSON.stringify(d), now(), t.id)];
+  /* ปิดโหมดช่างเคลื่อนที่ หรือพักร้าน = ลบตำแหน่งมือถือล่าสุดทิ้ง */
+  if (!roamOn(d) || vacationOf(d)) stmts.push(env.DB.prepare('UPDATE tech_profiles SET live_lat = NULL, live_lng = NULL, live_at = NULL WHERE id = ?').bind(t.id));
   /* รูปใหม่ต่อท้าย รูปที่ลบคือรหัสรูปของร้านนี้เท่านั้น — ลบรูปร้านอื่นผ่านทางนี้ไม่ได้ */
   if (Array.isArray(b.removePhotos)) b.removePhotos.slice(0, 20).forEach(id =>
     stmts.push(env.DB.prepare("DELETE FROM tech_docs WHERE id = ? AND uid = ? AND kind IN ('shop','work')").bind(Number(id), t.uid)));
@@ -2874,7 +3032,7 @@ async function advice(env, me) {
   if ((s.reviewCount || 0) < 3) add('high', 'เก็บรีวิวจากลูกค้า', 'ร้านที่มีรีวิวพร้อมรูปอย่างน้อย 3 รีวิว ลูกค้าใหม่เชื่อใจมากกว่า ปิดงานแล้วชวนลูกค้าให้คะแนนในแอป', 'reviews');
   if (!ph.some(x => x.kind === 'shop')) add('mid', 'เพิ่มรูปหน้าร้าน', 'ให้ลูกค้าเห็นว่าอู่มีอยู่จริง หาเจอง่าย', 'photos');
   if (!d.about || d.about.length < 40) add('mid', 'เขียนความถนัดให้ชัด', 'บอกรุ่นรถที่ถนัด เครื่องมือที่มี และงานที่ไม่รับ ช่วยให้ AI จับคู่ลูกค้าให้ตรงขึ้น', 'about');
-  if (!t.online) add('high', 'เปิดรับงาน', 'ตอนนี้คุณออฟไลน์ ประกาศงานใหม่จะไม่แจ้งเตือน', 'online');
+  if (!t.online && !vacationOf(d)) add('high', 'เปิดรับงาน', 'ตอนนี้ร้านรับงานแบบไม่แจ้งเตือน — งานด่วนแถวนี้จะไม่ส่ง LINE ถึงคุณ และในแอปไม่มีเสียงเตือน เปิดรับงานเพื่อให้งานด่วนถึงคุณก่อน', 'online');
   if (s.replyMin != null && s.replyMin > 30) add('high', 'ตอบให้เร็วขึ้น', `เฉลี่ยคุณเสนอราคาใน ${s.replyMin} นาที ร้านที่ตอบภายใน 15 นาทีมักได้งานมากกว่า`, 'queue');
   if (s.quoted >= 3 && s.winRate < 30) add('mid', 'ราคาอาจสูงไป', `ได้งาน ${s.winRate}% ของที่เสนอ ลองเขียนขอบเขตงานให้ละเอียดขึ้น หรือทบทวนราคา`, 'shop');
   if (med && d.from > med * 1.4) add('mid', 'ราคาเริ่มต้นสูงกว่าร้านอื่น', `ร้านหมวดเดียวกันเริ่มราว ฿${med.toLocaleString()} ของคุณ ฿${Number(d.from).toLocaleString()}`, 'shop');
@@ -2918,6 +3076,11 @@ async function route(request, env, verifyToken) {
     try { me = await who(request, env, wantTest,verifyToken); } catch (e) { if (wantTest) throw e; }
     return listTechs(env, me, url);
   }
+  if (p === '/api/tech/live' && m === 'GET') {
+    let me = null;
+    try { me = await who(request, env, false, verifyToken); } catch (e) {}
+    return liveTechs(env, me);
+  }
   if (p === '/api/tech/gigs' && m === 'GET') {
     let me = null;
     try { me = await who(request, env, false, verifyToken); } catch (e) {}
@@ -2945,9 +3108,13 @@ async function route(request, env, verifyToken) {
   /* หน้าเว็บใช้เช็กว่าเซิร์ฟเวอร์มีระบบช่างรุ่นนี้แล้ว — ถ้าไม่มี แสดงให้ทีมงานรู้ว่ายังไม่ได้ deploy */
   if (p === '/api/tech/ping') return { ok: true, version: API_VERSION, identity: diditReady(env) ? 'didit' : 'manual', consentVer: CONSENT_VER, photoAI: visionReady(env) };
   if (p === '/api/tech/didit/webhook' && m === 'POST') return diditWebhook(env, request);
+  const hdm = p.match(/^\/api\/tech\/handle\/([A-Za-z0-9-]{1,40})$/);
+  if (hdm && m === 'GET') return resolveHandle(env, handleIn(hdm[1]));
 
   const me = await who(request, env,true,verifyToken);
   if (p === '/api/tech/me' && m === 'GET') return meInfo(env, me);
+  if (p === '/api/tech/handle' && m === 'GET') return checkHandle(env, me, handleIn(url.searchParams.get('h')));
+  if (p === '/api/tech/handle' && m === 'POST') return setHandle(env, me, await body());
   if (p === '/api/tech/apply' && m === 'POST') return apply(env, me, await body());
   if (p === '/api/tech/apply/identity' && m === 'POST') return startIdentity(env, me);
   if (p === '/api/tech/apply/withdraw' && m === 'POST') return withdraw(env, me);
@@ -2984,6 +3151,7 @@ async function route(request, env, verifyToken) {
   if (p === '/api/tech/posts' && m === 'GET') return myPosts(env, me);
   if (p === '/api/tech/posts/near' && m === 'GET') return nearPosts(env, me);
   if (p === '/api/tech/online' && m === 'POST') return setOnline(env, me, await body());
+  if (p === '/api/tech/here' && m === 'POST') return setHere(env, me, await body());
   if (p === '/api/tech/shop' && m === 'POST') return editShop(env, me, await body());
   if (p === '/api/tech/gig' && m === 'POST') return saveGig(env, me, await body());
   if (p === '/api/tech/gig/delete' && m === 'POST') return delGig(env, me, await body());

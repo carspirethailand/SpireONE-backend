@@ -65,6 +65,8 @@ export const TABLES = [
   ['tech_profiles', MINE, []],
   ['tech_gigs', MINE, []],
   ['tech_sponsors', MINE, []],
+  /* ชื่อลิงก์เก่าของร้าน (ยังพาไปร้านเดิมช่วงหนึ่ง) */
+  ['tech_handle_history', MY_SHOP, []],
   ['tech_media', MINE, ['data']],
   ['tech_posts', 'customer_uid = ?', []],
   ['tech_jobs', 'customer_uid = ?', ['start_code']],
@@ -209,6 +211,11 @@ export async function deleteAccount(env, uid, { email = '' } = {}) {
     add('tech_showcase', await run(env, 'DELETE FROM tech_showcase WHERE tech_id = ?', shop.id));
     add('tech_profiles', await run(env, `UPDATE tech_profiles SET uid = 'deleted:' || id, phone = NULL, data = ?, verified = 0, suspended = 1, online = 0, updated_at = ? WHERE uid = ?`,
       JSON.stringify({ name: 'ร้านที่ปิดบัญชีแล้ว', shop: 'ร้านที่ปิดบัญชีแล้ว', deleted: true }), at, uid));
+    /* ชื่อลิงก์ร้าน (/tech/<ชื่อ>) คืนให้คนอื่นจองได้ ไม่ค้างพาไปร้านที่ปิดแล้ว */
+    await run(env, 'UPDATE tech_profiles SET handle = NULL WHERE id = ?', shop.id);
+    /* ตำแหน่งมือถือล่าสุดของช่างเคลื่อนที่ ลบทิ้งพร้อมกัน */
+    await run(env, 'UPDATE tech_profiles SET live_lat = NULL, live_lng = NULL, live_at = NULL WHERE id = ?', shop.id);
+    add('tech_handle_history', await run(env, 'DELETE FROM tech_handle_history WHERE tech_id = ?', shop.id));
   }
   /* แฮชเลขบัตรของร้านที่ทีมงานระงับ (ไม่ใช่พักเพราะรอยืนยันตัวตน) เก็บไว้กันสมัครซ้ำ — อย่างอื่นลบ */
   const keepClaim = shop && Number(shop.suspended) === 1 && Number(shop.id_hold) !== 1;

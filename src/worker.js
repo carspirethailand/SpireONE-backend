@@ -10,7 +10,7 @@ import { ONBOARDING_SQL, handleOnboarding, onboardingName, sanitizeSetupState } 
 import { buildFeatureRequest, cleanFeatureJson, featureCap } from './features-ai.mjs';
 import { soundText, legacySound, audioIdentity, VEHICLE_AUDIO_RULES } from './vehicle-audio.mjs';
 import {publicResearch, publicQuery, soundResearchQuery, researchBlock} from './vehicle-research.mjs';
-import { configuredProviders, providerOrder, benchSearch, searchWeb, sourceCards, BENCH_QUERIES } from './web-search.mjs';
+import { configuredProviders, providerOrder, benchSearch, searchWeb, sourcesBlock, sourceCards, BENCH_QUERIES } from './web-search.mjs';
 import { engineScanFailure } from './engine-scan-errors.mjs';
 import { liveToken, cleanHandle } from './live-setup.mjs';
 import { valetPrompt } from './agent-prompt.mjs';
@@ -2213,8 +2213,17 @@ async function executeDescribeMediaTool(env, messages, prompt) {
   throw lastErr || new Error('Failed to analyze media file with Gemini API');
 }
 
-/* ── ค้นข้อมูลอินเทอร์เน็ต (DuckDuckGo -> Gemini 3.1 -> Gemini 3.5 -> WebSearch) ── */
-async function executeGoogleSearchTool(env, query) {
+/* ── ค้นข้อมูลอินเทอร์เน็ตให้แชต ──
+   ตั้งคีย์ตัวค้น (Tavily/Exa/Firecrawl) ไว้ → ใช้ก่อน ได้ผลพร้อมเลขอ้างอิง [n]
+   ไม่มีคีย์ หรือไม่ได้ผล → ค้นสาธารณะแบบเดิม (DuckDuckGo → Bing RSS แล้วอ่านหน้าที่ robots.txt อนุญาต)
+   คำค้นต้องผ่าน publicQuery ก่อนทุกทาง — มีข้อมูลส่วนตัวปนอยู่ = ไม่ส่งออกไปที่ไหนเลย */
+export async function executeGoogleSearchTool(env, query) {
+  if (configuredProviders(env).length) {
+    try {
+      const r = await searchWeb(env, publicQuery(query), { mode: 'balanced' });
+      if (r.results.length) return '\n' + sourcesBlock(r);
+    } catch {}
+  }
   try{return researchBlock(await publicResearch(query))}catch{return 'Public web search requires a short topic without private details. Do not invent current facts or sources.'}
 }
 
