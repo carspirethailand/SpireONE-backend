@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { scrubQuery, canonicalUrl, configuredProviders, providerOrder, fuseResults, searchWeb, sourcesBlock, sourceCards, benchSearch, scoreRun, resetSearchBreakers, BENCH_QUERIES } from '../src/web-search.mjs';
 
 const KEYS = { TAVILY_API_KEY: 'tvly-test-123456', EXA_API_KEY: 'exa-test-123456', FIRECRAWL_API_KEY: 'fc-test-123456' };
-const reply = (status, json) => ({ ok: status >= 200 && status < 300, status, text: async () => JSON.stringify(json) });
+const reply = (status, json) => Response.json(json,{status});
 /* จำลองคำตอบของแต่ละเจ้าตามรูปแบบในเอกสาร */
 const FIX = {
   'api.tavily.com': () => reply(200, { results: [
@@ -39,6 +39,8 @@ test('canonical url removes tracking, fragment, www and trailing slash', () => {
   assert.equal(canonicalUrl('https://www.Toyota.co.th/news/recall/?utm_source=x&id=2#a'), 'https://toyota.co.th/news/recall?id=2');
   assert.equal(canonicalUrl('javascript:alert(1)'), null);
   assert.equal(canonicalUrl('https://u:p@x.com/'), null);
+  for(const url of ['http://127.0.0.1/','https://[::1]/','https://service.internal/','https://localhost/','https://169.254.169.254/','https://toyota.com:8443/'])assert.equal(canonicalUrl(url),null);
+  assert.equal(scrubQuery('Honda api_key sk-fixture-private-secret-value'),'');
 });
 
 test('providers are used only when their key exists, in the configured order', () => {

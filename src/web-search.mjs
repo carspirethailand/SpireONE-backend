@@ -5,6 +5,7 @@
    - ข้อความจากเว็บเป็นหลักฐานที่เชื่อไม่ได้ 100% ห้ามโมเดลทำตามคำสั่งในนั้น
    ราคาต่อครั้งเป็นค่าประมาณจากหน้าราคาของแต่ละเจ้า (ต.ค. 2569) ปรับได้ด้วย env *_USD_PER_CREDIT */
 
+import {requestText} from './request-json.mjs';
 export const SEARCH_PROVIDERS = Object.freeze(['tavily', 'exa', 'firecrawl']);
 const KEY = { tavily: 'TAVILY_API_KEY', exa: 'EXA_API_KEY', firecrawl: 'FIRECRAWL_API_KEY' };
 const TIMEOUT = { fast: 4500, balanced: 7000, deep: 12000 };
@@ -17,6 +18,9 @@ export const configuredProviders = env => SEARCH_PROVIDERS.filter(p => typeof en
 
 /* ── ล้างคำค้นก่อนส่งออกนอกระบบ: ตัดทิ้ง ไม่ปฏิเสธทั้งประโยค (ผู้ใช้ถามเรื่องรถ ไม่ควรค้นไม่ได้เพราะแนบเบอร์มา) ── */
 export function scrubQuery(raw) {
+  // A credential-looking query is not made safe by deleting just the word
+  // "token" and leaving its value behind. Refuse it instead of exporting it.
+  if(/\b(?:api[_ -]?key|bearer|password|secret|token)\b|AIza[A-Za-z0-9_-]{20,}|\b(?:sk-|ghp_|github_pat_)[A-Za-z0-9_-]{16,}/i.test(String(raw||'')))return '';
   let q = String(raw == null ? '' : raw).normalize('NFC').replace(/[\u0000-\u001f<>]/g, ' ');
   q = q.replace(/https?:\/\/\S+|www\.\S+/gi, ' ')
     .replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, ' ')
@@ -36,6 +40,7 @@ export function canonicalUrl(raw) {
   try {
     const u = new URL(raw);
     if (!/^https?:$/.test(u.protocol) || u.username || u.password) return null;
+    if(u.port||!u.hostname.includes('.')||/^[\d.]+$/.test(u.hostname)||u.hostname.includes(':')||/(?:^|\.)(localhost|local|internal|test|invalid)$/.test(u.hostname))return null;
     u.hash = '';
     for (const k of [...u.searchParams.keys()]) if (/^(utm_|fbclid$|gclid$|mc_|ref$|ref_src$)/i.test(k)) u.searchParams.delete(k);
     const host = u.hostname.toLowerCase().replace(/^www\./, '');
@@ -53,8 +58,8 @@ async function call(fetchFn, url, init, ms, signal) {
   const timer = setTimeout(stop, ms);
   if (signal) { if (signal.aborted) ac.abort(); else signal.addEventListener('abort', stop, { once: true }) }
   try {
-    const r = await fetchFn(url, { ...init, signal: ac.signal });
-    const text = await r.text();
+    const r = await fetchFn(url, { ...init, signal: ac.signal,redirect:'error' });
+    const text = await requestText(r,2*1024*1024);
     let data = null; try { data = JSON.parse(text) } catch {}
     if (!r.ok) throw Object.assign(Error((data && (data.error || data.detail || data.message)) || 'HTTP ' + r.status), { status: r.status });
     if (!data) throw Error('bad_json');
@@ -136,7 +141,7 @@ export function fuseResults(lists, { max = 6, topic = 'general', now = Date.now(
   for (const { provider, results } of lists) {
     (results || []).forEach((r, i) => {
       const key = canonicalUrl(r.url); if (!key) return;
-      const cur = byUrl.get(key) || { ...r, url: r.url, key, host: hostOf(r.url), providers: [], rrf: 0 };
+      const cur = byUrl.get(key) || { ...r, url: key, key, host: hostOf(key), providers: [], rrf: 0 };
       cur.rrf += 1 / (60 + i + 1);
       cur.providers.push(provider);
       if ((r.snippet || '').length > (cur.snippet || '').length) cur.snippet = r.snippet;
