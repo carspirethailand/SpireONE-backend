@@ -9,6 +9,7 @@ const PRESS=['headlightmag.com','autospinn.com','grandprix.co.th','autodeft.com'
 const HOSTS=[...OEM,...PRESS,'en.wikipedia.org'];
 const robotCache=new Map();
 const SEARCH_SITES=['https://www.headlightmag.com','https://www.autodeft.com','https://www.motortrivia.com'];
+import {configuredProviders,searchWeb} from './web-search.mjs';
 export function active(signal){if(signal?.aborted)throw Object.assign(new Error('ค้นนานเกินกำหนด'),{name:'AbortError'})}
 /* The race also bounds stalled response bodies and fetch mocks that ignore
  * abort. All nested requests inherit cancellation; no fallback survives it. */
@@ -97,13 +98,16 @@ async function readPage(raw,q,log,signal){
     log.push({step:'document',ok:true,url,title,chars:plain.length});return {url,title,text:excerpt(plain,q),primary:under(new URL(url).hostname,OEM)};
   }}catch(e){active(signal);log.push({step:'document',ok:false,url,err:String(e.message).slice(0,90)})}return null;
 }
-export async function collectSpecDocuments(q,log=[],signal){
+export async function collectSpecDocuments(q,log=[],signal,{env}={}){
   const deadline=Date.now()+12000;
   // Public publisher search APIs are read-only. These provide local-market
   // articles beyond Wikipedia's reference list; no search-service key needed.
   const localLinks=publisherLinks(q,log,signal);
   // Observe rejection even if required discovery exits before using links.
   localLinks.catch(()=>{});
+  /* ค้นหน้าสเปกเพิ่มผ่านตัวค้นของ AI (Exa/Tavily ประเภท spec) เมื่อตั้งคีย์ — ได้แค่ลิงก์ แล้วยังต้องผ่านรายชื่อเว็บที่อนุญาต
+     robots.txt และการตรวจรุ่น/ปีใน readPage เหมือนลิงก์อื่นทุกอย่าง */
+  const keyed=configuredProviders(env).length?searchWeb(env,q.make+' '+q.model+' '+q.year+' specifications',{kind:'spec',max:8,signal}).then(r=>{log.push({step:'search-discovery',ok:true,found:r.results.length,providers:r.providers.filter(p=>p.ok).map(p=>p.provider)});return r.results.map(x=>({url:x.url,title:x.title}))}).catch(e=>{active(signal);log.push({step:'search-discovery',ok:false,err:String(e.message||e).slice(0,90)});return []}):Promise.resolve([]);
   let chosen=null,page={parse:{}},plain='',discoveryError=null;
   try{
     const found=await wiki({action:'query',list:'search',srsearch:q.make+' '+q.model,srlimit:'3'},signal,deadline-Date.now());
@@ -111,7 +115,8 @@ export async function collectSpecDocuments(q,log=[],signal){
     if(chosen?.pageid){page=await wiki({action:'parse',pageid:String(chosen.pageid),prop:'wikitext|externallinks'},signal,deadline-Date.now());const raw=page.parse?.wikitext?.['*'];plain=raw?wikiPlain(raw):textOf(page.parse?.text?.['*']||'');}
   }catch(e){active(signal);discoveryError=e;log.push({step:'encyclopedia-discovery',ok:false,err:'Discovery unavailable; continue with readable publishers'});}
   let published=[];try{published=await localLinks}catch(e){active(signal)}
-  const candidates=[...published.map(x=>x.url),...(page.parse?.externallinks||[])].filter(allowedSource).filter(u=>!/^https:\/\/en\.wikipedia/.test(u));
+  const searched=await keyed;
+  const candidates=[...published.map(x=>x.url),...searched.map(x=>x.url),...(page.parse?.externallinks||[])].filter(allowedSource).filter(u=>!/^https:\/\/en\.wikipedia/.test(u));
   const metadata=new Map(published.map(x=>[x.url,x]));
   candidates.sort((a,b)=>documentRank(b,q,metadata.get(b))-documentRank(a,q,metadata.get(a)));
   const hostCounts=new Map(),unique=new Set(),urls=[];for(const u of candidates){const host=new URL(u).hostname.replace(/^www\./,'');if(unique.has(u)||(hostCounts.get(host)||0)>=2||/\.pdf(?:\?|$)/i.test(u))continue;unique.add(u);hostCounts.set(host,(hostCounts.get(host)||0)+1);urls.push(u);if(urls.length===10)break}

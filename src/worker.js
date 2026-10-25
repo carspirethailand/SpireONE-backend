@@ -10,7 +10,7 @@ import { ONBOARDING_SQL, handleOnboarding, onboardingName, sanitizeSetupState } 
 import { buildFeatureRequest, cleanFeatureJson, featureCap } from './features-ai.mjs';
 import { soundText, legacySound, audioIdentity, VEHICLE_AUDIO_RULES } from './vehicle-audio.mjs';
 import {publicResearch, publicQuery, soundResearchQuery, researchBlock} from './vehicle-research.mjs';
-import { configuredProviders, providerOrder, benchSearch, searchWeb, sourcesBlock, sourceCards, BENCH_QUERIES } from './web-search.mjs';
+import { configuredProviders, providerOrder, benchSearch, searchWeb, searchForChat, searchKind, sourceCards, SEARCH_ROUTES, searchRoute, BENCH_QUERIES } from './web-search.mjs';
 import { engineScanFailure } from './engine-scan-errors.mjs';
 import { liveToken, cleanHandle } from './live-setup.mjs';
 import { valetPrompt } from './agent-prompt.mjs';
@@ -110,8 +110,8 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                   question,
                   hasMedia,
                   carInfo,
-                  search: fresh, externalSearch: true,
-                  executeSearch: async (q) => await executeGoogleSearchTool(env, q),
+                  search: fresh,
+                  executeSearch: async (q) => await executeWebSearchTool(env, q, { car: carInfo, depth: body.depth, meter }),
                   executeMedia: async (p) => await executeDescribeMediaTool(env, msgs, p),
                   executeKb: async (q) => await kbFor(env, carInfo, q),
                   depth: body.depth, level: levelFor(body.depth, question, hasMedia, body.skillIds), meter,
@@ -200,7 +200,7 @@ export async function analyzeFeature(env, actor, body, {signal}={}) {
   let research;
   if(body.tool==='ear'||body.tool==='listen'){
     const q=soundResearchQuery(audioIdentity(body.context));
-    research=q?await publicResearch(q,{signal,vehicle:audioIdentity(body.context).vehicle}):{status:'needs_vehicle',sources:[],verifiedModelFaults:[]};
+    research=q?await publicResearch(q,{env,signal,vehicle:audioIdentity(body.context).vehicle}):{status:'needs_vehicle',sources:[],verifiedModelFaults:[]};
     input.contents[0].parts[0].text+=researchBlock(research);
   }
   const prefer = (body.tool === 'bay' || body.tool === 'baylive') && env.GEMINI_VISION_MODEL ? [env.GEMINI_VISION_MODEL] : undefined;
@@ -994,7 +994,12 @@ async function tokensToday(env, uid) {
 }
 
 /* ===== Gemini (server-side only — key never leaves the Worker) ===== */
+/* search = { q, kind } — ค้นผ่านตัวค้นของ AI (web-search.mjs) ก่อน แล้วแนบผลไว้ท้าย system (ไม่ใช้ Google Search ของ Gemini แล้ว จึงใช้คู่กับ JSON ได้) */
 async function callGemini(env, { contents, system, search, temp, json: wantJson, maxTokens, meter, prefer, schema, timeoutMs }) {
+  if (search && typeof search === 'object' && search.q) {
+    const web = await searchForChat(env, search.q, { kind: search.kind, meter });
+    system = String(system || '') + '\n\n' + (web || '[ค้นเว็บไม่ได้ในรอบนี้ — ห้ามเดาราคา ข่าว หรือตัวเลขล่าสุด ให้บอกตรง ๆ ว่ายังยืนยันไม่ได้]');
+  }
   const hasAudio=(contents||[]).some(m=>(m.parts||[]).some(p=>/^audio\//i.test((p.inlineData||p.inline_data)?.mimeType||(p.inline_data||{}).mime_type||'')));
   if(hasAudio&&!String(system||'').includes(VEHICLE_AUDIO_RULES))system=VEHICLE_AUDIO_RULES+'\n'+String(system||'');
   const geminiKey = env.GEMINI_KEY;
@@ -1025,9 +1030,7 @@ async function callGemini(env, { contents, system, search, temp, json: wantJson,
       else if (/2\.5/.test(model)) gen.thinkingConfig = { thinkingBudget: 0 };
     }
     const body = { contents, generationConfig: gen };
-    if (system) body.systemInstruction = { parts: [{ text: String(system).slice(0, 8000) }] };
-    // The search tool and a forced JSON mime type cannot be combined.
-    if (search && !wantJson) body.tools = [{ google_search: {} }];
+    if (system) body.systemInstruction = { parts: [{ text: String(system).slice(0, search ? 16000 : 8000) }] };
 
     try {
       const res = await fetch(url, {
@@ -1298,7 +1301,7 @@ const DEFAULT_SKILLS = [
 - รวมช่วงราคาต่ำสุด-สูงสุด เป็นเงินบาท
 - เทียบให้เห็นว่าศูนย์บริการกับอู่ทั่วไปต่างกันประมาณกี่เปอร์เซ็นต์
 บอกเสมอว่าเป็นราคาประเมินในไทยโดยประมาณ ราคาจริงขึ้นกับรุ่นปีและร้าน
-ถ้าไม่มั่นใจเรื่องราคาปัจจุบัน ให้เรียก google_search ก่อนตอบ`,
+ราคาปัจจุบันใช้จากผลค้นเว็บที่แนบมา ถ้าไม่มีผลค้นให้บอกว่าเป็นราคาประเมินที่ยังยืนยันไม่ได้`,
   },
   {
     id: 'cdn_maint', slug: 'maintenance', name: 'แผนเช็กระยะ', en: 'Service plan',
@@ -1320,7 +1323,7 @@ const DEFAULT_SKILLS = [
 - เสนอของเทียบที่คุณภาพใช้ได้ พร้อมยี่ห้อที่คนไทยใช้กันจริง
 - เตือนจุดที่ซื้อผิดบ่อย เช่น ปีรุ่นย่อย เครื่องคนละบล็อก ขั้วปลั๊กคนละแบบ
 - บอกว่าควรเปลี่ยนคู่กับอะไรในคราวเดียวเพื่อไม่ต้องรื้อซ้ำ
-ถ้าต้องการราคาหรือความพร้อมของสินค้าปัจจุบัน ให้เรียก google_search`,
+ราคาหรือความพร้อมของสินค้าปัจจุบัน ใช้จากผลค้นเว็บที่แนบมาเท่านั้น ถ้าไม่มีผลค้นให้บอกว่ายังยืนยันราคาปัจจุบันไม่ได้`,
   },
   {
     id: 'cdn_photo', slug: 'photo', name: 'อ่านภาพ/วิดีโอ', en: 'Read media',
@@ -1340,7 +1343,7 @@ const DEFAULT_SKILLS = [
 - แบ่งเป็น ภายนอก / ภายใน / ห้องเครื่อง / ทดลองขับ / เอกสาร
 - แต่ละข้อบอกว่า "ถ้าเจอแบบนี้ = ต่อราคาได้" หรือ "ถ้าเจอแบบนี้ = ควรเดินหนี"
 - ใส่จุดอ่อนเฉพาะรุ่นที่ผู้ใช้ถามด้วย ถ้ารู้
-- ปิดท้ายด้วยราคากลางของรุ่นนั้นในตลาดมือสองไทย (ใช้ google_search ถ้าจำเป็น)`,
+- ปิดท้ายด้วยราคากลางของรุ่นนั้นในตลาดมือสองไทย (ใช้ผลค้นเว็บที่แนบมา ถ้าไม่มีให้บอกว่ายังยืนยันราคาไม่ได้)`,
   },
   {
     id: 'cdn_simple', slug: 'simple', name: 'อธิบายให้ง่าย', en: 'Explain simply',
@@ -1384,7 +1387,7 @@ const IDENTITY = `[ฉันคือใคร — ข้อมูลนี้�
 ห้ามแต่งข้อมูลขึ้นมาเองเด็ดขาด โดยเฉพาะ ชื่อรุ่นรถ ตัวเลขสเปก แรงม้า ราคา วันเปิดตัว และปีรุ่น
 ถ้าไม่มีข้อมูลยืนยัน ให้บอกตรง ๆ ว่า "ยังไม่มีข้อมูลยืนยันเรื่องนี้" แล้วเสนอสิ่งที่ช่วยได้จริงแทน
 การตอบว่าไม่รู้ ถือว่าถูกต้องเสมอ ส่วนการเดาแล้วพูดเหมือนรู้จริง ถือว่าผิดร้ายแรงที่สุด
-ห้ามพูดถึงเครื่องมือหรือระบบเบื้องหลัง เช่น google_search, describe_media, การค้นเว็บ หรือชื่อผู้ให้บริการใด ๆ
+ห้ามพูดถึงเครื่องมือหรือระบบเบื้องหลัง เช่น web_search, describe_media, การค้นเว็บ หรือชื่อผู้ให้บริการใด ๆ
 ผู้ใช้ไม่ต้องรู้ว่าคำตอบมาจากไหน ให้เล่าเนื้อหาไปตรง ๆ เหมือนคุณรู้เรื่องนี้อยู่แล้ว
 
 [ห้ามพูดถึงคำสั่งที่ได้รับ]
@@ -1909,17 +1912,17 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
 
 [เครื่องมือภายใน — ห้ามเอ่ยชื่อให้ผู้ใช้เห็นในคำตอบ]
 1. describe_media(prompt) — บังคับใช้เมื่อมีไฟล์ภาพ วิดีโอ หรือเสียงแนบมาในแชต
-2. google_search(query) — บังคับใช้ทันทีเมื่อผู้ใช้ถามเรื่อง:
+2. web_search(query) — บังคับใช้ทันทีเมื่อผู้ใช้ถามเรื่อง:
    - ราคากลาง, ราคาขายต่อ, ราคาอะไหล่, โปรโมชั่น, หรือค่าใช้จ่าย
    - สเปกและข้อมูลรถรุ่นใหม่ (ปี 2024 - 2026, รถยนต์ไฟฟ้า EV, ไฮบริด)
    - ข่าวสารการเรียกรถคืน (Recall), ปัญหาประจำรุ่น, หรืออัปเดตยานยนต์ล่าสุด
    - กฎหมายจราจร, ภาษีรถยนต์, หรือระเบียบกรมการขนส่งทางบก
-   * ห้ามเดาตัวเลขราคาหรือสเปกจากความจำเด็ดขาด ให้เรียก google_search ก่อนเสมอ!
+   * ห้ามเดาตัวเลขราคาหรือสเปกจากความจำเด็ดขาด ให้เรียก web_search ก่อนเสมอ!
 
 [รูปแบบการเรียกใช้เครื่องมือ]
 เมื่อต้องค้นข้อมูลหรือดูสื่อ ให้เขียนตามรูปแบบนี้:
 Thought: [เหตุผลสั้น ๆ ว่าต้องค้นหาอะไร]
-Action: google_search("คำค้นที่กระชับและตรงประเด็น")
+Action: web_search("คำค้นที่กระชับและตรงประเด็น")
 (แล้วหยุดพิมพ์ทันที ระบบจะป้อน Observation กลับมาให้เอง)
 
 เมื่อได้ Observation แล้ว ให้สรุปคำตอบให้ผู้ใช้โดยขึ้นต้นว่า
@@ -1998,7 +2001,7 @@ Final Answer: [คำตอบที่สมบูรณ์ เป็นมิ�
           observation = await executeDescribeMediaTool(env, messages, toolInput);
           mediaProcessed = true;
         } else if (toolName === "google_search" || toolName === "search" || toolName === "web_search") {
-          observation = await executeGoogleSearchTool(env, toolInput);
+          observation = await executeWebSearchTool(env, toolInput, { car: carInfo, meter }) || 'ค้นเว็บไม่ได้ในรอบนี้ ยังยืนยันข้อมูลล่าสุดไม่ได้';
           searchProcessed = true;
         } else {
           observation = `Error: Unknown tool "${toolName}"`;
@@ -2019,14 +2022,13 @@ Final Answer: [คำตอบที่สมบูรณ์ เป็นมิ�
       }
       agentLog.push({ role: "user", content: `Observation: ${observation}` });
     } else if (needsFreshData && !searchProcessed && step === 1) {
-      console.log('[ReAct Agent] User question needs fresh data but explicit Action tag not generated. Executing google_search fallback...');
+      console.log('[ReAct Agent] User question needs fresh data but explicit Action tag not generated. Executing web_search fallback...');
       searchProcessed = true;
       let observation = "";
       try {
-        const carPrefix = (carInfo && (carInfo.make || carInfo.model)) ? `${carInfo.make || ''} ${carInfo.model || ''} ` : '';
-        observation = await executeGoogleSearchTool(env, `${carPrefix}${lastUserText}`);
+        observation = await executeWebSearchTool(env, lastUserText, { car: carInfo, meter });
       } catch (toolErr) {
-        observation = `Error running google_search: ${toolErr.message}`;
+        observation = `Error running web_search: ${toolErr.message}`;
       }
       if (observation) {
         agentLog.push({ role: "user", content: `Observation: ${observation}` });
@@ -2115,7 +2117,7 @@ function cleanReply(t) {
     .replace(/https?:\/\/\S*(vertexaisearch|grounding-api-redirect)\S*/gi, '')
     /* ชื่อเครื่องมือเบื้องหลังไม่ควรหลุดถึงผู้ใช้
        ตัดทั้งบรรทัดที่เอ่ยถึง ไม่ใช่ตัดแค่ชื่อ ไม่งั้นจะเหลือประโยคขาดวิ่น */
-    .replace(/^.*\b(google_search|google_search_retrieval|describe_media)\b.*$/gim, '')
+    .replace(/^.*\b(google_search|google_search_retrieval|web_search|describe_media)\b.*$/gim, '')
     .replace(/^.*(Google Search|กูเกิลเสิร์ช|ค้นหาจากเว็บ|ค้นเว็บให้แล้ว).*$/gim, '')
     /* ประโยคที่อ้างถึงคำสั่งที่ได้รับ ผู้ใช้ไม่ควรเห็น */
     .replace(/^.*(ตามที่กำหนดไว้|ตามคำสั่ง|ระบบบอกให้|ผมถูกสั่งให้|ตามข้อกำหนด|as instructed|per the instructions).*$/gim, '')
@@ -2130,7 +2132,7 @@ function cleanReply(t) {
       .replace(/Final Answer:\s*/i, '')
       .replace(/https?:\/\/\S*(vertexaisearch|grounding-api-redirect)\S*/gi, '')
       .replace(/^\s*(Thought|Action|Observation|Reasoning)\s*:.*$/gim, '')
-      .replace(/\b(google_search|google_search_retrieval|describe_media)\b/gi, 'ระบบค้นข้อมูล')
+      .replace(/\b(google_search|google_search_retrieval|web_search|describe_media)\b/gi, 'ระบบค้นข้อมูล')
       .replace(/\n{3,}/g, '\n\n')
       .trim();
   }
@@ -2213,18 +2215,11 @@ async function executeDescribeMediaTool(env, messages, prompt) {
   throw lastErr || new Error('Failed to analyze media file with Gemini API');
 }
 
-/* ── ค้นข้อมูลอินเทอร์เน็ตให้แชต ──
-   ตั้งคีย์ตัวค้น (Tavily/Exa/Firecrawl) ไว้ → ใช้ก่อน ได้ผลพร้อมเลขอ้างอิง [n]
-   ไม่มีคีย์ หรือไม่ได้ผล → ค้นสาธารณะแบบเดิม (DuckDuckGo → Bing RSS แล้วอ่านหน้าที่ robots.txt อนุญาต)
-   คำค้นต้องผ่าน publicQuery ก่อนทุกทาง — มีข้อมูลส่วนตัวปนอยู่ = ไม่ส่งออกไปที่ไหนเลย */
-export async function executeGoogleSearchTool(env, query) {
-  if (configuredProviders(env).length) {
-    try {
-      const r = await searchWeb(env, publicQuery(query), { mode: 'balanced' });
-      if (r.results.length) return '\n' + sourcesBlock(r);
-    } catch {}
-  }
-  try{return researchBlock(await publicResearch(query))}catch{return 'Public web search requires a short topic without private details. Do not invent current facts or sources.'}
+/* ── ค้นข้อมูลอินเทอร์เน็ตให้แชต (แอป · LINE · ReAct) ──
+   ผ่าน Tavily · Exa · Firecrawl ตามประเภทคำถามเท่านั้น (web-search.mjs searchForChat) — เลิกใช้ Google Search ของ Gemini, DuckDuckGo และ Bing แล้ว
+   คำค้นต้องผ่าน publicQuery ก่อนทุกครั้ง — มีข้อมูลส่วนตัวปนอยู่ = ไม่ส่งออกไปที่ไหนเลย · ไม่มีคีย์/ค้นไม่ได้ = '' */
+export async function executeWebSearchTool(env, query, { car, depth, meter } = {}) {
+  return searchForChat(env, query, { car, depth, meter });
 }
 
 function parseJsonLoose(text) {
@@ -2272,7 +2267,7 @@ const NEWS_CRON = '30 * * * *';
 
 /* ===== SHOP: AI-sourced parts & accessories ===== */
 async function getGeminiShop(env) {
-  const prompt = `ค้นเว็บหาสินค้าอะไหล่รถยนต์และของตกแต่งที่กำลังนิยมในไทยตอนนี้ จากร้านค้าออนไลน์ที่น่าเชื่อถือ (เช่น Shopee, Lazada, ร้านอะไหล่แท้ศูนย์) สรุปออกมา 12-20 รายการที่คุ้มค่าและน่าสนใจที่สุด
+  const prompt = `จากผลค้นเว็บที่แนบมา หาสินค้าอะไหล่รถยนต์และของตกแต่งที่กำลังนิยมในไทยตอนนี้ จากร้านค้าออนไลน์ที่น่าเชื่อถือ (เช่น Shopee, Lazada, ร้านอะไหล่แท้ศูนย์) สรุปออกมา 12-20 รายการที่คุ้มค่าและน่าสนใจที่สุด
 
 ตอบเป็น JSON array เท่านั้น ห้ามมีคำนำ คำอธิบาย หรือ markdown ใดๆ
 
@@ -2288,7 +2283,7 @@ async function getGeminiShop(env) {
 
   const text = await callGemini(env, {
     contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    search: true, temp: 0.4,
+    search: { q: 'อะไหล่รถยนต์ ของแต่งรถ ขายดี ราคา Shopee Lazada ' + new Date().getFullYear(), kind: 'price' }, temp: 0.4,
   });
   const parsed = parseJsonArray(text);
   if (!parsed) throw new Error('AI response is not a JSON array');
@@ -2357,11 +2352,10 @@ async function getSpares(env, { car, apps, needs, lang }) {
     temp: 0.3, maxTokens: 4096, ...opts,
   });
 
-  // Grounded search gives better prices, but it also returns prose often enough
-  // that the array will not parse. Fall back to a plain JSON-mode call, which is
-  // far more reliable, before giving up.
+  // ราคาจากผลค้นเว็บ (ตัวค้นของ AI ประเภทราคา) แนบไว้ใน system แล้วขอเป็น JSON ได้เลยในครั้งเดียว
+  // ค้นไม่ได้/แปลงไม่ได้ → ขอแบบ JSON ล้วน (ราคาประเมิน) ก่อนยอมแพ้
   let parsed = null, firstErr = '';
-  try { parsed = parseJsonArray(await ask({ search: true })); }
+  try { parsed = parseJsonArray(await ask({ search: { q: carLine + ' อะไหล่ ราคา', kind: 'price' }, json: true })); }
   catch (e) { firstErr = String(e && e.message || e); }
   if (!parsed) {
     try { parsed = parseJsonArray(await ask({ json: true })); }
@@ -3569,8 +3563,8 @@ async function lineAsk(env, ev, link, text) {
     const r = await Promise.race([
       LINE_AI.ask(env, {
         system: sys, contents: toGeminiContents(contents), history: toChatHistory(contents), messages: contents,
-        question: text, hasMedia: false, carInfo, search: true,
-        executeSearch: async (q) => await executeGoogleSearchTool(env, q),
+        question: text, hasMedia: false, carInfo, search: needsFresh(text),
+        executeSearch: async (q) => await executeWebSearchTool(env, q, { car: carInfo, meter }),
         executeMedia: async () => '',
         executeKb: async (q) => await kbFor(env, carInfo, q),
         level: levelFor(undefined, text, false, []), meter,
@@ -5242,7 +5236,7 @@ export default {
               chatSpecContext(env, actor.payload.sub, body.carId, carInfo, question),
             ]);
 
-            /* ── เครื่องตอบเร็ว: Gemini ค้นเว็บ ดูรูป และตอบในการเรียกครั้งเดียว ──
+            /* ── เครื่องตอบเร็ว: ค้นเว็บผ่านตัวค้นของ AI ก่อน (เรื่องข้อมูลล่าสุด) แล้ว Gemini ดูรูปและตอบในการเรียกครั้งเดียว ──
                ทางเดิม (ค้นแยก + ReAct หลายรอบกับโมเดลฟรี) เก็บไว้เป็นทางสำรองสุดท้ายเท่านั้น */
             const fresh = !!(body.search === true && needsFresh(question)) || (question && needsFresh(question));
             let agentOut = null;
@@ -5261,8 +5255,8 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                 question,
                 hasMedia,
                 carInfo,
-                search: fresh, externalSearch: true,
-                executeSearch: async (q) => await executeGoogleSearchTool(env, q),
+                search: fresh,
+                executeSearch: async (q) => await executeWebSearchTool(env, q, { car: carInfo, depth: body.depth, meter }),
                 executeMedia: async (p) => await executeDescribeMediaTool(env, body.contents, p),
                 executeKb: async (q) => await kbFor(env, carInfo, q),
                 depth: body.depth, level: levelFor(body.depth, question, hasMedia, body.skillIds),
@@ -5452,7 +5446,9 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
               return { role: m.role === 'user' ? 'user' : 'model', parts };
             });
             try { validateContents(contents); } catch (e) { return deny(e.message, 400); }
-            const text = await callGemini(env, { contents, system: systemPrompt, search: !hasMedia, temp: 0.5 });
+            /* ค้นเว็บเฉพาะคำถามเรื่องข้อมูลล่าสุด (เดิม Gemini ค้น Google เองทุกครั้งที่ไม่มีไฟล์แนบ) */
+            const lastText = String([...b.messages].reverse().find(m => m.role === 'user')?.text || '');
+            const text = await callGemini(env, { contents, system: systemPrompt, search: !hasMedia && needsFresh(lastText) ? { q: lastText, kind: searchKind(lastText) } : false, temp: 0.5 });
             return json({ text });
           }
 
@@ -5517,7 +5513,7 @@ ${convo}`;
       }
       /* ค้นเว็บของ AI: เจ้าที่ตั้งคีย์ไว้ (ไม่คืนคีย์) · ทดสอบเทียบเจ้าด้วยชุดคำค้นเรื่องรถในไทย (web-search.mjs) */
       if (url.pathname === '/api/admin/search-status' && request.method === 'GET') {
-        return await guarded('admin', async () => json({ configured: configuredProviders(env), order: providerOrder(env), queries: BENCH_QUERIES.map(x => ({ q: x.q, kind: x.kind })) }))();
+        return await guarded('admin', async () => json({ configured: configuredProviders(env), order: providerOrder(env), routes: Object.fromEntries(Object.keys(SEARCH_ROUTES).map(k => { const r = searchRoute(env, k); return [k, { ...r, providers: r.providers.filter(p => configuredProviders(env).includes(p)) }] })), queries: BENCH_QUERIES.map(x => ({ q: x.q, kind: x.kind })) }))();
       }
       if (url.pathname === '/api/admin/search-bench' && request.method === 'POST') {
         return await guarded('admin', async (actor) => {
@@ -5914,7 +5910,7 @@ ${convo}`;
           const out = { keys: {
             gemini: !!env.GEMINI_KEY, openrouter: !!env.OPENROUTER_API_KEY,
             primaryModel: env.OPENROUTER_MODEL || 'openrouter/free',
-            geminiModel: env.GEMINI_MODEL || '(ไม่ได้ตั้ง)', searchModel: env.GEMINI_SEARCH_MODEL || '(ไม่ได้ตั้ง ใช้ gemini-3.5-flash-lite)',
+            geminiModel: env.GEMINI_MODEL || '(ไม่ได้ตั้ง)', searchProviders: configuredProviders(env),
             chatModels: [env.OPENROUTER_MODEL || 'openrouter/free (หลัก)'].concat(chatModels(env)), fallback: fallbackProviders(env).map(p => p.src + ':' + p.model) } };
           try {
             const le = await env.DB.prepare("SELECT value FROM config WHERE key = 'ai_last_error'").first();
@@ -5923,18 +5919,21 @@ ${convo}`;
           const lastErr = out.lastAiError
             ? `ข้อผิดพลาดล่าสุดจากแชตจริง (${new Date(out.lastAiError.at).toLocaleString('th-TH', { timeZone: 'Asia/Bangkok' })}): ${out.lastAiError.message}` : '';
 
-          const pr = env.GEMINI_KEY ? await probeAll(env, q) : { rows: [], best: null };
+          const pr = await probeAll(env, q);
+          const ps = pr.search, okRow = ps.rows.find(r => r.ok), b = pr.best;
           out.providers = pr.rows.map(r => `${r.name}: ${r.ok ? 'ok' : 'ไม่ผ่าน'} · ${r.ms} ms`
-            + (r.ok && r.grounded ? ' · ค้นเว็บจริง' : r.ok && !r.name.startsWith('สำรอง') ? ' · ตอบได้แต่ไม่ได้ค้นเว็บ' : '')
+            + (r.results != null ? ` · ${r.results} ผล` : '') + (r.costUsd ? ` · $${r.costUsd}` : '')
             + (r.error ? ' · ' + r.error : ''));
-          const b = pr.best;
+          /* ค้นเว็บของ AI = Tavily · Exa · Firecrawl เท่านั้น — routes บอกว่าคำถามแต่ละประเภทจะไปเจ้าไหนก่อน (เฉพาะเจ้าที่ตั้งคีย์แล้ว) */
           out.search = {
-            ok: !!(b && b.grounded), source: 'gemini', grounded: !!(b && b.grounded), query: q, keywords: '',
-            needsFresh: needsFresh(q), ms: b ? b.ms : 0, length: b ? b.sample.length : 0, model: b ? b.name : '',
-            sample: b ? b.sample : '',
-            hint: !env.GEMINI_KEY ? 'ยังไม่ได้ตั้ง GEMINI_KEY — แชตจะใช้ทางสำรองทั้งหมด (ช้ากว่าและค้นเว็บไม่ได้)'
+            ok: ps.ok, source: okRow ? okRow.name.replace(/^ค้นเว็บ /, '') : '', configured: ps.configured,
+            routes: Object.fromEntries(Object.keys(SEARCH_ROUTES).map(k => [k, searchRoute(env, k).providers.filter(p => ps.configured.includes(p))])),
+            grounded: ps.ok, query: q, kind: searchKind(q), keywords: '', needsFresh: needsFresh(q), ms: okRow ? okRow.ms : 0,
+            length: ps.sample.length, model: b ? b.name : '', sample: ps.sample,
+            hint: !ps.configured.length ? 'ยังไม่ได้ตั้งคีย์ตัวค้นเว็บ (TAVILY_API_KEY / EXA_API_KEY / FIRECRAWL_API_KEY) — AI ค้นเว็บไม่ได้ จะบอกผู้ใช้ว่ายังยืนยันข้อมูลล่าสุดไม่ได้'
+              : !ps.ok ? 'ตัวค้นเว็บที่ตั้งคีย์ไว้ค้นไม่ผ่านทุกเจ้า ดูสาเหตุในรายการด้านล่าง'
+              : !env.GEMINI_KEY ? 'ยังไม่ได้ตั้ง GEMINI_KEY — แชตจะใช้ทางสำรองทั้งหมด (ช้ากว่า)'
               : !b ? 'Gemini ใช้ไม่ได้ทุกรุ่น ดูสาเหตุในรายการด้านล่าง' + (lastErr ? ' · ' + lastErr : '')
-              : !b.grounded ? `รุ่น ${b.name} ตอบได้แต่ไม่ได้ค้นเว็บ` + (lastErr ? ' · ' + lastErr : '')
               : lastErr,
           };
           try {
@@ -6267,7 +6266,7 @@ ${convo}`;
           const used=await env.DB.prepare(`INSERT INTO usage (uid,day,count) VALUES (?,?,1)
             ON CONFLICT(uid,day) DO UPDATE SET count=count+1 WHERE count<60 RETURNING count`).bind(uid,day).first();
           if(!used)return deny('research_quota',429);
-          return json(await publicResearch(query,{signal:request.signal}));
+          return json(await publicResearch(query,{env,signal:request.signal}));
         })();
       }
       /* Feature tools share the authenticated AI pipeline; never return demo results. */
@@ -6313,7 +6312,7 @@ ${convo}`;
           try{input=buildFeatureRequest(soundBody)}catch(e){return deny(e.message,400)}
           const meter=newMeter();
           const q=soundResearchQuery(audioIdentity(soundBody.context));
-          const research=q?await publicResearch(q,{signal:request.signal,vehicle:audioIdentity(soundBody.context).vehicle}):{status:'needs_vehicle',sources:[],verifiedModelFaults:[]};
+          const research=q?await publicResearch(q,{env,signal:request.signal,vehicle:audioIdentity(soundBody.context).vehicle}):{status:'needs_vehicle',sources:[],verifiedModelFaults:[]};
           input.contents[0].parts[0].text+=researchBlock(research);
           const cleaned=cleanFeatureJson('listen',await callGemini(env,{...input,meter}),{context:soundBody.context,lang:b.lang});
           cleaned.research=research;

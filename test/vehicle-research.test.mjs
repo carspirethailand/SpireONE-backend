@@ -1,7 +1,8 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
-import {VEHICLE_RESEARCH_COVERAGE,canonicalMake,publicQuery,researchURL,discoveredLinks,publicResearch,soundResearchQuery} from '../src/vehicle-research.mjs';
+import {VEHICLE_RESEARCH_COVERAGE,canonicalMake,publicQuery,researchURL,publicResearch,soundResearchQuery} from '../src/vehicle-research.mjs';
+import {resetSearchBreakers} from '../src/web-search.mjs';
 import {cleanSound,captureInfo,soundGrounding} from '../src/vehicle-audio.mjs';
 import {liveToken} from '../src/live-setup.mjs';
 import worker from '../src/worker.js';
@@ -35,18 +36,25 @@ test('query projection does not export recording, notes, private Garage fields o
 });
 test('SSRF, lookalike domains, embedded credentials and arbitrary URLs never become fetched sources',()=>{
   for(const u of ['http://honda.com/a','https://honda.com.evil.test','https://127.0.0.1','https://honda.com:8443','https://key@honda.com/a','https://evil.test/a'])assert.equal(researchURL(u),null);
-  const links=discoveredLinks('<a href="https://evil.test/a">bad</a><a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.thaihonda.co.th%2Fmanual">Honda manual</a>');
-  assert.equal(links.length,1);assert.equal(links[0].url,'https://www.thaihonda.co.th/manual');
 });
-test('research reads bounded allowed pages with robots permission; PDFs/blocked pages remain unread',async t=>{
-  const seen=[];t.mock.method(globalThis,'fetch',async url=>{seen.push(String(url));return new Response(String(url).endsWith('robots.txt')?'User-agent: *\nAllow: /':'<p>Honda Wave 110i 2023 owner manual maintenance information.</p>',{headers:{'Content-Type':'text/html'}})});
-  const r=await publicResearch('Honda Wave 110i 2023 manual',{fetchSearch:async()=>'<a href="https://www.thaihonda.co.th/manual">Wave manual</a><a href="https://www.thaihonda.co.th/manual.pdf">PDF</a>'});
-  assert.equal(r.status,'found');assert.equal(r.sources[0].status,'read');assert.match(r.sources[0].excerpt,/110i/);assert.equal(r.sources[1].status,'link_only');assert.deepEqual(r.verifiedModelFaults,[]);assert.ok(!seen.some(x=>x.endsWith('.pdf')));
+/* ค้นเอกสารผ่านตัวค้นของ AI (Exa ในเทสต์) เท่านั้น — ไม่ค้น DuckDuckGo/Bing และไม่เปิดหน้าเว็บเอง */
+const EXA={EXA_API_KEY:'exa-test-only-fixture-key'};
+test('research asks the keyed search for manufacturer documents only; provider page text counts as read, snippets stay link-only, other sites are dropped',async t=>{
+  resetSearchBreakers();const seen=[];t.mock.method(globalThis,'fetch',async(url,init)=>{seen.push({url:String(url),body:JSON.parse(init.body)});return Response.json({results:[
+    {title:'Wave manual',url:'https://www.thaihonda.co.th/manual',text:'Honda Wave 110i 2023 owner manual maintenance information. '.repeat(8)},
+    {title:'Wave brochure',url:'https://www.thaihonda.co.th/brochure',highlights:['Wave 110i brochure']},
+    {title:'Random blog',url:'https://evil.test/wave',text:'x'.repeat(400)}]})});
+  const r=await publicResearch('Honda Wave 110i 2023 manual',{env:EXA});
+  assert.deepEqual(seen.map(x=>x.url),['https://api.exa.ai/search'],'only the search API is called');
+  assert.ok(seen[0].body.includeDomains.includes('thaihonda.co.th'),'limited to the maker\'s own sites');
+  assert.equal(r.status,'found');assert.equal(r.sources.length,2);assert.equal(r.sources[0].status,'read');assert.match(r.sources[0].excerpt,/110i/);
+  assert.equal(r.sources[1].status,'link_only');assert.equal(r.sources[1].excerpt,'');assert.ok(!r.sources.some(x=>x.url.includes('evil.test')));assert.deepEqual(r.verifiedModelFaults,[]);
 });
-test('publisher restrictions, oversized bodies, provider outage and cancellation fail closed without invented faults',async t=>{
-  t.mock.method(globalThis,'fetch',async url=>new Response(String(url).endsWith('robots.txt')?'User-agent: Google-Extended\nDisallow: /':'secret page',{headers:{'Content-Type':'text/html'}}));
-  const r=await publicResearch('Yamaha NMAX manual',{fetchSearch:async()=>'<a href="https://yamaha-motor.co.th/manual">Manual</a>'});assert.equal(r.sources[0].status,'restricted');assert.equal(r.status,'links_only');assert.equal(r.sources[0].excerpt,'');
-  const ac=new AbortController();ac.abort();const cancelled=await publicResearch('Honda Wave manual',{signal:ac.signal});assert.equal(cancelled.status,'unavailable');
+test('no search key, provider outage and cancellation fail closed without invented sources or faults',async t=>{
+  resetSearchBreakers();const seen=[];t.mock.method(globalThis,'fetch',async url=>{seen.push(String(url));return new Response('down',{status:503})});
+  const none=await publicResearch('Yamaha NMAX manual');assert.equal(none.status,'unavailable');assert.equal(seen.length,0,'no key = nothing leaves the Worker');
+  const down=await publicResearch('Yamaha NMAX manual',{env:EXA});assert.equal(down.status,'unavailable');assert.deepEqual(down.sources,[]);
+  const ac=new AbortController();ac.abort();const cancelled=await publicResearch('Honda Wave manual',{env:EXA,signal:ac.signal});assert.equal(cancelled.status,'unavailable');
 });
 test('only new capable call clients get web_search; legacy schemas stay compatible',()=>{
   const names=o=>liveToken({model:'fixture',agent:true,...o}).bidiGenerateContentSetup.tools[0].functionDeclarations.map(x=>x.name);
@@ -58,8 +66,10 @@ test('research endpoint requires login, rejects private queries and never calls 
   const req=(query,auth)=>new Request('https://unit.test/api/ai/research',{method:'POST',headers:{'Content-Type':'application/json',...(auth?{Authorization:'Bearer dev:reader:reader@unit.test'}:{})},body:JSON.stringify({query})});
   assert.equal((await worker.fetch(req('Honda Wave manual',false),env(),{})).status,401);
   assert.equal((await worker.fetch(req('person@example.com',true),env(),{})).status,400);
-  const r=await worker.fetch(req('Honda Wave 110i 2023 manual',true),env(),{});assert.equal(r.status,200);assert.equal((await r.json()).status,'unavailable');assert.ok(seen.length);assert.ok(!seen.some(x=>/generativelanguage|openrouter|tavily|brave/.test(x)));
+  const r=await worker.fetch(req('Honda Wave 110i 2023 manual',true),env(),{});assert.equal(r.status,200);assert.equal((await r.json()).status,'unavailable');assert.equal(seen.length,0,'no search key = no outbound request');
 });
-test('typed chat and live paths use separate free research, not just navigation to the app map',async()=>{
-  const source=await readFile(new URL('../src/worker.js',import.meta.url),'utf8');assert.equal((source.match(/search: fresh, externalSearch: true/g)||[]).length,2);assert.match(source,/body.tool==='ear'\|\|body.tool==='listen'/);
+test('typed chat, LINE and live paths search through the keyed web search, never a Gemini Google Search tool',async()=>{
+  const source=await readFile(new URL('../src/worker.js',import.meta.url),'utf8');
+  assert.equal((source.match(/executeSearch: async \(q\) => await executeWebSearchTool\(/g)||[]).length,3);assert.doesNotMatch(source,/google_search: \{\}|externalSearch/);
+  assert.match(source,/body.tool==='ear'\|\|body.tool==='listen'/);assert.match(source,/publicResearch\(query,\{env,/);
 });

@@ -1,12 +1,12 @@
 /* ══ เครื่องตอบเร็วของ Cendon ══
-   ของเดิมต่อหนึ่งข้อความ: ค้นเว็บแยก (ไล่ลองได้ถึง 21 ครั้งกับโมเดลที่เลิกให้บริการแล้ว)
-   → อ่านรูปแยกอีกหนึ่งครั้ง → ส่งให้โมเดลฟรีที่คิดนานแล้วค่อยตอบ → พลาดก็ถามซ้ำ
-   ตอนนี้เหลือการเรียกครั้งเดียว: Gemini ค้นเว็บเอง เห็นรูปเอง คิด แล้วสตรีมคำตอบออกมาทันที
+   ต่อหนึ่งข้อความ: ถ้าเป็นเรื่องข้อมูลล่าสุด ค้นเว็บผ่าน Tavily/Exa/Firecrawl ตามประเภทคำถามก่อน (web-search.mjs)
+   แล้วเรียก Gemini ครั้งเดียว เห็นรูปเอง คิด แล้วสตรีมคำตอบออกมาทันที
+   ไม่ใช้ Google Search ของ Gemini, DuckDuckGo, Bing หรือ RSS ในการค้นของ AI แล้ว
 
    โมเดลเลือกจาก GEMINI_SEARCH_MODEL (ค่าเริ่มต้น gemini-3.8-flash) แล้วถอยไป GEMINI_MODEL
    ถ้าชื่อโมเดลไหนใช้ไม่ได้ (404/400) จะรู้ภายในเสี้ยววินาทีแล้วข้ามไปตัวถัดไปเอง */
 
-import { configuredProviders, searchWeb, sourcesBlock, sourceCards } from './web-search.mjs';
+import { configuredProviders, providerOrder, searchWeb, searchForChat } from './web-search.mjs';
 
 const DEFAULT_MODEL = 'gemini-3.1-flash-lite';
 
@@ -89,9 +89,9 @@ export function toGeminiContents(msgs, keepMediaTurns = 2) {
 }
 
 /* ── เรียก Gemini แบบสตรีมหนึ่งครั้ง ──
-   คืน { text, thoughts, grounded, queries } · เรียก onText/onThought ทันทีที่ได้แต่ละก้อน
+   คืน { text, thoughts } · เรียก onText/onThought ทันทีที่ได้แต่ละก้อน (ไม่ส่งเครื่องมือค้นเว็บให้ Gemini — ผลค้นมากับ system แล้ว)
    โยน error พร้อม e.retryable เพื่อบอกผู้เรียกว่าควรลองโมเดลถัดไปไหม (ยังไม่มีข้อความออกไปเลย) */
-async function streamOnce(env, model, { system, contents, search, level, onText, onThought, onSearch, meter, maxTokens, headerMs }) {
+async function streamOnce(env, model, { system, contents, level, onText, onThought, meter, maxTokens, headerMs }) {
   const base = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
   /* เพดานนี้นับรวมโทเคนที่ใช้คิดด้วย ตั้งให้พอ ไม่งั้นคิดเยอะแล้วคำตอบถูกตัดกลางประโยค */
   const gen = { maxOutputTokens: maxTokens || 8192 };
@@ -99,7 +99,6 @@ async function streamOnce(env, model, { system, contents, search, level, onText,
   if (tc) gen.thinkingConfig = tc;
   const body = { contents, generationConfig: gen };
   if (system) body.systemInstruction = { parts: [{ text: String(system).slice(0, 24000) }] };
-  if (search) body.tools = [{ google_search: {} }];
 
   /* รอหัวคำตอบไม่เกิน 12 วินาที (ช้ากว่านั้นไปทางสำรองดีกว่าให้ผู้ใช้รอ) และระหว่างสตรีมเงียบนานเกิน 30 วินาทีถือว่าค้าง */
   const ac = new AbortController();
@@ -120,9 +119,7 @@ async function streamOnce(env, model, { system, contents, search, level, onText,
     err.status = res.status; err.retryable = true;
     /* รุ่นนี้ไม่รับค่าการคิดแบบนี้ — ลองใหม่โดยลดระดับ/ไม่ส่ง แทนที่จะทิ้งทั้งรุ่น */
     err.thinking = res.status === 400 && /thinking/i.test(t);
-    /* รุ่นนี้ไม่รับเครื่องมือค้นเว็บ หรือโควตาค้นเว็บเต็ม — ลองรุ่นเดิมแบบไม่ค้นก่อนข้ามรุ่น */
-    err.tool = (res.status === 400 && /tool|search|grounding/i.test(t)) || res.status === 429;
-    err.dead = res.status === 404 || (res.status === 400 && /not (be )?found|not supported for|unknown model|invalid model/i.test(t) && !err.thinking && !err.tool);
+    err.dead = res.status === 404 || (res.status === 400 && /not (be )?found|not supported for|unknown model|invalid model/i.test(t) && !err.thinking);
     err.quota = res.status === 429;
     err.busy = res.status >= 500;
     throw err;
@@ -130,8 +127,7 @@ async function streamOnce(env, model, { system, contents, search, level, onText,
 
   const reader = res.body.getReader();
   const dec = new TextDecoder();
-  let buf = '', text = '', thoughts = '', grounded = false, usage = null;
-  const queries = new Set();
+  let buf = '', text = '', thoughts = '', usage = null;
   try {
     while (true) {
       clearTimeout(idle); idle = setTimeout(() => ac.abort('idle'), 30000);
@@ -146,13 +142,6 @@ async function streamOnce(env, model, { system, contents, search, level, onText,
         let d; try { d = JSON.parse(t.slice(5).trim()) } catch { continue }
         if (d.usageMetadata) usage = d.usageMetadata;
         const c = (d.candidates && d.candidates[0]) || {};
-        const gm = c.groundingMetadata || c.grounding_metadata;
-        if (gm) {
-          grounded = true;
-          for (const q of (gm.webSearchQueries || gm.web_search_queries || [])) {
-            if (!queries.has(q)) { queries.add(q); if (onSearch) await onSearch(q); }
-          }
-        }
         for (const p of ((c.content && c.content.parts) || [])) {
           if (!p.text) continue;
           if (p.thought) { thoughts += p.text; if (onThought) await onThought(p.text); }
@@ -174,10 +163,10 @@ async function streamOnce(env, model, { system, contents, search, level, onText,
        โควตาจึงหมดใน 1–2 ข้อความ — ต้นทุนเบื้องหลังเป็นเรื่องของระบบ ไม่ใช่ของผู้ใช้ */
     meter.in += userTokens(contents);
     meter.out += usage.candidatesTokenCount || Math.ceil(text.length / 3);
-    meter.calls += 1; meter.src.push(model + (grounded ? '+search' : ''));
+    meter.calls += 1; meter.src.push(model);
   }
   if (!text.trim()) { const err = new Error(`${model}: empty answer`); err.retryable = true; throw err; }
-  return { text, thoughts, grounded, queries: [...queries], model };
+  return { text, thoughts, model };
 }
 
 /* ── ตอบหนึ่งข้อความ ──
@@ -492,45 +481,39 @@ export async function reactAgent(env, opts) {
 }
 
 export async function fastAnswer(env, opts) {
-  let webResult;
-  const freshSystem=async()=>{
-    if(webResult===undefined)webResult=opts.question&&opts.executeSearch?await opts.executeSearch(opts.question).catch(()=> ''):'';
-    return (opts.system||'')+'\nผลค้นเว็บจริง:\n'+String(webResult||'ยังยืนยันข้อมูลล่าสุดไม่ได้ ต้องแจ้งผู้ใช้ตรง ๆ').slice(0,9000);
-  };
-  // Start the single-pass streaming route before the slower multi-turn free agent.
+  /* ค้นครั้งเดียวต่อคำถาม แล้วใช้ผลเดิมทั้งกับ Gemini และทางสำรอง (ไม่เสียค่าค้นซ้ำ) */
+  const memo = new Map(), raw = opts.executeSearch || (q => executeSearchInternal(env, q, opts));
+  const search = q => { if (!memo.has(q)) memo.set(q, Promise.resolve().then(() => raw(q)).catch(() => '')); return memo.get(q) };
+  let system = opts.system, grounded = false;
+  if (opts.search === true && opts.question) {
+    if (opts.onSearch) await opts.onSearch(opts.question);
+    const web = await search(opts.question);
+    grounded = !!String(web || '').trim();
+    system = (opts.system || '') + '\nผลค้นเว็บจริง:\n' + String(web || 'ค้นเว็บไม่ได้ในรอบนี้ ยังยืนยันข้อมูลล่าสุดไม่ได้ ต้องแจ้งผู้ใช้ตรง ๆ ห้ามเดาตัวเลขหรือข่าว').slice(0, 9000);
+  }
   if (env.GEMINI_KEY) {
     const scope = await geminiScope(env);
     const models = chatModels(env);
     for (const model of models) {
       const scoped = key => scope + '|' + key;
       if (bad(scoped(model))) continue;
-      let search=opts.search===true&&opts.externalSearch!==true&&!bad(scoped(model+'|grounding'));
-      let system=opts.system,level=opts.level||'minimal';
-      if(opts.search===true&&!search&&opts.question){if(opts.onSearch)await opts.onSearch(opts.question);system=await freshSystem();}
+      let level=opts.level||'minimal';
       for (let attempt=0;attempt<3;attempt++) {
         try {
           const t0=Date.now();
-          const r = await streamOnce(env, model, { ...opts, system, level, search, onThought:undefined, headerMs:6000 });
-          trail(opts.meter, { model, level, search, ok: true, ms:Date.now()-t0, grounded: r.grounded });
-          return {...r,thoughts:''};
+          const r = await streamOnce(env, model, { ...opts, system, level, onThought:undefined, headerMs:6000 });
+          trail(opts.meter, { model, level, search: grounded, ok: true, ms:Date.now()-t0, grounded });
+          return {...r,thoughts:'',grounded};
         } catch (e) {
-          if(e.partial)return {text:e.partial,thoughts:'',model,grounded:false,partial:true};
+          if(e.partial)return {text:e.partial,thoughts:'',model,grounded,partial:true};
           if(e.thinking&&level){level=level==='minimal'?null:'minimal';continue;}
-          if(e.tool&&search){
-            search=false;markBad(scoped(model+'|grounding'),60000);
-            // Keep fresh answers grounded even where Google's search quota is unavailable.
-            if(opts.question&&opts.executeSearch){
-              system=await freshSystem();
-            }
-            continue;
-          }
           if(e.quota||e.dead)markBad(scoped(model),60000);
           break;
         }
       }
     }
   }
-  const fallback=await reactAgent(env,{...opts,onThought:undefined});
+  const fallback=await reactAgent(env,{...opts,system,executeSearch:search,onThought:undefined});
   if(fallback&&fallback.text?.trim())return {...fallback,thoughts:'',reasoning:''};
   throw new Error('All configured AI providers failed');
 }
@@ -687,12 +670,11 @@ export async function fallbackAnswer(env, system, history, opts) {
   let list = media ? fallbackProviders(env, true).concat(fallbackProviders(env)) : fallbackProviders(env);
   /* ทุกเจ้าถูกพักไว้หมด — ดีกว่าตอบว่าไม่มีทางสำรอง ให้ลองทุกเจ้าอีกรอบ (อาจหายแล้ว) */
   if (!list.length) { BAD.forEach((_, k) => { if (k.startsWith('fb|')) BAD.delete(k) }); list = fallbackProviders(env, media).concat(media ? fallbackProviders(env) : []) }
-  /* ตัวสำรองค้นเว็บเองไม่ได้ — ค้น DuckDuckGo ให้ก่อนแล้วแนบผลไปในคำสั่งระบบ (ข้ามคำทักทายสั้น ๆ) */
+  /* ตัวสำรองค้นเว็บเองไม่ได้ — ค้นผ่านตัวค้นของ AI (Tavily/Exa/Firecrawl) ให้ก่อนแล้วแนบผลไปในคำสั่งระบบ (ข้ามคำทักทายสั้น ๆ) */
   let web = '';
   const lastUser = [...clean].reverse().find(m => m.role === 'user');
   const txt = m => typeof m.content === 'string' ? m.content : (m.content || []).filter(x => x.type === 'text').map(x => x.text).join(' ');
   const q = searchQuery(clean.filter(m => m.role === 'user').map(txt));
-  /* DuckDuckGo บล็อกการเรียกจาก Cloudflare (ได้หน้า captcha) — ปิดไว้จนกว่าจะมีตัวค้นที่ใช้ได้ (TAVILY_API_KEY) */
   const needWeb = opts.search === true || /ค้น|ข่าว|ล่าสุด|ตอนนี้|วันนี้|ปีนี้|ราคา|เปิดตัว|รุ่นใหม่|อัปเดต|internet|อินเทอร์เน็ต|research|search|latest|news|price|launch|20[2-3]\d|25[6-9]\d/i.test(q);
   if (q.length >= 6 && opts.search !== false && needWeb) {
     const t0 = Date.now();
@@ -780,12 +762,22 @@ export const FORCE_SEARCH = `
 export async function probeAll(env, q) {
   const rows = [];
   let best = null;
-  for (const model of chatModels(env)) {
+  /* ตัวค้นเว็บของ AI: ยิงคำค้นเดียวกันทีละเจ้าที่ตั้งคีย์ไว้ (ไม่คืนคีย์) */
+  const search = { configured: configuredProviders(env), rows: [], ok: false, sample: '' };
+  for (const p of search.configured) {
+    const r = await searchWeb(env, q, { mode: 'fast', providers: [p] }).catch(e => ({ results: [], providers: [{ provider: p, ok: false, ms: 0, error: String(e.message || e).slice(0, 120) }] }));
+    const run = r.providers[0] || { ok: false, ms: 0, error: 'not_run' };
+    const row = { name: 'ค้นเว็บ ' + p, ok: !!run.ok && r.results.length > 0, ms: run.ms, results: r.results.length, costUsd: +(+r.costUsd || 0).toFixed(4), error: run.error || (run.ok && !r.results.length ? 'no results' : ''), sample: r.results.slice(0, 3).map(x => x.title + ' — ' + x.host).join(' · ') };
+    search.rows.push(row); rows.push(row);
+    if (row.ok && !search.ok) { search.ok = true; search.sample = row.sample }
+  }
+  if (!search.configured.length) rows.push({ name: 'ค้นเว็บ', ok: false, ms: 0, error: 'ยังไม่ได้ตั้งคีย์ TAVILY_API_KEY / EXA_API_KEY / FIRECRAWL_API_KEY — AI ค้นเว็บไม่ได้' });
+  for (const model of env.GEMINI_KEY ? chatModels(env) : []) {
     const t = Date.now();
     try {
-      const r = await streamOnce(env, model, { system: 'ตอบสั้น ๆ เป็นภาษาไทย 2-3 บรรทัด', search: true, level: null,
-        contents: [{ role: 'user', parts: [{ text: 'ค้นข้อมูลล่าสุดแล้วสรุปสั้น ๆ: ' + q }] }] });
-      const row = { name: model, ok: true, grounded: r.grounded, ms: Date.now() - t, sample: r.text.slice(0, 400) };
+      const r = await streamOnce(env, model, { system: 'ตอบสั้น ๆ เป็นภาษาไทย 2-3 บรรทัด', level: null,
+        contents: [{ role: 'user', parts: [{ text: 'สรุปสั้น ๆ ว่าคุณช่วยเรื่องรถยนต์อะไรได้บ้าง' }] }] });
+      const row = { name: model, ok: true, ms: Date.now() - t, sample: r.text.slice(0, 400) };
       rows.push(row); if (!best) best = row;
     } catch (e) {
       rows.push({ name: model, ok: false, ms: Date.now() - t, error: String(e.message || e).slice(0, 300) });
@@ -800,7 +792,7 @@ export async function probeAll(env, q) {
       rows.push({ name: 'สำรอง ' + p.src + ' (' + p.model + ')', ok: false, ms: Date.now() - t, error: String(e.message || e).slice(0, 200) });
     }
   }
-  return { rows, best };
+  return { rows, best, search };
 }
 
 
@@ -857,265 +849,22 @@ export function badState(scope) {
 }
 export function unpark(key) { if (key) BAD.delete(key); else BAD.clear() }
 
-/* ค้นเว็บด้วย DuckDuckGo (หน้า HTML ไม่ต้องใช้คีย์)
-   คืนเป็นข้อความสรุป: หัวข้อ + เนื้อหาย่อ + ลิงก์ ไม่เกิน 6 รายการ · ล้มเหลว/ไม่เจอ = '' */
-export async function fetchDuckDuckGoSearch(query, { limit = 6, timeoutMs = 6000 } = {}) {
+/* ══ ค้นเว็บของ AI (ReAct · ทางสำรอง) ══
+   ผ่าน Tavily · Exa · Firecrawl ตามประเภทคำถามเท่านั้น (web-search.mjs) — เลิกใช้ DuckDuckGo, Google Search ของ Gemini,
+   Brave, Google News RSS, Bing และ Wikipedia แล้ว · ไม่มีคีย์ หรือคำค้นมีข้อมูลส่วนตัว = '' (ไม่ส่งอะไรออกไป) */
+export async function executeSearchInternal(env, query, opts = {}) {
   const q = String(query || '').trim();
   if (!q) return '';
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), timeoutMs);
-  try {
-    const res = await fetch('https://html.duckduckgo.com/html/?q=' + encodeURIComponent(q), {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'th-TH,th;q=0.9,en;q=0.8'
-      },
-      signal: ac.signal
-    });
-    if (!res.ok) return '';
-    const html = await res.text();
-    const txt = s => String(s || '').replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#x27;|&#39;/g, "'")
-      .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
-    const link = h => { const m = /[?&]uddg=([^&]+)/.exec(h || ''); try { return m ? decodeURIComponent(m[1]) : h } catch (e) { return h } };
-    const out = [];
-    const re = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?class="result__snippet"[^>]*>([\s\S]*?)<\/(?:a|span|div)>/g;
-    let m;
-    while ((m = re.exec(html)) && out.length < limit) {
-      if (/result--ad|badge--ad/i.test(m[0])) continue;
-      const title = txt(m[2]), snip = txt(m[3]);
-      if (title && snip) out.push(`- ${title}: ${snip} (${link(m[1])})`);
-    }
-    return out.length ? `ผลค้นเว็บล่าสุดสำหรับ "${q}":\n${out.join('\n')}` : '';
-  } catch (e) {
-    return '';
-  } finally {
-    clearTimeout(timer);
-  }
+  return searchForChat(env, q, { car: opts.carInfo, depth: opts.depth, meter: opts.meter });
 }
 
-/* ══ ฟังก์ชันค้นหาหลักของระบบ (ReAct & Tools) ══
-   1. ตัวหลัก: DuckDuckGo (เร็ว <1s, ฟรี, ไม่มีโควตา, เลี่ยงปัญหา Cloudflare Region Block)
-   2. ตัวสำรอง: Gemini Google Search (gemini-3.1-flash-lite -> gemini-3.5-flash-lite)
-   3. ตัวสำรองฉุกเฉิน: webSearch (Tavily / Brave / Google News RSS / Bing / Wikipedia) */
-export async function executeSearchInternal(env, query) {
-  const q = String(query || '').trim();
-  if (!q) return '';
-
-  // 0. ตัวค้นแบบมีคีย์ (Tavily · Exa · Firecrawl — web-search.mjs) ถ้าตั้งไว้ ใช้ก่อน: ได้ผลพร้อมเลขอ้างอิง ไม่โดนบล็อกแบบ DuckDuckGo
-  if (configuredProviders(env).length) {
-    try {
-      const r = await searchWeb(env, q, { mode: 'fast' });
-      if (r.results.length) { console.log(`[search] สำเร็จด้วย ${r.providers.filter(p => p.ok).map(p => p.provider).join('+')}`); return sourcesBlock(r); }
-    } catch (e) { console.warn('[search] providers error:', e.message || e); }
-  }
-
-  // 1. DuckDuckGo ค้นหาจริง
-  try {
-    const ddg = await fetchDuckDuckGoSearch(q);
-    if (ddg && ddg.trim()) {
-      console.log('[search] DuckDuckGo success');
-      return ddg;
-    }
-  } catch (e) {
-    console.warn('[search] DuckDuckGo unavailable');
-  }
-
-  // 2. Gemini Google Search (gemini-3.1-flash-lite -> gemini-3.5-flash-lite)
-  if (env.GEMINI_KEY && !bad('gemini|quota') && !bad('gemini|region')) {
-    const geminiKey = env.GEMINI_KEY;
-    const baseUrl = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
-    const models = ['gemini-3.1-flash-lite', 'gemini-3.5-flash-lite'];
-    const prompt = `ค้นข้อมูลล่าสุดในอินเทอร์เน็ตเรื่องนี้ แล้วสรุปเฉพาะข้อเท็จจริงที่ยืนยันได้: ${q}
-แหล่งที่เชื่อได้: เว็บผู้ผลิต ศูนย์บริการ สื่อรถยนต์ที่มีกองบรรณาธิการ สำนักข่าวหลัก ร้านค้าที่มีราคาชัดเจน
-รูปแบบการตอบ: ข้อเท็จจริงสั้น ๆ เป็นข้อ ๆ พร้อมระบุชื่อเว็บแหล่งที่มา ห้ามแต่งตัวเลข ถ้าไม่พบข้อมูลให้ตอบ "ไม่พบข้อมูลยืนยัน"`;
-
-    for (const m of models) {
-      try {
-        const res = await fetch(`${baseUrl}/v1beta/models/${m}:generateContent`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey },
-          body: JSON.stringify({
-            contents: [{ role: 'user', parts: [{ text: prompt }] }],
-            tools: [{ google_search: {} }],
-            generationConfig: { temperature: 0.2 },
-          }),
-        });
-        if (res.ok) {
-          const data = await res.json();
-          const cand = (data.candidates && data.candidates[0]) || {};
-          const txt = stripToolCalls(((cand.content && cand.content.parts) || []).map(x => x.text || '').join('').trim());
-          if (txt && !/^ไม่พบข้อมูลยืนยัน/.test(txt)) {
-            console.log(`[search] สำเร็จด้วย Gemini (${m})`);
-            return txt;
-          }
-        } else if (res.status === 429) {
-          markBad('gemini|quota', 60000);
-        } else if (res.status === 400) {
-          const errBody = await res.text().catch(() => '');
-          if (/location|region/i.test(errBody)) markBad('gemini|region', 300000);
-        }
-      } catch (e) {
-        console.warn('[search] Gemini unavailable');
-      }
-    }
-  }
-
-  // 3. ตัวสำรองฉุกเฉิน (Tavily / Brave / Google News RSS / Bing / Wikipedia)
-  try {
-    const ws = await webSearch(env, q);
-    if (ws && ws.text) {
-      console.log(`[search] สำเร็จด้วย webSearch (${ws.src})`);
-      return ws.text;
-    }
-  } catch (e) {}
-
-  return '';
-}
-
-
-
-/* ══ ค้นเว็บแยกจาก Gemini ══
-   Gemini Free Tier ใช้ Google Search ผ่าน API ไม่ได้ (429 ตั้งแต่ครั้งแรก) จึงค้นเองแล้วส่งผลให้โมเดลตอบ
-   ลำดับ: ตัวค้นแบบมีคีย์ (Tavily/Exa/Firecrawl ใน web-search.mjs) → Brave (BRAVE_API_KEY) → Google News RSS + Wikipedia (ฟรี ไม่ต้องมีคีย์) */
-const WEB_CACHE = new Map();
-const unent = s => String(s || '').replace(/<!\[CDATA\[|\]\]>/g, '').replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&').replace(/&quot;/g, '"')
-  .replace(/&#39;|&#x27;|&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
-async function getT(url, init = {}, ms = 5000) {
-  const ac = new AbortController(); const t = setTimeout(() => ac.abort(), ms);
-  try { return await fetch(url, { ...init, signal: ac.signal }) } finally { clearTimeout(t) }
-}
-export async function webSearch(env, query, { max = 6, depth = 1 } = {}) {
-  const q = String(query || '').trim().slice(0, 200);
+/* ทางสำรอง (Groq/OpenRouter) ค้นเองไม่ได้ — ค้นให้ก่อนแล้วแนบผลไปในคำสั่งระบบ
+   depth 0 = เจ้าเดียวที่เร็วสุด · 1 = ตามประเภทคำถาม · 2 = ทุกเจ้าพร้อมเนื้อหาเต็มหน้า */
+export async function webSearch(env, query, { depth = 1, meter } = {}) {
+  /* คำค้นแบบคำสำคัญจาก searchQuery มี "-คำ" ที่ไม่ต้องการปนมา ตัวค้นพวกนี้ไม่ได้ใช้ไวยากรณ์นั้น — ตัดออก */
+  const q = String(query || '').replace(/(^|\s)-\S+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 240);
   if (!q) return { text: '', src: '' };
-  const ck = q + '|' + depth;
-  const hit = WEB_CACHE.get(ck); if (hit && hit.exp > Date.now()) return hit.v;
-  const keep = v => { WEB_CACHE.set(ck, { v, exp: Date.now() + 600000 }); if (WEB_CACHE.size > 200) WEB_CACHE.delete(WEB_CACHE.keys().next().value); return v };
-  const fmt = rows => rows.slice(0, max + 4).map(r => `- ${r.title}${r.date ? ' (' + r.date + ')' : ''}: ${r.snip} [${r.url}]`).join('\n');
-  /* ตัวค้นแบบมีคีย์ (web-search.mjs): depth 0 = เจ้าเดียวที่เร็วสุด · 1 = สองเจ้ารวมผล · 2 = ทุกเจ้าพร้อมเนื้อหาเต็มหน้า */
-  if (configuredProviders(env).length) {
-    try {
-      const r = await searchWeb(env, q, { mode: depth >= 2 ? 'deep' : depth <= 0 ? 'fast' : 'balanced', max });
-      if (r.results.length) return keep({ text: sourcesBlock(r), src: r.providers.filter(p => p.ok).map(p => p.provider).join('+'), sources: sourceCards(r), costUsd: r.costUsd });
-    } catch (e) {}
-  }
-  try {
-    if (env.BRAVE_API_KEY) {
-      const r = await getT('https://api.search.brave.com/res/v1/web/search?count=' + max + '&q=' + encodeURIComponent(q), { headers: { Accept: 'application/json', 'X-Subscription-Token': env.BRAVE_API_KEY } });
-      if (r.ok) { const d = await r.json(); const rows = ((d.web && d.web.results) || []).map(x => ({ title: unent(x.title), snip: unent(x.description), url: x.url, date: x.age }));
-        if (rows.length) return keep({ text: fmt(rows), src: 'brave' }); }
-    }
-  } catch (e) {}
-  /* ฟรีไม่ต้องมีคีย์ — ยิงหลายแหล่งพร้อมกัน แหล่งไหนช้า/ถูกบล็อกก็ไม่ลากทั้งหมด (แต่ละแหล่งรอไม่เกิน 4 วิ)
-     Google News (ไทย+อังกฤษ) · Bing News · Bing เว็บทั่วไป · Wikipedia (ไทย+อังกฤษ) */
-  const th = /[฀-๿]/.test(q);
-  const UA = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36', 'Accept-Language': 'th,en;q=0.8' };
-  const rss = async (url, tag) => {
-    try {
-      const r = await getT(url, { headers: UA }, 4000);
-      if (!r.ok) return { tag, rows: [], err: String(r.status) };
-      const x = await r.text(), out = [];
-      for (const m of x.matchAll(/<item>([\s\S]*?)<\/item>/g)) {
-        const it = m[1], g = t => (it.match(new RegExp('<' + t + '[^>]*>([\\s\\S]*?)</' + t + '>')) || [])[1];
-        const d = g('pubDate'), ts = d ? Date.parse(d) : 0;
-        const title = unent(g('title')); if (!title) continue;
-        out.push({ title, snip: unent(g('description')).slice(0, 240), url: unent(g('link')), date: ts ? new Date(ts).toISOString().slice(0, 10) : '', ts, tag });
-        if (out.length >= 10) break; }
-      return { tag, rows: out, err: out.length ? '' : 'empty' };
-    } catch (e) { return { tag, rows: [], err: e.name === 'AbortError' ? 'timeout' : 'fail' } }
-  };
-  const wiki = async lang => {
-    try {
-      const r = await getT(`https://${lang}.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit=2&srsearch=` + encodeURIComponent(q.replace(/(^|\s)-\S+/g, '')), { headers: { 'User-Agent': 'CendonBot/1.0' } }, 4000);
-      if (!r.ok) return { tag: 'wiki-' + lang, rows: [], err: String(r.status) };
-      const d = await r.json();
-      const rows = ((d.query && d.query.search) || []).map(x => ({ title: 'Wikipedia: ' + x.title, snip: unent(x.snippet), url: `https://${lang}.wikipedia.org/wiki/` + encodeURIComponent(x.title.replace(/ /g, '_')), ts: 0, tag: 'wiki-' + lang }));
-      return { tag: 'wiki-' + lang, rows, err: rows.length ? '' : 'empty' };
-    } catch (e) { return { tag: 'wiki-' + lang, rows: [], err: 'fail' } }
-  };
-  const qe = encodeURIComponent(q);
-  const got = await Promise.all([
-    rss(`https://news.google.com/rss/search?q=${qe}&hl=th&gl=TH&ceid=TH:th`, 'gnews-th'),
-    rss(`https://news.google.com/rss/search?q=${qe}&hl=en-US&gl=US&ceid=US:en`, 'gnews-en'),
-    rss(`https://www.bing.com/news/search?q=${qe}&format=rss&setlang=${th ? 'th' : 'en'}`, 'bing-news'),
-    rss(`https://www.bing.com/search?q=${qe}&format=rss&setlang=${th ? 'th' : 'en'}`, 'bing-web'),
-    wiki('en'), th ? wiki('th') : Promise.resolve({ tag: 'wiki-th', rows: [], err: 'skip' }),
-  ]);
-  /* รวม: ข่าวใหม่สุดก่อน · ผลเว็บทั่วไปแทรกเข้ามา · ตัดหัวข้อซ้ำ · เก็บสถิติแต่ละแหล่งไว้ให้แผงผู้ดูแล */
-  const seen = new Set(), rows = [];
-  const pool = got.flatMap(g => g.rows).sort((a, b) => (b.ts || 0) - (a.ts || 0));
-  for (const x of pool) { const k = x.title.toLowerCase().replace(/\W+/g, '').slice(0, 50); if (!k || seen.has(k)) continue; seen.add(k); rows.push(x); if (rows.length >= max + 4) break; }
-  let stat = got.map(g => g.tag + ':' + (g.rows.length || g.err)).join(' ');
-  /* อ่านเนื้อหาจริงตามโหมด: Sprint ไม่อ่าน · Grand Tour 2 เว็บ (3 วิ) · Atelier 4 เว็บ (6 วิ) — เลือกเว็บน่าเชื่อถือก่อน */
-  const READ = depth >= 2 ? { n: 4, ms: 6000 } : depth == 1 ? { n: 2, ms: 3000 } : null;
-  let pages = '';
-  if (READ && rows.length) {
-    const rd = await readPages(rows, q, READ.n, READ.ms);
-    pages = rd.text; stat += ' · อ่าน ' + rd.ok + '/' + rd.tried + ' เว็บ';
-  }
-  return keep(rows.length ? { text: fmt(rows) + (pages ? '\n\nเนื้อหาจากหน้าเว็บที่เปิดอ่าน:\n' + pages : ''), src: 'multi', stat } : { text: '', src: '', stat });
-}
-export const webBlock = w => w && w.text ? `\n\n[ผลค้นเว็บจริง ณ ตอนนี้ (${w.src}) เรียงข่าวใหม่สุดก่อน — ข้อมูลนี้ใหม่กว่าความรู้ของคุณ ให้เชื่อข่าวเหล่านี้เป็นหลัก แม้ขัดกับที่คุณเคยรู้ (เช่น รุ่นที่คุณคิดว่ายังไม่เปิดตัว) ระบุแหล่ง/วันที่ ห้ามตอบว่ายังไม่มีข้อมูลยืนยันถ้าในผลค้นมีข่าวเรื่องนั้น]\n${w.text}` : '';
-
-
-/* ══ เปิดอ่านหน้าเว็บจริง ══ */
-const TRUST = [
-  /* ผู้ผลิตรถ */ /(^|\.)(mitsubishi-motors|toyota|honda|isuzu|nissan|mazda|ford|bmw|mercedes-benz|hyundai|kia|suzuki|mg|byd|gwm|subaru|lexus|volvo|porsche|tesla)\.(com|co\.th|co\.jp|net)$/i,
-  /* สื่อรถไทย */ /(^|\.)(headlightmag\.com|autospinn\.com|grandprix\.co\.th|carvariety\.com|autodeft\.com|checkraka\.com|one2car\.com|motortrivia\.com|autostation\.com|car250\.com|tnews\.co\.th)$/i,
-  /* สื่อรถต่างประเทศ */ /(^|\.)(carscoops\.com|motor1\.com|autocar\.co\.uk|caranddriver\.com|topgear\.com|carexpert\.com\.au|drive\.com\.au|paultan\.org|carsguide\.com\.au|autoblog\.com|motortrend\.com|whichcar\.com\.au|edmunds\.com)$/i,
-  /* ข่าวทั่วไป/ทางการ */ /(^|\.)(thairath\.co\.th|bangkokpost\.com|nationthailand\.com|matichon\.co\.th|prachachat\.net|thaipbs\.or\.th|reuters\.com|bbc\.com|apnews\.com|tmd\.go\.th|go\.th)$/i,
-];
-const hostOf = u => { try { return new URL(u).hostname.replace(/^www\./, '') } catch (e) { return '' } };
-export function publicPageUrl(value){
-  try{const u=new URL(value);return u.protocol==='https:'&&!u.username&&!u.password&&!u.port&&TRUST.some(re=>re.test(u.hostname))?u.href:null;}catch{return null;}
-}
-async function readPublicPage(value,headers,ms){
-  let url=publicPageUrl(value);if(!url)return null;
-  const ctl=new AbortController(),timer=setTimeout(()=>ctl.abort(),ms);
-  try{
-    for(let hops=0;hops<4;hops++){
-      const response=await fetch(url,{headers,signal:ctl.signal,redirect:'manual'});
-      if(response.status>=300&&response.status<400){
-        const location=response.headers.get('location');await response.body?.cancel();
-        if(!location)return null;url=publicPageUrl(new URL(location,url).href);if(!url)return null;continue;
-      }
-      if(!response.ok||!/html/i.test(response.headers.get('content-type')||'')){await response.body?.cancel();return null;}
-      const reader=response.body?.getReader();if(!reader)return null;
-      const chunks=[];let size=0;
-      while(size<400000){const {done,value}=await reader.read();if(done)break;const chunk=value.subarray(0,400000-size);chunks.push(chunk);size+=chunk.length;}
-      await reader.cancel().catch(()=>{});
-      const bytes=new Uint8Array(size);let at=0;for(const chunk of chunks){bytes.set(chunk,at);at+=chunk.length;}
-      return new TextDecoder().decode(bytes);
-    }
-    return null;
-  }finally{clearTimeout(timer);}
-}
-/* ลิงก์ Bing News เป็นลิงก์ผ่าน (apiclick ...&url=) — ดึง url จริงออกมา · ลิงก์ Google News เปิดตรงไม่ได้ ข้าม */
-function realUrl(u) {
-  try { const x = new URL(u); if (/bing\.com$/.test(x.hostname) && x.searchParams.get('url')) return x.searchParams.get('url');
-    if (/news\.google\.com$/.test(x.hostname)) return ''; return u } catch (e) { return '' }
-}
-function pageText(html, q) {
-  let t = String(html || '').replace(/<(script|style|noscript|svg|nav|footer|header|aside|form)[\s\S]*?<\/\1>/gi, ' ');
-  const art = t.match(/<article[\s\S]*?<\/article>/i); if (art) t = art[0];
-  t = unent(t);
-  /* เลือกช่วงที่มีคำค้นหนาแน่นที่สุด ไม่ใช่แค่ต้นหน้า (ซึ่งมักเป็นเมนู) */
-  const words = String(q).toLowerCase().split(/\s+/).filter(w => w.length > 2 && !w.startsWith('-'));
-  if (t.length <= 1600 || !words.length) return t.slice(0, 1600);
-  let best = 0, bestAt = 0;
-  for (let i = 0; i < t.length - 1600; i += 400) { const seg = t.slice(i, i + 1600).toLowerCase(); const sc = words.reduce((n, w) => n + seg.split(w).length - 1, 0); if (sc > best) { best = sc; bestAt = i } }
-  return t.slice(bestAt, bestAt + 1600);
-}
-export async function readPages(rows, q, n, budgetMs) {
-  const score = u => { const h = hostOf(u); const i = TRUST.findIndex(re => re.test(h)); return i < 0 ? 9 : i };
-  const cand = rows.map(r => ({ ...r, real: publicPageUrl(realUrl(r.url)) })).filter(r => r.real && !/wikipedia\.org/.test(r.real))
-    .sort((a, b) => score(a.real) - score(b.real)).slice(0, n);
-  const UA = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36', 'Accept-Language': 'th,en;q=0.8', Accept: 'text/html' };
-  const res = await Promise.all(cand.map(async r => {
-    try { const body=await readPublicPage(r.real,UA,budgetMs);if(!body)return '';
-      const txt = pageText(body, q);
-      return txt.length > 200 ? `【${r.title}】 (${hostOf(r.real)}${r.date ? ', ' + r.date : ''})\n${txt}` : '';
-    } catch (e) { return '' } }));
-  const ok = res.filter(Boolean);
-  return { text: ok.join('\n\n'), ok: ok.length, tried: cand.length };
+  if (!configuredProviders(env).length) return { text: '', src: '', stat: 'no_search_key' };
+  const text = await searchForChat(env, q, { depth, meter });
+  return text ? { text, src: providerOrder(env).join('+') } : { text: '', src: '', stat: 'no results' };
 }

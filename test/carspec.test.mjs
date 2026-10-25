@@ -13,8 +13,24 @@ const PAJERO={found:true,body:'suv',generation:'Gen 3 (2015–2024)',market:'ไ
   seats:7,doors:5,length_mm:4825,width_mm:1815,height_mm:1835,wheelbase_mm:2800,kerb_kg:2045,tank_l:68,tire:'265/60 R18',
   safety:['ถุงลมนิรภัย 7 ตำแหน่ง','ABS','ASC'],comfort:['กุญแจอัจฉริยะ'],notes:null};
 
+/* เอกสารสาธารณะจำลอง (ไม่มีการค้น Google อีกแล้ว): ทุกค่าของสองรอบเขียนเป็นประโยคพร้อมคำกำกับ/หน่วยในหน้า Wikipedia จำลอง
+   แล้ว "Gemini" ตอบด้วยหลักฐานที่คัดตรงตัวจากเอกสาร — ผ่านตัวตรวจหลักฐานจริง (cleanDocumentExtraction) เหมือนของจริง */
+const ORD=['first','second','third','fourth','fifth','sixth'];
+const FACT={seats:v=>v+' seats',doors:v=>v+' doors',length_mm:v=>'length '+v+' mm',width_mm:v=>'width '+v+' mm',height_mm:v=>'height '+v+' mm',wheelbase_mm:v=>'wheelbase '+v+' mm',
+  kerb_kg:v=>'kerb weight '+v+' kg',tank_l:v=>'fuel tank '+v+' litres',tire:v=>'tyres '+v,body:v=>'body '+v,generation:v=>'generation '+v,market:v=>'market '+v};
+const VAR={name:v=>'variant '+v,engine:v=>'engine '+v,fuel:v=>'fuel '+v,cc:v=>v+' cc',hp:v=>v+' hp',torque_nm:v=>'torque '+v+' Nm',gearbox:v=>'gearbox '+v,drive:v=>'drive '+v,l_per_100km:v=>v+' L/100 km'};
+function specDoc(pass,tag){
+  if(!pass||pass.found!==true)return {lines:[],evidence:[],scope:null};
+  const lines=['Lookup '+tag+' model years 1950-2030.','Lookup '+tag+' sold in Japan and Thailand.'],evidence=[];
+  for(const [k,f] of Object.entries(FACT))if(pass[k]!=null){const q='Lookup '+tag+' '+f(pass[k]);lines.push(q+'.');evidence.push({path:'facts.'+k,source:0,quote:q})}
+  (pass.variants||[]).forEach((v,i)=>{for(const [k,f] of Object.entries(VAR))if(v[k]!=null){const q='Lookup '+tag+' '+ORD[i]+' '+f(v[k]);lines.push(q+'.');evidence.push({path:'variants.'+i+'.'+k,source:0,quote:q})}});
+  return {lines,evidence,scope:{source:0,year_quote:'Lookup '+tag+' model years 1950-2030.',market_quote:'Lookup '+tag+' sold in Japan and Thailand.'}};
+}
+/* คำตอบแบบสกัดจากเอกสาร (รอบ B ขึ้นต้นด้วย "ตรวจอย่างระมัดระวัง") — ใช้ในเทสต์ที่จำลอง Gemini เอง */
+const isSecond=body=>/ตรวจอย่างระมัดระวัง/.test(body.contents[0].parts[0].text);
+function docAnswer(pass,second){const d=specDoc(pass,second?'B':'A');return pass&&pass.found===true?{...pass,scope:[d.scope],evidence:d.evidence}:pass}
 function setup({passA=PAJERO,passB=PAJERO,fail=false}={}){
-  const f=fixture({DEV_AUTH:'1',FIREBASE_PROJECT_ID:'unit-test',GEMINI_KEY:'test-only-key',GEMINI_SPEC_MODE:'grounded'});
+  const f=fixture({DEV_AUTH:'1',FIREBASE_PROJECT_ID:'unit-test',GEMINI_KEY:'test-only-key'});
   f.sqlite.exec(`CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT); INSERT INTO config VALUES ('schema_version','999');
     CREATE TABLE audit (id INTEGER PRIMARY KEY AUTOINCREMENT, t INTEGER, actor TEXT, action TEXT, target TEXT, detail TEXT);
     CREATE TABLE car_specs (k TEXT PRIMARY KEY, make TEXT NOT NULL, model TEXT NOT NULL, year TEXT NOT NULL, status TEXT NOT NULL, body TEXT, data TEXT,
@@ -24,13 +40,17 @@ function setup({passA=PAJERO,passB=PAJERO,fail=false}={}){
     CREATE TABLE user_state (uid TEXT NOT NULL, k TEXT NOT NULL, v TEXT NOT NULL, t INTEGER NOT NULL, PRIMARY KEY (uid, k));
     CREATE TABLE cars (id TEXT PRIMARY KEY, uid TEXT NOT NULL, make TEXT NOT NULL, model TEXT NOT NULL, year TEXT, mileage TEXT, created_at INTEGER NOT NULL, color TEXT, body TEXT, info TEXT);`);
   f.sqlite.prepare("INSERT INTO users (uid, role, banned) VALUES ('boss','admin',0),('cust','user',0)").run();
-  const ai=[],web=[];
+  const ai=[],web=[],A=specDoc(passA,'A'),B=specDoc(passB,'B');let title='';
   globalThis.fetch=async(url,init={})=>{const u=String(url);
     if(u.includes('generativelanguage')){const body=JSON.parse(init.body);ai.push({u,body});
       if(fail)return new Response('quota',{status:429});
-      const second=/ตรวจสอบข้อมูลจำเพาะ/.test(body.contents[0].parts[0].text);
-      return Response.json({candidates:[{content:{parts:[{text:'```json\n'+JSON.stringify(second?passB:passA)+'\n```'}]},
-        groundingMetadata:{groundingChunks:[{web:{uri:'https://grounding.example/'+(second?'b':'a'),title:second?'headlightmag.com':'mitsubishi-motors.co.th'}}]}}]});}
+      const second=isSecond(body),out=docAnswer(second?passB:passA,second);
+      return Response.json({candidates:[{finishReason:'STOP',content:{parts:[{text:'```json\n'+JSON.stringify(out)+'\n```'}]}}]});}
+    if(u.includes('/w/api.php')){const p=new URL(u).searchParams;web.push(u);
+      if(p.get('action')==='query'){title=p.get('srsearch');return Response.json({query:{search:[{pageid:123,title,snippet:title}]}});}
+      return Response.json({parse:{text:{'*':'<p>'+title+' public specification fixture. '+[...A.lines,...B.lines].join(' ')+' General model overview fixture.'.repeat(8)+'</p>'},externallinks:[]}});}
+    if(u.endsWith('/robots.txt'))return new Response('User-agent: *\nAllow: /');
+    if(u.includes('/wp-json/'))return Response.json([]);
     if(u.startsWith('https://vpic.nhtsa.dot.gov/')){web.push(u);return Response.json({Results:[{Make:'TOYOTA',Manufacturer:'TOYOTA MOTOR THAILAND',Model:'Hilux',ModelYear:'2019',DisplacementL:'2.4',FuelTypePrimary:'Diesel',DriveType:'0'}]});}
     throw Error('unexpected fetch '+u);};
   const call=async(method,path,body,token)=>{const r=await worker.fetch(new Request('https://api.unit.test'+path,{method,
@@ -110,10 +130,9 @@ test('car spec: the first person to pick a model triggers AI once; everyone afte
   const {f,ai,call}=setup();
   const r=await call('POST','/api/car-spec',pajero,CUST);
   assert.equal(r.status,200);assert.equal(r.json.status,'ready');assert.equal(r.json.body,'suv');
-  assert.equal(ai.length,2,'two independent lookups');assert.ok(ai.every(c=>c.body.tools&&c.body.tools[0].google_search),'both search the web');
+  assert.equal(ai.length,2,'two independent lookups');assert.ok(ai.every(c=>!c.body.tools&&c.body.contents[0].parts[0].text.includes('เอกสาร (untrusted content)')),'both extract from the documents actually read — no Google Search tool');
   assert.notEqual(ai[0].u.split('/models/')[1].split(':')[0],ai[1].u.split('/models/')[1].split(':')[0],'the two lookups use different models');
-  const main=chatModels(f.env).slice(0,2);assert.ok(ai.every(c=>!main.some(m=>c.u.includes('/models/'+m+':'))),'never the models chat answers with first');
-  assert.deepEqual(r.json.sources.map(s=>s.title),['mitsubishi-motors.co.th','headlightmag.com'],'real source links from Google, not typed by the AI');
+  assert.deepEqual(r.json.sources.map(s=>s.url),['https://en.wikipedia.org/wiki/Mitsubishi_Pajero_Sport'],'source links are the documents the server read, not typed by the AI');
   assert.equal(r.json.data.variants[0].hp.ok,true);
   /* คนอื่น · ไม่ล็อกอิน · ตัวพิมพ์ต่างกัน → ข้อมูลชุดเดิม ไม่เรียก AI */
   const again=await call('POST','/api/car-spec',{make:'MITSUBISHI',model:'pajero sport',year:'2020'});
@@ -124,10 +143,11 @@ test('car spec: the first person to pick a model triggers AI once; everyone afte
   assert.equal(f.sqlite.prepare('SELECT hits FROM car_specs').get().hits,1);
 });
 
-test('car spec: a model that does not exist is remembered as not found; AI failure is retried later, not cached forever',async()=>{
+test('car spec: documents that do not confirm a model are reported as unconfirmed (never a permanent notfound); AI failure is retried later, not cached forever',async()=>{
   let {ai,call}=setup({passA:{found:false},passB:{found:false}});
-  assert.equal((await call('POST','/api/car-spec',{make:'Toyota',model:'Supra',year:'1950'},CUST)).json.status,'notfound');
-  await call('POST','/api/car-spec',{make:'Toyota',model:'Supra',year:'1950'},CUST);assert.equal(ai.length,2,'not asked again');
+  const none=(await call('POST','/api/car-spec',{make:'Toyota',model:'Supra',year:'1950'},CUST)).json;
+  assert.equal(none.status,'failed');assert.equal(none.code,'unconfirmed');assert.notEqual(none.status,'notfound');
+  await call('POST','/api/car-spec',{make:'Toyota',model:'Supra',year:'1950'},CUST);assert.equal(ai.length,2,'opening again right away reuses the result');
   ({call}=setup({fail:true}));
   const r=await call('POST','/api/car-spec',pajero,CUST);
   assert.equal(r.json.status,'failed');assert.ok(r.json.error);
@@ -180,20 +200,18 @@ test('car info: optional fields are cleaned, saved with the car, and kept when n
   assert.deepEqual(JSON.parse(f.sqlite.prepare('SELECT info FROM cars').get().info),{plate:'กข 1234'},'sent = replaced, removed fields are gone');
 });
 
-test('car spec: a messy answer from web search is turned back into JSON by a light model (no new facts, no web)',async()=>{
+test('car spec: extraction asks for JSON straight from the read documents (no Google Search tool); a prose answer is never published',async()=>{
   const {f,ai}=setup();
   const real=globalThis.fetch;
   globalThis.fetch=async(url,init={})=>{const u=String(url);
-    if(u.includes('generativelanguage')){const body=JSON.parse(init.body);
-      if(body.tools){ai.push({u,body});return Response.json({candidates:[{finishReason:'STOP',content:{parts:[{text:'จากการค้นพบว่า Pajero Sport 2020 มีที่นั่ง 7 ที่นั่ง {"found":true, "seats":7, ตัวถัง suv'}]},groundingMetadata:{groundingChunks:[{web:{uri:'https://g/x',title:'example.com'}}]}}]});}
-      ai.push({u,body,repair:true});
-      assert.equal(body.generationConfig.responseMimeType,'application/json');assert.ok(!body.tools,'repair does not search the web');
-      return Response.json({candidates:[{content:{parts:[{text:JSON.stringify({found:true,body:'suv',seats:7})}]}}]});}
+    if(u.includes('generativelanguage')){const body=JSON.parse(init.body);ai.push({u,body});
+      return Response.json({candidates:[{finishReason:'STOP',content:{parts:[{text:'จากการค้นพบว่า Pajero Sport 2020 มีที่นั่ง 7 ที่นั่ง ตัวถัง suv'}]}}]});}
     return real(url,init);};
   const {ensureSpec}=await import('../src/carspec.js');
   const r=await ensureSpec(f.env,pajero,{who:'u:cust',user:true});
-  assert.equal(r.status,'ready');assert.equal(r.data.facts.seats.v,7);assert.ok(ai.some(c=>c.repair));
-  assert.ok(ai.filter(c=>!c.repair).every(c=>c.body.generationConfig.thinkingConfig),'thinking is capped so the answer is not cut off');
+  assert.equal(r.status,'failed');assert.equal(r.data,null,'prose is not turned into facts');
+  assert.ok(ai.length>0&&ai.every(c=>!c.body.tools&&c.body.generationConfig.responseMimeType==='application/json'),'JSON is requested directly and no web-search tool is attached');
+  assert.ok(ai.every(c=>c.body.generationConfig.thinkingConfig||!/gemini-3|gemini-2\.5/.test(c.u)),'thinking is capped so the answer is not cut off');
 });
 
 test('car spec: a slow lookup answers "pending" quickly and finishes in the background; admins see why a lookup failed',async()=>{
@@ -212,7 +230,7 @@ test('car spec: a slow lookup answers "pending" quickly and finishes in the back
   assert.match((await listSpecs(f.env)).find(x=>x.model==='Zzz').error,/ตอบ 404/);
 });
 
-test('car spec: "try again" really searches again; unavailable models fall back (chat models last); a model that rejects the thinking setting is retried without it',async()=>{
+test('car spec: "try again" really searches again; unavailable models fall back; a model that rejects the thinking setting is retried without it',async()=>{
   const {f,ai,call}=setup({fail:true});
   assert.equal((await call('POST','/api/car-spec',pajero,CUST)).json.status,'failed');
   const n=ai.length;
@@ -223,21 +241,20 @@ test('car spec: "try again" really searches again; unavailable models fall back 
     if(u.includes('generativelanguage')){const m=u.split('/models/')[1].split(':')[0],body=JSON.parse(init.body);seen.push({m,think:!!body.generationConfig.thinkingConfig});
       if(!main.includes(m))return new Response('model not found',{status:404});
       if(body.generationConfig.thinkingConfig)return new Response('thinking not supported',{status:400});
-      const second=/ตรวจสอบข้อมูลจำเพาะ/.test(body.contents[0].parts[0].text);
-      return Response.json({candidates:[{finishReason:'STOP',content:{parts:[{text:JSON.stringify(PAJERO)}]},groundingMetadata:{groundingChunks:[{web:{uri:'https://g/'+(second?'b':'a'),title:second?'b.com':'a.com'}}]}}]});}
+      return Response.json({candidates:[{finishReason:'STOP',content:{parts:[{text:JSON.stringify(docAnswer(PAJERO,isSecond(body)))}]}}]});}
     return real(url,init);};
   const r=await call('POST','/api/car-spec',{...pajero,retry:true},CUST);
   assert.equal(r.json.status,'ready','pressing try again searches again right away');
   assert.ok(seen.some(x=>main.includes(x.m)&&!x.think),'fell back to a model that works, without the thinking setting');
-  const firstChat=seen.findIndex(x=>main.includes(x.m));assert.ok(firstChat>0&&seen.slice(0,firstChat).every(x=>!main.includes(x.m)),'models chat answers with are tried last');
+  assert.ok(seen.some(x=>!main.includes(x.m)),'unavailable models were tried and skipped');
   globalThis.fetch=real;
 });
 
 test('car spec log: real Gemini error text and every attempt reach the floating admin panel',async()=>{
-  const {f,call}=setup();
-  globalThis.fetch=async(url)=>{const u=String(url);
+  const {f,call}=setup();const real=globalThis.fetch;
+  globalThis.fetch=async(url,init)=>{const u=String(url);
     if(u.includes('generativelanguage'))return Response.json({error:{code:403,status:'PERMISSION_DENIED',message:'API key not valid for this project'}},{status:403});
-    throw Error('unexpected fetch '+u);};
+    return real(url,init);};
   const r=await call('POST','/api/car-spec',pajero,CUST);
   assert.equal(r.json.status,'failed');
   assert.match(r.json.error,/403: PERMISSION_DENIED · API key not valid/,'the stored reason is the real one, not just a status code');
@@ -275,11 +292,11 @@ test('car spec: notfound in one lookup cannot compare the other positive lookup 
   assert.equal(r.json.data.body_ok,false);assert.equal(r.json.data.variants[0].hp.ok,null);assert.equal(r.json.data.coverage.passes,1);
 });
 test('car spec: source-free or empty model output is never published as a real ready specification',async()=>{
-  for(const empty of [false,true]){const {call}=setup();globalThis.fetch=async()=>Response.json({candidates:[{content:{parts:[{text:JSON.stringify(empty?{found:true}:PAJERO)}]},groundingMetadata:{groundingChunks:empty?[{web:{uri:'https://official.example.test',title:'official'}}]:[]}}]});
+  for(const empty of [false,true]){const {call}=setup();const real=globalThis.fetch;globalThis.fetch=async(url,init)=>String(url).includes('generativelanguage')?Response.json({candidates:[{content:{parts:[{text:JSON.stringify(empty?{found:true}:PAJERO)}]}}]}):real(url,init);
     const r=await call('POST','/api/car-spec',pajero,CUST);assert.equal(r.json.status,'failed');assert.equal(r.json.data,null);assert.equal(r.json.code,'unconfirmed');}
 });
 test('car spec: an unsuccessful negative lookup is not remembered as permanent notfound',async()=>{
-  const {f}=setup();let count=0;globalThis.fetch=async(url,init)=>{const second=/ตรวจสอบข้อมูลจำเพาะ/.test(JSON.parse(init.body).contents[0].parts[0].text);count++;if(second)return new Response('quota',{status:429});return Response.json({candidates:[{content:{parts:[{text:'{"found":false}'}]},groundingMetadata:{groundingChunks:[{web:{uri:'https://official.example.test',title:'official'}}]}}]})};
+  const {f}=setup();let count=0;const real=globalThis.fetch;globalThis.fetch=async(url,init)=>{if(!String(url).includes('generativelanguage'))return real(url,init);count++;if(isSecond(JSON.parse(init.body)))return new Response('quota',{status:429});return Response.json({candidates:[{content:{parts:[{text:'{"found":false}'}]}}]})};
   const {ensureSpec}=await import('../src/carspec.js');const r=await ensureSpec(f.env,pajero,{who:'u:cust',user:true});assert.equal(r.status,'failed');assert.ok(count>1);assert.notEqual(r.status,'notfound');
 });
 test('car spec: same model/year in different markets uses different shared cache records and never sends a VIN',async()=>{
@@ -322,7 +339,7 @@ test('car spec: seats/doors are exact and equal engines cannot merge different t
   assert.equal(m.facts.seats.ok,false);assert.equal(m.facts.doors.ok,false);assert.equal(m.variants.length,4);
 });
 test('car spec: unusable specifications refund lookup allowance but retain non-refundable safety attempts',async()=>{
-  const {f,call,ai}=setup();globalThis.fetch=async()=>{ai.push({});return Response.json({candidates:[{content:{parts:[{text:'{"found":true}'}]},groundingMetadata:{groundingChunks:[{web:{uri:'https://official.example.test/spec',title:'test'}}]}}]})};
+  const {f,call,ai}=setup();const real=globalThis.fetch;globalThis.fetch=async(url,init)=>{if(!String(url).includes('generativelanguage'))return real(url,init);ai.push({});return Response.json({candidates:[{content:{parts:[{text:'{"found":true}'}]}}]})};
   for(let i=0;i<9;i++)assert.equal((await call('POST','/api/car-spec',{make:'Fixture',model:'Empty '+i,year:'2020'})).json.code,'unconfirmed');
   assert.equal(f.sqlite.prepare("SELECT n FROM spec_quota WHERE who='ip:203.0.113.9'").get().n,0);assert.equal(f.sqlite.prepare("SELECT n FROM spec_quota WHERE who='*'").get().n,0);
   assert.equal(f.sqlite.prepare("SELECT n FROM spec_quota WHERE who='attempt:ip:203.0.113.9'").get().n,9);
