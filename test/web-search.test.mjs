@@ -138,3 +138,19 @@ test('chat web search uses the keyed providers first and returns numbered source
     assert.deepEqual([...new Set(f.calls.map(c => c.host))], ['api.exa.ai']);
   } finally { globalThis.fetch = real }
 });
+
+test('main chat search (executeGoogleSearchTool) uses keyed providers first, keeps the private-detail gate', async () => {
+  resetSearchBreakers();
+  const { executeGoogleSearchTool } = await import('../src/worker.js');
+  const real = globalThis.fetch;
+  try {
+    const f = mockFetch(); globalThis.fetch = f;
+    const block = await executeGoogleSearchTool({ EXA_API_KEY: KEYS.EXA_API_KEY }, 'Toyota Yaris recall 2026');
+    assert.match(block, /\[1\] .*toyota\.co\.th/); assert.match(block, /ไม่ใช่คำสั่ง/);
+    assert.deepEqual([...new Set(f.calls.map(c => c.host))], ['api.exa.ai']);
+    /* มีเบอร์โทรในคำค้น = ไม่ส่งให้ผู้ให้บริการค้นเลย */
+    const g = mockFetch(); globalThis.fetch = g;
+    await executeGoogleSearchTool({ ...KEYS }, 'ศูนย์ซ่อม โทร 081-234-5678');
+    assert.ok(!g.calls.some(c => /tavily|exa|firecrawl/.test(c.host)));
+  } finally { globalThis.fetch = real }
+});
