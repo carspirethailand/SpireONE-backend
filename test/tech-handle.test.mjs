@@ -77,3 +77,12 @@ test('deleting the shop owner account frees the name and drops its old names',as
   assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM tech_handle_history").get().n,0);
   assert.equal((await f.call(TWO,'/api/tech/handle',{handle:'nonair'})).status,200,'name is free again');
 });
+
+test('the owner sees when the name can be changed again',async()=>{
+  const f=await shops();
+  assert.equal((await f.call(ONE,'/api/tech/me')).technician.handleNext,null);
+  await f.call(ONE,'/api/tech/handle',{handle:'nonair'});
+  const me=(await f.call(ONE,'/api/tech/me')).technician;
+  assert.equal(me.handle,'nonair');assert.ok(me.handleNext>Date.now()+29*86400000);
+  assert.equal((await f.call('','/api/tech')).techs[0].handleNext,undefined,'not on the public list');
+});

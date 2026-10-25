@@ -545,6 +545,8 @@ async function meInfo(env, me) {
     uid: me.uid, email: me.email, admin: me.admin, staff: me.staff, owner: !!me.owner, version: API_VERSION,
     application: appOut(await openApp(env, a), false, ident),
     technician: t ? { ...publicTech((await withTrust(env, await withPhotos(env, [t])))[0]), suspended: !!t.suspended, listing: listingOf(t),
+      /* ชื่อลิงก์ร้าน: เปลี่ยนได้อีกครั้งเมื่อไหร่ (Studio บอกเจ้าของร้าน) */
+      handleNext: t.handle && t.handle_at ? t.handle_at + HANDLE_EVERY : null,
       /* งานค้าง/เพดาน (Studio บอกช่างก่อนเสนอราคา) */
       capacity: { open: jobs.filter(x => x.side === 'technician' && OPEN_STATES.includes(x.status)).length, cap: capOf(parse(t.data) || {}) },
       identityHold: !!(!t.test && t.suspended && t.id_hold),
