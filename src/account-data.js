@@ -213,6 +213,8 @@ export async function deleteAccount(env, uid, { email = '' } = {}) {
       JSON.stringify({ name: 'ร้านที่ปิดบัญชีแล้ว', shop: 'ร้านที่ปิดบัญชีแล้ว', deleted: true }), at, uid));
     /* ชื่อลิงก์ร้าน (/tech/<ชื่อ>) คืนให้คนอื่นจองได้ ไม่ค้างพาไปร้านที่ปิดแล้ว */
     await run(env, 'UPDATE tech_profiles SET handle = NULL WHERE id = ?', shop.id);
+    /* ตำแหน่งมือถือล่าสุดของช่างเคลื่อนที่ ลบทิ้งพร้อมกัน */
+    await run(env, 'UPDATE tech_profiles SET live_lat = NULL, live_lng = NULL, live_at = NULL WHERE id = ?', shop.id);
     add('tech_handle_history', await run(env, 'DELETE FROM tech_handle_history WHERE tech_id = ?', shop.id));
   }
   /* แฮชเลขบัตรของร้านที่ทีมงานระงับ (ไม่ใช่พักเพราะรอยืนยันตัวตน) เก็บไว้กันสมัครซ้ำ — อย่างอื่นลบ */
