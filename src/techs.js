@@ -203,6 +203,12 @@ const TECH_ALTER = [
       VALUES(CAST(strftime('%s','now') AS INTEGER)*1000,'system:profile-state','profile_state_change',NEW.id,
       json_object('from',json_object('test',OLD.test,'verified',OLD.verified,'suspended',OLD.suspended,'identityHold',OLD.id_hold),
                   'to',json_object('test',NEW.test,'verified',NEW.verified,'suspended',NEW.suspended,'identityHold',NEW.id_hold))); END`,
+  /* ชื่อลิงก์ร้าน: cendon…/tech/<handle> — ร้านละหนึ่งชื่อ ห้ามซ้ำกัน (NULL = ยังไม่ได้จอง ซ้ำกันได้) · handle_at = เวลาที่ตั้งล่าสุด (คุมความถี่การเปลี่ยน)
+     ชื่อเก่าที่เลิกใช้เก็บไว้ใน tech_handle_history: ลิงก์เดิมยังพาไปร้านเดิม และคนอื่นจองชื่อนั้นไม่ได้ระยะหนึ่ง */
+  `ALTER TABLE tech_profiles ADD COLUMN handle TEXT`,
+  `ALTER TABLE tech_profiles ADD COLUMN handle_at INTEGER`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS tech_profiles_handle ON tech_profiles(handle)`,
+  `CREATE TABLE IF NOT EXISTS tech_handle_history (handle TEXT PRIMARY KEY, tech_id TEXT NOT NULL, retired_at INTEGER NOT NULL)`,
 ];
 const techReady = new WeakMap();
 async function ensureTech(env) {
@@ -416,7 +422,7 @@ function publicTech(r) {
     phone: d.showPhone ? String(d.phone || r.phone || '') : undefined, showPhone: !!d.showPhone,
     subs: d.subs || [], week: d.week || null, brands2: d.brands2 || [], line: d.line || '', facebook: d.facebook || '', address: d.address || '',
     /* โหมดพักร้อน: แสดงบนหน้าร้าน และงดรับคำขอใหม่จนกว่าจะถึงวันที่ตั้ง */
-    vacation: vacationOf(d), greet: d.greet || '', theme: d.theme || '',
+    vacation: vacationOf(d), greet: d.greet || '', theme: d.theme || '', handle: r.handle || '',
     /* งานที่ซ่อมจบพร้อมหลักฐานที่ AI ตรวจผ่าน (รวม + แยกหมวด) · full = งานค้างเต็ม เสนอราคางานใหม่ไม่ได้ชั่วคราว */
     proven: r.proven ? r.proven.n : 0, provenCats: r.proven ? r.proven.cats : {}, full: !r.test && (r.openJobs || 0) >= capOf(d),
     vetting: d.vetting && r.verified ? { at: d.vetting.at, identity: !!d.vetting.identity, phone: !!d.vetting.phone, shop: d.vetting.shop || '', skills: d.vetting.skills || '', cats: d.vetting.cats || [], mobile: !!d.vetting.mobile } : null,
@@ -1189,6 +1195,82 @@ async function moderate(env, me, b) {
   ]);
   if (!r.meta.changes) fail(404, 'ไม่พบช่าง');
   return { ok: true };
+}
+
+/* ══ ชื่อลิงก์ร้าน ══
+   ร้านที่ผ่านการตรวจจองชื่อสั้น ๆ ได้หนึ่งชื่อ เช่น /tech/nonair — จำง่าย พิมพ์ง่าย แชร์แล้วไม่เป็นรหัสยาว
+   - ตัวอังกฤษเล็ก ตัวเลข และขีด 3–30 ตัว (ภาษาไทยในลิงก์กลายเป็น %E0%B8… เมื่อคัดลอกไปวางใน LINE/Facebook)
+   - ชื่อเส้นทางของระบบ ชื่อ Cendon และชื่อยี่ห้อ/แบรนด์ดัง สงวนไว้ กันการแอบอ้างเป็นศูนย์บริการทางการ
+   - เปลี่ยนชื่อได้ทุก 30 วัน · ชื่อเก่าพาไปร้านเดิมและคนอื่นจองไม่ได้ 90 วัน — ลิงก์ที่แจกไปแล้วไม่ตาย และแย่งชื่อทันทีไม่ได้
+   - ร้านทดลอง/ยังไม่ผ่านการตรวจจองไม่ได้ (ไม่มีหน้าสาธารณะ และกันจองชื่อทิ้งไว้) · เจ้าของระบบ/admin ตั้งหรือถอนชื่อให้ร้านใดก็ได้ */
+const HANDLE_RE = /^(?=.{3,30}$)[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const HANDLE_HOLD = 90 * 86400000, HANDLE_EVERY = 30 * 86400000;
+const HANDLE_RESERVED = new Set(('admin api app about help terms privacy login logout signup register me my new edit settings setting studio shop shops store '
+  + 'tech techs service services category categories search map jobs job post posts quote quotes reviews review chat messages staff support team '
+  + 'official verified null undefined root www mail cendon spire spireone line facebook google tiktok youtube instagram grab lineman '
+  + 'toyota honda isuzu nissan mazda mitsubishi ford chevrolet suzuki hyundai kia bmw benz mercedes mercedes-benz audi volvo porsche lexus tesla byd mg gwm haval ora neta '
+  + 'ptt bangchak shell caltex esso cockpit bquik b-quik autobacs fitauto bridgestone michelin yokohama goodyear').split(' '));
+export function handleProblem(h) {
+  if (!HANDLE_RE.test(h)) return 'format';
+  if (HANDLE_RESERVED.has(h) || /^(cendon|spire|admin|official)/.test(h)) return 'reserved';
+  return null;
+}
+/* ใครถือชื่อนี้อยู่: ร้านที่ใช้ชื่อนี้ตอนนี้ หรือร้านที่เพิ่งเลิกใช้ (ยังอยู่ในช่วงกันไว้) */
+async function handleHolder(env, h) {
+  const cur = await env.DB.prepare('SELECT id FROM tech_profiles WHERE handle = ?').bind(h).first();
+  if (cur) return { techId: cur.id, current: true };
+  const old = await env.DB.prepare('SELECT tech_id, retired_at FROM tech_handle_history WHERE handle = ?').bind(h).first();
+  return old && now() - old.retired_at < HANDLE_HOLD ? { techId: old.tech_id, current: false } : null;
+}
+const handleIn = v => String(v || '').trim().toLowerCase();
+async function checkHandle(env, me, h) {
+  await limit(env, 'handle-check', me.uid, 300);
+  const mine = await env.DB.prepare('SELECT id, handle FROM tech_profiles WHERE uid = ?').bind(me.uid).first();
+  const bad = handleProblem(h);
+  if (bad) return { handle: h, ok: false, reason: bad };
+  const who = await handleHolder(env, h);
+  if (who && mine && who.techId === mine.id) return { handle: h, ok: true, reason: who.current ? 'current' : null };
+  return { handle: h, ok: !who, reason: who ? 'taken' : null };
+}
+async function setHandle(env, me, b) {
+  const boss = me.owner || me.admin;
+  const t = b.techId != null && boss ? await techById(env, String(b.techId))
+    : await env.DB.prepare('SELECT * FROM tech_profiles WHERE uid = ?').bind(me.uid).first();
+  if (!t) fail(404, 'ไม่พบร้าน');
+  const h = handleIn(b.handle), at = now();
+  if (!boss) {
+    if (!t.verified || t.test) fail(403, 'จองชื่อลิงก์ได้เมื่อร้านผ่านการตรวจแล้ว');
+    if (t.suspended) fail(403, 'ร้านพักใช้งานอยู่ เปิดร้านก่อนแล้วค่อยจองชื่อ');
+    if (!h) fail(400, 'กรอกชื่อลิงก์ร้าน');
+  }
+  if (h === (t.handle || '')) return { ok: true, handle: t.handle || '' };
+  if (!boss && t.handle && t.handle_at && at - t.handle_at < HANDLE_EVERY)
+    fail(429, 'เปลี่ยนชื่อลิงก์ได้อีกครั้งวันที่ ' + new Date(t.handle_at + HANDLE_EVERY).toLocaleDateString('th-TH', { day: 'numeric', month: 'short', year: 'numeric' }));
+  if (h) {
+    const bad = handleProblem(h);
+    if (bad === 'format') fail(400, 'ใช้ตัวอังกฤษเล็ก ตัวเลข และขีด (-) 3–30 ตัว เช่น nonair-bangna');
+    if (bad === 'reserved' && !boss) fail(409, 'ชื่อนี้สงวนไว้ เลือกชื่ออื่น');
+    const who = await handleHolder(env, h);
+    if (who && who.techId !== t.id) fail(409, 'ชื่อนี้มีร้านอื่นใช้แล้ว');
+  }
+  await limit(env, 'handle-set', t.uid, 5);
+  const stmts = [];
+  /* ชื่อเดิมไม่หายทันที: ลิงก์เก่ายังพาไปร้านนี้ และคนอื่นจองไม่ได้จนพ้นช่วงกันไว้ */
+  if (t.handle) stmts.push(env.DB.prepare(`INSERT INTO tech_handle_history (handle, tech_id, retired_at) VALUES (?,?,?)
+    ON CONFLICT(handle) DO UPDATE SET tech_id = excluded.tech_id, retired_at = excluded.retired_at`).bind(t.handle, t.id, at));
+  if (h) stmts.push(env.DB.prepare('DELETE FROM tech_handle_history WHERE handle = ? AND tech_id = ?').bind(h, t.id));
+  stmts.push(env.DB.prepare('UPDATE tech_profiles SET handle = ?, handle_at = ?, updated_at = ? WHERE id = ?').bind(h || null, at, at, t.id));
+  try { await env.DB.batch(stmts); }
+  catch (e) { if (/UNIQUE/i.test(String(e && e.message))) fail(409, 'ชื่อนี้มีร้านอื่นใช้แล้ว'); throw e; }
+  if (t.uid !== me.uid) await audit(env, me, 'handle.set', t.id, (t.handle || '-') + ' → ' + (h || '-'));
+  return { ok: true, handle: h, previous: t.handle || '' };
+}
+/* หน้าสาธารณะใช้หาร้านจากชื่อลิงก์ (รวมชื่อเก่าที่ยังอยู่ในช่วงพาไปร้านเดิม) — เฉพาะร้านที่เปิดให้คนทั่วไปเห็น */
+async function resolveHandle(env, h) {
+  const who = HANDLE_RE.test(h) ? await handleHolder(env, h) : null;
+  const t = who && await techById(env, who.techId);
+  if (!t || !t.verified || t.test || t.suspended) fail(404, 'ไม่พบร้าน');
+  return { techId: t.id, handle: t.handle || '', current: who.current };
 }
 
 /* ── ใบงาน ── */
@@ -2973,9 +3055,13 @@ async function route(request, env, verifyToken) {
   /* หน้าเว็บใช้เช็กว่าเซิร์ฟเวอร์มีระบบช่างรุ่นนี้แล้ว — ถ้าไม่มี แสดงให้ทีมงานรู้ว่ายังไม่ได้ deploy */
   if (p === '/api/tech/ping') return { ok: true, version: API_VERSION, identity: diditReady(env) ? 'didit' : 'manual', consentVer: CONSENT_VER, photoAI: visionReady(env) };
   if (p === '/api/tech/didit/webhook' && m === 'POST') return diditWebhook(env, request);
+  const hdm = p.match(/^\/api\/tech\/handle\/([A-Za-z0-9-]{1,40})$/);
+  if (hdm && m === 'GET') return resolveHandle(env, handleIn(hdm[1]));
 
   const me = await who(request, env,true,verifyToken);
   if (p === '/api/tech/me' && m === 'GET') return meInfo(env, me);
+  if (p === '/api/tech/handle' && m === 'GET') return checkHandle(env, me, handleIn(url.searchParams.get('h')));
+  if (p === '/api/tech/handle' && m === 'POST') return setHandle(env, me, await body());
   if (p === '/api/tech/apply' && m === 'POST') return apply(env, me, await body());
   if (p === '/api/tech/apply/identity' && m === 'POST') return startIdentity(env, me);
   if (p === '/api/tech/apply/withdraw' && m === 'POST') return withdraw(env, me);
