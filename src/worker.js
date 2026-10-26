@@ -868,6 +868,20 @@ async function getConfig(env, key, fallback) {
   } catch { return fallback; }
 }
 
+/* อ่านหลายค่าในคำสั่งเดียว — ทุกคำสั่งที่ไปฐานข้อมูลคือการเดินทางไปกลับหนึ่งรอบ (/api/config เคยอ่านทีละค่า 5 รอบต่อกัน) */
+async function getConfigs(env, defaults) {
+  const keys = Object.keys(defaults), out = {}, miss = [];
+  for (const k of keys) { const hit = CONFIG_CACHE.get(k); if (hit && Date.now() - hit.t < 15000) out[k] = hit.v === undefined ? defaults[k] : hit.v; else miss.push(k); }
+  if (miss.length) {
+    try {
+      const { results } = await env.DB.prepare(`SELECT key, value FROM config WHERE key IN (${miss.map(() => '?').join(',')})`).bind(...miss).all();
+      const rows = new Map((results || []).map(r => [r.key, r.value]));
+      for (const k of miss) { let v; try { v = rows.get(k) ? JSON.parse(rows.get(k)) : undefined; } catch { v = undefined; } CONFIG_CACHE.set(k, { v, t: Date.now() }); out[k] = v === undefined ? defaults[k] : v; }
+    } catch { for (const k of miss) out[k] = defaults[k]; }
+  }
+  return out;
+}
+
 async function setConfig(env, key, value) {
   CONFIG_CACHE.delete(key);
   await env.DB.prepare(
@@ -4142,15 +4156,14 @@ export default {
 
       /* ===== PUBLIC: site config (announcement / maintenance) ===== */
       if (url.pathname === '/api/config' && request.method === 'GET') {
-        const announcement = await getConfig(env, 'announcement', { enabled: false, text: '', type: 'info' });
-        const maintenance = await getConfig(env, 'maintenance', { enabled: false, message: '' });
-        const features = await getConfig(env, 'features', {});
-        const limits = await getConfig(env, 'limits', {
-          aiDaily: parseInt(env.AI_DAILY_LIMIT || '60', 10),
-          anonDaily: parseInt(env.AI_ANON_DAILY_LIMIT || '15', 10),
+        /* หน้านับถอยหลังก่อนเปิดตัว (launch): แอปอ่านค่านี้แล้วพาคนทั่วไปไปหน้า /launch จนถึงเวลา (ทีมงานเข้าแอปได้ตามปกติ) */
+        const { announcement, maintenance, features, limits, launch } = await getConfigs(env, {
+          announcement: { enabled: false, text: '', type: 'info' },
+          maintenance: { enabled: false, message: '' },
+          features: {},
+          limits: { aiDaily: parseInt(env.AI_DAILY_LIMIT || '60', 10), anonDaily: parseInt(env.AI_ANON_DAILY_LIMIT || '15', 10) },
+          launch: LAUNCH_OFF,
         });
-        /* หน้านับถอยหลังก่อนเปิดตัว: แอปอ่านค่านี้แล้วพาคนทั่วไปไปหน้า /launch จนถึงเวลา (ทีมงานเข้าแอปได้ตามปกติ) */
-        const launch = await getConfig(env, 'launch', LAUNCH_OFF);
         return json({ announcement, maintenance, features, limits, launch, now: Date.now() });
       }
 
