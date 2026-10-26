@@ -6,6 +6,7 @@
    ราคาต่อครั้งเป็นค่าประมาณจากหน้าราคาของแต่ละเจ้า (ต.ค. 2569) ปรับได้ด้วย env *_USD_PER_CREDIT */
 
 import {requestText} from './request-json.mjs';
+import { detectCar, sameCar } from './chat-subject.mjs';
 export const SEARCH_PROVIDERS = Object.freeze(['tavily', 'exa', 'firecrawl']);
 const KEY = { tavily: 'TAVILY_API_KEY', exa: 'EXA_API_KEY', firecrawl: 'FIRECRAWL_API_KEY' };
 const TIMEOUT = { fast: 4500, balanced: 7000, deep: 12000 };
@@ -272,8 +273,11 @@ export const sourceCards = r => (r?.results || []).map(({ id, title, url, host, 
    ไม่มีคีย์ / ไม่ผ่านด่าน / ค้นไม่ได้ = '' — ผู้เรียกต้องบอกโมเดลให้แจ้งผู้ใช้ตรง ๆ ว่ายังยืนยันข้อมูลล่าสุดไม่ได้ */
 export function chatSearchQuery(question, car) {
   let q = String(question || '').normalize('NFC').replace(/\s+/g, ' ').trim();
-  const model = String(car?.model || '').trim();
-  if (model && !q.toLowerCase().includes(model.toLowerCase())) q = [car.make, model, car.year].filter(Boolean).join(' ') + ' ' + q;
+  const model = String(car?.model || '').trim(), asked = detectCar(q);
+  /* เติมชื่อรถเฉพาะเมื่อคำถามไม่ได้พูดถึงรถคันอื่นอยู่แล้ว — ของเดิมเติมรถในการาจเสมอ
+     ถาม "Tesla Model Y ชาร์จนานไหม" คำค้นจึงกลายเป็น "Honda City 2019 Tesla Model Y …" ผลค้นเอียงไปทาง Honda */
+  const otherCar = asked && car && !sameCar(asked, car);
+  if (model && !otherCar && !q.toLowerCase().includes(model.toLowerCase())) q = [car.make, model, car.year].filter(Boolean).join(' ') + ' ' + q;
   return q.length > 240 ? q.slice(0, 240).replace(/\s+\S*$/, '') : q;
 }
 export async function searchForChat(env, question, { car, kind, depth, cite = false, meter, signal, fetch: fetchFn } = {}) {

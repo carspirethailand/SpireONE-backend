@@ -30,6 +30,7 @@ import { confirmedMileage, applyConfirmedMileage } from './odo-sync.mjs';
 import { decodeVin, vpic, cleanInfo } from './vin.js';
 import { LINE_AI, LINE_TALK, LINE_MARK, linePlain, lineChunks, lineCodeIn } from './line-chat.js';
 import { handleVec, kbScores, refreshKb } from './vectors.js';
+import { resolveSubject, subjectBlock, searchCarFor, carName } from './chat-subject.mjs';
 import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels, toChatHistory, levelFor, depthNote, featuresBlock, badState, geminiScope, unpark, unparkShared, syncHealth, executeSearchInternal } from './fastai.js';
 
 /*
@@ -46,7 +47,7 @@ export async function generateChatAnswer(env, actor, body, send, lifecycle={}) {
             const meter = newMeter();
             const t0 = Date.now();
             const trail = (m, x) => (m.trail = m.trail || []).push({ at: Date.now(), ...x });
-            let failed = false, cut = false;
+            let failed = false, cut = false, cacheCar = null;
             let text = '', question = '', hasMedia = false, carInfo = null;
             try {
               const msgs = body.contents || [];
@@ -96,26 +97,32 @@ export async function generateChatAnswer(env, actor, body, send, lifecycle={}) {
                 return ci;
               })();
               const blocks = t => String(t || '').split(/\n— .+ —\n/).length - 1;
-              const [ci, kbBlock, userBlock, prefs, skillBlock, specCtx] = await Promise.all([
-                (async () => { await step('car', 'start'); const c = await carP; await step('car', 'done', { car: [c.make, c.model, c.year].filter(Boolean).join(' ').slice(0, 60) }); return c })(),
-                timed('kb', carP.then(c => kbFor(env, c, question)), blocks),
+              /* ถามถึงรถคันไหน (ไม่ใช่รถในการาจเสมอไป) — ตัดสินจากคำถาม + ข้อความก่อนหน้า */
+              const subjP = carP.then(c => resolveSubject(question, c, priorUserTexts(msgs)));
+              const [ci, kbBlock, userBlock, prefs, skillBlock, specCtx, subj] = await Promise.all([
+                (async () => { await step('car', 'start'); const c = await carP, sj = await subjP, other = sj.mode === 'other' || sj.mode === 'both';
+                  await step('car', 'done', { car: (other ? carName(sj.subject) : carName(c)).slice(0, 60), ...(other ? { other: true, mode: sj.mode } : {}) }); return c })(),
+                timed('kb', subjP.then(sj => carP.then(c => kbFor(env, kbCarOf(sj, c), question))), blocks),
                 timed('history', userContext(env, uid, body.carId, { userName: body.userName })),
                 getChatPrefs(env, uid),
                 skillsPrompt(env, uid, body.skillIds),
-                timed('spec', carP.then(c => chatSpecContext(env, uid, body.carId, c, question))),
+                timed('spec', subjP.then(sj => carP.then(c => subjectSpec(env, uid, body.carId, sj, c, question)))),
+                subjP,
               ]);
               carInfo = ci;
+              const searchCar = searchCarFor(subj);
+              /* คำตอบเรื่องรถคันอื่นเก็บในคลังคำตอบของคันนั้น · เทียบสองคันไม่เก็บ (ผูกกับรถของคนนี้) */
+              cacheCar = subj.mode === 'both' ? null : subj.mode === 'other' ? kbCarOf(subj, ci) : ci;
               const activeStyle = (body.style && (CHAT_STYLES[body.style] || body.style === 'custom')) ? body.style : prefs.style;
               const activeCustom = body.customStyle !== undefined ? String(body.customStyle) : prefs.customStyle;
 
               const fresh = !!question && needsFresh(question);
-              const carContext = (carInfo.make || carInfo.model)
-                ? `\nรถของผู้ใช้: ${carInfo.make || ''} ${carInfo.model || ''} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` : '';
+              const carContext = subjectBlock(subj, carInfo);
               /* ส่วนที่เหมือนกันทุกข้อความไว้หน้า ส่วนที่เปลี่ยนไว้หลัง — Gemini จำส่วนหน้าไว้ได้ ตอบรอบถัดไปเร็วขึ้น */
               const sys = `${IDENTITY}
 
 ${STREAM_TALK}${featuresBlock()}${valetPrompt(body)}${smartBlock()}${stylePrompt(activeStyle, activeCustom)}${depthNote(body.depth)}
-${carContext ? `\n[รถที่กำลังคุยถึง]${carContext}${specCtx}` : ''}${userBlock}${kbBlock}${skillBlock}${fresh ? FORCE_SEARCH : ''}${languageRule(body.lang)}`;
+${carContext}${specCtx || ''}${userBlock}${kbBlock}${skillBlock}${fresh ? FORCE_SEARCH : ''}${languageRule(body.lang)}`;
 
               await send({ type: 'status', key: fresh ? 'search' : (hasMedia ? 'media' : 'think'),
                 text: fresh ? 'กำลังค้นข้อมูลล่าสุด' : hasMedia ? 'กำลังดูไฟล์ที่แนบมา' : 'กำลังคิด' });
@@ -148,14 +155,14 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                   carInfo,
                   search: fresh,
                   executeSearch: async (q) => {
-                    const s0 = Date.now(), block = await executeWebSearchTool(env, q, { car: carInfo, depth: body.depth, meter }).catch(() => '');
+                    const s0 = Date.now(), block = await executeWebSearchTool(env, q, { car: searchCar, depth: body.depth, meter }).catch(() => '');
                     const found = sourcesOf(block);
                     if (found.length) await send({ type: 'sources', items: found });
                     await step('search', block ? 'done' : 'fail', { ms: Date.now() - s0, n: found.length });
                     return block;
                   },
                   executeMedia: async (p) => await executeDescribeMediaTool(env, msgs, p),
-                  executeKb: async (q) => await kbFor(env, carInfo, q),
+                  executeKb: async (q) => await kbFor(env, kbCarOf(subj, carInfo), q),
                   depth: body.depth, level: levelFor(body.depth, question, hasMedia, body.skillIds), meter,
                   onSearch: async q => { await step('search', 'start', { q: String(q).slice(0, 120) }); await send({ type: 'research', q: String(q).slice(0, 120) }); await send({ type: 'status', key: 'search', text: 'กำลังค้น: ' + String(q).slice(0, 60) }) },
                   onPhase,
@@ -214,7 +221,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                 const day = new Date().toISOString().slice(0, 10);
                 await Promise.all([
                   (!hasMedia && !(body.skillIds && body.skillIds.length) && !needsFresh(question))
-                    ? cacheSave(env, carInfo, question, text, uid) : null,
+                    && cacheCar ? cacheSave(env, cacheCar, question, text, uid) : null,
                   rememberTurn(env, uid, body.carId, question, text),
                   env.DB.prepare(`
                     INSERT INTO chat_logs (uid, car_id, prompt, response, in_tok, out_tok, total_tok, model, day, created_at)
@@ -1671,6 +1678,20 @@ export function chatQuality(trails) {
   const lens = sums.filter(x => !x.fail).map(x => x.len).filter(v => Number.isFinite(v));
   return { n, ttftP50: q(ttft, .5), ttftP95: q(ttft, .95), fallbackPct: pct(x => x.fb), failPct: pct(x => x.fail), cutPct: pct(x => x.cut), lenP50: q(lens, .5) };
 }
+
+/* ── รถที่ถามถึง vs รถในการาจ (chat-subject.mjs) ──
+   คลังความรู้/สเปก/งานซ่อมจริงต้องเป็นของ "คันที่ถาม" · รถคันอื่นไม่ใส่ข้อมูลส่วนตัวของรถในการาจ (ไมล์ ประวัติ VIN) */
+const kbCarOf = (subj, garage) => (subj.mode === 'other' || subj.mode === 'both') ? { year: '', ...subj.subject } : garage;
+async function subjectSpec(env, uid, carId, subj, garage, question) {
+  if (subj.mode === 'other') return chatSpecContext(env, null, null, kbCarOf(subj, garage), question);
+  if (subj.mode === 'both') {
+    const [mine, theirs] = await Promise.all([chatSpecContext(env, uid, carId, garage, question), chatSpecContext(env, null, null, kbCarOf(subj, garage), question)]);
+    return (mine ? `\n[ข้อมูลรถของผู้ใช้ ${carName(garage)}]${mine}` : '') + (theirs ? `\n[ข้อมูลรถที่ถามถึง ${carName(subj.subject)}]${theirs}` : '');
+  }
+  return chatSpecContext(env, uid, carId, garage, question);
+}
+const priorUserTexts = msgs => (msgs || []).filter(m => m && m.role === 'user').slice(0, -1).reverse()
+  .map(m => (m.parts || []).map(x => x.text || '').join(' ') || m.text || '').filter(Boolean);
 
 async function chatSpecContext(env, uid, carId, carInfo, question) {
   if (!carInfo || !(carInfo.make || carInfo.model)) return '';
@@ -3614,14 +3635,15 @@ async function lineAsk(env, ev, link, text) {
       if (c) { carId = c.id; carInfo = { make: c.make || '', model: c.model || '', year: c.year != null ? String(c.year) : '', mileage: c.mileage != null ? String(c.mileage) : '' }; }
     } catch (e) {}
   }
+  /* รถที่ถามถึงในข้อความนี้ (ไม่ใช่รถในการาจเสมอไป) */
+  const lineSubj = resolveSubject(text, carInfo, hist.filter(m => m.role === 'user').reverse().map(m => (m.parts || []).map(x => x.text || '').join(' ')));
   const [userBlock, kbBlock, specCtx] = await Promise.all([
     link ? userContext(env, link.uid, carId, { userName: name }).catch(() => '') : '',
-    kbFor(env, carInfo, text).catch(() => ''),
-    link ? chatSpecContext(env, link.uid, carId, carInfo, text) : '',
+    kbFor(env, kbCarOf(lineSubj, carInfo), text).catch(() => ''),
+    link || lineSubj.mode === 'other' ? subjectSpec(env, link && link.uid, carId, lineSubj, carInfo, text) : '',
   ]);
-  const carContext = (carInfo.make || carInfo.model)
-    ? `\n[รถที่กำลังคุยถึง]\nรถของผู้ใช้: ${carInfo.make} ${carInfo.model} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` : '';
-  const sys = `${IDENTITY}\n\n${STREAM_TALK}\n\n${LINE_TALK}${carContext}${carContext ? specCtx : ''}${userBlock || ''}${kbBlock || ''}${needsFresh(text) ? FORCE_SEARCH : ''}`;
+  const carContext = subjectBlock(lineSubj, carInfo);
+  const sys = `${IDENTITY}\n\n${STREAM_TALK}\n\n${LINE_TALK}${carContext}${specCtx || ''}${userBlock || ''}${kbBlock || ''}${needsFresh(text) ? FORCE_SEARCH : ''}`;
   const contents = [...hist, { role: 'user', parts: [{ text: text.slice(0, 2000) }] }];
   const meter = newMeter();
 
@@ -3631,9 +3653,9 @@ async function lineAsk(env, ev, link, text) {
       LINE_AI.ask(env, {
         system: sys, contents: toGeminiContents(contents), history: toChatHistory(contents), messages: contents,
         question: text, hasMedia: false, carInfo, search: needsFresh(text),
-        executeSearch: async (q) => await executeWebSearchTool(env, q, { car: carInfo, meter }),
+        executeSearch: async (q) => await executeWebSearchTool(env, q, { car: searchCarFor(lineSubj), meter }),
         executeMedia: async () => '',
-        executeKb: async (q) => await kbFor(env, carInfo, q),
+        executeKb: async (q) => await kbFor(env, kbCarOf(lineSubj, carInfo), q),
         level: levelFor(undefined, text, false, []), meter,
       }),
       new Promise((_, no) => setTimeout(() => no(new Error('LINE AI timeout')), LINE_AI.timeoutMs)),
@@ -5282,6 +5304,7 @@ export default {
               ? body.contents[body.contents.length - 1] : null;
             const question = (lastMsg && lastMsg.parts)
               ? lastMsg.parts.map(x => x.text || '').join(' ').trim() : '';
+            const chatSubj = resolveSubject(question, carInfo, priorUserTexts(body.contents));
             const hasMedia = (body.contents || []).some(m =>
               m.parts && m.parts.some(x => x.inline_data));
 
@@ -5291,7 +5314,7 @@ export default {
                หรือผู้ใช้เลือกสกิลไว้ เพราะคำสั่งเปลี่ยนคำตอบ */
             if (!hasMedia && !(body.skillIds && body.skillIds.length) && body.fresh !== true && !body.agent
                 && !needsFresh(question)) {
-              const hit = await cacheLookup(env, carInfo, question);
+              const hit = chatSubj.mode === 'both' ? null : await cacheLookup(env, kbCarOf(chatSubj, carInfo), question);
               if (hit) {
                 try {
                   await env.DB.prepare(
@@ -5306,20 +5329,19 @@ export default {
 
             const [userBlock, kbBlock, specCtx] = await Promise.all([
               userContext(env, actor.payload.sub, body.carId, { userName: body.userName }),
-              kbFor(env, carInfo, question),
-              chatSpecContext(env, actor.payload.sub, body.carId, carInfo, question),
+              kbFor(env, kbCarOf(chatSubj, carInfo), question),
+              subjectSpec(env, actor.payload.sub, body.carId, chatSubj, carInfo, question),
             ]);
 
             /* ── เครื่องตอบเร็ว: ค้นเว็บผ่านตัวค้นของ AI ก่อน (เรื่องข้อมูลล่าสุด) แล้ว Gemini ดูรูปและตอบในการเรียกครั้งเดียว ──
                ทางเดิม (ค้นแยก + ReAct หลายรอบกับโมเดลฟรี) เก็บไว้เป็นทางสำรองสุดท้ายเท่านั้น */
             const fresh = !!(body.search === true && needsFresh(question)) || (question && needsFresh(question));
             let agentOut = null;
-            const carContext = (carInfo.make || carInfo.model)
-              ? `\nรถของผู้ใช้: ${carInfo.make || ''} ${carInfo.model || ''} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` : '';
+            const carContext = subjectBlock(chatSubj, carInfo);
             const sys = `${IDENTITY}
 
 ${STREAM_TALK}${featuresBlock()}${valetPrompt(body)}${smartBlock()}${stylePrompt(activeStyle, activeCustomStyle)}${depthNote(body.depth)}
-${carContext ? `\n[รถที่กำลังคุยถึง]${carContext}${specCtx}` : ''}${userBlock}${kbBlock}${skillPrompt || ''}${fresh ? FORCE_SEARCH : ''}${languageRule(body.lang)}`;
+${carContext}${specCtx || ''}${userBlock}${kbBlock}${skillPrompt || ''}${fresh ? FORCE_SEARCH : ''}${languageRule(body.lang)}`;
             try {
               const r = await fastAnswer(env, {
                 system: sys,
@@ -5330,9 +5352,9 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                 hasMedia,
                 carInfo,
                 search: fresh,
-                executeSearch: async (q) => await executeWebSearchTool(env, q, { car: carInfo, depth: body.depth, meter }),
+                executeSearch: async (q) => await executeWebSearchTool(env, q, { car: searchCarFor(chatSubj), depth: body.depth, meter }),
                 executeMedia: async (p) => await executeDescribeMediaTool(env, body.contents, p),
-                executeKb: async (q) => await kbFor(env, carInfo, q),
+                executeKb: async (q) => await kbFor(env, kbCarOf(chatSubj, carInfo), q),
                 depth: body.depth, level: levelFor(body.depth, question, hasMedia, body.skillIds),
                 meter
               });

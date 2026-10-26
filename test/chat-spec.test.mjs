@@ -58,9 +58,11 @@ test('chat, streaming chat and LINE chat all include it — read-only, never a n
   assert.doesNotMatch(fn, /ensureSpec|research\(/, 'reads the cache only');
   assert.match(fn, /getSpec\(env, k\)/);
   assert.match(fn, /catch \(e\) \{ console\.error\('\[chat spec\]'/);
-  assert.equal((worker.match(/chatSpecContext\(env, (?!uid, carId,)/g) || []).length, 3, 'chat · stream · LINE (voice endpoint uses compact argument formatting)');
-  assert.equal((worker.match(/\[รถที่กำลังคุยถึง\]\$\{carContext\}\$\{specCtx\}/g) || []).length, 2);
-  assert.match(worker, /\$\{LINE_TALK\}\$\{carContext\}\$\{carContext \? specCtx : ''\}/);
+  /* chat · stream · LINE ผ่าน subjectSpec (สเปกของ "คันที่ถาม" ไม่ใช่รถในการาจเสมอไป) */
+  assert.equal((worker.match(/(?<!function )subjectSpec\(env, /g) || []).length, 3, 'chat · stream · LINE');
+  const sub = worker.slice(worker.indexOf('async function subjectSpec('), worker.indexOf('const priorUserTexts'));
+  assert.match(sub, /chatSpecContext\(env, null, null, kbCarOf\(subj, garage\), question\)/, 'another car never reads the garage car private info');
+  assert.equal((worker.match(/\$\{carContext\}\$\{specCtx \|\| ''\}/g) || []).length, 3);
 });
 
 test('chat spec: deeper fields (top speed, 0-100, clearance, turning radius, boot, suspension, brakes) reach the AI with their markers',()=>{
