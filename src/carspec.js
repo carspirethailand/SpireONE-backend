@@ -266,7 +266,7 @@ async function researchWithin(env,q,log,signal,kind,deadline,reserveMs){
   log.push({ step: 'setup', ok: !!ai.key, keyFrom: env.GEMINI_SPEC_KEY ? 'GEMINI_SPEC_KEY' : env.GEMINI_NEWS_KEY ? 'GEMINI_NEWS_KEY' : env.GEMINI_KEY ? 'GEMINI_KEY' : 'ไม่มี', models: ai.models });
   if (!ai.key) throw new Error('ยังไม่ได้ตั้งคีย์ Gemini');
   /* ทุกแบบสกัดจากเอกสารที่อ่านได้จริง (Wikipedia · เว็บผู้ผลิต/สื่อรถในรายชื่อ · ลิงก์จากตัวค้นของ AI) — เลิกโหมดให้ Gemini ค้น Google เองแล้ว */
-  const docs=await collectSpecDocuments(q,log,signal,{env});
+  const docs=await collectSpecDocuments(q,log,signal,{env,kind});
   const general=q.market==='GLOBAL';
   const detailShape=' Extra optional fields per variant: '+JSON.stringify(Object.fromEntries([...Object.keys(DETAIL_NUM),...DETAIL_TEXT].map(k=>[k,null])))+'; extra model facts: '+JSON.stringify(Object.fromEntries(Object.keys(DETAIL_FACTS).map(k=>[k,null])))+'. Require exact evidence paths for every field. price_thb is the original Thai new-car list price for that exact variant/year only, not used market value, financing, accessories or foreign currency conversion. Unknown fields must be null. Do not infer fluid capacities or safety-critical service settings.';
   const marketRule=general?'นี่คือข้อมูลอ้างอิงพื้นฐานของรุ่นรถ ไม่ได้ขอยืนยันสเปกตลาดไทยหรือรถส่วนตัว ไม่จำเป็นต้องมี market_quote ใช้ข้อมูลผู้ผลิตหรือเอกสารอ้างอิงของรุ่น/เจเนอเรชันที่ครอบคลุมปีที่ขอได้ บอกตลาดจริงของเอกสารใน market ถ้ามี อย่าปฏิเสธข้อมูลเพราะไม่มีประเทศตลาดที่ระบุ':'ต้องมี market_quote ที่ยืนยันประเทศตลาดที่ขอ ห้ามนำตัวเลขคนละตลาดมาใช้';

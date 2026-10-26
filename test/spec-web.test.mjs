@@ -223,3 +223,42 @@ test('merge: deeper fields are compared field by field and counted in the agreem
   assert.ok(m.score.cells>=6&&m.score.conflicts===1);
   assert.equal(merge({turning_m:25,cargo_l:2},{}).facts.turning_m,null,'impossible values are dropped');
 });
+
+test('Tavily: page text from Tavily is used without a direct fetch; a page that blocks the Worker is read via Tavily Extract; every page still passes the allowlist, robots and model/year checks',async()=>{
+  const read='https://www.headlightmag.com/fixture-pajero-sport-2020-spec',blocked='https://www.autospinn.com/fixture-pajero-sport-2020-price',
+    banned='https://www.car250.com/fixture-pajero-sport-2020',outside='https://random-blog.example/pajero-sport-2020',wrongYear='https://www.grandprix.co.th/fixture-pajero-sport-2018';
+  const direct=[],bodies=[];
+  globalThis.fetch=async(raw,init={})=>{const u=String(raw);
+    if(u.includes('/w/api.php'))return new Response('Unavailable',{status:503});
+    if(u.includes('/wp-json/'))return Response.json([]);
+    if(u==='https://api.tavily.com/search'){const b=JSON.parse(init.body);bodies.push(b);assert.equal(init.redirect,'manual');assert.equal(b.include_raw_content,'markdown');assert.ok(b.include_domains.includes('headlightmag.com'));
+      return Response.json({results:[
+        {url:read,title:'2020 Mitsubishi Pajero Sport ราคา สเปก',content:'x',raw_content:paragraph},
+        {url:blocked,title:'2020 Mitsubishi Pajero Sport price list',content:'x',raw_content:null},
+        {url:banned,title:'2020 Mitsubishi Pajero Sport',content:'x',raw_content:paragraph},
+        {url:outside,title:'2020 Mitsubishi Pajero Sport',content:'x',raw_content:paragraph},
+        {url:wrongYear,title:'2018 Mitsubishi Pajero Sport',content:'x',raw_content:paragraph.replaceAll('2020','2018')}]})}
+    if(u==='https://api.tavily.com/extract'){const b=JSON.parse(init.body);assert.deepEqual(b.urls,[blocked]);return Response.json({results:[{url:blocked,raw_content:'2020 Mitsubishi Pajero Sport official price list '+paragraph}]})}
+    if(u.endsWith('/robots.txt'))return new Response(u.includes('car250')?'User-agent: *\nDisallow: /':'User-agent: *\nAllow: /');
+    direct.push(u);
+    if(u===blocked)return new Response('Forbidden',{status:403});
+    throw Error('Unexpected fixture request '+u);
+  };
+  const trail=[],result=await collectSpecDocuments(q,trail,undefined,{env:{TAVILY_API_KEY:'tvly-fixture-only'},kind:'equipment'});
+  assert.deepEqual(result.map(d=>d.url).sort(),[blocked,read].sort());
+  assert.ok(!direct.includes(read),'Tavily already read this page');assert.ok(!direct.some(u=>u===outside||u===banned),'never fetched: off-list or robots-disallowed');
+  assert.match(bodies[0].query,/ตารางอุปกรณ์|equipment/,'equipment lookups search for equipment tables');
+  assert.ok(trail.some(x=>x.step==='tavily-search'&&x.found===10));assert.ok(trail.some(x=>x.step==='tavily-extract'&&x.got===1));
+  assert.ok(trail.some(x=>x.step==='document'&&x.via==='tavily'));assert.ok(trail.some(x=>x.step==='document'&&x.via==='tavily-extract'));
+});
+
+test('Tavily: without a key nothing is sent to Tavily and discovery works as before',async()=>{
+  const url='https://www.autodeft.com/fixture-pajero-sport-2020';let tavily=0;
+  globalThis.fetch=async raw=>{const u=String(raw);if(u.includes('tavily'))tavily++;
+    if(u.includes('/w/api.php'))return new Response('Unavailable',{status:503});
+    if(u.endsWith('/robots.txt'))return new Response('User-agent: *\nAllow: /');
+    if(u.includes('/wp-json/'))return Response.json(u.includes('autodeft.com')?[{link:url,title:{rendered:'2020 Mitsubishi Pajero Sport'},date:'2020-01-01'}]:[]);
+    if(u===url)return new Response('<title>2020 Mitsubishi Pajero Sport</title><p>'+paragraph+'</p>',{headers:{'content-type':'text/html'}});
+    throw Error('Unexpected fixture request');};
+  const result=await collectSpecDocuments(q,[],undefined,{env:{}});assert.equal(result.length,1);assert.equal(tavily,0);
+});
