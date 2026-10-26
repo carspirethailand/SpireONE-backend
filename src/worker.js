@@ -30,7 +30,7 @@ import { confirmedMileage, applyConfirmedMileage } from './odo-sync.mjs';
 import { decodeVin, vpic, cleanInfo } from './vin.js';
 import { LINE_AI, LINE_TALK, LINE_MARK, linePlain, lineChunks, lineCodeIn } from './line-chat.js';
 import { handleVec, kbScores, refreshKb } from './vectors.js';
-import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels, toChatHistory, levelFor, depthNote, featuresBlock, badState, geminiScope, unpark, executeSearchInternal } from './fastai.js';
+import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels, toChatHistory, levelFor, depthNote, featuresBlock, badState, geminiScope, unpark, unparkShared, syncHealth, executeSearchInternal } from './fastai.js';
 
 /*
  * SpireONE backend — security-hardened.
@@ -45,12 +45,32 @@ export async function generateChatAnswer(env, actor, body, send, lifecycle={}) {
   const uid = actor.payload.sub;
             const meter = newMeter();
             const t0 = Date.now();
+            const trail = (m, x) => (m.trail = m.trail || []).push({ at: Date.now(), ...x });
+            let failed = false, cut = false;
             let text = '', question = '', hasMedia = false, carInfo = null;
             try {
               const msgs = body.contents || [];
               const lastMsg = msgs.length ? msgs[msgs.length - 1] : null;
               question = (lastMsg && lastMsg.parts) ? lastMsg.parts.map(x => x.text || '').join(' ').trim() : '';
               hasMedia = msgs.some(m => m.parts && m.parts.some(x => x.inline_data || x.inlineData));
+              /* ── สถานะทีละขั้น (type:'step') ให้หน้าแชตเห็นว่า AI กำลังทำอะไรจริง ──
+                 ผู้ใช้เห็นแค่ชื่อขั้นแบบภาษาคน · ชื่อรุ่น/เหตุผลเชิงเทคนิค (dev) ส่งเฉพาะแอดมิน */
+              const isDev = rank(actor.role) >= rank('admin');
+              const step = async (id, state, extra = {}) => {
+                const { dev, ...rest } = extra;
+                await send({ type: 'step', id, state, at: Date.now() - t0, ...rest, ...(isDev && dev ? { dev } : {}) });
+              };
+              /* แต่ละแหล่งข้อมูลมีเวลาของมันเอง ช้าเกินก็ข้าม — ข้อมูลเสริมไม่ควรทำให้ทั้งคำตอบช้า */
+              const CTX_MS = 2500;
+              const timed = async (id, work, count) => {
+                const s0 = Date.now(); await step(id, 'start');
+                let late = false, timer;
+                const out = await Promise.race([Promise.resolve(work).catch(() => ''), new Promise(r => { timer = setTimeout(() => { late = true; r('') }, CTX_MS) })]);
+                clearTimeout(timer);
+                const n = !late && count ? count(out) : undefined;
+                await step(id, late ? 'skip' : 'done', { ms: Date.now() - s0, ...(n != null ? { n } : {}) });
+                return out;
+              };
               await send({ type: 'status', key: 'context', text: 'กำลังดูข้อมูลรถและประวัติของคุณ' });
 
               /* ── รวบรวมบริบททั้งหมดพร้อมกัน ── (ของเดิมรอทีละคำสั่ง ราวสิบรอบก่อนเริ่มคิด) */
@@ -75,13 +95,14 @@ export async function generateChatAnswer(env, actor, body, send, lifecycle={}) {
                 }
                 return ci;
               })();
+              const blocks = t => String(t || '').split(/\n— .+ —\n/).length - 1;
               const [ci, kbBlock, userBlock, prefs, skillBlock, specCtx] = await Promise.all([
-                carP,
-                carP.then(c => kbFor(env, c, question)),
-                userContext(env, uid, body.carId, { userName: body.userName }),
+                (async () => { await step('car', 'start'); const c = await carP; await step('car', 'done', { car: [c.make, c.model, c.year].filter(Boolean).join(' ').slice(0, 60) }); return c })(),
+                timed('kb', carP.then(c => kbFor(env, c, question)), blocks),
+                timed('history', userContext(env, uid, body.carId, { userName: body.userName })),
                 getChatPrefs(env, uid),
                 skillsPrompt(env, uid, body.skillIds),
-                carP.then(c => chatSpecContext(env, uid, body.carId, c, question)),
+                timed('spec', carP.then(c => chatSpecContext(env, uid, body.carId, c, question))),
               ]);
               carInfo = ci;
               const activeStyle = (body.style && (CHAT_STYLES[body.style] || body.style === 'custom')) ? body.style : prefs.style;
@@ -100,7 +121,22 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                 text: fresh ? 'กำลังค้นข้อมูลล่าสุด' : hasMedia ? 'กำลังดูไฟล์ที่แนบมา' : 'กำลังคิด' });
 
               /* ── คำตอบ: เรียก Gemini ครั้งเดียว ค้นเว็บ ดูรูป คิด และสตรีมออกมาในตัว ── */
-              let firstText = true;
+              let firstText = true, thinking = false, firstAt = 0;
+              const sourcesOf = block => {
+                const out = [], re = /\n\[(\d+)\] (.+?) — ([^\s(]+)(?: \([^)]*\))?\n(https?:\/\/\S+)/g; let m;
+                while ((m = re.exec(String(block || ''))) && out.length < 8) out.push({ title: m[2].slice(0, 120), host: m[3].slice(0, 80), url: m[4].slice(0, 400) });
+                return out;
+              };
+              const onPhase = async (name, info) => {
+                if (name === 'attempt' || name === 'hedge') {
+                  if (!thinking) { thinking = true; await step('think', 'start', { dev: { model: info.model } }) }
+                  else if (name === 'hedge') await step('think', 'backup', { dev: { model: info.model } });
+                  else if (info.fallback) await step('think', 'backup', { dev: { model: info.model } });
+                } else if (name === 'fail') await step('think', 'retry', { dev: { model: info.model, why: info.why } });
+                else if (name === 'first') await step('think', 'done', { ms: info.ms, dev: { model: info.model, hedged: !!info.hedged } });
+                else if (name === 'fallback') await step('think', 'backup', { dev: { why: info.why } });
+                else if (name === 'continue') await step('check', 'continue', { dev: { why: info.why } });
+              };
               try {
                 const r = await fastAnswer(env, {
                   system: sys,
@@ -111,21 +147,39 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                   hasMedia,
                   carInfo,
                   search: fresh,
-                  executeSearch: async (q) => await executeWebSearchTool(env, q, { car: carInfo, depth: body.depth, meter }),
+                  executeSearch: async (q) => {
+                    const s0 = Date.now(), block = await executeWebSearchTool(env, q, { car: carInfo, depth: body.depth, meter }).catch(() => '');
+                    const found = sourcesOf(block);
+                    if (found.length) await send({ type: 'sources', items: found });
+                    await step('search', block ? 'done' : 'fail', { ms: Date.now() - s0, n: found.length });
+                    return block;
+                  },
                   executeMedia: async (p) => await executeDescribeMediaTool(env, msgs, p),
                   executeKb: async (q) => await kbFor(env, carInfo, q),
                   depth: body.depth, level: levelFor(body.depth, question, hasMedia, body.skillIds), meter,
-                  onSearch: async q => { await send({ type: 'research', q: String(q).slice(0, 120) }); await send({ type: 'status', key: 'search', text: 'กำลังค้น: ' + String(q).slice(0, 60) }) },
+                  onSearch: async q => { await step('search', 'start', { q: String(q).slice(0, 120) }); await send({ type: 'research', q: String(q).slice(0, 120) }); await send({ type: 'status', key: 'search', text: 'กำลังค้น: ' + String(q).slice(0, 60) }) },
+                  onPhase,
                   onText: async d => {
-                    if (firstText) { firstText = false; await send({ type: 'status', key: 'write', text: 'กำลังเขียนคำตอบ' }); }
+                    if (firstText) { firstText = false; firstAt = Date.now(); await step('write', 'start'); await send({ type: 'status', key: 'write', text: 'กำลังเขียนคำตอบ' }); }
                     await send({ type: 'text', delta: d });
                   },
                 });
                 text = r.text;
+                if (!firstText) await step('write', 'done', { len: text.length });
+                cut = !!r.partial;
+                await step('check', r.partial ? 'fail' : 'done');
+                if (r.partial) await send({ type: 'notice', kind: 'cut' });
+                trail(meter, { kind: 'sum', ttft: firstAt ? firstAt - t0 : null, len: text.length, cut: !!r.partial, fb: !!r.fallback });
               } catch (e) {
                 console.error('[stream fast] request_failed');
                 noteAiError(env, e);
-                const errMsg = 'ขออภัยครับ ขณะนี้ระบบประมวลผล AI กำลังมีผู้ใช้งานหนาแน่น กรุณาลองใหม่อีกครั้งในอีกสักครู่ครับ';
+                await step('think', 'fail');
+                await send({ type: 'notice', kind: 'failed' });
+                trail(meter, { kind: 'sum', ttft: null, len: 0, fail: true });
+                failed = true;
+                /* บอกตรง ๆ ว่าลองครบแล้ว — หน้าแชตขึ้นปุ่ม "ลองอีกครั้ง" จาก notice:failed */
+                const errMsg = body.lang === 'en' ? 'Cendon AI could not answer right now — every route was tried. Tap "Try again" in a moment.'
+                  : 'ตอนนี้ Cendon AI ตอบไม่ได้ชั่วคราว (ลองครบทุกเส้นทางแล้ว) กด "ลองอีกครั้ง" ได้เลยครับ';
                 if (firstText) {
                   firstText = false;
                   await send({ type: 'status', key: 'write', text: 'ระบบ AI ขัดข้องชั่วคราว' });
@@ -145,7 +199,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
               } catch (e) {}
               await send({ type: 'done', usage });
               const okStep = (meter.trail || []).filter(x => x.ok).pop();
-              logAiEvent(env, { uid, ok: true, ms: Date.now() - t0, model: okStep ? okStep.model + (okStep.grounded ? ' +ค้นเว็บ' : '') : (meter.src || []).join(','),
+              logAiEvent(env, { uid, ok: !failed, ms: Date.now() - t0, model: okStep ? okStep.model + (okStep.grounded ? ' +ค้นเว็บ' : '') : (meter.src || []).join(','),
                 trail: meter.trail, q: question, depth: body.depth, cost: meter.in + meter.out });
             } catch (err) {
               console.error('[stream] request_failed');
@@ -154,7 +208,8 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
             }
 
             /* งานเก็บกวาด — ผู้ใช้ได้คำตอบครบไปแล้ว ไม่ต้องรอส่วนนี้ */
-            if (text && carInfo && (!lifecycle.active || await lifecycle.active())) {
+            /* คำตอบที่ล้ม/ถูกตัด ไม่เก็บเป็นคำตอบสำเร็จรูปหรือความจำ (ของเดิมเก็บข้อความขอโทษไว้ใช้ซ้ำได้) */
+            if (text && carInfo && !failed && !cut && (!lifecycle.active || await lifecycle.active())) {
               try {
                 const day = new Date().toISOString().slice(0, 10);
                 await Promise.all([
@@ -1606,6 +1661,17 @@ function withoutDeletedCars(key, value, deleted) {
 
 /* สเปกรุ่นรถจากคลัง car_specs + ข้อมูลที่เจ้าของบันทึกเอง ให้ AI ตอบตรงรุ่น (chat-spec.mjs)
    อ่านอย่างเดียว ไม่ค้นใหม่ ไม่เรียก AI · พังก็แค่ไม่ใส่ แชตยังตอบได้ตามปกติ */
+/* สรุปคุณภาพแชตจากบันทึก (แถว 'sum' ที่ generateChatAnswer จดไว้ทุกข้อความ) */
+export function chatQuality(trails) {
+  const sums = trails.map(t => (Array.isArray(t) ? t : []).find(x => x && x.kind === 'sum')).filter(Boolean);
+  const n = sums.length; if (!n) return { n: 0 };
+  const pct = f => Math.round(sums.filter(f).length * 1000 / n) / 10;
+  const q = (arr, p) => { if (!arr.length) return null; const a = [...arr].sort((x, y) => x - y); return a[Math.min(a.length - 1, Math.floor(p * a.length))] };
+  const ttft = sums.map(x => x.ttft).filter(v => Number.isFinite(v));
+  const lens = sums.filter(x => !x.fail).map(x => x.len).filter(v => Number.isFinite(v));
+  return { n, ttftP50: q(ttft, .5), ttftP95: q(ttft, .95), fallbackPct: pct(x => x.fb), failPct: pct(x => x.fail), cutPct: pct(x => x.cut), lenP50: q(lens, .5) };
+}
+
 async function chatSpecContext(env, uid, carId, carInfo, question) {
   if (!carInfo || !(carInfo.make || carInfo.model)) return '';
   try {
@@ -1766,7 +1832,8 @@ const STREAM_TALK = `[วิธีคุย]
 - ใช้หัวข้อย่อยเมื่อของมันเป็นรายการจริง ๆ เท่านั้น
 - ห้ามทวนคำถาม ห้ามเกริ่นว่า "จากข้อมูลที่ให้มา" หรือ "ในฐานะผู้ช่วย AI"
 - ห้ามเขียน Thought: Action: หรือ Final Answer: เด็ดขาด ตอบเนื้อหาออกมาตรง ๆ เลย
-- ความยาวพอดีกับคำถาม ถามสั้นตอบสั้น`;
+- ความยาว: คุยเล่นหรือถามสั้น ๆ ตอบสั้น · คำถามเรื่องรถตอบให้ครบเท่าที่เกี่ยว: สาเหตุที่เป็นไปได้ วิธีเช็กเอง ความเร่งด่วน และค่าใช้จ่ายคร่าว ๆ
+- เขียนให้จบครบทุกครั้ง ห้ามตัดจบกลางรายการหรือกลางประโยค`;
 
 function askBlockText() {
   return `
@@ -5081,12 +5148,17 @@ export default {
           }return reply({error:'Method not allowed'},405);
         })();
       }
-      if (/^\/api\/ai\/jobs(?:\/[a-f0-9-]{36}(?:\/cancel)?)?$/.test(url.pathname)) {
+      if (/^\/api\/ai\/jobs(?:\/[a-f0-9-]{36}(?:\/cancel|\/events)?)?$/.test(url.pathname)) {
         return await guarded('user',async actor=>{
           const reply=(value,status=200)=>new Response(JSON.stringify(value),{status,headers:{...cors,'Content-Type':'application/json','Cache-Control':'private, no-store','Vary':'Authorization, Origin'}});
           if(!env.CHAT_JOBS)return reply({error:'Background answers unavailable'},503);
           const uid=actor.payload.sub,stub=env.CHAT_JOBS.getByName('user:'+uid),parts=url.pathname.split('/').slice(4);
           let result;
+          /* ช่องสด: snapshot → เหตุการณ์ทีละอย่าง (step/text/sources/notice) → end · หน้าเว็บต่อใหม่ได้เสมอ */
+          if(request.method==='GET'&&parts[1]==='events'){
+            const live=await stub.stream(uid,parts[0]);if(!live)return reply({error:'Not found'},404);
+            return new Response(live,{headers:{...cors,'Content-Type':'text/event-stream; charset=utf-8','Cache-Control':'private, no-store','X-Accel-Buffering':'no','Vary':'Authorization, Origin'}});
+          }
           if(request.method==='GET')result=parts[0]?await stub.read(uid,parts[0]):await stub.list(uid);
           else if(request.method==='POST'&&parts[1]==='cancel')result=await stub.cancel(uid,parts[0]);
           else if(request.method==='POST'&&!parts[0]){
@@ -5127,7 +5199,9 @@ export default {
           };
 
           /* งานหลักทำเบื้องหลัง ปล่อยให้ตอบกลับทันทีเพื่อให้สตรีมเริ่มไหลเลย */
-          const work = generateChatAnswer(env, actor, body, send).finally(async () => { try { await writer.close() } catch {} });
+          /* สัญญาณ "ยังทำงานอยู่" ทุก 5 วินาที — ช่วงที่โมเดลคิดนานหน้าเว็บจะไม่คิดว่าสายตาย */
+          const ping = setInterval(() => { send({ type: 'ping' }) }, 5000);
+          const work = generateChatAnswer(env, actor, body, send).finally(async () => { clearInterval(ping); try { await writer.close() } catch {} });
           ctx.waitUntil(work);
 
           return new Response(readable, {
@@ -5877,7 +5951,7 @@ ${convo}`;
       /* ── แผงผู้ดูแลแบบลอย: สถานะสดของ AI ── */
       if (url.pathname === '/api/admin/live' && request.method === 'GET') {
         return await guarded('admin', async () => {
-          let events = [], stats = { hour: 0, ok: 0, fail: 0, avgMs: 0 }, lastAiError = null;
+          let events = [], stats = { hour: 0, ok: 0, fail: 0, avgMs: 0 }, lastAiError = null, quality = null;
           try {
             const since = Date.now() - 3600000;
             const r = await env.DB.prepare('SELECT at, uid, ok, ms, model, trail, err, q, depth, cost FROM ai_events ORDER BY id DESC LIMIT 40').all();
@@ -5885,23 +5959,27 @@ ${convo}`;
             const h = events.filter(e => e.at > since);
             stats = { hour: h.length, ok: h.filter(e => e.ok).length, fail: h.filter(e => !e.ok).length,
               avgMs: h.length ? Math.round(h.reduce((a, e) => a + (e.ms || 0), 0) / h.length) : 0 };
+            /* คุณภาพของแชตจาก 300 ข้อความล่าสุด: เวลาจนตัวอักษรแรก · % ใช้ทางสำรอง · % ไม่ได้คำตอบ · % ถูกตัด */
+            const all = await env.DB.prepare('SELECT trail FROM ai_events ORDER BY id DESC LIMIT 300').all();
+            quality = chatQuality((all.results || []).map(e => { try { return JSON.parse(e.trail || '[]') } catch { return [] } }));
           } catch (e) {}
           try { const le = await env.DB.prepare("SELECT value FROM config WHERE key = 'ai_last_error'").first(); lastAiError = le && le.value ? JSON.parse(le.value) : null } catch (e) {}
+          await syncHealth(env, true);
           const parked = badState(await geminiScope(env));
           /* บันทึกการค้นสเปกรถ (ทุกคน ทุกหน้า) + รุ่นที่ใช้ค้น */
           const specLog = await specLogList(env, 40);
           const sa = specAI(env), spec = { models: sa.models, key: env.GEMINI_SPEC_KEY ? 'GEMINI_SPEC_KEY' : env.GEMINI_NEWS_KEY ? 'GEMINI_NEWS_KEY' : env.GEMINI_KEY ? 'GEMINI_KEY' : '' };
-          const primaryModel = env.OPENROUTER_MODEL || 'openrouter/free';
-          const fullChain = [primaryModel].concat(chatModels(env));
+          /* ลำดับจริง: Gemini ตามลำดับ (ยิงสำรองคู่ขนานเมื่อช้า) แล้วค่อยทางสำรอง — OpenRouter ไม่ใช่ตัวหลัก */
+          const fullChain = chatModels(env);
           return json({ now: Date.now(),
             chain: fullChain.map(m => ({ name: m, parked: parked.find(p => p.model === m) || null, searchParked: parked.find(p => p.model === m + '|search') || null })),
             fallbacks: fallbackProviders(env).concat(fallbackProviders(env, true)).map(p => ({ name: p.src + ':' + p.model })),
             keys: { gemini: !!env.GEMINI_KEY, groq: !!env.GROQ_API_KEY, cerebras: !!env.CEREBRAS_API_KEY, openrouter: !!env.OPENROUTER_API_KEY, workersAI: !!env.AI },
-            parked, stats, events, lastAiError, specLog, spec });
+            parked, stats, quality, events, lastAiError, specLog, spec });
         })();
       }
       if (url.pathname === '/api/admin/unpark' && request.method === 'POST') {
-        return await guarded('admin', async () => { let b = {}; try { b = await request.json() } catch {} unpark(b.key); return json({ ok: true }) })();
+        return await guarded('admin', async () => { let b = {}; try { b = await request.json() } catch {} await unparkShared(env, b.key); return json({ ok: true }) })();
       }
       if (url.pathname === '/api/admin/diag' && request.method === 'GET') {
         return await guarded('moderator', async () => {
@@ -5909,9 +5987,9 @@ ${convo}`;
           const q = url.searchParams.get('q') || 'ราคาน้ำมันเบนซินในไทยวันนี้';
           const out = { keys: {
             gemini: !!env.GEMINI_KEY, openrouter: !!env.OPENROUTER_API_KEY,
-            primaryModel: env.OPENROUTER_MODEL || 'openrouter/free',
+            primaryModel: chatModels(env)[0] || '(ไม่ได้ตั้ง)',
             geminiModel: env.GEMINI_MODEL || '(ไม่ได้ตั้ง)', searchProviders: configuredProviders(env),
-            chatModels: [env.OPENROUTER_MODEL || 'openrouter/free (หลัก)'].concat(chatModels(env)), fallback: fallbackProviders(env).map(p => p.src + ':' + p.model) } };
+            chatModels: chatModels(env), fallback: fallbackProviders(env).map(p => p.src + ':' + p.model) } };
           try {
             const le = await env.DB.prepare("SELECT value FROM config WHERE key = 'ai_last_error'").first();
             out.lastAiError = le && le.value ? JSON.parse(le.value) : null;

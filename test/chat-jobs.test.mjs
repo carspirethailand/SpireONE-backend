@@ -39,9 +39,35 @@ test('cancel/purge during inference cannot resurrect encrypted results',async()=
     const r=await f.engine.read('one',b.jobId);assert.equal(action==='purge'?r.status:r.job.status,action==='purge'?404:'cancelled');assert.ok(![...f.map.keys()].some(k=>k.startsWith('result:')));
   }
 });
-test('alarm recovery does not repeat an interrupted paid inference',async()=>{
-  let n=0;const f=fixture(async()=>{n++}),b=body();await f.create(b);const m=await f.storage.get('m:'+b.jobId);m.status='running';await f.storage.put('m:'+b.jobId,m);
-  await f.engine.alarm();assert.equal(n,0);assert.equal((await f.engine.read('one',b.jobId)).job.status,'error');
+test('interrupted inference is retried once only when nothing reached the user; never after text or a second attempt',async()=>{
+  /* รีสตาร์ตก่อนมีตัวอักษรออกไป → ทำใหม่หนึ่งครั้ง */
+  let n=0;const f=fixture(async(e,a,b,send)=>{n++;await send({type:'text',delta:'retried answer'});await send({type:'done'})}),b=body();await f.create(b);
+  let m=await f.storage.get('m:'+b.jobId);m.status='running';m.attempts=1;await f.storage.put('m:'+b.jobId,m);
+  await f.engine.alarm();assert.equal(n,1);let r=(await f.engine.read('one',b.jobId)).job;assert.equal(r.status,'complete');assert.equal(r.text,'retried answer');
+  /* มีข้อความออกไปแล้ว → ไม่ทำซ้ำ */
+  let k=0;const g=fixture(async()=>{k++}),c=body();await g.create(c);
+  m=await g.storage.get('m:'+c.jobId);m.status='running';m.attempts=1;m.hadText=true;await g.storage.put('m:'+c.jobId,m);
+  await g.engine.alarm();assert.equal(k,0);assert.equal((await g.engine.read('one',c.jobId)).job.status,'error');
+  /* ลองซ้ำไปแล้วหนึ่งรอบ → ไม่ทำซ้ำอีก */
+  const h=fixture(async()=>{k++}),d=body();await h.create(d);
+  m=await h.storage.get('m:'+d.jobId);m.status='running';m.attempts=2;await h.storage.put('m:'+d.jobId,m);
+  await h.engine.alarm();assert.equal(k,0);r=(await h.engine.read('one',d.jobId)).job;assert.equal(r.status,'error');assert.equal(r.notice,'failed');
+});
+async function drain(stream){const rd=stream.getReader(),dec=new TextDecoder(),out=[];let buf='';for(;;){const {done,value}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});const parts=buf.split('\n\n');buf=parts.pop();for(const p of parts)if(p.startsWith('data: '))out.push(JSON.parse(p.slice(6)))}return out}
+test('live channel: snapshot first, then each step/text/sources event in order, then end; steps and sources are also persisted for polling clients',async()=>{
+  let release;const gate=new Promise(r=>release=r);
+  const f=fixture(async(e,a,b,send)=>{await gate;await send({type:'step',id:'kb',state:'start',at:5});await send({type:'step',id:'kb',state:'done',n:2,ms:40});
+    await send({type:'sources',items:[{title:'T',host:'toyota.co.th',url:'https://toyota.co.th/x'}]});await send({type:'text',delta:'สวัส'});await send({type:'text',delta:'ดี'});await send({type:'notice',kind:'cut'});await send({type:'done'})}),b=body();
+  await f.create(b);const live=await f.engine.stream('one',b.jobId);assert.ok(live);
+  assert.equal(await f.engine.stream('two',b.jobId),null,'another account cannot follow the job');
+  const got=drain(live),run=f.engine.alarm();release();await run;const ev=await got;
+  assert.equal(ev[0].type,'snapshot');assert.equal(ev.at(-1).type,'end');assert.equal(ev.at(-1).status,'complete');
+  const types=ev.map(e=>e.type).filter(t=>t!=='ping');assert.deepEqual(types,['snapshot','step','step','sources','text','text','notice','done','end']);
+  const seq=ev.slice(1).map(e=>e.seq);assert.deepEqual(seq,[...seq].sort((x,y)=>x-y),'events carry increasing sequence numbers');
+  const job=(await f.engine.read('one',b.jobId)).job;assert.equal(job.text,'สวัสดี');assert.deepEqual(job.steps.map(s=>[s.id,s.state,s.n]),[['kb','done',2]]);
+  assert.equal(job.sources[0].host,'toyota.co.th');assert.equal(job.notice,'cut');
+  /* ต่อใหม่หลังจบ: ได้ snapshot แล้ว end ทันที ไม่ค้าง */
+  const again=await drain(await f.engine.stream('one',b.jobId));assert.deepEqual(again.map(e=>e.type),['snapshot','end']);
 });
 test('expired work and results are removed and no alarm remains',async()=>{
   const f=fixture(),b=body();await f.create(b);const m=await f.storage.get('m:'+b.jobId);m.expiresAt=Date.now()-1;await f.storage.put('m:'+b.jobId,m);

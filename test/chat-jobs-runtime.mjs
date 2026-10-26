@@ -13,6 +13,11 @@ let mf=new Miniflare(options);const call=async(uid,id,b)=>{const r=await mf.disp
 const b={jobId:crypto.randomUUID(),sessionId:'s1792720000000',carId:'car-one',contents:[{role:'user',parts:[{text:'Synthetic only'}]}]};
 try{
   assert.equal((await call('one',null,b)).job.id,b.jobId);
+  /* ช่องสดผ่าน RPC จริง: snapshot → step → text → done → end */
+  const live=await mf.dispatchFetch('https://fixture.test/?uid=one&events=1&id='+b.jobId);assert.equal(live.status,200);
+  const events=(await live.text()).split('\n\n').filter(x=>x.startsWith('data: ')).map(x=>JSON.parse(x.slice(6))).filter(e=>e.type!=='ping');
+  assert.deepEqual(events.map(e=>e.type),['snapshot','step','text','done','end']);assert.equal(events.at(-1).status,'complete');
+  assert.equal((await mf.dispatchFetch('https://fixture.test/?uid=two&events=1&id='+b.jobId)).status,404);
   // No stream/subscriber remains open; the actual workerd alarm finishes the job.
   let r;for(let n=0;n<100;n++){r=await call('one',b.jobId);if(r.job?.status==='complete')break;await new Promise(r=>setTimeout(r,30))}
   assert.equal(r.job.status,'complete');assert.equal(r.job.text,'Runtime fixture answer');
@@ -22,5 +27,5 @@ try{
   assert.equal((await call('two',b.jobId)).status,404);
   await mf.dispose();mf=new Miniflare(options);
   assert.equal((await call('one',b.jobId)).job.text,'Runtime fixture answer','encrypted result survives runtime restart');
-  console.log('PASS: actual SQLite DO + RPC + alarm + detached client + account isolation + persisted runtime restart (6 checks)');
+  console.log('PASS: actual SQLite DO + RPC + alarm + detached client + account isolation + persisted runtime restart + live RPC stream (8 checks)');
 }finally{await mf.dispose()}

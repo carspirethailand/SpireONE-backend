@@ -16,7 +16,7 @@ import { open, CTX } from './vault.js';
 /* ตารางที่ไม่มีข้อมูลรายคน (ใช้ร่วมกันทั้งแอป) — เทสต์ใช้ยืนยันว่าทุกตารางถูกจัดกลุ่มแล้ว */
 /* qa_cache = คำตอบใช้ซ้ำตามรุ่นรถ (ไม่มี uid · cacheSave ไม่เก็บคำถามที่มีชื่อ/อีเมล/เบอร์ของคนถาม)
    part_prices / part_price_runs = ราคาอะไหล่ตามรุ่นรถ (ตารางรุ่นเก่าจาก migrations) */
-export const SHARED_TABLES = ['config', 'kb', 'qa_cache', 'magazine', 'shop', 'car_specs', 'vec_store', 'tech_views', 'tech_identity_events',
+export const SHARED_TABLES = ['config', 'ai_health', 'kb', 'qa_cache', 'magazine', 'shop', 'car_specs', 'vec_store', 'tech_views', 'tech_identity_events',
   'auth_otp', 'auth_rate', 'media_parts', 'audit', 'tech_audit', 'spec_log', 'ws_store', 'part_prices', 'part_price_runs'];
 
 const MINE = 'uid = ?';

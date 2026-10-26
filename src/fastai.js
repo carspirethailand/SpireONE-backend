@@ -39,9 +39,13 @@ export function chatModels(env) {
 /* ระดับการคิด — คิดมากขึ้นเฉพาะเรื่องที่ต้องคิดจริง คำถามสั้นหรือคุยเล่นตอบไวกว่า */
 export function thinkingFor(question, hasMedia, skillIds) {
   const q = String(question || '');
-  const hard = hasMedia || (skillIds && skillIds.length) || q.length > 140
+  /* คิดลึก (medium) เฉพาะงานที่ต้องดูไฟล์หรือใช้ทักษะเฉพาะ — คำถามอาการรถทั่วไปใช้ low
+     ของเดิมให้ medium กับทุกคำถามที่มีคำว่า อาการ/เสียง/ร้อน ฯลฯ (เกือบทุกคำถามเรื่องรถ)
+     รุ่น flash-lite คิดนานจนเริ่มตอบช้า แล้วโดนตัดเวลาทิ้งไปลองรุ่นอื่น */
+  if (hasMedia || (skillIds && skillIds.length)) return 'medium';
+  const hard = q.length > 140
     || /อาการ|เสียง|สั่น|รั่ว|ไฟโชว์|ไฟเตือน|สตาร์ท|ดับ|กระตุก|ร้อน|ควัน|วินิจฉัย|สาเหตุ|ทำไม|เปรียบเทียบ|เทียบ|คุ้ม|แนะนำ|diagnos|why|compare|noise|leak|warning/i.test(q);
-  if (hard) return 'medium';
+  if (hard) return 'low';
   /* คำถามสั้นที่ตอบจากข้อมูลที่มีอยู่แล้ว เช่น "รถผมรุ่นอะไร" หรือคุยเล่น — แทบไม่ต้องคิด ตอบทันที */
   return q.length <= 60 ? 'minimal' : 'low';
 }
@@ -89,7 +93,7 @@ export function toGeminiContents(msgs, keepMediaTurns = 2) {
 /* ── เรียก Gemini แบบสตรีมหนึ่งครั้ง ──
    คืน { text, thoughts } · เรียก onText/onThought ทันทีที่ได้แต่ละก้อน (ไม่ส่งเครื่องมือค้นเว็บให้ Gemini — ผลค้นมากับ system แล้ว)
    โยน error พร้อม e.retryable เพื่อบอกผู้เรียกว่าควรลองโมเดลถัดไปไหม (ยังไม่มีข้อความออกไปเลย) */
-async function streamOnce(env, model, { system, contents, level, onText, onThought, meter, maxTokens, headerMs }) {
+async function streamOnce(env, model, { system, contents, level, onText, onThought, meter, maxTokens, headerMs, signal }) {
   const base = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
   /* เพดานนี้นับรวมโทเคนที่ใช้คิดด้วย ตั้งให้พอ ไม่งั้นคิดเยอะแล้วคำตอบถูกตัดกลางประโยค */
   const gen = { maxOutputTokens: maxTokens || 8192 };
@@ -101,17 +105,21 @@ async function streamOnce(env, model, { system, contents, level, onText, onThoug
   /* รอหัวคำตอบไม่เกิน 12 วินาที (ช้ากว่านั้นไปทางสำรองดีกว่าให้ผู้ใช้รอ) และระหว่างสตรีมเงียบนานเกิน 30 วินาทีถือว่าค้าง */
   const ac = new AbortController();
   let idle = setTimeout(() => ac.abort('timeout'), headerMs || 9000);
+  /* signal จากข้างนอก = ตัวแข่งอีกตัวตอบก่อนแล้ว (ยิงคู่ขนาน) — เลิกทันที */
+  const outer = () => ac.abort(signal.reason || 'cancel');
+  if (signal) { if (signal.aborted) outer(); else signal.addEventListener('abort', outer, { once: true }) }
+  const why = () => ac.signal.reason === 'timeout' ? { timeout: true } : ac.signal.reason === 'idle' ? { idle: true } : ac.signal.aborted ? { aborted: true } : {};
   let res;
   try {
     res = await fetch(`${base}/v1beta/models/${model}:streamGenerateContent?alt=sse`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_KEY }, body: JSON.stringify(body), signal: ac.signal,
     });
   } catch (e) {
-    clearTimeout(idle);
-    const err = new Error(`${model}: ${e.message || e}`); err.retryable = true; throw err;
+    clearTimeout(idle); signal?.removeEventListener?.('abort', outer);
+    const err = Object.assign(new Error(`${model}: ${ac.signal.reason === 'timeout' ? 'no response in ' + (headerMs || 9000) + ' ms' : e.message || e}`), why()); err.retryable = true; throw err;
   }
   if (!res.ok || !res.body) {
-    clearTimeout(idle);
+    clearTimeout(idle); signal?.removeEventListener?.('abort', outer);
     const t = await res.text().catch(() => '');
     const err = new Error(`${model} ${res.status}: ${t.slice(0, 1500)}`);
     err.status = res.status; err.retryable = true;
@@ -125,7 +133,7 @@ async function streamOnce(env, model, { system, contents, level, onText, onThoug
 
   const reader = res.body.getReader();
   const dec = new TextDecoder();
-  let buf = '', text = '', thoughts = '', usage = null;
+  let buf = '', text = '', thoughts = '', usage = null, finish = '';
   try {
     while (true) {
       clearTimeout(idle); idle = setTimeout(() => ac.abort('idle'), 30000);
@@ -140,6 +148,7 @@ async function streamOnce(env, model, { system, contents, level, onText, onThoug
         let d; try { d = JSON.parse(t.slice(5).trim()) } catch { continue }
         if (d.usageMetadata) usage = d.usageMetadata;
         const c = (d.candidates && d.candidates[0]) || {};
+        if (c.finishReason) finish = String(c.finishReason);
         for (const p of ((c.content && c.content.parts) || [])) {
           if (!p.text) continue;
           if (p.thought) { thoughts += p.text; if (onThought) await onThought(p.text); }
@@ -148,11 +157,11 @@ async function streamOnce(env, model, { system, contents, level, onText, onThoug
       }
     }
   } catch (e) {
-    clearTimeout(idle);
-    const err = new Error(`${model} stream: ${e.message || e}`);
+    clearTimeout(idle); signal?.removeEventListener?.('abort', outer);
+    const err = Object.assign(new Error(`${model} stream: ${ac.signal.reason === 'idle' ? 'stalled' : e.message || e}`), why());
     err.retryable = !text; err.partial = text; throw err;
   }
-  clearTimeout(idle);
+  clearTimeout(idle); signal?.removeEventListener?.('abort', outer);
   if (usage && meter) {
     /* ส่วนที่ Gemini จำไว้แล้ว (คำสั่งระบบที่ซ้ำทุกข้อความ) Google คิดราคาราวหนึ่งในสี่
        คิดโควตาผู้ใช้ตามต้นทุนจริงแบบเดียวกัน คุยต่อเนื่องจะไม่เผาโควตาเร็วเกินจริง */
@@ -163,8 +172,8 @@ async function streamOnce(env, model, { system, contents, level, onText, onThoug
     meter.out += usage.candidatesTokenCount || Math.ceil(text.length / 3);
     meter.calls += 1; meter.src.push(model);
   }
-  if (!text.trim()) { const err = new Error(`${model}: empty answer`); err.retryable = true; throw err; }
-  return { text, thoughts, model };
+  if (!text.trim()) { const err = new Error(`${model}: empty answer${finish ? ' (' + finish + ')' : ''}`); err.retryable = true; err.finish = finish; throw err; }
+  return { text, thoughts, model, finish };
 }
 
 /* ── ตอบหนึ่งข้อความ ──
@@ -176,6 +185,41 @@ const BAD = new Map();
    ข้อความถัดไปจึงไม่ต้องเสียเวลายิงของที่เพิ่งพัง แต่ก็กลับมาลองใหม่เร็วเมื่อหายแล้ว */
 const bad = k => { const v = BAD.get(k); return v && Date.now() < v };
 const markBad = (k, ms = 600000) => BAD.set(k, Date.now() + ms);
+
+/* ── สุขภาพของรุ่นร่วมกันทุกเครื่อง (D1 ตาราง ai_health) ──
+   แชตแต่ละคนวิ่งคนละเครื่อง (Durable Object ของใครของมัน) ความจำในเครื่องเดียวจึงไม่พอ
+   รุ่นที่เพิ่งล่ม (503) / ไม่ตอบในเวลา / โควตาเต็ม จดลงฐานข้อมูล ทุกเครื่องข้ามรุ่นนั้นพร้อมกัน
+   อ่านซ้ำไม่บ่อยกว่า 5 วินาทีต่อเครื่อง · ไม่มี DB (เทสต์) = ใช้ความจำในเครื่องอย่างเดียว */
+const PARK_MS = { quota: 60000, dead: 600000, busy: 45000, timeout: 30000 };
+let healthAt = 0, healthReady = false;
+async function healthDb(env) {
+  if (!env || !env.DB) return null;
+  if (!healthReady) { await env.DB.prepare('CREATE TABLE IF NOT EXISTS ai_health (k TEXT PRIMARY KEY, until INTEGER NOT NULL, why TEXT)').run(); healthReady = true }
+  return env.DB;
+}
+export async function syncHealth(env, force) {
+  if (!force && Date.now() - healthAt < 5000) return;
+  healthAt = Date.now();
+  try {
+    const db = await healthDb(env); if (!db) return;
+    const rs = await db.prepare('SELECT k, until FROM ai_health WHERE until > ?').bind(Date.now()).all();
+    for (const r of rs.results || []) if ((BAD.get(r.k) || 0) < r.until) BAD.set(r.k, r.until);
+  } catch (e) { /* อ่านไม่ได้ก็ใช้ความจำในเครื่อง */ }
+}
+async function park(env, k, ms, why) {
+  markBad(k, ms);
+  try {
+    const db = await healthDb(env); if (!db) return;
+    await db.prepare('INSERT INTO ai_health (k, until, why) VALUES (?, ?, ?) ON CONFLICT(k) DO UPDATE SET until = excluded.until, why = excluded.why')
+      .bind(k, Date.now() + ms, String(why || '').slice(0, 40)).run();
+  } catch (e) { /* จดไม่ได้ก็ยังพักในเครื่องนี้ */ }
+}
+export async function unparkShared(env, key) {
+  unpark(key);
+  try { const db = await healthDb(env); if (db) await (key ? db.prepare('DELETE FROM ai_health WHERE k = ?').bind(key) : db.prepare('DELETE FROM ai_health')).run() } catch (e) {}
+}
+/* แยกชนิดความล้มเหลว → พักนานเท่าไร (ยิงแข่งแล้วแพ้ = ไม่ใช่ความผิดของรุ่น ไม่พัก) */
+const failKind = e => e.aborted ? '' : e.quota ? 'quota' : e.dead ? 'dead' : e.busy ? 'busy' : (e.timeout || e.idle) ? 'timeout' : '';
 
 /* Never carry per-project/model throttles across a credential change. The hash,
    not the secret or its suffix, is safe to display in admin diagnostics. */
@@ -464,42 +508,115 @@ export async function reactAgent(env, opts) {
   throw lastErr || new Error('reactAgent failed across all providers');
 }
 
+/* ── ยิง Gemini แบบมีตัวสำรองคู่ขนาน ──
+   เริ่มรุ่นแรก · ถ้ายังไม่มีตัวอักษรแรกใน HEDGE_MS ยิงรุ่นถัดไปพร้อมกัน · ตัวไหนพิมพ์ก่อนชนะ ตัวอื่นถูกยกเลิก
+   รุ่นไหนพังก่อนพิมพ์ → ยิงรุ่นถัดไปทันที (ไม่ต้องรอ) · รวมแล้วรอตัวอักษรแรกไม่เกิน FIRST_MS
+   ของเดิมลองทีละรุ่น รุ่นละ 6 วินาที — Gemini ช้าหรือคนแน่น ผู้ใช้รอเป็นนาทีแล้วอาจไม่ได้อะไรเลย */
+export const RACE = { HEDGE_MS: 4500, FIRST_MS: 25000, HEADER_MS: 14000 };
+async function raceGemini(env, scope, models, base, hooks = {}) {
+  const queue = models.slice(), live = new Set();
+  let winner = null, settled = false, lastErr = null, hedge = null, deadline = null;
+  return new Promise((resolve, reject) => {
+    const finish = (val, err) => {
+      if (settled) return; settled = true; clearTimeout(hedge); clearTimeout(deadline);
+      for (const a of live) if (a !== winner) a.ac.abort('lost');
+      err ? reject(err) : resolve(val);
+    };
+    deadline = setTimeout(() => finish(null, Object.assign(new Error('no first token in ' + RACE.FIRST_MS + ' ms'), { timeout: true })), RACE.FIRST_MS);
+    const claim = a => {
+      winner = a; clearTimeout(hedge); clearTimeout(deadline);
+      for (const o of live) if (o !== a) o.ac.abort('lost');
+      if (hooks.onFirst) hooks.onFirst(a.model, Date.now() - a.t0, live.size > 1 || a.hedged);
+    };
+    const run = async a => {
+      let level = base.level;
+      for (let i = 0; i < 3; i++) {
+        try {
+          return await streamOnce(env, a.model, { ...base, level, signal: a.ac.signal, headerMs: RACE.HEADER_MS,
+            onText: async d => { if (!winner && !settled) claim(a); if (winner === a && base.onText) await base.onText(d) } });
+        } catch (e) {
+          if (e.thinking && level && winner !== a && !a.ac.signal.aborted) { level = level === 'minimal' ? null : 'minimal'; continue }
+          throw e;
+        }
+      }
+      throw new Error(a.model + ': thinking setting rejected');
+    };
+    const launch = hedged => {
+      if (settled || winner) return false;
+      const model = queue.shift(); if (!model) return false;
+      const a = { model, ac: new AbortController(), t0: Date.now(), hedged };
+      live.add(a);
+      if (hooks.onAttempt) hooks.onAttempt(model, hedged);
+      run(a).then(r => {
+        live.delete(a);
+        trail(base.meter, { model, level: base.level, ok: true, ms: Date.now() - a.t0, finish: r.finish || '', len: r.text.length, hedge: hedged || undefined });
+        if (winner === a) finish({ ...r, model });
+      }).catch(async e => {
+        live.delete(a);
+        if (winner === a) { trail(base.meter, { model, ok: !!e.partial, ms: Date.now() - a.t0, err: 'cut: ' + String(e.message || e).slice(0, 120), len: (e.partial || '').length });
+          return e.partial ? finish({ text: e.partial, model, partial: true }) : finish(null, e) }
+        if (e.aborted && (winner || settled)) return;              /* แพ้การแข่ง — ไม่ใช่ความผิดของรุ่น */
+        lastErr = e;
+        trail(base.meter, { model, ok: false, ms: Date.now() - a.t0, err: String(e.message || e).slice(0, 160), hedge: hedged || undefined });
+        const k = failKind(e); if (k) await park(env, scope + '|' + model, PARK_MS[k], k);
+        if (hooks.onFail) hooks.onFail(model, k || 'error');
+        if (!winner && !settled && !launch(false) && !live.size) finish(null, lastErr);
+      });
+      clearTimeout(hedge);
+      hedge = setTimeout(() => { if (!winner && !settled) launch(true) }, RACE.HEDGE_MS);
+      return true;
+    };
+    if (!launch(false)) finish(null, new Error('no Gemini model available'));
+  });
+}
+
+/* คำตอบโดนตัด (โทเคนหมด / สายหลุดกลางทาง) → ให้รุ่นที่ยังดีเขียนต่อจากจุดเดิมหนึ่งครั้ง */
+const CONTINUE = 'เขียนต่อจากจุดที่ค้างไว้ทันที ต่อประโยคเดิมได้เลย ห้ามทวนสิ่งที่เขียนไปแล้ว ห้ามขึ้นต้นใหม่ ห้ามขอโทษ';
+
 export async function fastAnswer(env, opts) {
   /* ค้นครั้งเดียวต่อคำถาม แล้วใช้ผลเดิมทั้งกับ Gemini และทางสำรอง (ไม่เสียค่าค้นซ้ำ) */
   const memo = new Map(), raw = opts.executeSearch || (q => executeSearchInternal(env, q, opts));
   const search = q => { if (!memo.has(q)) memo.set(q, Promise.resolve().then(() => raw(q)).catch(() => '')); return memo.get(q) };
-  let system = opts.system, grounded = false;
+  const phase = (name, info) => { try { if (opts.onPhase) return opts.onPhase(name, info || {}) } catch (e) {} };
+  let system = opts.system, grounded = false, web = null;
   if (opts.search === true && opts.question) {
     if (opts.onSearch) await opts.onSearch(opts.question);
-    const web = await search(opts.question);
-    grounded = !!String(web || '').trim();
-    system = (opts.system || '') + '\nผลค้นเว็บจริง:\n' + String(web || 'ค้นเว็บไม่ได้ในรอบนี้ ยังยืนยันข้อมูลล่าสุดไม่ได้ ต้องแจ้งผู้ใช้ตรง ๆ ห้ามเดาตัวเลขหรือข่าว').slice(0, 9000);
+    web = String(await search(opts.question) || '');
+    grounded = !!web.trim();
+    system = (opts.system || '') + '\nผลค้นเว็บจริง:\n' + (web || 'ค้นเว็บไม่ได้ในรอบนี้ ยังยืนยันข้อมูลล่าสุดไม่ได้ ต้องแจ้งผู้ใช้ตรง ๆ');
   }
+  let geminiError = null;
   if (env.GEMINI_KEY) {
-    const scope = await geminiScope(env);
-    const models = chatModels(env);
-    for (const model of models) {
-      const scoped = key => scope + '|' + key;
-      if (bad(scoped(model))) continue;
-      let level=opts.level||'minimal';
-      for (let attempt=0;attempt<3;attempt++) {
-        try {
-          const t0=Date.now();
-          const r = await streamOnce(env, model, { ...opts, system, level, onThought:undefined, headerMs:6000 });
-          trail(opts.meter, { model, level, search: grounded, ok: true, ms:Date.now()-t0, grounded });
-          return {...r,thoughts:'',grounded};
-        } catch (e) {
-          if(e.partial)return {text:e.partial,thoughts:'',model,grounded,partial:true};
-          if(e.thinking&&level){level=level==='minimal'?null:'minimal';continue;}
-          if(e.quota||e.dead)markBad(scoped(model),60000);
-          break;
+    await syncHealth(env);
+    const scope = await geminiScope(env), all = chatModels(env);
+    let models = all.filter(m => !bad(scope + '|' + m));
+    /* ทุกรุ่นถูกพักและไม่มีทางสำรอง — ลองของจริงดีกว่าไม่ตอบ */
+    if (!models.length && !fallbackProviders(env, !!opts.hasMedia).length) models = all;
+    if (models.length) {
+      const base = { ...opts, system, onThought: undefined };
+      const hooks = { onAttempt: (m, hedged) => phase(hedged ? 'hedge' : 'attempt', { model: m }), onFail: (m, why) => phase('fail', { model: m, why }),
+        onFirst: (m, ms, hedged) => phase('first', { model: m, ms, hedged }) };
+      try {
+        const r = await raceGemini(env, scope, models, base, hooks);
+        let text = r.text, cut = !!r.partial || r.finish === 'MAX_TOKENS';
+        if (cut) {
+          phase('continue', { model: r.model, why: r.partial ? 'stream' : 'max_tokens' });
+          const contents = [...(opts.contents || []), { role: 'model', parts: [{ text }] }, { role: 'user', parts: [{ text: CONTINUE }] }];
+          try {
+            const more = await raceGemini(env, scope, chatModels(env).filter(m => !bad(scope + '|' + m)), { ...base, contents, level: null }, {});
+            text += more.text; cut = !!more.partial || more.finish === 'MAX_TOKENS';
+          } catch (e) { /* ต่อไม่ได้ ส่งเท่าที่มีพร้อมบอกว่าถูกตัด */ }
         }
-      }
+        return { text, thoughts: '', model: r.model, grounded, partial: cut, finish: r.finish || '' };
+      } catch (e) { geminiError = e }
     }
   }
-  const fallback=await reactAgent(env,{...opts,system,executeSearch:search,onThought:undefined});
-  if(fallback&&fallback.text?.trim())return {...fallback,thoughts:'',reasoning:''};
-  throw new Error('All configured AI providers failed');
+  /* ── ทางสำรอง: ยิงครั้งเดียวแบบสตรีม (Groq → OpenRouter) แนบผลค้นที่ได้แล้ว ──
+     ของเดิมเป็นตัวแทนคิดหลายรอบ (ReAct) กับโมเดลฟรีที่สุ่มมา — ช้า และคำตอบสั้น/แปลก */
+  phase('fallback', { why: geminiError ? String(geminiError.message || geminiError).slice(0, 120) : 'no gemini' });
+  const history = opts.history || toChatHistory(opts.messages || opts.contents || []);
+  const fb = await fallbackAnswer(env, opts.system || '', history, { ...opts, prefetchedWeb: web, geminiError });
+  return { text: fb.text, thoughts: '', reasoning: '', model: fb.src + ':' + (fb.model || ''), grounded: grounded || !!fb.grounded, partial: !!fb.partial, fallback: true };
 }
 
 /* ══ ทางสำรองเมื่อ Gemini ใช้ไม่ได้ ══
@@ -660,7 +777,8 @@ export async function fallbackAnswer(env, system, history, opts) {
   const txt = m => typeof m.content === 'string' ? m.content : (m.content || []).filter(x => x.type === 'text').map(x => x.text).join(' ');
   const q = searchQuery(clean.filter(m => m.role === 'user').map(txt));
   const needWeb = opts.search === true || /ค้น|ข่าว|ล่าสุด|ตอนนี้|วันนี้|ปีนี้|ราคา|เปิดตัว|รุ่นใหม่|อัปเดต|internet|อินเทอร์เน็ต|research|search|latest|news|price|launch|20[2-3]\d|25[6-9]\d/i.test(q);
-  if (q.length >= 6 && opts.search !== false && needWeb) {
+  if (opts.prefetchedWeb != null) web = String(opts.prefetchedWeb || '');   /* ค้นมาแล้วในรอบนี้ ไม่ค้นซ้ำ */
+  else if (q.length >= 6 && opts.search !== false && needWeb) {
     const t0 = Date.now();
     const w = await webSearch(env, q, { depth: opts.depth == null ? 1 : +opts.depth }); web = w.text;
     trail(opts.meter, { model: 'ค้นเว็บ:' + (w.src || 'ไม่พบ'), ok: !!web, ms: Date.now() - t0, err: w.stat || (web ? '' : 'no results') });
@@ -676,15 +794,19 @@ export async function fallbackAnswer(env, system, history, opts) {
     out[i] = { ...out[i], content: `ข้อมูลที่ค้นจากเว็บมาให้แล้ว (ใช้ตอบได้เลย):\n${web.slice(0, 9000)}\n\n---\nคำถามของฉัน: ${out[i].content}\n\n(สรุปจากข้อมูลข้างบนเท่าที่มี บอกแหล่งที่มา ถ้าข้อมูลมีแค่บางส่วนให้ตอบส่วนที่มีพร้อมบอกว่าส่วนไหนยังไม่ยืนยัน ห้ามตอบว่าไม่มีข้อมูลถ้าข้างบนมีเนื้อหาเกี่ยวข้อง)` };
     return out;
   };
+  /* มีตัวอักษรออกไปถึงผู้ใช้แล้ว ห้ามสลับเจ้าแล้วเริ่มใหม่ (ผู้ใช้จะเห็นคำตอบซ้อนกัน) — ส่งเท่าที่มีพร้อมบอกว่าถูกตัด */
+  let shown = '';
+  const fopts = { ...opts, onText: async d => { shown += d; if (opts.onText) await opts.onText(d) } };
   for (const p of list) {
+    if (opts.onPhase) try { opts.onPhase('attempt', { model: p.src + ':' + p.model, fallback: true }) } catch (e) {}
     let sys = system + (web ? NO_TOOLS.replace(/เรื่องที่ต้องใช้ข้อมูลล่าสุด[^\n]*/, 'ข้อมูลล่าสุดให้ใช้ผลค้นเว็บด้านล่าง') : NO_TOOLS) + WEB + FOCUS;
     for (let attempt = 0; attempt < 2; attempt++) {
       const t0 = Date.now();
       try {
-        const r = await streamProvider(env, p, [{ role: 'system', content: sys }, ...(p.vision ? clean : withWeb(flat(clean)))], opts);
+        const r = await streamProvider(env, p, [{ role: 'system', content: sys }, ...(p.vision ? clean : withWeb(flat(clean)))], fopts);
         trail(opts.meter, { model: p.src + ':' + p.model, ok: !!r.text.trim() && !isJunk(r.text), ms: Date.now() - t0, err: isJunk(r.text) ? 'junk answer' : (r.text.trim() ? '' : 'empty') });
         if (isJunk(r.text)) break;
-        if (r.text.trim()) return { ...r, src: p.src };
+        if (r.text.trim()) return { ...r, src: p.src, model: p.model, grounded: !!web };
         if (r.toolCall && attempt === 0) {
           /* มันยังพยายามเรียกเครื่องมือ — ย้ำอีกรอบ ถ้ายังดื้อก็ไปตัวถัดไป */
           sys += '\n\nย้ำ: ตอบเป็นข้อความธรรมดาเท่านั้น'; continue;
@@ -693,6 +815,7 @@ export async function fallbackAnswer(env, system, history, opts) {
       } catch (e) {
         trail(opts.meter, { model: p.src + ':' + p.model, ok: false, ms: Date.now() - t0, err: String(e.message || e).slice(0, 160) });
         last = e;
+        if (shown.trim()) return { text: shown, src: p.src, model: p.model, grounded: !!web, partial: true };
         if (/ 40[134]:/.test(e.message || '')) markBad('fb|' + p.src);   /* คีย์ผิด/ไม่มีสิทธิ์/ไม่มีรุ่นนี้ */
         /* โควตารายวันหมด (Workers AI 4006 / 429) — พักเจ้านี้ 6 ชั่วโมง ไม่ต้องลองทุกข้อความ */
         if (/4006|neurons| 402:|payment required/i.test(e.message || '')) markBad('fb|' + p.src, 6 * 3600000);   /* โควตารายวันหมด / ต้องจ่ายเงิน */

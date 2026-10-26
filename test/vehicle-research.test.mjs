@@ -70,6 +70,6 @@ test('research endpoint requires login, rejects private queries and never calls 
 });
 test('typed chat, LINE and live paths search through the keyed web search, never a Gemini Google Search tool',async()=>{
   const source=await readFile(new URL('../src/worker.js',import.meta.url),'utf8');
-  assert.equal((source.match(/executeSearch: async \(q\) => await executeWebSearchTool\(/g)||[]).length,3);assert.doesNotMatch(source,/google_search: \{\}|externalSearch/);
+  assert.equal((source.match(/executeSearch: async \(q\) => (?:await executeWebSearchTool\(|\{[\s\S]{0,160}?executeWebSearchTool\()/g)||[]).length,3);assert.doesNotMatch(source,/google_search: \{\}|externalSearch/);
   assert.match(source,/body.tool==='ear'\|\|body.tool==='listen'/);assert.match(source,/publicResearch\(query,\{env,/);
 });

@@ -7,7 +7,27 @@ const validId=x=>typeof x==='string'&&/^[a-f0-9-]{36}$/.test(x);
 const validCar=x=>typeof x==='string'&&/^[\w-]{1,100}$/.test(x);
 const clean=m=>({id:m.id,sessionId:m.sessionId,carId:m.carId,status:m.status,createdAt:m.createdAt,updatedAt:m.updatedAt,expiresAt:m.expiresAt});
 export class ChatJobEngine {
-  constructor(ctx,env,execute,notify){this.ctx=ctx;this.env=env;this.execute=execute;this.notify=notify}
+  constructor(ctx,env,execute,notify){this.ctx=ctx;this.env=env;this.execute=execute;this.notify=notify;this.hub=new Map()}
+  /* ── ช่องสดของงานที่กำลังทำ (อยู่ในหน่วยความจำของ Durable Object ตัวที่รันงานเอง) ──
+     หน้าแชตต่อเข้ามาได้หลายแท็บ · ต่อใหม่เมื่อไรได้ภาพรวมล่าสุด (snapshot) ก่อนเสมอ แล้วตามด้วยเหตุการณ์สด
+     ของเดิมหน้าแชตต้องถามทุก 1 วินาที และเห็นแค่สถานะล่าสุดอันเดียว ข้อความจึงมาเป็นก้อน ๆ */
+  hubOf(id){let h=this.hub.get(id);if(!h){h={seq:0,subs:new Set(),done:false,state:{text:'',statusText:'',steps:[],sources:[],research:[],notice:null}};this.hub.set(id,h)}return h}
+  emit(id,event){const h=this.hubOf(id);h.seq++;const out={seq:h.seq,...event};for(const f of h.subs)f(out);if(event.type==='end'){h.done=true;const t=setTimeout(()=>{if(this.hub.get(id)===h&&!h.subs.size)this.hub.delete(id)},60000);t?.unref?.()}}
+  async stream(uid,id){
+    if(!validId(id)||!await this.owner(uid))return null;
+    const m=await this.ctx.storage.get('m:'+id);if(!m||m.expiresAt<=Date.now())return null;
+    const h=this.hubOf(id),enc=new TextEncoder();let sub=null,ping=null,stop=null;
+    const end=()=>{clearInterval(ping);clearTimeout(stop);if(sub)h.subs.delete(sub);sub=null};
+    return new ReadableStream({start:c=>{
+      const write=o=>{try{c.enqueue(enc.encode('data: '+JSON.stringify(o)+'\n\n'))}catch{}};
+      const close=()=>{end();try{c.close()}catch{}};
+      write({type:'snapshot',seq:h.seq,status:m.status,...h.state});
+      if(done(m.status)||h.done){write({type:'end',status:m.status});close();return}
+      sub=o=>{write(o);if(o.type==='end')close()};h.subs.add(sub);
+      /* สัญญาณ "ยังทำงานอยู่" ทุก 5 วินาที · ปิดเองหลัง 2 นาที ให้หน้าเว็บต่อใหม่ (ไม่มีสายค้างไม่รู้จบ) */
+      ping=setInterval(()=>write({type:'ping'}),5000);stop=setTimeout(close,120000);
+    },cancel:end});
+  }
   key(uid,id,kind){return 'cendon:chat-job:'+uid+':'+id+':'+kind}
   async owner(uid){return (await this.ctx.storage.get('owner'))===uid}
   async writeBlob(tx,id,kind,value){const chunks=Math.ceil(value.length/CHUNK);const entries={};for(let i=0;i<chunks;i++)entries[`${kind}:${id}:${i}`]=value.slice(i*CHUNK,(i+1)*CHUNK);await tx.put(entries);return chunks}
@@ -32,12 +52,13 @@ export class ChatJobEngine {
   }
   async list(uid){if(!await this.owner(uid))return {jobs:[]};const rows=[...(await this.ctx.storage.list({prefix:'m:'})).values()];return {jobs:rows.filter(m=>m.expiresAt>Date.now()).sort((a,b)=>b.createdAt-a.createdAt).slice(0,20).map(clean)}}
   async read(uid,id){if(!validId(id)||!await this.owner(uid))return fail('Not found',404);const m=await this.ctx.storage.get('m:'+id);if(!m||m.expiresAt<=Date.now())return fail('Not found',404);let result={};if(m.resultParts)try{result=await this.blob(uid,m,'result')}catch{return fail('Answer temporarily unavailable',503)}return {job:{...clean(m),...result}}}
-  async cancel(uid,id){if(!validId(id)||!await this.owner(uid))return fail('Not found',404);return this.ctx.storage.transaction(async tx=>{const m=await tx.get('m:'+id);if(!m)return fail('Not found',404);if(!done(m.status)){m.status='cancelled';m.updatedAt=Date.now();await this.dropBlob(tx,m,'input');m.inputParts=0;await tx.put('m:'+id,m)}return {job:clean(m)}})}
+  async cancel(uid,id){const r=await this.cancelJob(uid,id);if(r&&r.job&&this.hub.has(id))this.emit(id,{type:'end',status:r.job.status});return r}
+  async cancelJob(uid,id){if(!validId(id)||!await this.owner(uid))return fail('Not found',404);return this.ctx.storage.transaction(async tx=>{const m=await tx.get('m:'+id);if(!m)return fail('Not found',404);if(!done(m.status)){m.status='cancelled';m.updatedAt=Date.now();await this.dropBlob(tx,m,'input');m.inputParts=0;await tx.put('m:'+id,m)}return {job:clean(m)}})}
   async purge(uid){if(!await this.owner(uid))return {ok:true};await this.ctx.storage.deleteAll();await this.ctx.storage.deleteAlarm();return {ok:true}}
   async result(uid,id,result,status){
     const encrypted=await seal(this.env,JSON.stringify(result),this.key(uid,id,'result'));
     return this.ctx.storage.transaction(async tx=>{const m=await tx.get('m:'+id);if(!m||m.status!=='running')return false;
-      await this.dropBlob(tx,m,'result');m.resultParts=await this.writeBlob(tx,id,'result',encrypted);m.updatedAt=Date.now();if(status)m.status=status;
+      await this.dropBlob(tx,m,'result');m.resultParts=await this.writeBlob(tx,id,'result',encrypted);m.updatedAt=Date.now();if(status)m.status=status;if(result.text)m.hadText=true;
       if(done(m.status)){await this.dropBlob(tx,m,'input');m.inputParts=0;if(this.notify){m.deliveryAt=Date.now();m.deliveryTries=0;await tx.setAlarm(Date.now()+1)}}await tx.put('m:'+id,m);return true;
     });
   }
@@ -46,24 +67,38 @@ export class ChatJobEngine {
     let rows=[...(await this.ctx.storage.list({prefix:'m:'})).values()];
     for(const m of rows.filter(m=>m.expiresAt<=Date.now()))await this.ctx.storage.transaction(async tx=>{await this.dropBlob(tx,m,'input');await this.dropBlob(tx,m,'result');await tx.delete('m:'+m.id)});
     rows=rows.filter(m=>m.expiresAt>Date.now());
-    /* An interrupted paid inference is not blindly replayed on alarm retry. */
-    for(const m of rows.filter(m=>m.status==='running'))await this.result(uid,m.id,{text:'การประมวลผลสะดุด กรุณาส่งใหม่อีกครั้ง',retryable:true},'error');
+    /* งานที่ค้างสถานะ "กำลังทำ" = เครื่องถูกรีสตาร์ต (deploy ฯลฯ) ระหว่างตอบ
+       ยังไม่มีตัวอักษรถึงผู้ใช้และเพิ่งลองครั้งแรก → ทำใหม่อีกหนึ่งครั้ง (ผู้ใช้ไม่เห็นอะไรซ้ำ)
+       มีข้อความออกไปแล้ว หรือลองซ้ำแล้ว → ไม่ทำซ้ำ (ไม่จ่ายค่าโมเดลซ้ำไม่รู้จบ) แจ้งให้ส่งใหม่ */
+    for(const m of rows.filter(m=>m.status==='running')){
+      if(!m.hadText&&(m.attempts||1)<2&&m.inputParts){await this.ctx.storage.transaction(async tx=>{const live=await tx.get('m:'+m.id);if(live?.status==='running'){live.status='queued';await tx.put('m:'+m.id,live)}});m.status='queued'}
+      else await this.result(uid,m.id,{text:'การประมวลผลสะดุด กรุณาส่งใหม่อีกครั้ง',retryable:true,notice:'failed'},'error');
+    }
     const m=rows.filter(m=>m.status==='queued').sort((a,b)=>a.createdAt-b.createdAt)[0];
     if(m){
-      const claimed=await this.ctx.storage.transaction(async tx=>{const live=await tx.get('m:'+m.id);if(live?.status!=='queued')return false;live.status='running';await tx.put('m:'+m.id,live);return true});
-      if(claimed){let result={text:'',research:[],statusText:'กำลังคิด'},last=0;
-        const active=async()=>{const live=await this.ctx.storage.get('m:'+m.id);return live?.status==='running'&&live.expiresAt>Date.now()};
+      const claimed=await this.ctx.storage.transaction(async tx=>{const live=await tx.get('m:'+m.id);if(live?.status!=='queued')return false;live.status='running';live.attempts=(live.attempts||0)+1;await tx.put('m:'+m.id,live);return true});
+      if(claimed){
+        const h=this.hubOf(m.id),st=h.state;st.text='';st.steps=[];st.sources=[];st.notice=null;st.statusText='กำลังคิด';
+        let result={text:'',research:[],statusText:'กำลังคิด',steps:[],sources:[],notice:null},last=0,checked=0,alive=true;
+        /* เช็กว่างานยังไม่ถูกยกเลิก — อ่านฐานข้อมูลไม่เกินวินาทีละครั้ง (ของเดิมอ่านทุกเหตุการณ์ รวมทุกตัวอักษร) */
+        const active=async()=>{if(Date.now()-checked<1000)return alive;checked=Date.now();const live=await this.ctx.storage.get('m:'+m.id);return alive=live?.status==='running'&&live.expiresAt>Date.now()};
+        const sync=()=>{st.text=result.text;st.statusText=result.statusText;st.steps=result.steps;st.sources=result.sources;st.notice=result.notice;st.research=result.research};
         try{const input=await this.blob(uid,m,'input');await this.execute(this.env,input.actor,input.body,async event=>{
           if(!await active())throw Error('job no longer active');
           if(event.type==='text')result.text=(result.text+String(event.delta||'')).slice(0,160000);
           if(event.type==='text_done')result.text=String(event.text||result.text).slice(0,160000);
           if(event.type==='status')result.statusText=String(event.text||'').slice(0,160);
           if(event.type==='research'&&result.research.length<12)result.research.push(String(event.q||'').slice(0,120));
+          if(event.type==='step'&&typeof event.id==='string'){const i=result.steps.findIndex(x=>x.id===event.id),{type,...row}=event;if(i<0){if(result.steps.length<16)result.steps.push(row)}else result.steps[i]={...result.steps[i],...row}}
+          if(event.type==='sources'&&Array.isArray(event.items))result.sources=event.items.slice(0,8);
+          if(event.type==='notice')result.notice=String(event.kind||'').slice(0,20);
           if(event.type==='done')result.usage=event.usage||null;
           if(event.type==='error')throw Error('generation failed');
+          sync();if(event.type!=='ping')this.emit(m.id,event);
           if(Date.now()-last>1000||event.type==='done'){last=Date.now();await this.result(uid,m.id,result)}
-        },{active});result.statusText='';await this.result(uid,m.id,result,'complete');}
-        catch{await this.result(uid,m.id,{text:result.text||'ยังตอบไม่ได้ชั่วคราว กรุณาลองใหม่',retryable:true},'error')}
+        },{active});result.statusText='';sync();await this.result(uid,m.id,result,'complete');this.emit(m.id,{type:'end',status:'complete'});}
+        catch{const fail={text:result.text||'ยังตอบไม่ได้ชั่วคราว กรุณาลองใหม่',retryable:true,steps:result.steps,sources:result.sources,notice:result.text?'cut':'failed'};
+          await this.result(uid,m.id,fail,'error');this.emit(m.id,{type:'end',status:'error'})}
       }
     }
     /* Retry delivery only; never repeat an inference because a push failed. Stable tags deduplicate notifications. */
