@@ -29,7 +29,7 @@ test('AI web search never opens arbitrary pages itself; only the keyed search AP
     globalThis.fetch=async(url,init)=>{seen.push({url:String(url),redirect:init.redirect});return Response.json({results:[]})};
     const {searchWeb,resetSearchBreakers}=await import('../src/web-search.mjs');resetSearchBreakers();
     await searchWeb({TAVILY_API_KEY:'tvly-test-only-fixture'},'Toyota Yaris engine noise',{mode:'fast'});
-    assert.deepEqual(seen.map(x=>x.url),['https://api.tavily.com/search']);assert.equal(seen[0].redirect,'error');
+    assert.deepEqual(seen.map(x=>x.url),['https://api.tavily.com/search']);assert.equal(seen[0].redirect,'manual','Workers rejects redirect:error before sending the request');
     seen.length=0;assert.equal(await fa.executeSearchInternal({},'Toyota Yaris recall'),'','no key = nothing leaves the Worker');assert.equal(seen.length,0);
   }finally{globalThis.fetch=original}
 });

@@ -25,13 +25,11 @@ export function chatModels(env) {
     env?.GEMINI_CHAT_MODEL,
     env?.GEMINI_SEARCH_MODEL,
     env?.GEMINI_MODEL,
-    'gemini-2.5-flash',
     'gemini-3.1-flash-lite',
     'gemini-3.5-flash-lite',
     'gemini-3.6-flash',
     'gemini-3.8-flash',
-    env?.GEMINI_MODEL,
-    'gemini-2.5-flash'
+    env?.GEMINI_MODEL
   ]
     .map(m => String(m || '').trim())
     .filter(m => m && !/^gemma/i.test(m));
@@ -225,7 +223,7 @@ export function reactProviders(env) {
       timeoutMs: 10000
     });
   }
-  // 2. ตัวสำรอง ReAct: Groq เท่านั้น (openai/gpt-oss-120b, openai/gpt-oss-20b, llama-3.1-8b-instant)
+  // 2. ตัวสำรอง ReAct: Groq เท่านั้น (openai/gpt-oss-120b, openai/gpt-oss-20b) · llama-3.1-8b-instant ถูก Groq ปิดแล้ว (16 ส.ค. 2026)
   if (env.GROQ_API_KEY && !bad('react|groq')) {
     const gu = `${env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1'}/chat/completions`;
     L.push({
@@ -234,7 +232,6 @@ export function reactProviders(env) {
       key: env.GROQ_API_KEY,
       model: env.GROQ_MODEL || 'openai/gpt-oss-120b',
       altModel: 'openai/gpt-oss-20b',
-      emergencyModel: 'llama-3.1-8b-instant',
       timeoutMs: 10000
     });
   }
@@ -320,23 +317,10 @@ export async function reactAgent(env, opts) {
             signal: ac.signal
           });
 
-          // Groq fallback if model 404/429/413 (e.g. gpt-oss-120b -> gpt-oss-20b -> llama-3.1-8b-instant)
+          // Groq fallback if model 404/429/413 (gpt-oss-120b -> gpt-oss-20b)
           if (!res.ok && p.src === 'groq') {
             if (p.altModel && (res.status === 404 || res.status === 429 || res.status === 413)) {
               bodyPayload.model = p.altModel;
-              res = await fetch(p.url, {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'Authorization': `Bearer ${p.key}`,
-                  ...(p.headers || {})
-                },
-                body: JSON.stringify(bodyPayload),
-                signal: ac.signal
-              });
-            }
-            if (!res.ok && p.emergencyModel && (res.status === 404 || res.status === 429 || res.status === 413)) {
-              bodyPayload.model = p.emergencyModel;
               res = await fetch(p.url, {
                 method: 'POST',
                 headers: {
@@ -627,7 +611,7 @@ export function fallbackProviders(env, media) {
   if (env.GROQ_API_KEY) {
     const gu = `${env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1'}/chat/completions`;
     L.push({ src: 'groq', url: gu, key: env.GROQ_API_KEY, model: env.GROQ_MODEL || 'openai/gpt-oss-120b' });
-    L.push({ src: 'groq-alt', url: gu, key: env.GROQ_API_KEY, model: env.GROQ_ALT_MODEL || 'llama-3.1-8b-instant' });
+    L.push({ src: 'groq-alt', url: gu, key: env.GROQ_API_KEY, model: env.GROQ_ALT_MODEL || 'openai/gpt-oss-20b' });
   }
   if (env.OPENROUTER_API_KEY) L.push({ src: 'openrouter', url: `${env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1'}/chat/completions`,
     key: env.OPENROUTER_API_KEY, model: env.OPENROUTER_MODEL || 'openrouter/free',

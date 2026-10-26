@@ -103,6 +103,15 @@ test('fallback: a failing provider is skipped and paused, the next one answers',
   assert.ok(!again.calls.some(c => c.host === 'api.tavily.com'), 'quota-hit provider is paused');
 });
 
+test('redirects use manual mode (Workers rejects redirect:error before sending) and are never followed with the key', async () => {
+  resetSearchBreakers();
+  const seen = [];
+  const f = async (url, init) => { seen.push({ url: String(url), redirect: init.redirect }); return new Response(null, { status: 302, headers: { Location: 'https://other.test/' } }) };
+  const r = await searchWeb({ TAVILY_API_KEY: KEYS.TAVILY_API_KEY }, 'Toyota recall', { mode: 'fast', fetch: f });
+  assert.deepEqual(seen, [{ url: 'https://api.tavily.com/search', redirect: 'manual' }]);
+  assert.equal(r.status, 'unavailable'); assert.equal(r.providers[0].error, 'http_302');
+});
+
 test('timeout is reported as such and does not hang the answer', async () => {
   resetSearchBreakers();
   const slow = (url, init) => new Promise((_, rej) => init.signal.addEventListener('abort', () => rej(Object.assign(Error('aborted'), { name: 'AbortError' }))));

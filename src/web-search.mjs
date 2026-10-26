@@ -100,7 +100,8 @@ async function call(fetchFn, url, init, ms, signal) {
   const timer = setTimeout(stop, ms);
   if (signal) { if (signal.aborted) ac.abort(); else signal.addEventListener('abort', stop, { once: true }) }
   try {
-    const r = await fetchFn(url, { ...init, signal: ac.signal,redirect:'error' });
+    /* Workers ไม่รับ redirect:'error' (โยน TypeError ทันทีก่อนส่งคำขอ ทุกเจ้าจึงล้มใน 0 ms) · manual + เช็ก !r.ok ข้างล่าง = ไม่ตาม redirect ที่พาคีย์ไปเว็บอื่น */
+    const r = await fetchFn(url, { ...init, signal: ac.signal, redirect: 'manual' });
     const text = await requestText(r,2*1024*1024);
     let data = null; try { data = JSON.parse(text) } catch {}
     if (!r.ok) throw Object.assign(Error((data && (data.error || data.detail || data.message)) || 'HTTP ' + r.status), { status: r.status });

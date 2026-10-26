@@ -4,7 +4,6 @@ import {fixture} from './tech-fixtures.mjs';
 import worker from '../src/worker.js';
 import {validQuery, merge, field, specAI} from '../src/carspec.js';
 import {decodeVin, cleanInfo} from '../src/vin.js';
-import {chatModels} from '../src/fastai.js';
 
 /* คลังสเปกรถ: ค้นจริงครั้งเดียว ทุกคนใช้ร่วมกัน · Gemini และเว็บในเทสต์เป็นของปลอมทั้งหมด */
 const PAJERO={found:true,body:'suv',generation:'Gen 3 (2015–2024)',market:'ไทย',
@@ -236,7 +235,8 @@ test('car spec: "try again" really searches again; unavailable models fall back;
   const n=ai.length;
   assert.equal((await call('POST','/api/car-spec',pajero,CUST)).json.status,'failed');assert.equal(ai.length,n,'just opening again within 2 minutes reuses the result');
   /* ตอนนี้ AI กลับมาใช้ได้ แต่รุ่นที่ไม่ใช่ของแชตใช้ไม่ได้ทั้งหมด และบางรุ่นไม่รับค่าการคิด */
-  const real=globalThis.fetch,main=chatModels(f.env).slice(0,2),seen=[];
+  /* ใช้ได้เฉพาะรุ่นท้ายแถว (รุ่นของแชต) — รุ่นก่อนหน้าทั้งหมดตอบ 404 */
+  const real=globalThis.fetch,main=specAI(f.env).models.slice(-2),seen=[];
   globalThis.fetch=async(url,init={})=>{const u=String(url);
     if(u.includes('generativelanguage')){const m=u.split('/models/')[1].split(':')[0],body=JSON.parse(init.body);seen.push({m,think:!!body.generationConfig.thinkingConfig});
       if(!main.includes(m))return new Response('model not found',{status:404});

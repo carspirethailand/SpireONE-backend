@@ -24,15 +24,16 @@ test('one model returning 429 does not park every model in the project',async()=
   globalThis.fetch=async(url,request)=>{calls.push(url);return url.includes('gemini-3.8-flash')?limited():success(false);};
   try{
     const result=await fastAnswer(env('quota-fixture'),{...opts,question:'Test-only fresh question',executeSearch:async()=>'[ผลค้นเว็บ fixture]'});
-    assert.equal(result.model,'gemini-2.5-flash');assert.equal(result.grounded,true);
-    assert.ok(calls.some(url=>url.includes('gemini-2.5-flash')));
+    assert.equal(result.model,'gemini-3.1-flash-lite');assert.equal(result.grounded,true);
+    assert.ok(calls.some(url=>url.includes('gemini-3.1-flash-lite')));
+    assert.ok(!calls.some(url=>url.includes('gemini-2.5-flash')),'gemini-2.5-flash ปิดให้ผู้ใช้ใหม่แล้ว (404) ไม่ต้องลอง');
   }finally{globalThis.fetch=original;unpark();}
 });
 test('model availability cooldowns are also scoped to credentials',async()=>{
   unpark();const original=globalThis.fetch,calls=[];
   globalThis.fetch=async(url,request)=>{const key=request.headers['x-goog-api-key'];calls.push({key,url});return key==='restricted-fixture'&&url.includes('gemini-3.8-flash')?new Response('Model not found',{status:404}):success(true);};
   try{
-    assert.equal((await fastAnswer(env('restricted-fixture'),opts)).model,'gemini-2.5-flash');
+    assert.equal((await fastAnswer(env('restricted-fixture'),opts)).model,'gemini-3.1-flash-lite');
     assert.equal((await fastAnswer(env('enabled-fixture'),opts)).model,'gemini-3.8-flash');
   }finally{globalThis.fetch=original;unpark();}
 });
