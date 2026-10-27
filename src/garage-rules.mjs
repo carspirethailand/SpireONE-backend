@@ -111,10 +111,16 @@ export function costReferences(rows,now=Date.now()){
 const INFO_ENUMS={market:['TH','JP','US','UK','DE','AU','EU','GLOBAL'],drive:['FWD','RWD','AWD','4WD'],gear:['อัตโนมัติ','ธรรมดา','CVT','DCT','AT','MT','Automatic','Manual'],fuel:['เบนซิน','ดีเซล','ไฮบริด','ปลั๊กอินไฮบริด','ไฟฟ้า','แก๊ส','petrol','diesel','hybrid','phev','ev','lpg']};
 const PROVINCES='กรุงเทพมหานคร กระบี่ กาญจนบุรี กาฬสินธุ์ กำแพงเพชร ขอนแก่น จันทบุรี ฉะเชิงเทรา ชลบุรี ชัยนาท ชัยภูมิ ชุมพร เชียงราย เชียงใหม่ ตรัง ตราด ตาก นครนายก นครปฐม นครพนม นครราชสีมา นครศรีธรรมราช นครสวรรค์ นนทบุรี นราธิวาส น่าน บึงกาฬ บุรีรัมย์ ปทุมธานี ประจวบคีรีขันธ์ ปราจีนบุรี ปัตตานี พระนครศรีอยุธยา พะเยา พังงา พัทลุง พิจิตร พิษณุโลก เพชรบุรี เพชรบูรณ์ แพร่ ภูเก็ต มหาสารคาม มุกดาหาร แม่ฮ่องสอน ยโสธร ยะลา ร้อยเอ็ด ระนอง ระยอง ราชบุรี ลพบุรี ลำปาง ลำพูน เลย ศรีสะเกษ สกลนคร สงขลา สตูล สมุทรปราการ สมุทรสงคราม สมุทรสาคร สระแก้ว สระบุรี สิงห์บุรี สุโขทัย สุพรรณบุรี สุราษฎร์ธานี สุรินทร์ หนองคาย หนองบัวลำภู อ่างทอง อำนาจเจริญ อุดรธานี อุตรดิตถ์ อุทัยธานี อุบลราชธานี'.split(' ');
 const PROVINCES_EN='Bangkok|Krabi|Kanchanaburi|Kalasin|Kamphaeng Phet|Khon Kaen|Chanthaburi|Chachoengsao|Chon Buri|Chonburi|Chai Nat|Chaiyaphum|Chumphon|Chiang Rai|Chiang Mai|Trang|Trat|Tak|Nakhon Nayok|Nakhon Pathom|Nakhon Phanom|Nakhon Ratchasima|Nakhon Si Thammarat|Nakhon Sawan|Nonthaburi|Narathiwat|Nan|Bueng Kan|Buri Ram|Buriram|Pathum Thani|Prachuap Khiri Khan|Prachin Buri|Pattani|Phra Nakhon Si Ayutthaya|Ayutthaya|Phayao|Phang Nga|Phatthalung|Phichit|Phitsanulok|Phetchaburi|Phetchabun|Phrae|Phuket|Maha Sarakham|Mukdahan|Mae Hong Son|Yasothon|Yala|Roi Et|Ranong|Rayong|Ratchaburi|Lop Buri|Lopburi|Lampang|Lamphun|Loei|Si Sa Ket|Sisaket|Sakon Nakhon|Songkhla|Satun|Samut Prakan|Samut Songkhram|Samut Sakhon|Sa Kaeo|Saraburi|Sing Buri|Sukhothai|Suphan Buri|Surat Thani|Surin|Nong Khai|Nong Bua Lam Phu|Ang Thong|Amnat Charoen|Udon Thani|Uttaradit|Uthai Thani|Ubon Ratchathani'.toLowerCase().split('|');
+function engineCode(s){
+  // Shape checks are not proof that this code belongs to this vehicle.
+  const code=s.toUpperCase(),core=code.replace(/[ ./-]/g,'');
+  if(!/^[A-Z0-9]+(?:[ ./-][A-Z0-9]+)*$/.test(code)||core.length<2||core.length>14||!/[A-Z]/.test(core)||/([A-Z0-9])\1{3}/.test(core)||/[A-Z]{6}/.test(core)||/\d{6}/.test(code)||(!/\d/.test(core)&&core.length>5))return false;
+  return !['QWERTYUIOP','ASDFGHJKL','ZXCVBNM'].some(row=>[row,[...row].reverse().join('')].some(r=>Array.from({length:r.length-3},(_,i)=>r.slice(i,i+4)).some(run=>core.includes(run))));
+}
 function detailField(k,s,input){
   if(INFO_ENUMS[k]&&!INFO_ENUMS[k].includes(s))fail(k,'เลือกค่าจากรายการ / Choose a supported option');
   if(k==='engine'&&!/\d|ดีเซล|เบนซิน|ไฟฟ้า|ไฮบริด|แก๊ส|diesel|petrol|gasoline|electric|hybrid|rotary/i.test(s))fail(k,'ระบุชนิดหรือขนาดเครื่องจากคู่มือ หรือเว้นว่าง / Use a documented engine type or size, or leave blank');
-  if(k==='engine_code'&&(!/^[A-Za-z0-9][A-Za-z0-9 ./-]{1,24}$/.test(s)||!(/\d/.test(s)||/^[A-Z]{2,5}$/.test(s))))fail(k,'ใช้รหัสเครื่องจากคู่มือ เช่น 1KD-FTV หรือเว้นว่าง / Use the documented engine code or leave blank');
+  if(k==='engine_code'&&!engineCode(s))fail(k,'ใช้รหัสเครื่องจากคู่มือ เช่น 1KD-FTV, K20C1 หรือเว้นว่าง / Use a documented engine code or leave blank');
   if(k==='plate'&&(!/^[\p{L}\p{N} -]{2,20}$/u.test(s)||!/[0-9๐-๙]/.test(s)))fail(k,'ตรวจรูปแบบทะเบียนรถ / Check the plate format');
   if(k==='province'&&(!input.market||input.market==='TH')&&!PROVINCES.includes(s.replace(/^จังหวัด|^จ\.\s*/,'').trim())&&!PROVINCES_EN.includes(s.toLowerCase()))fail(k,'ใช้ชื่อจังหวัดจริง เช่น กรุงเทพมหานคร / Use a valid province name');
   if(k==='tire'&&!/^(?:(?:[1-4]\d{2})\/(?:[2-9]\d)\s*(?:ZR|R|-)\s*(?:1\d|2\d)(?:\s*\d{2,3}[A-Z])?|(?:[6-9]\d|1\d{2})\/(?:[5-9]\d|100)\s*(?:R|-)\s*(?:1\d|2\d)|\d{1,2}\.\d{2}\s*(?:R|-)\s*(?:1\d|2\d))$/i.test(s))fail(k,'ตรวจขนาดยาง เช่น 265/60 R18 / Check the tyre size');
@@ -126,13 +132,13 @@ function infoPatch(input,previous={}){
   for(const [k,v] of Object.entries(input)){
     if(!Object.hasOwn(INFO_FIELDS,k))continue;
     if(Object.hasOwn(previous||{},k)&&v===previous[k]){out[k]=v;continue}
-    if(typeof v!=='string'||Array.from(v).length>INFO_FIELDS[k]||/[\u0000-\u001f\u202a-\u202e]/.test(v))fail('info','ข้อมูลยาวหรือรูปแบบไม่ถูกต้อง / Invalid detail length or format');
+    if(k==='model_year'&&v!==''&&(typeof v!=='string'||!/^\d{4}$/.test(v.trim())||+v<1950||+v>new Date().getFullYear()+1))fail(k,'ปีรุ่นไม่ถูกต้อง / Invalid model year');
+    if(typeof v!=='string'||Array.from(v).length>INFO_FIELDS[k]||/[\u0000-\u001f\u202a-\u202e]/.test(v))fail(k,'ข้อมูลยาวหรือรูปแบบไม่ถูกต้อง / Invalid detail length or format');
     const s=v.normalize('NFC').trim();if(!s){out[k]='';continue}
     if(k==='vin'&&!/^[A-HJ-NPR-Z0-9]{17}$/.test(s.toUpperCase().replace(/[\s-]/g,'')))fail('vin','เลขตัวถังไม่ถูกต้อง / Invalid VIN');
-    if(k==='model_year'&&(!/^\d{4}$/.test(s)||+s<1950||+s>new Date().getFullYear()+1))fail('year','ปีรุ่นไม่ถูกต้อง / Invalid model year');
     detailField(k,s,input);
-    if(/_due$/.test(k))date(s);
-    if(!['vin','plate','model_year','tax_due','ins_due','tire','engine_code'].includes(k))label(s,INFO_FIELDS[k],1);
+    if(/_due$/.test(k)){try{date(s)}catch(e){e.field=k;throw e}}
+    if(!['vin','plate','model_year','tax_due','ins_due','tire','engine_code'].includes(k)){try{label(s,INFO_FIELDS[k],1)}catch(e){e.field=k;throw e}}
     out[k]=k==='vin'?s.toUpperCase().replace(/[\s-]/g,''):s;
   }
   return out;
