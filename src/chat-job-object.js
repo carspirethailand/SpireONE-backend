@@ -6,6 +6,7 @@ export class CendonChatJobs extends DurableObject {
   create(uid,actor,body){return this.jobs.create(uid,actor,body)}
   list(uid){return this.jobs.list(uid)}
   read(uid,id){return this.jobs.read(uid,id)}
+  stream(uid,id){return this.jobs.stream(uid,id)}
   cancel(uid,id){return this.jobs.cancel(uid,id)}
   purge(uid){return this.jobs.purge(uid)}
   alarm(){return this.jobs.alarm()}

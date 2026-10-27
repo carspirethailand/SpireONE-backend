@@ -10,7 +10,7 @@ import { ONBOARDING_SQL, handleOnboarding, onboardingName, sanitizeSetupState } 
 import { buildFeatureRequest, cleanFeatureJson, featureCap } from './features-ai.mjs';
 import { soundText, legacySound, audioIdentity, VEHICLE_AUDIO_RULES } from './vehicle-audio.mjs';
 import {publicResearch, publicQuery, soundResearchQuery, researchBlock} from './vehicle-research.mjs';
-import { configuredProviders, providerOrder, benchSearch, searchWeb, sourcesBlock, sourceCards, BENCH_QUERIES } from './web-search.mjs';
+import { configuredProviders, providerOrder, benchSearch, searchWeb, searchForChat, searchKind, sourceCards, SEARCH_ROUTES, searchRoute, BENCH_QUERIES } from './web-search.mjs';
 import { engineScanFailure } from './engine-scan-errors.mjs';
 import { liveToken, cleanHandle } from './live-setup.mjs';
 import { valetPrompt } from './agent-prompt.mjs';
@@ -30,7 +30,8 @@ import { confirmedMileage, applyConfirmedMileage } from './odo-sync.mjs';
 import { decodeVin, vpic, cleanInfo } from './vin.js';
 import { LINE_AI, LINE_TALK, LINE_MARK, linePlain, lineChunks, lineCodeIn } from './line-chat.js';
 import { handleVec, kbScores, refreshKb } from './vectors.js';
-import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels, toChatHistory, levelFor, depthNote, featuresBlock, badState, geminiScope, unpark, executeSearchInternal } from './fastai.js';
+import { resolveSubject, subjectBlock, searchCarFor, carName } from './chat-subject.mjs';
+import { fastAnswer, fallbackAnswer, fallbackProviders, stripToolCalls, probeAll, toGeminiContents, thinkingFor, smartBlock, FORCE_SEARCH, chatModels, toChatHistory, levelFor, depthNote, featuresBlock, badState, geminiScope, unpark, unparkShared, syncHealth, executeSearchInternal } from './fastai.js';
 
 /*
  * SpireONE backend — security-hardened.
@@ -45,12 +46,32 @@ export async function generateChatAnswer(env, actor, body, send, lifecycle={}) {
   const uid = actor.payload.sub;
             const meter = newMeter();
             const t0 = Date.now();
+            const trail = (m, x) => (m.trail = m.trail || []).push({ at: Date.now(), ...x });
+            let failed = false, cut = false, cacheCar = null;
             let text = '', question = '', hasMedia = false, carInfo = null;
             try {
               const msgs = body.contents || [];
               const lastMsg = msgs.length ? msgs[msgs.length - 1] : null;
               question = (lastMsg && lastMsg.parts) ? lastMsg.parts.map(x => x.text || '').join(' ').trim() : '';
               hasMedia = msgs.some(m => m.parts && m.parts.some(x => x.inline_data || x.inlineData));
+              /* ── สถานะทีละขั้น (type:'step') ให้หน้าแชตเห็นว่า AI กำลังทำอะไรจริง ──
+                 ผู้ใช้เห็นแค่ชื่อขั้นแบบภาษาคน · ชื่อรุ่น/เหตุผลเชิงเทคนิค (dev) ส่งเฉพาะแอดมิน */
+              const isDev = rank(actor.role) >= rank('admin');
+              const step = async (id, state, extra = {}) => {
+                const { dev, ...rest } = extra;
+                await send({ type: 'step', id, state, at: Date.now() - t0, ...rest, ...(isDev && dev ? { dev } : {}) });
+              };
+              /* แต่ละแหล่งข้อมูลมีเวลาของมันเอง ช้าเกินก็ข้าม — ข้อมูลเสริมไม่ควรทำให้ทั้งคำตอบช้า */
+              const CTX_MS = 2500;
+              const timed = async (id, work, count) => {
+                const s0 = Date.now(); await step(id, 'start');
+                let late = false, timer;
+                const out = await Promise.race([Promise.resolve(work).catch(() => ''), new Promise(r => { timer = setTimeout(() => { late = true; r('') }, CTX_MS) })]);
+                clearTimeout(timer);
+                const n = !late && count ? count(out) : undefined;
+                await step(id, late ? 'skip' : 'done', { ms: Date.now() - s0, ...(n != null ? { n } : {}) });
+                return out;
+              };
               await send({ type: 'status', key: 'context', text: 'กำลังดูข้อมูลรถและประวัติของคุณ' });
 
               /* ── รวบรวมบริบททั้งหมดพร้อมกัน ── (ของเดิมรอทีละคำสั่ง ราวสิบรอบก่อนเริ่มคิด) */
@@ -75,32 +96,54 @@ export async function generateChatAnswer(env, actor, body, send, lifecycle={}) {
                 }
                 return ci;
               })();
-              const [ci, kbBlock, userBlock, prefs, skillBlock, specCtx] = await Promise.all([
-                carP,
-                carP.then(c => kbFor(env, c, question)),
-                userContext(env, uid, body.carId, { userName: body.userName }),
+              const blocks = t => String(t || '').split(/\n— .+ —\n/).length - 1;
+              /* ถามถึงรถคันไหน (ไม่ใช่รถในการาจเสมอไป) — ตัดสินจากคำถาม + ข้อความก่อนหน้า */
+              const subjP = carP.then(c => resolveSubject(question, c, priorUserTexts(msgs)));
+              const [ci, kbBlock, userBlock, prefs, skillBlock, specCtx, subj] = await Promise.all([
+                (async () => { await step('car', 'start'); const c = await carP, sj = await subjP, other = sj.mode === 'other' || sj.mode === 'both';
+                  await step('car', 'done', { car: (other ? carName(sj.subject) : carName(c)).slice(0, 60), ...(other ? { other: true, mode: sj.mode } : {}) }); return c })(),
+                timed('kb', subjP.then(sj => carP.then(c => kbFor(env, kbCarOf(sj, c), question))), blocks),
+                timed('history', userContext(env, uid, body.carId, { userName: body.userName })),
                 getChatPrefs(env, uid),
                 skillsPrompt(env, uid, body.skillIds),
-                carP.then(c => chatSpecContext(env, uid, body.carId, c, question)),
+                timed('spec', subjP.then(sj => carP.then(c => subjectSpec(env, uid, body.carId, sj, c, question)))),
+                subjP,
               ]);
               carInfo = ci;
+              const searchCar = searchCarFor(subj);
+              /* คำตอบเรื่องรถคันอื่นเก็บในคลังคำตอบของคันนั้น · เทียบสองคันไม่เก็บ (ผูกกับรถของคนนี้) */
+              cacheCar = subj.mode === 'both' ? null : subj.mode === 'other' ? kbCarOf(subj, ci) : ci;
               const activeStyle = (body.style && (CHAT_STYLES[body.style] || body.style === 'custom')) ? body.style : prefs.style;
               const activeCustom = body.customStyle !== undefined ? String(body.customStyle) : prefs.customStyle;
 
               const fresh = !!question && needsFresh(question);
-              const carContext = (carInfo.make || carInfo.model)
-                ? `\nรถของผู้ใช้: ${carInfo.make || ''} ${carInfo.model || ''} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` : '';
+              const carContext = subjectBlock(subj, carInfo);
               /* ส่วนที่เหมือนกันทุกข้อความไว้หน้า ส่วนที่เปลี่ยนไว้หลัง — Gemini จำส่วนหน้าไว้ได้ ตอบรอบถัดไปเร็วขึ้น */
               const sys = `${IDENTITY}
 
 ${STREAM_TALK}${featuresBlock()}${valetPrompt(body)}${smartBlock()}${stylePrompt(activeStyle, activeCustom)}${depthNote(body.depth)}
-${carContext ? `\n[รถที่กำลังคุยถึง]${carContext}${specCtx}` : ''}${userBlock}${kbBlock}${skillBlock}${fresh ? FORCE_SEARCH : ''}${languageRule(body.lang)}`;
+${carContext}${specCtx || ''}${userBlock}${kbBlock}${skillBlock}${fresh ? FORCE_SEARCH : ''}${languageRule(body.lang)}`;
 
               await send({ type: 'status', key: fresh ? 'search' : (hasMedia ? 'media' : 'think'),
                 text: fresh ? 'กำลังค้นข้อมูลล่าสุด' : hasMedia ? 'กำลังดูไฟล์ที่แนบมา' : 'กำลังคิด' });
 
               /* ── คำตอบ: เรียก Gemini ครั้งเดียว ค้นเว็บ ดูรูป คิด และสตรีมออกมาในตัว ── */
-              let firstText = true;
+              let firstText = true, thinking = false, firstAt = 0;
+              const sourcesOf = block => {
+                const out = [], re = /\n\[(\d+)\] (.+?) — ([^\s(]+)(?: \([^)]*\))?\n(https?:\/\/\S+)/g; let m;
+                while ((m = re.exec(String(block || ''))) && out.length < 8) out.push({ title: m[2].slice(0, 120), host: m[3].slice(0, 80), url: m[4].slice(0, 400) });
+                return out;
+              };
+              const onPhase = async (name, info) => {
+                if (name === 'attempt' || name === 'hedge') {
+                  if (!thinking) { thinking = true; await step('think', 'start', { dev: { model: info.model } }) }
+                  else if (name === 'hedge') await step('think', 'backup', { dev: { model: info.model } });
+                  else if (info.fallback) await step('think', 'backup', { dev: { model: info.model } });
+                } else if (name === 'fail') await step('think', 'retry', { dev: { model: info.model, why: info.why } });
+                else if (name === 'first') await step('think', 'done', { ms: info.ms, dev: { model: info.model, hedged: !!info.hedged } });
+                else if (name === 'fallback') await step('think', 'backup', { dev: { why: info.why } });
+                else if (name === 'continue') await step('check', 'continue', { dev: { why: info.why } });
+              };
               try {
                 const r = await fastAnswer(env, {
                   system: sys,
@@ -110,22 +153,40 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                   question,
                   hasMedia,
                   carInfo,
-                  search: fresh, externalSearch: true,
-                  executeSearch: async (q) => await executeGoogleSearchTool(env, q),
+                  search: fresh,
+                  executeSearch: async (q) => {
+                    const s0 = Date.now(), block = await executeWebSearchTool(env, q, { car: searchCar, depth: body.depth, meter }).catch(() => '');
+                    const found = sourcesOf(block);
+                    if (found.length) await send({ type: 'sources', items: found });
+                    await step('search', block ? 'done' : 'fail', { ms: Date.now() - s0, n: found.length });
+                    return block;
+                  },
                   executeMedia: async (p) => await executeDescribeMediaTool(env, msgs, p),
-                  executeKb: async (q) => await kbFor(env, carInfo, q),
+                  executeKb: async (q) => await kbFor(env, kbCarOf(subj, carInfo), q),
                   depth: body.depth, level: levelFor(body.depth, question, hasMedia, body.skillIds), meter,
-                  onSearch: async q => { await send({ type: 'research', q: String(q).slice(0, 120) }); await send({ type: 'status', key: 'search', text: 'กำลังค้น: ' + String(q).slice(0, 60) }) },
+                  onSearch: async q => { await step('search', 'start', { q: String(q).slice(0, 120) }); await send({ type: 'research', q: String(q).slice(0, 120) }); await send({ type: 'status', key: 'search', text: 'กำลังค้น: ' + String(q).slice(0, 60) }) },
+                  onPhase,
                   onText: async d => {
-                    if (firstText) { firstText = false; await send({ type: 'status', key: 'write', text: 'กำลังเขียนคำตอบ' }); }
+                    if (firstText) { firstText = false; firstAt = Date.now(); await step('write', 'start'); await send({ type: 'status', key: 'write', text: 'กำลังเขียนคำตอบ' }); }
                     await send({ type: 'text', delta: d });
                   },
                 });
                 text = r.text;
+                if (!firstText) await step('write', 'done', { len: text.length });
+                cut = !!r.partial;
+                await step('check', r.partial ? 'fail' : 'done');
+                if (r.partial) await send({ type: 'notice', kind: 'cut' });
+                trail(meter, { kind: 'sum', ttft: firstAt ? firstAt - t0 : null, len: text.length, cut: !!r.partial, fb: !!r.fallback });
               } catch (e) {
                 console.error('[stream fast] request_failed');
                 noteAiError(env, e);
-                const errMsg = 'ขออภัยครับ ขณะนี้ระบบประมวลผล AI กำลังมีผู้ใช้งานหนาแน่น กรุณาลองใหม่อีกครั้งในอีกสักครู่ครับ';
+                await step('think', 'fail');
+                await send({ type: 'notice', kind: 'failed' });
+                trail(meter, { kind: 'sum', ttft: null, len: 0, fail: true });
+                failed = true;
+                /* บอกตรง ๆ ว่าลองครบแล้ว — หน้าแชตขึ้นปุ่ม "ลองอีกครั้ง" จาก notice:failed */
+                const errMsg = body.lang === 'en' ? 'Cendon AI could not answer right now — every route was tried. Tap "Try again" in a moment.'
+                  : 'ตอนนี้ Cendon AI ตอบไม่ได้ชั่วคราว (ลองครบทุกเส้นทางแล้ว) กด "ลองอีกครั้ง" ได้เลยครับ';
                 if (firstText) {
                   firstText = false;
                   await send({ type: 'status', key: 'write', text: 'ระบบ AI ขัดข้องชั่วคราว' });
@@ -145,7 +206,7 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
               } catch (e) {}
               await send({ type: 'done', usage });
               const okStep = (meter.trail || []).filter(x => x.ok).pop();
-              logAiEvent(env, { uid, ok: true, ms: Date.now() - t0, model: okStep ? okStep.model + (okStep.grounded ? ' +ค้นเว็บ' : '') : (meter.src || []).join(','),
+              logAiEvent(env, { uid, ok: !failed, ms: Date.now() - t0, model: okStep ? okStep.model + (okStep.grounded ? ' +ค้นเว็บ' : '') : (meter.src || []).join(','),
                 trail: meter.trail, q: question, depth: body.depth, cost: meter.in + meter.out });
             } catch (err) {
               console.error('[stream] request_failed');
@@ -154,12 +215,13 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
             }
 
             /* งานเก็บกวาด — ผู้ใช้ได้คำตอบครบไปแล้ว ไม่ต้องรอส่วนนี้ */
-            if (text && carInfo && (!lifecycle.active || await lifecycle.active())) {
+            /* คำตอบที่ล้ม/ถูกตัด ไม่เก็บเป็นคำตอบสำเร็จรูปหรือความจำ (ของเดิมเก็บข้อความขอโทษไว้ใช้ซ้ำได้) */
+            if (text && carInfo && !failed && !cut && (!lifecycle.active || await lifecycle.active())) {
               try {
                 const day = new Date().toISOString().slice(0, 10);
                 await Promise.all([
                   (!hasMedia && !(body.skillIds && body.skillIds.length) && !needsFresh(question))
-                    ? cacheSave(env, carInfo, question, text, uid) : null,
+                    && cacheCar ? cacheSave(env, cacheCar, question, text, uid) : null,
                   rememberTurn(env, uid, body.carId, question, text),
                   env.DB.prepare(`
                     INSERT INTO chat_logs (uid, car_id, prompt, response, in_tok, out_tok, total_tok, model, day, created_at)
@@ -200,7 +262,7 @@ export async function analyzeFeature(env, actor, body, {signal}={}) {
   let research;
   if(body.tool==='ear'||body.tool==='listen'){
     const q=soundResearchQuery(audioIdentity(body.context));
-    research=q?await publicResearch(q,{signal,vehicle:audioIdentity(body.context).vehicle}):{status:'needs_vehicle',sources:[],verifiedModelFaults:[]};
+    research=q?await publicResearch(q,{env,signal,vehicle:audioIdentity(body.context).vehicle}):{status:'needs_vehicle',sources:[],verifiedModelFaults:[]};
     input.contents[0].parts[0].text+=researchBlock(research);
   }
   const prefer = (body.tool === 'bay' || body.tool === 'baylive') && env.GEMINI_VISION_MODEL ? [env.GEMINI_VISION_MODEL] : undefined;
@@ -806,6 +868,20 @@ async function getConfig(env, key, fallback) {
   } catch { return fallback; }
 }
 
+/* อ่านหลายค่าในคำสั่งเดียว — ทุกคำสั่งที่ไปฐานข้อมูลคือการเดินทางไปกลับหนึ่งรอบ (/api/config เคยอ่านทีละค่า 5 รอบต่อกัน) */
+async function getConfigs(env, defaults) {
+  const keys = Object.keys(defaults), out = {}, miss = [];
+  for (const k of keys) { const hit = CONFIG_CACHE.get(k); if (hit && Date.now() - hit.t < 15000) out[k] = hit.v === undefined ? defaults[k] : hit.v; else miss.push(k); }
+  if (miss.length) {
+    try {
+      const { results } = await env.DB.prepare(`SELECT key, value FROM config WHERE key IN (${miss.map(() => '?').join(',')})`).bind(...miss).all();
+      const rows = new Map((results || []).map(r => [r.key, r.value]));
+      for (const k of miss) { let v; try { v = rows.get(k) ? JSON.parse(rows.get(k)) : undefined; } catch { v = undefined; } CONFIG_CACHE.set(k, { v, t: Date.now() }); out[k] = v === undefined ? defaults[k] : v; }
+    } catch { for (const k of miss) out[k] = defaults[k]; }
+  }
+  return out;
+}
+
 async function setConfig(env, key, value) {
   CONFIG_CACHE.delete(key);
   await env.DB.prepare(
@@ -994,7 +1070,12 @@ async function tokensToday(env, uid) {
 }
 
 /* ===== Gemini (server-side only — key never leaves the Worker) ===== */
+/* search = { q, kind } — ค้นผ่านตัวค้นของ AI (web-search.mjs) ก่อน แล้วแนบผลไว้ท้าย system (ไม่ใช้ Google Search ของ Gemini แล้ว จึงใช้คู่กับ JSON ได้) */
 async function callGemini(env, { contents, system, search, temp, json: wantJson, maxTokens, meter, prefer, schema, timeoutMs }) {
+  if (search && typeof search === 'object' && search.q) {
+    const web = await searchForChat(env, search.q, { kind: search.kind, meter });
+    system = String(system || '') + '\n\n' + (web || '[ค้นเว็บไม่ได้ในรอบนี้ — ห้ามเดาราคา ข่าว หรือตัวเลขล่าสุด ให้บอกตรง ๆ ว่ายังยืนยันไม่ได้]');
+  }
   const hasAudio=(contents||[]).some(m=>(m.parts||[]).some(p=>/^audio\//i.test((p.inlineData||p.inline_data)?.mimeType||(p.inline_data||{}).mime_type||'')));
   if(hasAudio&&!String(system||'').includes(VEHICLE_AUDIO_RULES))system=VEHICLE_AUDIO_RULES+'\n'+String(system||'');
   const geminiKey = env.GEMINI_KEY;
@@ -1025,9 +1106,7 @@ async function callGemini(env, { contents, system, search, temp, json: wantJson,
       else if (/2\.5/.test(model)) gen.thinkingConfig = { thinkingBudget: 0 };
     }
     const body = { contents, generationConfig: gen };
-    if (system) body.systemInstruction = { parts: [{ text: String(system).slice(0, 8000) }] };
-    // The search tool and a forced JSON mime type cannot be combined.
-    if (search && !wantJson) body.tools = [{ google_search: {} }];
+    if (system) body.systemInstruction = { parts: [{ text: String(system).slice(0, search ? 16000 : 8000) }] };
 
     try {
       const res = await fetch(url, {
@@ -1298,7 +1377,7 @@ const DEFAULT_SKILLS = [
 - รวมช่วงราคาต่ำสุด-สูงสุด เป็นเงินบาท
 - เทียบให้เห็นว่าศูนย์บริการกับอู่ทั่วไปต่างกันประมาณกี่เปอร์เซ็นต์
 บอกเสมอว่าเป็นราคาประเมินในไทยโดยประมาณ ราคาจริงขึ้นกับรุ่นปีและร้าน
-ถ้าไม่มั่นใจเรื่องราคาปัจจุบัน ให้เรียก google_search ก่อนตอบ`,
+ราคาปัจจุบันใช้จากผลค้นเว็บที่แนบมา ถ้าไม่มีผลค้นให้บอกว่าเป็นราคาประเมินที่ยังยืนยันไม่ได้`,
   },
   {
     id: 'cdn_maint', slug: 'maintenance', name: 'แผนเช็กระยะ', en: 'Service plan',
@@ -1320,7 +1399,7 @@ const DEFAULT_SKILLS = [
 - เสนอของเทียบที่คุณภาพใช้ได้ พร้อมยี่ห้อที่คนไทยใช้กันจริง
 - เตือนจุดที่ซื้อผิดบ่อย เช่น ปีรุ่นย่อย เครื่องคนละบล็อก ขั้วปลั๊กคนละแบบ
 - บอกว่าควรเปลี่ยนคู่กับอะไรในคราวเดียวเพื่อไม่ต้องรื้อซ้ำ
-ถ้าต้องการราคาหรือความพร้อมของสินค้าปัจจุบัน ให้เรียก google_search`,
+ราคาหรือความพร้อมของสินค้าปัจจุบัน ใช้จากผลค้นเว็บที่แนบมาเท่านั้น ถ้าไม่มีผลค้นให้บอกว่ายังยืนยันราคาปัจจุบันไม่ได้`,
   },
   {
     id: 'cdn_photo', slug: 'photo', name: 'อ่านภาพ/วิดีโอ', en: 'Read media',
@@ -1340,7 +1419,7 @@ const DEFAULT_SKILLS = [
 - แบ่งเป็น ภายนอก / ภายใน / ห้องเครื่อง / ทดลองขับ / เอกสาร
 - แต่ละข้อบอกว่า "ถ้าเจอแบบนี้ = ต่อราคาได้" หรือ "ถ้าเจอแบบนี้ = ควรเดินหนี"
 - ใส่จุดอ่อนเฉพาะรุ่นที่ผู้ใช้ถามด้วย ถ้ารู้
-- ปิดท้ายด้วยราคากลางของรุ่นนั้นในตลาดมือสองไทย (ใช้ google_search ถ้าจำเป็น)`,
+- ปิดท้ายด้วยราคากลางของรุ่นนั้นในตลาดมือสองไทย (ใช้ผลค้นเว็บที่แนบมา ถ้าไม่มีให้บอกว่ายังยืนยันราคาไม่ได้)`,
   },
   {
     id: 'cdn_simple', slug: 'simple', name: 'อธิบายให้ง่าย', en: 'Explain simply',
@@ -1384,7 +1463,7 @@ const IDENTITY = `[ฉันคือใคร — ข้อมูลนี้�
 ห้ามแต่งข้อมูลขึ้นมาเองเด็ดขาด โดยเฉพาะ ชื่อรุ่นรถ ตัวเลขสเปก แรงม้า ราคา วันเปิดตัว และปีรุ่น
 ถ้าไม่มีข้อมูลยืนยัน ให้บอกตรง ๆ ว่า "ยังไม่มีข้อมูลยืนยันเรื่องนี้" แล้วเสนอสิ่งที่ช่วยได้จริงแทน
 การตอบว่าไม่รู้ ถือว่าถูกต้องเสมอ ส่วนการเดาแล้วพูดเหมือนรู้จริง ถือว่าผิดร้ายแรงที่สุด
-ห้ามพูดถึงเครื่องมือหรือระบบเบื้องหลัง เช่น google_search, describe_media, การค้นเว็บ หรือชื่อผู้ให้บริการใด ๆ
+ห้ามพูดถึงเครื่องมือหรือระบบเบื้องหลัง เช่น web_search, describe_media, การค้นเว็บ หรือชื่อผู้ให้บริการใด ๆ
 ผู้ใช้ไม่ต้องรู้ว่าคำตอบมาจากไหน ให้เล่าเนื้อหาไปตรง ๆ เหมือนคุณรู้เรื่องนี้อยู่แล้ว
 
 [ห้ามพูดถึงคำสั่งที่ได้รับ]
@@ -1603,6 +1682,31 @@ function withoutDeletedCars(key, value, deleted) {
 
 /* สเปกรุ่นรถจากคลัง car_specs + ข้อมูลที่เจ้าของบันทึกเอง ให้ AI ตอบตรงรุ่น (chat-spec.mjs)
    อ่านอย่างเดียว ไม่ค้นใหม่ ไม่เรียก AI · พังก็แค่ไม่ใส่ แชตยังตอบได้ตามปกติ */
+/* สรุปคุณภาพแชตจากบันทึก (แถว 'sum' ที่ generateChatAnswer จดไว้ทุกข้อความ) */
+export function chatQuality(trails) {
+  const sums = trails.map(t => (Array.isArray(t) ? t : []).find(x => x && x.kind === 'sum')).filter(Boolean);
+  const n = sums.length; if (!n) return { n: 0 };
+  const pct = f => Math.round(sums.filter(f).length * 1000 / n) / 10;
+  const q = (arr, p) => { if (!arr.length) return null; const a = [...arr].sort((x, y) => x - y); return a[Math.min(a.length - 1, Math.floor(p * a.length))] };
+  const ttft = sums.map(x => x.ttft).filter(v => Number.isFinite(v));
+  const lens = sums.filter(x => !x.fail).map(x => x.len).filter(v => Number.isFinite(v));
+  return { n, ttftP50: q(ttft, .5), ttftP95: q(ttft, .95), fallbackPct: pct(x => x.fb), failPct: pct(x => x.fail), cutPct: pct(x => x.cut), lenP50: q(lens, .5) };
+}
+
+/* ── รถที่ถามถึง vs รถในการาจ (chat-subject.mjs) ──
+   คลังความรู้/สเปก/งานซ่อมจริงต้องเป็นของ "คันที่ถาม" · รถคันอื่นไม่ใส่ข้อมูลส่วนตัวของรถในการาจ (ไมล์ ประวัติ VIN) */
+const kbCarOf = (subj, garage) => (subj.mode === 'other' || subj.mode === 'both') ? { year: '', ...subj.subject } : garage;
+async function subjectSpec(env, uid, carId, subj, garage, question) {
+  if (subj.mode === 'other') return chatSpecContext(env, null, null, kbCarOf(subj, garage), question);
+  if (subj.mode === 'both') {
+    const [mine, theirs] = await Promise.all([chatSpecContext(env, uid, carId, garage, question), chatSpecContext(env, null, null, kbCarOf(subj, garage), question)]);
+    return (mine ? `\n[ข้อมูลรถของผู้ใช้ ${carName(garage)}]${mine}` : '') + (theirs ? `\n[ข้อมูลรถที่ถามถึง ${carName(subj.subject)}]${theirs}` : '');
+  }
+  return chatSpecContext(env, uid, carId, garage, question);
+}
+const priorUserTexts = msgs => (msgs || []).filter(m => m && m.role === 'user').slice(0, -1).reverse()
+  .map(m => (m.parts || []).map(x => x.text || '').join(' ') || m.text || '').filter(Boolean);
+
 async function chatSpecContext(env, uid, carId, carInfo, question) {
   if (!carInfo || !(carInfo.make || carInfo.model)) return '';
   try {
@@ -1763,7 +1867,8 @@ const STREAM_TALK = `[วิธีคุย]
 - ใช้หัวข้อย่อยเมื่อของมันเป็นรายการจริง ๆ เท่านั้น
 - ห้ามทวนคำถาม ห้ามเกริ่นว่า "จากข้อมูลที่ให้มา" หรือ "ในฐานะผู้ช่วย AI"
 - ห้ามเขียน Thought: Action: หรือ Final Answer: เด็ดขาด ตอบเนื้อหาออกมาตรง ๆ เลย
-- ความยาวพอดีกับคำถาม ถามสั้นตอบสั้น`;
+- ความยาว: คุยเล่นหรือถามสั้น ๆ ตอบสั้น · คำถามเรื่องรถตอบให้ครบเท่าที่เกี่ยว: สาเหตุที่เป็นไปได้ วิธีเช็กเอง ความเร่งด่วน และค่าใช้จ่ายคร่าว ๆ
+- เขียนให้จบครบทุกครั้ง ห้ามตัดจบกลางรายการหรือกลางประโยค`;
 
 function askBlockText() {
   return `
@@ -1909,17 +2014,17 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
 
 [เครื่องมือภายใน — ห้ามเอ่ยชื่อให้ผู้ใช้เห็นในคำตอบ]
 1. describe_media(prompt) — บังคับใช้เมื่อมีไฟล์ภาพ วิดีโอ หรือเสียงแนบมาในแชต
-2. google_search(query) — บังคับใช้ทันทีเมื่อผู้ใช้ถามเรื่อง:
+2. web_search(query) — บังคับใช้ทันทีเมื่อผู้ใช้ถามเรื่อง:
    - ราคากลาง, ราคาขายต่อ, ราคาอะไหล่, โปรโมชั่น, หรือค่าใช้จ่าย
    - สเปกและข้อมูลรถรุ่นใหม่ (ปี 2024 - 2026, รถยนต์ไฟฟ้า EV, ไฮบริด)
    - ข่าวสารการเรียกรถคืน (Recall), ปัญหาประจำรุ่น, หรืออัปเดตยานยนต์ล่าสุด
    - กฎหมายจราจร, ภาษีรถยนต์, หรือระเบียบกรมการขนส่งทางบก
-   * ห้ามเดาตัวเลขราคาหรือสเปกจากความจำเด็ดขาด ให้เรียก google_search ก่อนเสมอ!
+   * ห้ามเดาตัวเลขราคาหรือสเปกจากความจำเด็ดขาด ให้เรียก web_search ก่อนเสมอ!
 
 [รูปแบบการเรียกใช้เครื่องมือ]
 เมื่อต้องค้นข้อมูลหรือดูสื่อ ให้เขียนตามรูปแบบนี้:
 Thought: [เหตุผลสั้น ๆ ว่าต้องค้นหาอะไร]
-Action: google_search("คำค้นที่กระชับและตรงประเด็น")
+Action: web_search("คำค้นที่กระชับและตรงประเด็น")
 (แล้วหยุดพิมพ์ทันที ระบบจะป้อน Observation กลับมาให้เอง)
 
 เมื่อได้ Observation แล้ว ให้สรุปคำตอบให้ผู้ใช้โดยขึ้นต้นว่า
@@ -1998,7 +2103,7 @@ Final Answer: [คำตอบที่สมบูรณ์ เป็นมิ�
           observation = await executeDescribeMediaTool(env, messages, toolInput);
           mediaProcessed = true;
         } else if (toolName === "google_search" || toolName === "search" || toolName === "web_search") {
-          observation = await executeGoogleSearchTool(env, toolInput);
+          observation = await executeWebSearchTool(env, toolInput, { car: carInfo, meter }) || 'ค้นเว็บไม่ได้ในรอบนี้ ยังยืนยันข้อมูลล่าสุดไม่ได้';
           searchProcessed = true;
         } else {
           observation = `Error: Unknown tool "${toolName}"`;
@@ -2019,14 +2124,13 @@ Final Answer: [คำตอบที่สมบูรณ์ เป็นมิ�
       }
       agentLog.push({ role: "user", content: `Observation: ${observation}` });
     } else if (needsFreshData && !searchProcessed && step === 1) {
-      console.log('[ReAct Agent] User question needs fresh data but explicit Action tag not generated. Executing google_search fallback...');
+      console.log('[ReAct Agent] User question needs fresh data but explicit Action tag not generated. Executing web_search fallback...');
       searchProcessed = true;
       let observation = "";
       try {
-        const carPrefix = (carInfo && (carInfo.make || carInfo.model)) ? `${carInfo.make || ''} ${carInfo.model || ''} ` : '';
-        observation = await executeGoogleSearchTool(env, `${carPrefix}${lastUserText}`);
+        observation = await executeWebSearchTool(env, lastUserText, { car: carInfo, meter });
       } catch (toolErr) {
-        observation = `Error running google_search: ${toolErr.message}`;
+        observation = `Error running web_search: ${toolErr.message}`;
       }
       if (observation) {
         agentLog.push({ role: "user", content: `Observation: ${observation}` });
@@ -2115,7 +2219,7 @@ function cleanReply(t) {
     .replace(/https?:\/\/\S*(vertexaisearch|grounding-api-redirect)\S*/gi, '')
     /* ชื่อเครื่องมือเบื้องหลังไม่ควรหลุดถึงผู้ใช้
        ตัดทั้งบรรทัดที่เอ่ยถึง ไม่ใช่ตัดแค่ชื่อ ไม่งั้นจะเหลือประโยคขาดวิ่น */
-    .replace(/^.*\b(google_search|google_search_retrieval|describe_media)\b.*$/gim, '')
+    .replace(/^.*\b(google_search|google_search_retrieval|web_search|describe_media)\b.*$/gim, '')
     .replace(/^.*(Google Search|กูเกิลเสิร์ช|ค้นหาจากเว็บ|ค้นเว็บให้แล้ว).*$/gim, '')
     /* ประโยคที่อ้างถึงคำสั่งที่ได้รับ ผู้ใช้ไม่ควรเห็น */
     .replace(/^.*(ตามที่กำหนดไว้|ตามคำสั่ง|ระบบบอกให้|ผมถูกสั่งให้|ตามข้อกำหนด|as instructed|per the instructions).*$/gim, '')
@@ -2130,7 +2234,7 @@ function cleanReply(t) {
       .replace(/Final Answer:\s*/i, '')
       .replace(/https?:\/\/\S*(vertexaisearch|grounding-api-redirect)\S*/gi, '')
       .replace(/^\s*(Thought|Action|Observation|Reasoning)\s*:.*$/gim, '')
-      .replace(/\b(google_search|google_search_retrieval|describe_media)\b/gi, 'ระบบค้นข้อมูล')
+      .replace(/\b(google_search|google_search_retrieval|web_search|describe_media)\b/gi, 'ระบบค้นข้อมูล')
       .replace(/\n{3,}/g, '\n\n')
       .trim();
   }
@@ -2213,18 +2317,11 @@ async function executeDescribeMediaTool(env, messages, prompt) {
   throw lastErr || new Error('Failed to analyze media file with Gemini API');
 }
 
-/* ── ค้นข้อมูลอินเทอร์เน็ตให้แชต ──
-   ตั้งคีย์ตัวค้น (Tavily/Exa/Firecrawl) ไว้ → ใช้ก่อน ได้ผลพร้อมเลขอ้างอิง [n]
-   ไม่มีคีย์ หรือไม่ได้ผล → ค้นสาธารณะแบบเดิม (DuckDuckGo → Bing RSS แล้วอ่านหน้าที่ robots.txt อนุญาต)
-   คำค้นต้องผ่าน publicQuery ก่อนทุกทาง — มีข้อมูลส่วนตัวปนอยู่ = ไม่ส่งออกไปที่ไหนเลย */
-export async function executeGoogleSearchTool(env, query) {
-  if (configuredProviders(env).length) {
-    try {
-      const r = await searchWeb(env, publicQuery(query), { mode: 'balanced' });
-      if (r.results.length) return '\n' + sourcesBlock(r);
-    } catch {}
-  }
-  try{return researchBlock(await publicResearch(query))}catch{return 'Public web search requires a short topic without private details. Do not invent current facts or sources.'}
+/* ── ค้นข้อมูลอินเทอร์เน็ตให้แชต (แอป · LINE · ReAct) ──
+   ผ่าน Tavily · Exa · Firecrawl ตามประเภทคำถามเท่านั้น (web-search.mjs searchForChat) — เลิกใช้ Google Search ของ Gemini, DuckDuckGo และ Bing แล้ว
+   คำค้นต้องผ่าน publicQuery ก่อนทุกครั้ง — มีข้อมูลส่วนตัวปนอยู่ = ไม่ส่งออกไปที่ไหนเลย · ไม่มีคีย์/ค้นไม่ได้ = '' */
+export async function executeWebSearchTool(env, query, { car, depth, meter } = {}) {
+  return searchForChat(env, query, { car, depth, meter });
 }
 
 function parseJsonLoose(text) {
@@ -2272,7 +2369,7 @@ const NEWS_CRON = '30 * * * *';
 
 /* ===== SHOP: AI-sourced parts & accessories ===== */
 async function getGeminiShop(env) {
-  const prompt = `ค้นเว็บหาสินค้าอะไหล่รถยนต์และของตกแต่งที่กำลังนิยมในไทยตอนนี้ จากร้านค้าออนไลน์ที่น่าเชื่อถือ (เช่น Shopee, Lazada, ร้านอะไหล่แท้ศูนย์) สรุปออกมา 12-20 รายการที่คุ้มค่าและน่าสนใจที่สุด
+  const prompt = `จากผลค้นเว็บที่แนบมา หาสินค้าอะไหล่รถยนต์และของตกแต่งที่กำลังนิยมในไทยตอนนี้ จากร้านค้าออนไลน์ที่น่าเชื่อถือ (เช่น Shopee, Lazada, ร้านอะไหล่แท้ศูนย์) สรุปออกมา 12-20 รายการที่คุ้มค่าและน่าสนใจที่สุด
 
 ตอบเป็น JSON array เท่านั้น ห้ามมีคำนำ คำอธิบาย หรือ markdown ใดๆ
 
@@ -2288,7 +2385,7 @@ async function getGeminiShop(env) {
 
   const text = await callGemini(env, {
     contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    search: true, temp: 0.4,
+    search: { q: 'อะไหล่รถยนต์ ของแต่งรถ ขายดี ราคา Shopee Lazada ' + new Date().getFullYear(), kind: 'price' }, temp: 0.4,
   });
   const parsed = parseJsonArray(text);
   if (!parsed) throw new Error('AI response is not a JSON array');
@@ -2357,11 +2454,10 @@ async function getSpares(env, { car, apps, needs, lang }) {
     temp: 0.3, maxTokens: 4096, ...opts,
   });
 
-  // Grounded search gives better prices, but it also returns prose often enough
-  // that the array will not parse. Fall back to a plain JSON-mode call, which is
-  // far more reliable, before giving up.
+  // ราคาจากผลค้นเว็บ (ตัวค้นของ AI ประเภทราคา) แนบไว้ใน system แล้วขอเป็น JSON ได้เลยในครั้งเดียว
+  // ค้นไม่ได้/แปลงไม่ได้ → ขอแบบ JSON ล้วน (ราคาประเมิน) ก่อนยอมแพ้
   let parsed = null, firstErr = '';
-  try { parsed = parseJsonArray(await ask({ search: true })); }
+  try { parsed = parseJsonArray(await ask({ search: { q: carLine + ' อะไหล่ ราคา', kind: 'price' }, json: true })); }
   catch (e) { firstErr = String(e && e.message || e); }
   if (!parsed) {
     try { parsed = parseJsonArray(await ask({ json: true })); }
@@ -3553,14 +3649,15 @@ async function lineAsk(env, ev, link, text) {
       if (c) { carId = c.id; carInfo = { make: c.make || '', model: c.model || '', year: c.year != null ? String(c.year) : '', mileage: c.mileage != null ? String(c.mileage) : '' }; }
     } catch (e) {}
   }
+  /* รถที่ถามถึงในข้อความนี้ (ไม่ใช่รถในการาจเสมอไป) */
+  const lineSubj = resolveSubject(text, carInfo, hist.filter(m => m.role === 'user').reverse().map(m => (m.parts || []).map(x => x.text || '').join(' ')));
   const [userBlock, kbBlock, specCtx] = await Promise.all([
     link ? userContext(env, link.uid, carId, { userName: name }).catch(() => '') : '',
-    kbFor(env, carInfo, text).catch(() => ''),
-    link ? chatSpecContext(env, link.uid, carId, carInfo, text) : '',
+    kbFor(env, kbCarOf(lineSubj, carInfo), text).catch(() => ''),
+    link || lineSubj.mode === 'other' ? subjectSpec(env, link && link.uid, carId, lineSubj, carInfo, text) : '',
   ]);
-  const carContext = (carInfo.make || carInfo.model)
-    ? `\n[รถที่กำลังคุยถึง]\nรถของผู้ใช้: ${carInfo.make} ${carInfo.model} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` : '';
-  const sys = `${IDENTITY}\n\n${STREAM_TALK}\n\n${LINE_TALK}${carContext}${carContext ? specCtx : ''}${userBlock || ''}${kbBlock || ''}${needsFresh(text) ? FORCE_SEARCH : ''}`;
+  const carContext = subjectBlock(lineSubj, carInfo);
+  const sys = `${IDENTITY}\n\n${STREAM_TALK}\n\n${LINE_TALK}${carContext}${specCtx || ''}${userBlock || ''}${kbBlock || ''}${needsFresh(text) ? FORCE_SEARCH : ''}`;
   const contents = [...hist, { role: 'user', parts: [{ text: text.slice(0, 2000) }] }];
   const meter = newMeter();
 
@@ -3569,10 +3666,10 @@ async function lineAsk(env, ev, link, text) {
     const r = await Promise.race([
       LINE_AI.ask(env, {
         system: sys, contents: toGeminiContents(contents), history: toChatHistory(contents), messages: contents,
-        question: text, hasMedia: false, carInfo, search: true,
-        executeSearch: async (q) => await executeGoogleSearchTool(env, q),
+        question: text, hasMedia: false, carInfo, search: needsFresh(text),
+        executeSearch: async (q) => await executeWebSearchTool(env, q, { car: searchCarFor(lineSubj), meter }),
         executeMedia: async () => '',
-        executeKb: async (q) => await kbFor(env, carInfo, q),
+        executeKb: async (q) => await kbFor(env, kbCarOf(lineSubj, carInfo), q),
         level: levelFor(undefined, text, false, []), meter,
       }),
       new Promise((_, no) => setTimeout(() => no(new Error('LINE AI timeout')), LINE_AI.timeoutMs)),
@@ -4059,15 +4156,14 @@ export default {
 
       /* ===== PUBLIC: site config (announcement / maintenance) ===== */
       if (url.pathname === '/api/config' && request.method === 'GET') {
-        const announcement = await getConfig(env, 'announcement', { enabled: false, text: '', type: 'info' });
-        const maintenance = await getConfig(env, 'maintenance', { enabled: false, message: '' });
-        const features = await getConfig(env, 'features', {});
-        const limits = await getConfig(env, 'limits', {
-          aiDaily: parseInt(env.AI_DAILY_LIMIT || '60', 10),
-          anonDaily: parseInt(env.AI_ANON_DAILY_LIMIT || '15', 10),
+        /* หน้านับถอยหลังก่อนเปิดตัว (launch): แอปอ่านค่านี้แล้วพาคนทั่วไปไปหน้า /launch จนถึงเวลา (ทีมงานเข้าแอปได้ตามปกติ) */
+        const { announcement, maintenance, features, limits, launch } = await getConfigs(env, {
+          announcement: { enabled: false, text: '', type: 'info' },
+          maintenance: { enabled: false, message: '' },
+          features: {},
+          limits: { aiDaily: parseInt(env.AI_DAILY_LIMIT || '60', 10), anonDaily: parseInt(env.AI_ANON_DAILY_LIMIT || '15', 10) },
+          launch: LAUNCH_OFF,
         });
-        /* หน้านับถอยหลังก่อนเปิดตัว: แอปอ่านค่านี้แล้วพาคนทั่วไปไปหน้า /launch จนถึงเวลา (ทีมงานเข้าแอปได้ตามปกติ) */
-        const launch = await getConfig(env, 'launch', LAUNCH_OFF);
         return json({ announcement, maintenance, features, limits, launch, now: Date.now() });
       }
 
@@ -5087,12 +5183,17 @@ export default {
           }return reply({error:'Method not allowed'},405);
         })();
       }
-      if (/^\/api\/ai\/jobs(?:\/[a-f0-9-]{36}(?:\/cancel)?)?$/.test(url.pathname)) {
+      if (/^\/api\/ai\/jobs(?:\/[a-f0-9-]{36}(?:\/cancel|\/events)?)?$/.test(url.pathname)) {
         return await guarded('user',async actor=>{
           const reply=(value,status=200)=>new Response(JSON.stringify(value),{status,headers:{...cors,'Content-Type':'application/json','Cache-Control':'private, no-store','Vary':'Authorization, Origin'}});
           if(!env.CHAT_JOBS)return reply({error:'Background answers unavailable'},503);
           const uid=actor.payload.sub,stub=env.CHAT_JOBS.getByName('user:'+uid),parts=url.pathname.split('/').slice(4);
           let result;
+          /* ช่องสด: snapshot → เหตุการณ์ทีละอย่าง (step/text/sources/notice) → end · หน้าเว็บต่อใหม่ได้เสมอ */
+          if(request.method==='GET'&&parts[1]==='events'){
+            const live=await stub.stream(uid,parts[0]);if(!live)return reply({error:'Not found'},404);
+            return new Response(live,{headers:{...cors,'Content-Type':'text/event-stream; charset=utf-8','Cache-Control':'private, no-store','X-Accel-Buffering':'no','Vary':'Authorization, Origin'}});
+          }
           if(request.method==='GET')result=parts[0]?await stub.read(uid,parts[0]):await stub.list(uid);
           else if(request.method==='POST'&&parts[1]==='cancel')result=await stub.cancel(uid,parts[0]);
           else if(request.method==='POST'&&!parts[0]){
@@ -5133,7 +5234,9 @@ export default {
           };
 
           /* งานหลักทำเบื้องหลัง ปล่อยให้ตอบกลับทันทีเพื่อให้สตรีมเริ่มไหลเลย */
-          const work = generateChatAnswer(env, actor, body, send).finally(async () => { try { await writer.close() } catch {} });
+          /* สัญญาณ "ยังทำงานอยู่" ทุก 5 วินาที — ช่วงที่โมเดลคิดนานหน้าเว็บจะไม่คิดว่าสายตาย */
+          const ping = setInterval(() => { send({ type: 'ping' }) }, 5000);
+          const work = generateChatAnswer(env, actor, body, send).finally(async () => { clearInterval(ping); try { await writer.close() } catch {} });
           ctx.waitUntil(work);
 
           return new Response(readable, {
@@ -5214,6 +5317,7 @@ export default {
               ? body.contents[body.contents.length - 1] : null;
             const question = (lastMsg && lastMsg.parts)
               ? lastMsg.parts.map(x => x.text || '').join(' ').trim() : '';
+            const chatSubj = resolveSubject(question, carInfo, priorUserTexts(body.contents));
             const hasMedia = (body.contents || []).some(m =>
               m.parts && m.parts.some(x => x.inline_data));
 
@@ -5223,7 +5327,7 @@ export default {
                หรือผู้ใช้เลือกสกิลไว้ เพราะคำสั่งเปลี่ยนคำตอบ */
             if (!hasMedia && !(body.skillIds && body.skillIds.length) && body.fresh !== true && !body.agent
                 && !needsFresh(question)) {
-              const hit = await cacheLookup(env, carInfo, question);
+              const hit = chatSubj.mode === 'both' ? null : await cacheLookup(env, kbCarOf(chatSubj, carInfo), question);
               if (hit) {
                 try {
                   await env.DB.prepare(
@@ -5238,20 +5342,19 @@ export default {
 
             const [userBlock, kbBlock, specCtx] = await Promise.all([
               userContext(env, actor.payload.sub, body.carId, { userName: body.userName }),
-              kbFor(env, carInfo, question),
-              chatSpecContext(env, actor.payload.sub, body.carId, carInfo, question),
+              kbFor(env, kbCarOf(chatSubj, carInfo), question),
+              subjectSpec(env, actor.payload.sub, body.carId, chatSubj, carInfo, question),
             ]);
 
-            /* ── เครื่องตอบเร็ว: Gemini ค้นเว็บ ดูรูป และตอบในการเรียกครั้งเดียว ──
+            /* ── เครื่องตอบเร็ว: ค้นเว็บผ่านตัวค้นของ AI ก่อน (เรื่องข้อมูลล่าสุด) แล้ว Gemini ดูรูปและตอบในการเรียกครั้งเดียว ──
                ทางเดิม (ค้นแยก + ReAct หลายรอบกับโมเดลฟรี) เก็บไว้เป็นทางสำรองสุดท้ายเท่านั้น */
             const fresh = !!(body.search === true && needsFresh(question)) || (question && needsFresh(question));
             let agentOut = null;
-            const carContext = (carInfo.make || carInfo.model)
-              ? `\nรถของผู้ใช้: ${carInfo.make || ''} ${carInfo.model || ''} ปี ${carInfo.year || '-'} เลขไมล์ ${carInfo.mileage || '-'} กม.` : '';
+            const carContext = subjectBlock(chatSubj, carInfo);
             const sys = `${IDENTITY}
 
 ${STREAM_TALK}${featuresBlock()}${valetPrompt(body)}${smartBlock()}${stylePrompt(activeStyle, activeCustomStyle)}${depthNote(body.depth)}
-${carContext ? `\n[รถที่กำลังคุยถึง]${carContext}${specCtx}` : ''}${userBlock}${kbBlock}${skillPrompt || ''}${fresh ? FORCE_SEARCH : ''}${languageRule(body.lang)}`;
+${carContext}${specCtx || ''}${userBlock}${kbBlock}${skillPrompt || ''}${fresh ? FORCE_SEARCH : ''}${languageRule(body.lang)}`;
             try {
               const r = await fastAnswer(env, {
                 system: sys,
@@ -5261,10 +5364,10 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
                 question,
                 hasMedia,
                 carInfo,
-                search: fresh, externalSearch: true,
-                executeSearch: async (q) => await executeGoogleSearchTool(env, q),
+                search: fresh,
+                executeSearch: async (q) => await executeWebSearchTool(env, q, { car: searchCarFor(chatSubj), depth: body.depth, meter }),
                 executeMedia: async (p) => await executeDescribeMediaTool(env, body.contents, p),
-                executeKb: async (q) => await kbFor(env, carInfo, q),
+                executeKb: async (q) => await kbFor(env, kbCarOf(chatSubj, carInfo), q),
                 depth: body.depth, level: levelFor(body.depth, question, hasMedia, body.skillIds),
                 meter
               });
@@ -5452,7 +5555,9 @@ ${carContext ? `\n[รถที่กำลังคุยถึง]${carContext
               return { role: m.role === 'user' ? 'user' : 'model', parts };
             });
             try { validateContents(contents); } catch (e) { return deny(e.message, 400); }
-            const text = await callGemini(env, { contents, system: systemPrompt, search: !hasMedia, temp: 0.5 });
+            /* ค้นเว็บเฉพาะคำถามเรื่องข้อมูลล่าสุด (เดิม Gemini ค้น Google เองทุกครั้งที่ไม่มีไฟล์แนบ) */
+            const lastText = String([...b.messages].reverse().find(m => m.role === 'user')?.text || '');
+            const text = await callGemini(env, { contents, system: systemPrompt, search: !hasMedia && needsFresh(lastText) ? { q: lastText, kind: searchKind(lastText) } : false, temp: 0.5 });
             return json({ text });
           }
 
@@ -5517,7 +5622,7 @@ ${convo}`;
       }
       /* ค้นเว็บของ AI: เจ้าที่ตั้งคีย์ไว้ (ไม่คืนคีย์) · ทดสอบเทียบเจ้าด้วยชุดคำค้นเรื่องรถในไทย (web-search.mjs) */
       if (url.pathname === '/api/admin/search-status' && request.method === 'GET') {
-        return await guarded('admin', async () => json({ configured: configuredProviders(env), order: providerOrder(env), queries: BENCH_QUERIES.map(x => ({ q: x.q, kind: x.kind })) }))();
+        return await guarded('admin', async () => json({ configured: configuredProviders(env), order: providerOrder(env), routes: Object.fromEntries(Object.keys(SEARCH_ROUTES).map(k => { const r = searchRoute(env, k); return [k, { ...r, providers: r.providers.filter(p => configuredProviders(env).includes(p)) }] })), queries: BENCH_QUERIES.map(x => ({ q: x.q, kind: x.kind })) }))();
       }
       if (url.pathname === '/api/admin/search-bench' && request.method === 'POST') {
         return await guarded('admin', async (actor) => {
@@ -5881,7 +5986,7 @@ ${convo}`;
       /* ── แผงผู้ดูแลแบบลอย: สถานะสดของ AI ── */
       if (url.pathname === '/api/admin/live' && request.method === 'GET') {
         return await guarded('admin', async () => {
-          let events = [], stats = { hour: 0, ok: 0, fail: 0, avgMs: 0 }, lastAiError = null;
+          let events = [], stats = { hour: 0, ok: 0, fail: 0, avgMs: 0 }, lastAiError = null, quality = null;
           try {
             const since = Date.now() - 3600000;
             const r = await env.DB.prepare('SELECT at, uid, ok, ms, model, trail, err, q, depth, cost FROM ai_events ORDER BY id DESC LIMIT 40').all();
@@ -5889,23 +5994,27 @@ ${convo}`;
             const h = events.filter(e => e.at > since);
             stats = { hour: h.length, ok: h.filter(e => e.ok).length, fail: h.filter(e => !e.ok).length,
               avgMs: h.length ? Math.round(h.reduce((a, e) => a + (e.ms || 0), 0) / h.length) : 0 };
+            /* คุณภาพของแชตจาก 300 ข้อความล่าสุด: เวลาจนตัวอักษรแรก · % ใช้ทางสำรอง · % ไม่ได้คำตอบ · % ถูกตัด */
+            const all = await env.DB.prepare('SELECT trail FROM ai_events ORDER BY id DESC LIMIT 300').all();
+            quality = chatQuality((all.results || []).map(e => { try { return JSON.parse(e.trail || '[]') } catch { return [] } }));
           } catch (e) {}
           try { const le = await env.DB.prepare("SELECT value FROM config WHERE key = 'ai_last_error'").first(); lastAiError = le && le.value ? JSON.parse(le.value) : null } catch (e) {}
+          await syncHealth(env, true);
           const parked = badState(await geminiScope(env));
           /* บันทึกการค้นสเปกรถ (ทุกคน ทุกหน้า) + รุ่นที่ใช้ค้น */
           const specLog = await specLogList(env, 40);
           const sa = specAI(env), spec = { models: sa.models, key: env.GEMINI_SPEC_KEY ? 'GEMINI_SPEC_KEY' : env.GEMINI_NEWS_KEY ? 'GEMINI_NEWS_KEY' : env.GEMINI_KEY ? 'GEMINI_KEY' : '' };
-          const primaryModel = env.OPENROUTER_MODEL || 'openrouter/free';
-          const fullChain = [primaryModel].concat(chatModels(env));
+          /* ลำดับจริง: Gemini ตามลำดับ (ยิงสำรองคู่ขนานเมื่อช้า) แล้วค่อยทางสำรอง — OpenRouter ไม่ใช่ตัวหลัก */
+          const fullChain = chatModels(env);
           return json({ now: Date.now(),
             chain: fullChain.map(m => ({ name: m, parked: parked.find(p => p.model === m) || null, searchParked: parked.find(p => p.model === m + '|search') || null })),
             fallbacks: fallbackProviders(env).concat(fallbackProviders(env, true)).map(p => ({ name: p.src + ':' + p.model })),
             keys: { gemini: !!env.GEMINI_KEY, groq: !!env.GROQ_API_KEY, cerebras: !!env.CEREBRAS_API_KEY, openrouter: !!env.OPENROUTER_API_KEY, workersAI: !!env.AI },
-            parked, stats, events, lastAiError, specLog, spec });
+            parked, stats, quality, events, lastAiError, specLog, spec });
         })();
       }
       if (url.pathname === '/api/admin/unpark' && request.method === 'POST') {
-        return await guarded('admin', async () => { let b = {}; try { b = await request.json() } catch {} unpark(b.key); return json({ ok: true }) })();
+        return await guarded('admin', async () => { let b = {}; try { b = await request.json() } catch {} await unparkShared(env, b.key); return json({ ok: true }) })();
       }
       if (url.pathname === '/api/admin/diag' && request.method === 'GET') {
         return await guarded('moderator', async () => {
@@ -5913,9 +6022,9 @@ ${convo}`;
           const q = url.searchParams.get('q') || 'ราคาน้ำมันเบนซินในไทยวันนี้';
           const out = { keys: {
             gemini: !!env.GEMINI_KEY, openrouter: !!env.OPENROUTER_API_KEY,
-            primaryModel: env.OPENROUTER_MODEL || 'openrouter/free',
-            geminiModel: env.GEMINI_MODEL || '(ไม่ได้ตั้ง)', searchModel: env.GEMINI_SEARCH_MODEL || '(ไม่ได้ตั้ง ใช้ gemini-3.5-flash-lite)',
-            chatModels: [env.OPENROUTER_MODEL || 'openrouter/free (หลัก)'].concat(chatModels(env)), fallback: fallbackProviders(env).map(p => p.src + ':' + p.model) } };
+            primaryModel: chatModels(env)[0] || '(ไม่ได้ตั้ง)',
+            geminiModel: env.GEMINI_MODEL || '(ไม่ได้ตั้ง)', searchProviders: configuredProviders(env),
+            chatModels: chatModels(env), fallback: fallbackProviders(env).map(p => p.src + ':' + p.model) } };
           try {
             const le = await env.DB.prepare("SELECT value FROM config WHERE key = 'ai_last_error'").first();
             out.lastAiError = le && le.value ? JSON.parse(le.value) : null;
@@ -5923,18 +6032,21 @@ ${convo}`;
           const lastErr = out.lastAiError
             ? `ข้อผิดพลาดล่าสุดจากแชตจริง (${new Date(out.lastAiError.at).toLocaleString('th-TH', { timeZone: 'Asia/Bangkok' })}): ${out.lastAiError.message}` : '';
 
-          const pr = env.GEMINI_KEY ? await probeAll(env, q) : { rows: [], best: null };
+          const pr = await probeAll(env, q);
+          const ps = pr.search, okRow = ps.rows.find(r => r.ok), b = pr.best;
           out.providers = pr.rows.map(r => `${r.name}: ${r.ok ? 'ok' : 'ไม่ผ่าน'} · ${r.ms} ms`
-            + (r.ok && r.grounded ? ' · ค้นเว็บจริง' : r.ok && !r.name.startsWith('สำรอง') ? ' · ตอบได้แต่ไม่ได้ค้นเว็บ' : '')
+            + (r.results != null ? ` · ${r.results} ผล` : '') + (r.costUsd ? ` · $${r.costUsd}` : '')
             + (r.error ? ' · ' + r.error : ''));
-          const b = pr.best;
+          /* ค้นเว็บของ AI = Tavily · Exa · Firecrawl เท่านั้น — routes บอกว่าคำถามแต่ละประเภทจะไปเจ้าไหนก่อน (เฉพาะเจ้าที่ตั้งคีย์แล้ว) */
           out.search = {
-            ok: !!(b && b.grounded), source: 'gemini', grounded: !!(b && b.grounded), query: q, keywords: '',
-            needsFresh: needsFresh(q), ms: b ? b.ms : 0, length: b ? b.sample.length : 0, model: b ? b.name : '',
-            sample: b ? b.sample : '',
-            hint: !env.GEMINI_KEY ? 'ยังไม่ได้ตั้ง GEMINI_KEY — แชตจะใช้ทางสำรองทั้งหมด (ช้ากว่าและค้นเว็บไม่ได้)'
+            ok: ps.ok, source: okRow ? okRow.name.replace(/^ค้นเว็บ /, '') : '', configured: ps.configured,
+            routes: Object.fromEntries(Object.keys(SEARCH_ROUTES).map(k => [k, searchRoute(env, k).providers.filter(p => ps.configured.includes(p))])),
+            grounded: ps.ok, query: q, kind: searchKind(q), keywords: '', needsFresh: needsFresh(q), ms: okRow ? okRow.ms : 0,
+            length: ps.sample.length, model: b ? b.name : '', sample: ps.sample,
+            hint: !ps.configured.length ? 'ยังไม่ได้ตั้งคีย์ตัวค้นเว็บ (TAVILY_API_KEY / EXA_API_KEY / FIRECRAWL_API_KEY) — AI ค้นเว็บไม่ได้ จะบอกผู้ใช้ว่ายังยืนยันข้อมูลล่าสุดไม่ได้'
+              : !ps.ok ? 'ตัวค้นเว็บที่ตั้งคีย์ไว้ค้นไม่ผ่านทุกเจ้า ดูสาเหตุในรายการด้านล่าง'
+              : !env.GEMINI_KEY ? 'ยังไม่ได้ตั้ง GEMINI_KEY — แชตจะใช้ทางสำรองทั้งหมด (ช้ากว่า)'
               : !b ? 'Gemini ใช้ไม่ได้ทุกรุ่น ดูสาเหตุในรายการด้านล่าง' + (lastErr ? ' · ' + lastErr : '')
-              : !b.grounded ? `รุ่น ${b.name} ตอบได้แต่ไม่ได้ค้นเว็บ` + (lastErr ? ' · ' + lastErr : '')
               : lastErr,
           };
           try {
@@ -5956,6 +6068,7 @@ ${convo}`;
               /* สมัครช่าง: ตั้งแล้วหรือยัง (ไม่ส่งค่าจริงออกไป) */
               diditKey: !!env.DIDIT_API_KEY, diditWorkflow: !!env.DIDIT_WORKFLOW_ID, diditWebhook: !!env.DIDIT_WEBHOOK_SECRET,
               idHashKey: !!env.ID_HASH_KEY, privacyUrl: env.ONBOARDING_PRIVACY_URL || '', appUrl: env.APP_URL || '',
+              tavilyKey: !!env.TAVILY_API_KEY, exaKey: !!env.EXA_API_KEY, firecrawlKey: !!env.FIRECRAWL_API_KEY,
               model: env.GEMINI_MODEL || 'gemini-3.5-flash-lite',
               searchModel: env.GEMINI_SEARCH_MODEL || '',
               fallbackModel: env.GEMINI_FALLBACK_MODEL || '',
@@ -6267,7 +6380,7 @@ ${convo}`;
           const used=await env.DB.prepare(`INSERT INTO usage (uid,day,count) VALUES (?,?,1)
             ON CONFLICT(uid,day) DO UPDATE SET count=count+1 WHERE count<60 RETURNING count`).bind(uid,day).first();
           if(!used)return deny('research_quota',429);
-          return json(await publicResearch(query,{signal:request.signal}));
+          return json(await publicResearch(query,{env,signal:request.signal}));
         })();
       }
       /* Feature tools share the authenticated AI pipeline; never return demo results. */
@@ -6313,7 +6426,7 @@ ${convo}`;
           try{input=buildFeatureRequest(soundBody)}catch(e){return deny(e.message,400)}
           const meter=newMeter();
           const q=soundResearchQuery(audioIdentity(soundBody.context));
-          const research=q?await publicResearch(q,{signal:request.signal,vehicle:audioIdentity(soundBody.context).vehicle}):{status:'needs_vehicle',sources:[],verifiedModelFaults:[]};
+          const research=q?await publicResearch(q,{env,signal:request.signal,vehicle:audioIdentity(soundBody.context).vehicle}):{status:'needs_vehicle',sources:[],verifiedModelFaults:[]};
           input.contents[0].parts[0].text+=researchBlock(research);
           const cleaned=cleanFeatureJson('listen',await callGemini(env,{...input,meter}),{context:soundBody.context,lang:b.lang});
           cleaned.research=research;

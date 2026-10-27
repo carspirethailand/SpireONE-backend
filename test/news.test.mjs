@@ -45,9 +45,10 @@ function setup(env={},{feedsFail=false,aiFail=false}={}){
   globalThis.fetch=async(url,init={})=>{const u=String(url);
     if(u.includes('generativelanguage')){const body=JSON.parse(init.body);ai.push({u,key:init.headers['x-goog-api-key'],body});
       if(aiFail)return new Response('quota',{status:429});
-      if(body.tools){return Response.json({candidates:[{content:{parts:[{text:JSON.stringify([{title:'ข่าวจากการค้นเว็บ',summary:'ส',points:['a'],body:'b',category:'EV',score:4,source:'สำนักข่าว'}])}]}}]});}
+      if(/เลือกข่าวรถยนต์ที่คนใช้รถในไทยควรรู้จากผลค้น/.test(body.contents[0].parts[0].text)){return Response.json({candidates:[{content:{parts:[{text:JSON.stringify([{n:1,title:'ข่าวจากการค้นเว็บ',summary:'ส',points:['a'],body:'b',category:'EV',score:4,source:'สำนักข่าว'}])}]}}]});}
       const list=JSON.parse(body.contents[0].parts[0].text.split('ข่าว:\n')[1]);
       return Response.json({candidates:[{content:{parts:[{text:JSON.stringify(list.map(x=>({i:x.i,keep:!/โฆษณา/.test(x.title),title:'พาดหัว '+x.title,summary:'สรุป',points:['ราคา 799,000 บาท'],body:'ย่อหน้า 1\n\nย่อหน้า 2',category:x.i===0?'รถใหม่':'ไม่มีหมวดนี้',score:x.i===3?5:2})))}]}}]});}
+    if(u==='https://api.tavily.com/search'){const q=JSON.parse(init.body);ai.push({u,search:q});return Response.json({results:[{title:'EV news',url:'https://th.example/search-news',content:'ข่าวรถยนต์ไฟฟ้าเปิดตัวใหม่',published_date:new Date(NOW-3600000).toISOString(),score:.9}],usage:{credits:1}});}
     if(feedsFail)throw Error('blocked');
     if(u==='https://www.headlightmag.com/feed/')return new Response(rss([...[1,2,3,4].map(n=>wpItem(n,{img:n!==4,ago:n})),wpItem('โฆษณา')]));
     if(u==='https://www.motor1.com/rss/news/all/')return new Response(rss([`<item><title>New EV</title><link>https://en.example/ev</link><pubDate>${new Date(NOW-1800000).toUTCString()}</pubDate><description>Range 600 km</description></item>`,
@@ -123,11 +124,16 @@ test('refresh: a separate news key keeps news off the chat quota entirely',async
   assert.ok(ai.length>0&&ai.every(c=>c.key==='news-key-test-only'));
 });
 
-test('refresh: no feeds reachable → AI searches the web; AI down → stories stay and the error is recorded',async()=>{
-  let {f,ai}=setup({},{feedsFail:true});
+test('refresh: no feeds reachable → news is searched through the keyed web search (no Google Search tool) and keeps the real link; AI down → stories stay and the error is recorded',async()=>{
+  let {f,ai}=setup({TAVILY_API_KEY:'tvly-test-only-fixture'},{feedsFail:true});
   let st=await refreshNews(f.env,{force:true});
-  assert.equal(st.mode,'ai');assert.ok(ai[0].body.tools,'uses web search');
-  assert.equal(f.sqlite.prepare("SELECT origin FROM magazine WHERE title='ข่าวจากการค้นเว็บ'").get().origin,'ai');
+  assert.equal(st.mode,'ai');
+  const search=ai.find(x=>x.search);assert.equal(search.search.topic,'news','searched as news');
+  const write=ai.find(x=>x.body);assert.ok(!write.body.tools,'Gemini gets no search tool');assert.match(write.body.contents[0].parts[0].text,/th\.example\/search-news/,'writes from the search results');
+  const row=f.sqlite.prepare("SELECT origin,url FROM magazine WHERE title='ข่าวจากการค้นเว็บ'").get();
+  assert.equal(row.origin,'ai');assert.equal(row.url,'https://th.example/search-news','the story links to the real source');
+  ({f}=setup({},{feedsFail:true}));
+  st=await refreshNews(f.env,{force:true});assert.ok(st.error,'no search key → honest error, nothing invented');
   ({f}=setup({},{aiFail:true}));
   st=await refreshNews(f.env,{force:true});
   assert.match(st.error,/AI สรุปข่าวไม่สำเร็จ/);

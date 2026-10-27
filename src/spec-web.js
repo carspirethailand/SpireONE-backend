@@ -1,6 +1,8 @@
-/* Free, document-backed discovery. No search-service key, Bing RSS, Google
- * grounding tool, browser cookies or VIN is used. Only pages actually read
- * can become sources. Robots restrictions and access barriers are respected. */
+/* Document-backed discovery. No Bing RSS, Google grounding tool, browser
+ * cookies or VIN is used. Only pages actually read can become sources.
+ * With TAVILY_API_KEY, Tavily searches the allowlisted sites and returns page
+ * text (also for pages that block the Worker or need JavaScript); that text
+ * passes the same allowlist, robots.txt and model/year checks as a direct read. */
 import {DETAIL_NUM,DETAIL_TEXT,DETAIL_FACTS,DETAIL_WORDS} from './spec-details.mjs';
 const WIKI='https://en.wikipedia.org/w/api.php';
 const UA='CendonSpecs/1.0 (+https://cendon-beta.pages.dev/)';
@@ -9,6 +11,7 @@ const PRESS=['headlightmag.com','autospinn.com','grandprix.co.th','autodeft.com'
 const HOSTS=[...OEM,...PRESS,'en.wikipedia.org'];
 const robotCache=new Map();
 const SEARCH_SITES=['https://www.headlightmag.com','https://www.autodeft.com','https://www.motortrivia.com'];
+import {configuredProviders,searchWeb} from './web-search.mjs';
 export function active(signal){if(signal?.aborted)throw Object.assign(new Error('ค้นนานเกินกำหนด'),{name:'AbortError'})}
 /* The race also bounds stalled response bodies and fetch mocks that ignore
  * abort. All nested requests inherit cancellation; no fallback survives it. */
@@ -83,44 +86,102 @@ export function excerpt(text,q){
   const at=production?.index??exact?.index??-1,start=Math.max(0,at<0?0:at-(production?350:1800));
   return text.slice(start,start+9000);
 }
+/* เอกสารหนึ่งหน้าผ่านด่านเดียวกันเสมอ ไม่ว่าเปิดเองหรือได้เนื้อหามาจาก Tavily:
+   เว็บในรายชื่อ · robots.txt อนุญาต · ไม่ใช่หน้ากันบอต · ยาวพอ · พูดถึงยี่ห้อ+รุ่นจริง · ชื่อหน้า/ปีตรง */
+async function checkDoc(url,title,plain,q,log,signal,via){
+  if(!allowedSource(url)||!await mayRead(url,signal))return null;
+  title=textOf(title||new URL(url).hostname);plain=String(plain||'');
+  if(/captcha|verify you are human|access denied|enable javascript.*cookies|checking your browser/i.test(plain.slice(0,1200))||plain.length<250||!relevant(plain,q))return null;
+  if(!normal(title+' '+new URL(url).pathname).includes(normal(q.model)))return null;
+  const titleYears=title.match(/\b(?:19|20)\d{2}\b/g)||[];
+  if(titleYears.length&&!titleYears.includes(String(q.year)))return null;
+  log.push({step:'document',ok:true,url,title,chars:plain.length,...(via?{via}:{})});return {url,title,text:excerpt(plain,q),primary:under(new URL(url).hostname,OEM)};
+}
+/* เปิดหน้าเอง · ถูกบล็อก/ต้องใช้ JavaScript/กันบอต = {retry} ให้ลองอ่านผ่าน Tavily Extract แทน
+   (ไม่อ่านเพราะ robots ไม่อนุญาต หรือไม่ใช่รุ่น/ปีนี้ = ไม่ลองซ้ำ) */
 async function readPage(raw,q,log,signal){
   if(!allowedSource(raw)||/\.pdf(?:\?|$)/i.test(raw))return null;
   let url=raw;try{for(let hop=0;hop<3;hop++){
     active(signal);if(!allowedSource(url)||!await mayRead(url,signal))return null;
     const {r,text}=await request(url,6500,signal);if([301,302,303,307,308].includes(r.status)){url=new URL(r.headers.get('location')||'',url).href;continue}
-    if(!r.ok||!/(?:text\/html|text\/plain|application\/xhtml)/i.test(r.headers.get('content-type')||'text/html'))return null;
-    const title=textOf((text.match(/<title[^>]*>([\s\S]*?)<\/title>/i)||[])[1]||new URL(url).hostname),plain=textOf(text);
-    if(/captcha|verify you are human|access denied|enable javascript.*cookies|checking your browser/i.test(plain.slice(0,1200))||plain.length<250||!relevant(plain,q))return null;
-    if(!normal(title+' '+new URL(url).pathname).includes(normal(q.model)))return null;
-    const titleYears=title.match(/\b(?:19|20)\d{2}\b/g)||[];
-    if(titleYears.length&&!titleYears.includes(String(q.year)))return null;
-    log.push({step:'document',ok:true,url,title,chars:plain.length});return {url,title,text:excerpt(plain,q),primary:under(new URL(url).hostname,OEM)};
-  }}catch(e){active(signal);log.push({step:'document',ok:false,url,err:String(e.message).slice(0,90)})}return null;
+    if(!r.ok)return {retry:url};
+    if(!/(?:text\/html|text\/plain|application\/xhtml)/i.test(r.headers.get('content-type')||'text/html'))return null;
+    const title=(text.match(/<title[^>]*>([\s\S]*?)<\/title>/i)||[])[1]||'',plain=textOf(text);
+    if(/captcha|verify you are human|access denied|enable javascript|checking your browser/i.test(plain.slice(0,1200))||plain.length<250)return {retry:url};
+    return checkDoc(url,title,plain,q,log,signal);
+  }}catch(e){active(signal);log.push({step:'document',ok:false,url,err:String(e.message).slice(0,90)});return {retry:url}}return null;
 }
-export async function collectSpecDocuments(q,log=[],signal){
-  const deadline=Date.now()+12000;
+/* ── Tavily: ค้นหน้าสเปก/ตารางอุปกรณ์ในเว็บที่อนุญาต พร้อมเนื้อหาหน้า (Tavily เปิดหน้าให้ รวมหน้าที่ต้องใช้ JavaScript) ──
+   ของเดิมได้แค่ลิงก์แล้ว Worker ต้องเปิดเอง เว็บรถไทยหลายเว็บบล็อก/ต้องใช้ JavaScript จึงได้เอกสารบ้างไม่ได้บ้าง
+   ไม่มีคีย์ = ข้ามทั้งหมด (ทำแบบเดิม) */
+const TAVILY='https://api.tavily.com';
+const SPEC_QUERIES={
+  spec:q=>[`${q.make} ${q.model} ${q.year} specifications dimensions engine`,`สเปก ${q.make} ${q.model} ${q.year} ข้อมูลทางเทคนิค ขนาด เครื่องยนต์ ช่วงล่าง`],
+  equipment:q=>[`${q.make} ${q.model} ${q.year} ตารางอุปกรณ์ ทุกรุ่นย่อย ราคา`,`${q.make} ${q.model} ${q.year} features equipment list all trims`],
+};
+async function tavilyCall(env,path,body,ms,signal){
+  return timebox(async own=>{
+    const r=await fetch(TAVILY+path,{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+env.TAVILY_API_KEY},body:JSON.stringify(body),redirect:'manual',signal:own});
+    const text=await boundedText(r,6000000);if(!r.ok)throw Error('tavily_http_'+r.status);return JSON.parse(text);
+  },ms,signal);
+}
+export async function tavilyDiscovery(env,q,kind,log,signal){
+  if(!env?.TAVILY_API_KEY)return [];
+  const domains=HOSTS.filter(h=>h!=='en.wikipedia.org');
+  const rows=(await Promise.all((SPEC_QUERIES[kind]||SPEC_QUERIES.spec)(q).map(query=>
+    tavilyCall(env,'/search',{query,search_depth:'advanced',max_results:8,include_raw_content:'markdown',include_answer:false,include_domains:domains},9000,signal)
+      .then(d=>Array.isArray(d.results)?d.results:[]).catch(e=>{active(signal);log.push({step:'tavily-search',ok:false,err:String(e.message).slice(0,90)});return []})))).flat();
+  log.push({step:'tavily-search',ok:rows.length>0,found:rows.length,withText:rows.filter(r=>r.raw_content).length});
+  return rows.filter(r=>r&&allowedSource(r.url));
+}
+export async function tavilyExtract(env,urls,q,log,signal){
+  if(!env?.TAVILY_API_KEY||!urls.length)return [];
+  try{
+    const d=await tavilyCall(env,'/extract',{urls:urls.slice(0,5),extract_depth:'advanced',format:'markdown'},9000,signal);
+    const rows=Array.isArray(d.results)?d.results:[];
+    log.push({step:'tavily-extract',ok:rows.length>0,asked:Math.min(5,urls.length),got:rows.length});
+    return rows.filter(r=>r&&allowedSource(r.url)&&r.raw_content);
+  }catch(e){active(signal);log.push({step:'tavily-extract',ok:false,err:String(e.message).slice(0,90)});return []}
+}
+export const MAX_DOCS=8;
+export async function collectSpecDocuments(q,log=[],signal,{env,kind='spec'}={}){
+  const deadline=Date.now()+(env?.TAVILY_API_KEY?15000:12000);
   // Public publisher search APIs are read-only. These provide local-market
   // articles beyond Wikipedia's reference list; no search-service key needed.
   const localLinks=publisherLinks(q,log,signal);
   // Observe rejection even if required discovery exits before using links.
   localLinks.catch(()=>{});
+  const tav=tavilyDiscovery(env,q,kind,log,signal);tav.catch(()=>{});
+  /* ค้นหน้าสเปกเพิ่มผ่านตัวค้นของ AI (Exa/Tavily ประเภท spec) เมื่อตั้งคีย์ — ได้แค่ลิงก์ แล้วยังผ่าน allowedSource,
+     robots.txt และการตรวจรุ่น/ปีใน readPage เหมือนลิงก์อื่นทุกอย่าง */
+  const keyed=configuredProviders(env).length?searchWeb(env,q.make+' '+q.model+' '+q.year+' specifications',{kind:'spec',max:8,signal}).then(r=>{log.push({step:'search-discovery',ok:true,found:r.results.length,providers:r.providers.filter(p=>p.ok).map(p=>p.provider)});return r.results.map(x=>({url:x.url,title:x.title}))}).catch(e=>{active(signal);log.push({step:'search-discovery',ok:false,err:String(e.message||e).slice(0,90)});return []}):Promise.resolve([]);
   let chosen=null,page={parse:{}},plain='',discoveryError=null;
   try{
     const found=await wiki({action:'query',list:'search',srsearch:q.make+' '+q.model,srlimit:'3'},signal,deadline-Date.now());
     const rows=found.query?.search||[];chosen=rows.find(x=>normal(x.title)===normal(q.make+' '+q.model))||rows.find(x=>relevant(textOf(x.title+' '+x.snippet),q));
-    if(chosen?.pageid){page=await wiki({action:'parse',pageid:String(chosen.pageid),prop:'wikitext|externallinks'},signal,deadline-Date.now());const raw=page.parse?.wikitext?.['*'];plain=raw?wikiPlain(raw):textOf(page.parse?.text?.['*']||'');}
+    if(chosen?.pageid){page=await wiki({action:'parse',pageid:String(chosen.pageid),prop:'wikitext|externallinks'},signal,deadline-Date.now());const raw=page.parse?.wikitext?.['*'];plain=raw?wikiPlain(raw):textOf(page.parse?.text?.['*']||'')}
   }catch(e){active(signal);discoveryError=e;log.push({step:'encyclopedia-discovery',ok:false,err:'Discovery unavailable; continue with readable publishers'});}
   let published=[];try{published=await localLinks}catch(e){active(signal)}
-  const candidates=[...published.map(x=>x.url),...(page.parse?.externallinks||[])].filter(allowedSource).filter(u=>!/^https:\/\/en\.wikipedia/.test(u));
-  const metadata=new Map(published.map(x=>[x.url,x]));
+  const searched=await keyed,tavRows=await tav.catch(()=>[]);
+  const given=new Map(tavRows.filter(r=>r.raw_content).map(r=>[r.url,r]));
+  const candidates=[...tavRows.map(x=>x.url),...published.map(x=>x.url),...searched.map(x=>x.url),...(page.parse?.externallinks||[])].filter(allowedSource).filter(u=>!/^https:\/\/en\.wikipedia/.test(u));
+  const metadata=new Map([...published.map(x=>[x.url,x]),...tavRows.map(x=>[x.url,{title:x.title,published:x.published_date}])]);
   candidates.sort((a,b)=>documentRank(b,q,metadata.get(b))-documentRank(a,q,metadata.get(a)));
-  const hostCounts=new Map(),unique=new Set(),urls=[];for(const u of candidates){const host=new URL(u).hostname.replace(/^www\./,'');if(unique.has(u)||(hostCounts.get(host)||0)>=2||/\.pdf(?:\?|$)/i.test(u))continue;unique.add(u);hostCounts.set(host,(hostCounts.get(host)||0)+1);urls.push(u);if(urls.length===10)break}
+  const hostCounts=new Map(),unique=new Set(),urls=[];for(const u of candidates){const host=new URL(u).hostname.replace(/^www\./,'');if(unique.has(u)||(hostCounts.get(host)||0)>=2||/\.pdf(?:\?|$)/i.test(u))continue;unique.add(u);hostCounts.set(host,(hostCounts.get(host)||0)+1);urls.push(u);if(urls.length===14)break}
   const docs=[];if(relevant(plain,q)&&plain.length>250){docs.push({url:'https://en.wikipedia.org/wiki/'+encodeURIComponent(chosen.title.replace(/ /g,'_')),title:chosen.title,text:excerpt(plain,q),primary:false,license:'CC BY-SA'});log.push({step:'document',ok:true,url:docs[0].url,title:chosen.title,chars:plain.length})}
+  const retry=[];
   // Four simultaneous requests at most; no payment keys and no access-barrier
-  // workarounds. Five distinct readable sites are the target, not fabricated.
-  for(let i=0;i<urls.length&&docs.length<6&&Date.now()<deadline;i+=4){active(signal);
-    try{await timebox(own=>Promise.all(urls.slice(i,i+4).map(async u=>{const d=await readPage(u,q,log,own);active(own);if(d&&docs.length<6)docs.push(d)})),Math.min(7000,deadline-Date.now()),signal)}
+  // workarounds. Pages Tavily already read skip the direct fetch.
+  for(let i=0;i<urls.length&&docs.length<MAX_DOCS&&Date.now()<deadline;i+=4){active(signal);
+    try{await timebox(own=>Promise.all(urls.slice(i,i+4).map(async u=>{
+      const g=given.get(u),d=g?await checkDoc(u,g.title,g.raw_content,q,log,own,'tavily'):await readPage(u,q,log,own);active(own);
+      if(d&&d.retry){retry.push(d.retry);return}
+      if(d&&docs.length<MAX_DOCS)docs.push(d)})),Math.min(7000,Math.max(1,deadline-Date.now())),signal)}
     catch(e){active(signal);log.push({step:'documents-partial',ok:false,err:'บางเอกสารอ่านไม่ทัน ใช้เฉพาะเอกสารที่อ่านเสร็จแล้ว'})}
+  }
+  /* หน้าที่เปิดเองไม่ได้ (บล็อก/ต้องใช้ JavaScript) ให้ Tavily เปิดแทน แล้วผ่านด่านตรวจเดิมทุกข้อ */
+  if(docs.length<MAX_DOCS&&retry.length&&Date.now()<deadline){
+    for(const r of await tavilyExtract(env,retry,q,log,signal)){if(docs.length>=MAX_DOCS)break;const d=await checkDoc(r.url,r.title||'',r.raw_content,q,log,signal,'tavily-extract').catch(()=>null);if(d&&!docs.some(x=>x.url===d.url))docs.push(d)}
   }
   if(!docs.length)throw discoveryError||Error('ไม่พบหน้าเอกสารที่เปิดอ่านและใช้อ้างอิงได้');return docs.map((d,id)=>({...d,id}));
 }

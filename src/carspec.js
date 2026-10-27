@@ -40,19 +40,17 @@ export function validQuery(q) {
   return { make, model, year,market };
 }
 
-/* ─────────── Gemini (ค้นเว็บ) ─────────── */
-const SPEC_MODELS = ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-2.5-flash', 'gemini-3.5-flash-lite'];
+/* ─────────── Gemini (สกัดสเปกจากเอกสารที่อ่านจริง) ─────────── */
 export function specAI(env) {
   const key = env.GEMINI_SPEC_KEY || env.GEMINI_NEWS_KEY || env.GEMINI_KEY || '';
   const own = !!(env.GEMINI_SPEC_KEY || env.GEMINI_NEWS_KEY);
   const chatMain = own ? [] : chatModels(env).slice(0, 2);
   /* รุ่นที่แชตไม่ได้ใช้ตอบเป็นหลักก่อน → แล้วค่อยถอยไปรุ่นของแชตเป็นทางสุดท้าย
      สเปกรถค้นครั้งเดียวต่อรุ่นรถตลอดไป การค้นสำเร็จสำคัญกว่าการหลบโควตาแชตทุกครั้ง */
-  const defaults=env.GEMINI_SPEC_MODE==='grounded'?SPEC_MODELS:['gemini-3.1-flash-lite','gemini-3.5-flash-lite','gemini-3.6-flash','gemini-3.8-flash'];
-  const models = [env.GEMINI_SPEC_MODEL, ...defaults.filter((m) => env.GEMINI_SPEC_MODE!=='grounded'||!chatMain.includes(m)), ...chatMain.filter(m=>!/^gemini-2/.test(m))]
+  const defaults=['gemini-3.1-flash-lite','gemini-3.5-flash-lite','gemini-3.6-flash','gemini-3.8-flash'];
+  const models = [env.GEMINI_SPEC_MODEL, ...defaults, ...chatMain.filter(m=>!/^gemini-2/.test(m))]
     .map((m) => norm(m)).filter(Boolean);
-  const repair = ['gemini-3.5-flash-lite', 'gemini-2.5-flash-lite', 'gemini-3.1-flash-lite', ...chatMain];
-  return { key, own, models: [...new Set(models)], repair };
+  return { key, own, models: [...new Set(models)] };
 }
 
 /* โมเดลที่คิดนานกินโทเคนคำตอบไปกับการคิด (นับรวมใน maxOutputTokens) จน JSON โดนตัดกลางทาง
@@ -60,7 +58,7 @@ export function specAI(env) {
 const thinking = (model, json) => /gemini-3|gemini-[4-9]/.test(model) ? { thinkingLevel: 'low', includeThoughts: false }
   : /2\.5/.test(model) ? { thinkingBudget: json ? 0 : 512, includeThoughts: false } : undefined;
 export const CALL_MS = 40000;
-async function searchCall(env, ai, model, prompt, docs=null,signal) {
+async function searchCall(env, ai, model, prompt, docs,signal) {
   const base = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
   return timebox(async own=>{
     const send = (think) => fetch(`${base}/v1beta/models/${model}:generateContent`, {
@@ -68,8 +66,7 @@ async function searchCall(env, ai, model, prompt, docs=null,signal) {
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': ai.key },
       body: JSON.stringify({
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        ...(docs?{}:{tools: [{ google_search: {} }]}),
-        generationConfig: { temperature: 0.1, maxOutputTokens: 8192, ...(docs?{responseMimeType:'application/json'}:{}),...(think ? { thinkingConfig: think } : {}) },
+        generationConfig: { temperature: 0.1, maxOutputTokens: 8192, responseMimeType:'application/json',...(think ? { thinkingConfig: think } : {}) },
       }),
     });
     let r = await send(thinking(model, false)), retried = false;
@@ -84,9 +81,8 @@ async function searchCall(env, ai, model, prompt, docs=null,signal) {
     }
     if (c.finishReason && !/STOP|MAX_TOKENS/.test(c.finishReason)) throw Object.assign(new Error(`${model} หยุดเพราะ ${c.finishReason}`), { http: 200, retried });
     const text = ((c.content && c.content.parts) || []).filter(p=>!p.thought).map((p) => p.text || '').join('');
-    const chunks = (c.groundingMetadata && c.groundingMetadata.groundingChunks) || [];
-    const sources = docs?docs.map(d=>({title:d.title,url:d.url,docId:d.id,primary:d.primary,license:d.license})):chunks.map((x) => x && x.web).filter((w) => w && safeSource(w.uri))
-      .map((w) => ({ title: norm(w.title).slice(0, 120), url: String(w.uri).slice(0, 1000) }));
+    /* สเปกมาจากเอกสารที่อ่านจริงเท่านั้น — ไม่ใช้ Google Search ของ Gemini แล้ว */
+    const sources = docs.map(d=>({title:d.title,url:d.url,docId:d.id,primary:d.primary,license:d.license}));
     return { text, sources, model, finish: c.finishReason || '', retried };
   },CALL_MS,signal);
 }
@@ -99,32 +95,6 @@ async function errText(r,key='') {
   let safe=String(m || 'ไม่มีรายละเอียด').replace(/\s+/g, ' ').replace(/AIza[\w-]+/g,'[redacted-key]');if(key)safe=safe.split(key).join('[redacted-key]');return safe.slice(0, 240);
 }
 
-/* คำตอบจากการค้นเว็บบางครั้งมีข้อความปน หรือ JSON ไม่ครบ — ให้โมเดลเบาแปลงเป็น JSON ตามรูปแบบอีกครั้ง (ไม่ค้นเว็บ ไม่แต่งเพิ่ม) */
-async function repairJson(env, ai, text, log, pass,signal) {
-  const base = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
-  for (const model of ai.repair) {
-    active(signal);const t0 = Date.now();
-    const note = (o) => log && log.push({ p: pass, step: 'repair', m: model, ms: Date.now() - t0, ...o });
-    try {
-      const result=await timebox(async own=>{const r = await fetch(`${base}/v1beta/models/${model}:generateContent`, {
-        method: 'POST', signal: own, headers: { 'Content-Type': 'application/json', 'x-goog-api-key': ai.key },
-        body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: `แปลงข้อมูลสเปกรถด้านล่างเป็น JSON object ตามรูปแบบนี้ ใช้เฉพาะข้อมูลที่มีในข้อความ ห้ามเพิ่มหรือเดาค่าใหม่ ค่าที่ไม่มีให้เป็น null
-รูปแบบ: ${SHAPE}
-
-ข้อมูล:
-${String(text).slice(0, 12000)}` }] }],
-          generationConfig: { temperature: 0, maxOutputTokens: 8192, responseMimeType: 'application/json', ...(thinking(model, true) ? { thinkingConfig: thinking(model, true) } : {}) } }),
-      });
-      if (!r.ok) { note({ ok: false, st: r.status, err: await errText(r,ai.key) }); return null; }
-      const j = await r.json();
-      const o = parseObj(((((j.candidates || [])[0] || {}).content || {}).parts || []).filter(p=>!p.thought).map((p) => p.text || '').join(''));
-      note({ ok: !!o, st: 200, err: o ? '' : 'แปลงเป็น JSON ไม่ได้' });
-      return o;},12000,signal);if(result)return result;
-    } catch (e) { active(signal);note({ ok: false, err: e && e.name === 'AbortError' ? 'เกิน 12 วินาที' : String((e && e.message) || e).slice(0, 200) }); }
-  }
-  return null;
-}
-
 export function parseObj(text) {
   const s = String(text || '').replace(/```(?:json)?/gi, '');
   const a = s.indexOf('{'), b = s.lastIndexOf('}');
@@ -132,7 +102,6 @@ export function parseObj(text) {
   try { const o = JSON.parse(s.slice(a, b + 1)); return o && typeof o === 'object' && !Array.isArray(o) ? o : null; } catch (e) { return null; }
 }
 
-function safeSource(raw){try{const u=new URL(raw);return ['https:','http:'].includes(u.protocol)&&!u.username&&!u.password}catch{return false}}
 export function specFailure(raw){
   const s=String(raw||'');
   if(/source_unavailable|discovery_http/i.test(s))return {code:'source_unavailable',retryable:true};
@@ -161,29 +130,6 @@ const SHAPE = `{"found":true,
 const DEEP_RULE='top_kmh = ความเร็วสูงสุดเป็น km/h เท่านั้น (เอกสารให้ mph อย่างเดียว = null) · accel_s = เวลา 0-100 km/h (หรือ 0-62 mph) เป็นวินาที ไม่ใช่ 0-60 mph · '
   +'ground_clearance_mm = ระยะต่ำสุดจากพื้นเป็นมม. · turning_m = รัศมีวงเลี้ยวแคบสุดเป็นเมตร (เอกสารให้เส้นผ่านศูนย์กลาง turning circle = null ห้ามหารเอง) · '
   +'cargo_l = ความจุที่เก็บของท้ายรถปกติเป็นลิตร · suspension_front/suspension_rear/brakes_front/brakes_rear = ชนิดช่วงล่างและเบรกหน้า/หลัง ใช้ถ้อยคำจริงจากเอกสาร';
-function promptA(q) {
-  return `ค้นเว็บหาข้อมูลจำเพาะ (สเปก) จริงของรถ ${q.make} ${q.model} ปี ${q.year}
-ใช้รุ่นที่ขายใน${MARKETS[q.market||'TH']} ห้ามนำตัวเลขจากคนละตลาดมาปน ถ้าหาไม่ได้ให้เป็น null และบอกตลาดจริงใน market
-อ่านอย่างน้อย 5 แหล่งที่น่าเชื่อถือ เช่น เว็บผู้ผลิต/ตัวแทนจำหน่ายในไทย, Headlightmag, Autospinn, Grandprix, เว็บรีวิวและฐานข้อมูลสเปก
-ใส่ทุกรุ่นย่อยที่ขายในปีนั้น (เครื่องยนต์/เกียร์/ระบบขับเคลื่อนต่างกัน) ใน variants
-ห้ามเดาเด็ดขาด ค่าไหนไม่พบในแหล่งข้อมูลให้ใส่ null ตัวเลขใส่เป็นตัวเลขล้วน ไม่ใส่หน่วย
-fuel ใช้ petrol/diesel/hybrid/phev/ev/lpg และ drive ใช้ FWD/RWD/4WD/AWD; hp ต้องเป็นแรงม้า ไม่ใช่ kW
-${DEEP_RULE}
-ถ้ารถรุ่นนี้ในปีนี้ไม่มีอยู่จริง ตอบ {"found":false}
-ตอบเป็น JSON object เท่านั้น ไม่มีคำนำหรือ markdown รูปแบบ:
-${SHAPE}`;
-}
-function promptB(q) {
-  return `ตรวจสอบข้อมูลจำเพาะของ ${q.make} ${q.model} รุ่นปี ${q.year} อย่างเป็นอิสระ
-ค้นอย่างน้อย 5 แหล่ง ให้ความสำคัญกับเอกสารสเปกของผู้ผลิตใน${MARKETS[q.market||'TH']} ห้ามนำคนละปีหรือตลาดมาปน
-รวบรวมรุ่นย่อยทั้งหมดของปีนั้น ค่าไหนไม่แน่ใจหรือหาไม่เจอให้เป็น null ห้ามประมาณเอง ตัวเลขไม่ใส่หน่วย
-fuel ใช้ petrol/diesel/hybrid/phev/ev/lpg และ drive ใช้ FWD/RWD/4WD/AWD; hp ต้องเป็นแรงม้า ไม่ใช่ kW
-${DEEP_RULE}
-ถ้าไม่มีรุ่นนี้ในปีนี้จริง ตอบ {"found":false}
-ตอบ JSON object อย่างเดียว ตามรูปแบบ:
-${SHAPE}`;
-}
-
 /* ลองรุ่นโมเดลตามลำดับจนได้ JSON ที่อ่านได้ (เริ่มคนละตัวในสองรอบ = สองความเห็นที่ไม่ลอกกัน) */
 /* log: ทุกครั้งที่เรียกโมเดล บันทึก รอบ · รุ่น · เวลา · สถานะ HTTP · ความยาวคำตอบ · จำนวนแหล่ง · อ่าน JSON ได้ไหม · ข้อผิดพลาดจริง */
 async function lookup(env, ai, prompt, start, log = [], pass = 'A',docs=null,q=null,signal,kind='spec') {
@@ -198,10 +144,10 @@ async function lookup(env, ai, prompt, start, log = [], pass = 'A',docs=null,q=n
       const direct = parseObj(r.text);
       const step = { p: pass, step: 'search', m, ms: 0, st: 200, len: r.text.length, src: r.sources.length, fin: r.finish, retried: r.retried || undefined };
       log.push(step);
-      const o = direct || (!docs&&r.text.trim() ? await repairJson(env, ai, r.text, log, pass,signal) : null);
-      step.ms = Date.now() - t0; step.ok = !!o; step.json = direct ? 'ok' : o ? 'ซ่อมแล้ว' : r.text.trim() ? 'อ่านไม่ได้' : 'ว่าง';
+      const o = direct;
+      step.ms = Date.now() - t0; step.ok = !!o; step.json = direct ? 'ok' : r.text.trim() ? 'อ่านไม่ได้' : 'ว่าง';
       if (!o) step.head = r.text.slice(0, 160);
-      if (o){const data=docs?(o.found===false?{found:false}:cleanDocumentExtraction(o,docs,q,{kind})):o;if(data.diagnostic)step.evidence=data.diagnostic;return {...r,data}}
+      if (o){const data=o.found===false?{found:false}:cleanDocumentExtraction(o,docs,q,{kind});if(data.diagnostic)step.evidence=data.diagnostic;return {...r,data}}
       last = new Error(m + (r.text.trim() ? ' ตอบไม่เป็น JSON' : ' ตอบว่าง'));
       step.err = last.message;
     } catch (e) {
@@ -319,8 +265,8 @@ async function researchWithin(env,q,log,signal,kind,deadline,reserveMs){
   const ai = specAI(env);
   log.push({ step: 'setup', ok: !!ai.key, keyFrom: env.GEMINI_SPEC_KEY ? 'GEMINI_SPEC_KEY' : env.GEMINI_NEWS_KEY ? 'GEMINI_NEWS_KEY' : env.GEMINI_KEY ? 'GEMINI_KEY' : 'ไม่มี', models: ai.models });
   if (!ai.key) throw new Error('ยังไม่ได้ตั้งคีย์ Gemini');
-  let docs=null;
-  if(env.GEMINI_SPEC_MODE!=='grounded'||kind==='equipment'||kind==='details')docs=await collectSpecDocuments(q,log,signal);
+  /* ทุกแบบสกัดจากเอกสารที่อ่านได้จริง (Wikipedia · เว็บผู้ผลิต/สื่อรถในรายชื่อ · ลิงก์จากตัวค้นของ AI) — เลิกโหมดให้ Gemini ค้น Google เองแล้ว */
+  const docs=await collectSpecDocuments(q,log,signal,{env,kind});
   const general=q.market==='GLOBAL';
   const detailShape=' Extra optional fields per variant: '+JSON.stringify(Object.fromEntries([...Object.keys(DETAIL_NUM),...DETAIL_TEXT].map(k=>[k,null])))+'; extra model facts: '+JSON.stringify(Object.fromEntries(Object.keys(DETAIL_FACTS).map(k=>[k,null])))+'. Require exact evidence paths for every field. price_thb is the original Thai new-car list price for that exact variant/year only, not used market value, financing, accessories or foreign currency conversion. Unknown fields must be null. Do not infer fluid capacities or safety-critical service settings.';
   const marketRule=general?'นี่คือข้อมูลอ้างอิงพื้นฐานของรุ่นรถ ไม่ได้ขอยืนยันสเปกตลาดไทยหรือรถส่วนตัว ไม่จำเป็นต้องมี market_quote ใช้ข้อมูลผู้ผลิตหรือเอกสารอ้างอิงของรุ่น/เจเนอเรชันที่ครอบคลุมปีที่ขอได้ บอกตลาดจริงของเอกสารใน market ถ้ามี อย่าปฏิเสธข้อมูลเพราะไม่มีประเทศตลาดที่ระบุ':'ต้องมี market_quote ที่ยืนยันประเทศตลาดที่ขอ ห้ามนำตัวเลขคนละตลาดมาใช้';
@@ -333,14 +279,11 @@ async function researchWithin(env,q,log,signal,kind,deadline,reserveMs){
   const run=(text,start,pass)=>{if(kind!=='equipment')return lookup(env,ai,text,start,log,pass,docs,q,signal,kind);
     const ms=Math.max(1,Math.min(14000,deadline-Date.now()-reserveMs));
     return timebox(own=>lookup(env,ai,text,start,log,pass,docs,q,own,kind),ms,signal).catch(e=>{active(signal);log.push({p:pass,step:'extraction-deadline',ok:false,ms,err:String(e.message).slice(0,160)});throw e});};
-  const [a, b] = await Promise.allSettled([run(docs?prompt:promptA(q),0,'A'),run(docs?(kind==='equipment'?'ตรวจอย่างระมัดระวัง ไม่เดารุ่นย่อยหรืออุปกรณ์มาตรฐาน\n':'ตรวจอย่างระมัดระวัง แยกแต่ละรุ่นย่อยและปฏิเสธค่าที่เอกสารไม่ระบุ\n')+prompt:promptB(q),Math.min(1,ai.models.length-1),'B')]);
+  const [a, b] = await Promise.allSettled([run(prompt,0,'A'),run((kind==='equipment'?'ตรวจอย่างระมัดระวัง ไม่เดารุ่นย่อยหรืออุปกรณ์มาตรฐาน\n':'ตรวจอย่างระมัดระวัง แยกแต่ละรุ่นย่อยและปฏิเสธค่าที่เอกสารไม่ระบุ\n')+prompt,Math.min(1,ai.models.length-1),'B')]);
   active(signal);
   const A = a.status === 'fulfilled' ? a.value : null, B = b.status === 'fulfilled' ? b.value : null;
   if (!A && !B) throw (a.reason || b.reason || new Error('ค้นข้อมูลไม่สำเร็จ'));
   const first = A || B, second = A ? B : null;
-  if (!docs&&first.data.found === false && second && second.data.found === false&&first.sources.length&&second.sources.length) {
-    return { status: 'notfound', data: null, sources: [], models: [first.model, second && second.model].filter(Boolean) };
-  }
   const positive=[A,B].filter(r=>r&&r.data.found===true&&r.sources.length);
   if(!positive.length)throw new Error('ยังไม่มีแหล่งข้อมูลที่ใช้ยืนยันสเปกได้');
   if(kind==='equipment'){
@@ -362,7 +305,7 @@ async function researchWithin(env,q,log,signal,kind,deadline,reserveMs){
   for (const s of positive.flatMap(r=>r.sources)) {
     const k = s.url; if (seen.has(k)) continue; seen.add(k); sources.push(s);
   }
-  data.schema=2;data.depth=DEPTH;data.review=docs?'document_extraction':'ai_crosscheck';
+  data.schema=2;data.depth=DEPTH;data.review='document_extraction';
   data.query={...q,market:q.market||'GLOBAL'};
   if(docs){const used=new Set([...Object.values(data.facts).flatMap(f=>f?.sourceIds||[]),...data.bodySourceIds,...data.generationSourceIds,...data.variants.flatMap(v=>[...v.sourceIds,...v.fuelSourceIds,...['engine','gearbox','drive',...VNUM,...DETAIL_TEXT].flatMap(k=>v[k]?.sourceIds||[])])]);
     for(let i=sources.length-1;i>=0;i--)if(!used.has(sources[i].docId))sources.splice(i,1);

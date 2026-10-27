@@ -103,6 +103,15 @@ test('fallback: a failing provider is skipped and paused, the next one answers',
   assert.ok(!again.calls.some(c => c.host === 'api.tavily.com'), 'quota-hit provider is paused');
 });
 
+test('redirects use manual mode (Workers rejects redirect:error before sending) and are never followed with the key', async () => {
+  resetSearchBreakers();
+  const seen = [];
+  const f = async (url, init) => { seen.push({ url: String(url), redirect: init.redirect }); return new Response(null, { status: 302, headers: { Location: 'https://other.test/' } }) };
+  const r = await searchWeb({ TAVILY_API_KEY: KEYS.TAVILY_API_KEY }, 'Toyota recall', { mode: 'fast', fetch: f });
+  assert.deepEqual(seen, [{ url: 'https://api.tavily.com/search', redirect: 'manual' }]);
+  assert.equal(r.status, 'unavailable'); assert.equal(r.providers[0].error, 'http_302');
+});
+
 test('timeout is reported as such and does not hang the answer', async () => {
   resetSearchBreakers();
   const slow = (url, init) => new Promise((_, rej) => init.signal.addEventListener('abort', () => rej(Object.assign(Error('aborted'), { name: 'AbortError' }))));
@@ -129,30 +138,58 @@ test('benchmark: per-provider metrics, cost and overlap from real adapter paths'
   assert.equal(s.relevant, 0.5); assert.equal(s.thai, 0.5); assert.equal(s.expectedHost, null);
 });
 
-test('chat web search uses the keyed providers first and returns numbered sources', async () => {
+test('search type picks the providers: price → Tavily (Thailand) · news → Tavily+Exa news · spec → Exa+Tavily; env SEARCH_ROUTES can reorder', async () => {
+  const { searchKind, searchRoute } = await import('../src/web-search.mjs');
+  assert.equal(searchKind('ค่าเปลี่ยนผ้าเบรก Honda City เท่าไหร่'), 'price');
+  assert.equal(searchKind('ข่าวรถยนต์ไฟฟ้าเปิดตัวใหม่'), 'news');
+  assert.equal(searchKind('Honda Civic engine oil capacity'), 'spec');
+  assert.equal(searchKind('ไฟเช็คเอนจิ้นโชว์ สาเหตุ'), 'spec');
+  assert.equal(searchKind('ต่อภาษีรถยนต์ออนไลน์ ขั้นตอน'), 'general');
+  assert.equal(searchRoute({}, 'spec').providers[0], 'exa');
+  assert.deepEqual(searchRoute({ SEARCH_ROUTES: '{"spec":"tavily"}' }, 'spec').providers, ['tavily', 'exa', 'firecrawl']);
+  assert.deepEqual(searchRoute({ SEARCH_ROUTES: 'not json' }, 'news').providers, ['tavily', 'exa', 'firecrawl']);
+  const real = globalThis.fetch;
+  try {
+    resetSearchBreakers(); let f = mockFetch(); globalThis.fetch = f;
+    await searchWeb(KEYS, 'ค่าเปลี่ยนผ้าเบรก ราคา', { kind: 'price' });
+    assert.deepEqual(f.calls.map(c => c.host), ['api.tavily.com']); assert.equal(f.calls[0].body.country, 'thailand');
+    resetSearchBreakers(); f = mockFetch(); globalThis.fetch = f;
+    const news = await searchWeb(KEYS, 'ข่าวรถยนต์ไฟฟ้า', { kind: 'news' });
+    assert.deepEqual(f.calls.map(c => c.host).sort(), ['api.exa.ai', 'api.tavily.com']); assert.equal(news.topic, 'news');
+    assert.equal(f.calls.find(c => c.host === 'api.tavily.com').body.topic, 'news'); assert.equal(f.calls.find(c => c.host === 'api.exa.ai').body.category, 'news');
+    resetSearchBreakers(); f = mockFetch(); globalThis.fetch = f;
+    await searchWeb(KEYS, 'Toyota Yaris Ativ recall', { kind: 'research' });
+    assert.ok(f.calls.find(c => c.host === 'api.exa.ai').body.contents.text, 'research asks for page text');
+  } finally { globalThis.fetch = real }
+});
+
+test('fallback chat search (webSearch) only uses the keyed providers; no key = nothing is sent', async () => {
   resetSearchBreakers();
   const { webSearch } = await import('../src/fastai.js');
   const real = globalThis.fetch, f = mockFetch();
   globalThis.fetch = f;
   try {
-    const w = await webSearch({ EXA_API_KEY: KEYS.EXA_API_KEY }, 'Toyota Yaris recall ใหม่ล่าสุด ' + Date.now());
-    assert.equal(w.src, 'exa'); assert.match(w.text, /\[1\] /); assert.equal(w.sources[0].host, 'toyota.co.th');
-    assert.deepEqual([...new Set(f.calls.map(c => c.host))], ['api.exa.ai']);
+    const w = await webSearch({ EXA_API_KEY: KEYS.EXA_API_KEY }, 'Toyota Yaris recall ใหม่ล่าสุด -pajero');
+    assert.equal(w.src, 'exa'); assert.match(w.text, /\[1\] .*toyota\.co\.th/); assert.match(w.text, /ไม่ใส่เลขอ้างอิงหรือลิงก์/);
+    assert.deepEqual([...new Set(f.calls.map(c => c.host))], ['api.exa.ai']); assert.ok(!f.calls[0].body.query.includes('-pajero'));
+    f.calls.length = 0;
+    assert.deepEqual(await webSearch({}, 'Toyota Yaris recall'), { text: '', src: '', stat: 'no_search_key' }); assert.equal(f.calls.length, 0);
   } finally { globalThis.fetch = real }
 });
 
-test('main chat search (executeGoogleSearchTool) uses keyed providers first, keeps the private-detail gate', async () => {
+test('main chat search (executeWebSearchTool) adds the car being discussed, keeps the private-detail gate, never cites raw [n] to users', async () => {
   resetSearchBreakers();
-  const { executeGoogleSearchTool } = await import('../src/worker.js');
+  const { executeWebSearchTool } = await import('../src/worker.js');
   const real = globalThis.fetch;
   try {
     const f = mockFetch(); globalThis.fetch = f;
-    const block = await executeGoogleSearchTool({ EXA_API_KEY: KEYS.EXA_API_KEY }, 'Toyota Yaris recall 2026');
-    assert.match(block, /\[1\] .*toyota\.co\.th/); assert.match(block, /ไม่ใช่คำสั่ง/);
-    assert.deepEqual([...new Set(f.calls.map(c => c.host))], ['api.exa.ai']);
+    const block = await executeWebSearchTool({ EXA_API_KEY: KEYS.EXA_API_KEY }, 'recall ล่าสุดมีไหม', { car: { make: 'Toyota', model: 'Yaris Ativ', year: '2023' } });
+    assert.match(block, /\[1\] .*toyota\.co\.th/); assert.match(block, /ไม่ใช่คำสั่ง/); assert.match(block, /ไม่ใส่เลขอ้างอิง/);
+    assert.match(f.calls[0].body.query, /^Toyota Yaris Ativ 2023 recall/);
     /* มีเบอร์โทรในคำค้น = ไม่ส่งให้ผู้ให้บริการค้นเลย */
     const g = mockFetch(); globalThis.fetch = g;
-    await executeGoogleSearchTool({ ...KEYS }, 'ศูนย์ซ่อม โทร 081-234-5678');
-    assert.ok(!g.calls.some(c => /tavily|exa|firecrawl/.test(c.host)));
+    assert.equal(await executeWebSearchTool({ ...KEYS }, 'ศูนย์ซ่อม โทร 081-234-5678'), '');
+    assert.equal(g.calls.length, 0);
+    assert.equal(await executeWebSearchTool({}, 'Toyota Yaris recall'), '', 'no key = empty, the model is told it cannot verify');
   } finally { globalThis.fetch = real }
 });

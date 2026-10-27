@@ -2,7 +2,6 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {localTestIdentity} from '../src/auth.js';
 import {requestJson,RequestBodyError} from '../src/request-json.mjs';
-import {readPages,publicPageUrl} from '../src/fastai.js';
 import {readFileSync} from 'node:fs';
 
 test('synthetic auth stays local even when DEV_AUTH is accidentally set on production',()=>{
@@ -23,18 +22,15 @@ test('JSON limits apply to streamed bytes, not only client Content-Length',async
   await assert.rejects(requestJson(request(stream),20),e=>e.status===413);assert.ok(cancelled);
 });
 
-test('AI page readers reject private URLs, credentials, lookalike domains and unsafe redirects',async()=>{
-  for(const url of ['http://toyota.com/x','https://127.0.0.1/','https://[::1]/','https://169.254.169.254/','https://toyota.com.evil.example/','https://name:secret@toyota.com/','https://toyota.com:8443/'])assert.equal(publicPageUrl(url),null,url);
-  assert.ok(publicPageUrl('https://www.toyota.com/cars'));
+test('AI web search never opens arbitrary pages itself; only the keyed search APIs are called, with redirects refused',async()=>{
+  const fa=await import('../src/fastai.js');assert.equal(fa.readPages,undefined);assert.equal(fa.publicPageUrl,undefined);assert.equal(fa.fetchDuckDuckGoSearch,undefined);
   const original=globalThis.fetch,seen=[];
   try{
-    globalThis.fetch=async(url,init)=>{seen.push(url);assert.equal(init.redirect,'manual');return new Response(null,{status:302,headers:{Location:'https://169.254.169.254/private'}})};
-    const r=await readPages([{url:'https://toyota.com/engine',title:'Public vehicle page'}],'engine',1,1000);
-    assert.equal(r.ok,0);assert.deepEqual(seen,['https://toyota.com/engine']);
-    let cancelled=false;
-    globalThis.fetch=async()=>new Response(new ReadableStream({pull(c){c.enqueue(new TextEncoder().encode('engine '.repeat(10000)))},cancel(){cancelled=true}}),{headers:{'content-type':'text/html'}});
-    const result=await readPages([{url:'https://toyota.com/engine',title:'Public page'}],'engine',1,1000);
-    assert.equal(result.ok,1);assert.ok(cancelled,'huge pages are cancelled at the byte cap');
+    globalThis.fetch=async(url,init)=>{seen.push({url:String(url),redirect:init.redirect});return Response.json({results:[]})};
+    const {searchWeb,resetSearchBreakers}=await import('../src/web-search.mjs');resetSearchBreakers();
+    await searchWeb({TAVILY_API_KEY:'tvly-test-only-fixture'},'Toyota Yaris engine noise',{mode:'fast'});
+    assert.deepEqual(seen.map(x=>x.url),['https://api.tavily.com/search']);assert.equal(seen[0].redirect,'manual','Workers rejects redirect:error before sending the request');
+    seen.length=0;assert.equal(await fa.executeSearchInternal({},'Toyota Yaris recall'),'','no key = nothing leaves the Worker');assert.equal(seen.length,0);
   }finally{globalThis.fetch=original}
 });
 

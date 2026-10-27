@@ -50,10 +50,12 @@
     "OPENROUTER_BASE_URL": "https://openrouter.ai/api/v1",
     "CF_AI_FALLBACK_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
   },
-  // smart placement เคยพา worker ไปรันในพื้นที่ที่ Gemini ไม่รองรับ (400 "User location is not supported")
-  // ล็อกไว้ที่สหรัฐฯ ซึ่ง Gemini/Google/Bing ใช้ได้แน่นอน
+  // ที่ตั้งของ worker ต้องใกล้ฐานข้อมูล D1 (อยู่ฝั่งเอเชีย) — ทุกคำสั่งอ่าน/เขียนคือการเดินทางไปกลับหนึ่งรอบ
+  // เคยล็อกไว้ที่สหรัฐฯ (gcp:us-east4): วัดจริงคำสั่งละ ~0.3 วิ หน้าแอปที่อ่าน 4–6 คำสั่งจึงช้า 1.5–3 วิ ทุกหน้า
+  // ห้ามใช้ smart placement: เคยพาไปพื้นที่ที่ Gemini ไม่รองรับ (400 "User location is not supported" — แถวฮ่องกง)
+  // สิงคโปร์: ใกล้ D1 และผู้ใช้ไทย · Gemini/Groq/Cerebras/Tavily ใช้ได้
   "placement": {
-    "region": "gcp:us-east4"
+    "region": "gcp:asia-southeast1"
   },
   "triggers": {
     "crons": [

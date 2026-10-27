@@ -1,4 +1,5 @@
 import { chatModels } from './fastai.js';
+import { searchWeb, sourcesBlock, configuredProviders } from './web-search.mjs';
 
 /* ══════════════════════════════════════════════════════════════════
    นิตยสาร Cendon — รวมข่าวรถจากแหล่งข่าวจริง แบบ Google News
@@ -6,7 +7,7 @@ import { chatModels } from './fastai.js';
    1) ดึง RSS ของเว็บข่าวรถไทยและต่างประเทศพร้อมกัน → ได้หัวข่าว ลิงก์ รูป และเวลาของจริง
    2) ให้ Gemini คัดเฉพาะข่าวรถ เขียนพาดหัว สรุป และเล่าข่าวเป็นภาษาไทย จัดหมวด ให้คะแนนความสำคัญ
       AI เขียนจากเนื้อข่าวที่ดึงมาเท่านั้น ห้ามแต่งข้อเท็จจริงเพิ่ม และทุกข่าวมีลิงก์ไปต้นฉบับ
-   3) ถ้าดึงฟีดได้น้อยเกินไป ถอยไปให้ AI ค้นเว็บเอง (แบบเดิม) — นิตยสารต้องไม่ว่าง
+   3) ถ้าดึงฟีดได้น้อยเกินไป ถอยไปค้นข่าวผ่านตัวค้นของ AI (Tavily/Exa) แล้วให้ AI เรียบเรียงจากผลค้น — นิตยสารต้องไม่ว่าง
 
    ช่องข่าวแบบเลื่อน (20 ช่อง) — อัปเดตทุก 5 ชั่วโมง
    - แต่ละรอบเพิ่มเฉพาะข่าวที่ยังไม่มี (เทียบลิงก์และพาดหัวต้นฉบับ) ข่าวเดิมอยู่ต่อ
@@ -189,7 +190,7 @@ export function newsAI(env) {
   return { key: env.GEMINI_NEWS_KEY || env.GEMINI_KEY || '', own, models: [...new Set(models)], chatMain };
 }
 
-async function gemini(env, ai, { prompt, json = true, search = false, maxTokens = 8192 }) {
+async function gemini(env, ai, { prompt, json = true, maxTokens = 8192 }) {
   if (!ai.key) throw new Error('ยังไม่ได้ตั้งคีย์ Gemini');
   const base = env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
   let last = null;
@@ -201,8 +202,6 @@ async function gemini(env, ai, { prompt, json = true, search = false, maxTokens 
       else if (/2\.5/.test(model)) gen.thinkingConfig = { thinkingBudget: 0 };
     }
     const body = { contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: gen };
-    /* ค้นเว็บใช้คู่กับบังคับ JSON ไม่ได้ */
-    if (search && !json) body.tools = [{ google_search: {} }];
     try {
       const send = () => fetch(`${base}/v1beta/models/${model}:generateContent`, {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': ai.key }, body: JSON.stringify(body) });
@@ -282,21 +281,29 @@ async function ogImage(url) {
   } catch (e) { return ''; }
 }
 
-/* ทางสำรอง: ดึงฟีดไม่ได้เลย ให้ AI ค้นเว็บสรุปข่าวเอง (ไม่มีรูป/ลิงก์ แต่หน้านิตยสารไม่ว่าง) */
+/* ทางสำรอง: ดึงฟีดไม่ได้เลย → ค้นข่าวผ่านตัวค้นของ AI (Tavily/Exa ประเภทข่าว 3 วันล่าสุด) แล้วให้ AI เรียบเรียงจากผลค้นเท่านั้น
+   ได้ลิงก์ข่าวต้นทางจริงทุกข่าว (เลิกให้ Gemini ค้น Google เองแล้ว) · ไม่มีคีย์ตัวค้น = โยน error ให้หน้านิตยสารแสดงข่าวเดิมต่อ */
 async function aiSearchNews(env, ai) {
-  const r = await gemini(env, ai, { json: false, search: true, prompt: `${EDITOR}
+  const found = await searchWeb(env, 'ข่าวรถยนต์ล่าสุด ประเทศไทย รถยนต์ไฟฟ้า เปิดตัว ราคา', { kind: 'news', days: 3, max: 10 });
+  if (!found.results.length) throw new Error(configuredProviders(env).length ? 'ค้นข่าวไม่พบ' : 'ยังไม่ได้ตั้งคีย์ตัวค้นเว็บ (TAVILY_API_KEY / EXA_API_KEY / FIRECRAWL_API_KEY)');
+  const r = await gemini(env, ai, { json: true, prompt: `${EDITOR}
 
-ค้นเว็บหาข่าวรถยนต์ล่าสุดที่คนใช้รถในไทยควรรู้ (ไม่เกิน 3 วัน) ทั้งข่าวไทยและต่างประเทศ เลือก 12–16 ข่าว
-ตอบเป็น JSON array เท่านั้น ห้ามมีคำนำหรือ markdown:
-[{"title":"พาดหัวไทย ไม่เกิน 80 ตัวอักษร","summary":"สรุป 1–2 ประโยค","points":["ข้อเท็จจริงสั้น ๆ"],"body":"เล่าข่าว 2–4 ย่อหน้าสั้น","category":"เลือกจาก ${CATS.join(' / ')}","score":3,"source":"ชื่อสำนักข่าวต้นทาง"}]
-ห้ามแต่งตัวเลขหรือราคาที่ไม่แน่ใจ` });
+เลือกข่าวรถยนต์ที่คนใช้รถในไทยควรรู้จากผลค้นด้านล่างเท่านั้น (ไม่เกิน 3 วัน) เขียนจากเนื้อหาในผลค้น ห้ามเพิ่มข้อเท็จจริงเอง
+ตอบเป็น JSON array เท่านั้น:
+[{"n":1,"title":"พาดหัวไทย ไม่เกิน 80 ตัวอักษร","summary":"สรุป 1–2 ประโยค","points":["ข้อเท็จจริงสั้น ๆ"],"body":"เล่าข่าว 2–4 ย่อหน้าสั้น","category":"เลือกจาก ${CATS.join(' / ')}","score":3,"source":"ชื่อสำนักข่าวต้นทาง"}]
+n = เลขของผลค้นที่ใช้เขียนข่าวนั้น · ห้ามแต่งตัวเลขหรือราคาที่ไม่มีในผลค้น
+
+${sourcesBlock(found, { cite: false })}` });
   const arr = parseArr(r.text) || [];
   const now = Date.now();
-  return { model: r.model, items: arr.filter((o) => o && o.title).slice(0, 16).map((o) => ({
-    title: clip(o.title, 140), summary: clip(o.summary, 300), body: clip(o.body, 1600),
-    points: (Array.isArray(o.points) ? o.points : []).map((p) => clip(p, 160)).filter(Boolean).slice(0, 4),
-    category: CATS.includes(o.category) ? o.category : 'ข่าวเด่น', score: Math.max(1, Math.min(5, Math.round(Number(o.score) || 2))),
-    source: clip(o.source, 80), url: '', image: '', at: now, lang: 'th' })) };
+  return { model: r.model, items: arr.filter((o) => o && o.title).slice(0, 16).map((o) => {
+    const src = found.results.find((x) => x.id === Number(o.n));
+    return {
+      title: clip(o.title, 140), summary: clip(o.summary, 300), body: clip(o.body, 1600),
+      points: (Array.isArray(o.points) ? o.points : []).map((p) => clip(p, 160)).filter(Boolean).slice(0, 4),
+      category: CATS.includes(o.category) ? o.category : 'ข่าวเด่น', score: Math.max(1, Math.min(5, Math.round(Number(o.score) || 2))),
+      source: clip(o.source || (src && src.host), 80), url: src ? src.url : '', image: '', at: now, lang: 'th' };
+  }) };
 }
 
 /* ข่าวเด่นสุดขึ้นก่อน (ให้น้ำหนักข่าวที่มีรูป เพราะขึ้นเป็นภาพใหญ่หัวหน้า) แล้วตามความสด */
