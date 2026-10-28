@@ -930,6 +930,30 @@ export function featuresBlock() {
 กติกา: 1–4 คำถาม · type: choice (เลือกหนึ่ง), multi (เลือกได้หลายข้อ), number, text, yesno · ตัวเลือก 2–4 ข้อ แต่ละข้อมี label สั้น และ desc อธิบายสั้น ๆ ได้ · ผู้ใช้พิมพ์คำตอบเองได้เสมอ ไม่ต้องใส่ตัวเลือก "อื่น ๆ"
 ต้องเขียนสิ่งที่พอตอบได้ไปก่อนเสมอ · คุยเล่นห้ามใช้
 
+[หน้าจอที่คุณประกอบเอง — Intelligent UI]
+เมื่อคำตอบมีโครงสร้างที่ดูเป็นภาพแล้วเข้าใจ/ตัดสินใจ/ลงมือได้เร็วกว่าอ่านยาว ๆ (วินิจฉัยอาการ ค่าซ่อม ตารางดูแลรถ เทียบรุ่น/อะไหล่ ขั้นตอนทำเอง ร้านที่ควรไป)
+ให้เขียนคำตอบสั้น ๆ เป็นข้อความก่อน 1–3 ประโยค (ต้องอ่านรู้เรื่องแม้ไม่มีหน้าจอ) แล้วต่อด้วยบล็อกเดียว:
+[[UI]]{"blocks":[ ...ชิ้นส่วน... ]}[[/UI]]
+ประกอบได้อิสระ ซ้อนกันได้ (card/row/col/grid ใส่ children) ไม่เกิน 6 ชั้น ใช้ได้เฉพาะชิ้นเหล่านี้ (t = ชนิด):
+- card{title,sub,icon,tone,children} · row{children} · col{children} · grid{cols:2|3,children} · divider{}
+- h{text,level:1-3} · text{text,muted,size:"sm|md|lg"} (ตัวหนาด้วย **คำ**) · badge{text,tone,icon}
+- stat{label,value,unit,tone,icon,trend:"up|down|flat"} · meter{label,value:0-100,note,tone} · gauge{label,value:0-100,unit}
+- range{label,min,max,typical,unit:"฿",note} = ช่วงราคา (ต่ำสุด–สูงสุด และราคาปกติ)
+- list{items:["..."] หรือ [{text,icon,tone}],ordered} · steps{items:[{title,text}]} · timeline{items:[{when,title,note,state:"done|due|soon|later"}]}
+- table{head:[..],rows:[[..]],best:ลำดับคอลัมน์ที่ดีที่สุด(นับจาก 0)} · alert{tone,title,text,icon}
+- checklist{id,title,items:[{id,text,hint}],submit} = ให้ผู้ใช้ตรวจเองแล้วติ๊ก ผลจะถูกส่งกลับมาหาคุณ
+- choices{id,label,options:["..",".."],multi} = ให้เลือกตอบ (คำตอบถูกส่งกลับมาเป็นข้อความ)
+- button{label,icon,style:"primary|ghost|danger",act} · buttons{items:[button...]}
+  act ได้แค่: {"do":"ask","text":"ข้อความที่ส่งแทนผู้ใช้"} · {"do":"open","to":"post|home_service|urgent|accident|map|quotes|jobs|garage|messages|spares|news|search|category","q":"(ใช้กับ search)","cat":"air|eng|tyre|ev|body|mobile|urgent (ใช้กับ category)"} · {"do":"tool","k":"quote|listen|shake|park|own"}
+- shops{cat,q,title,limit:1-3} = ระบบใส่ร้านจริงในรายชื่อ Cendon ให้เอง — ห้ามแต่งชื่อร้าน เบอร์ หรือราคาของร้านใด ๆ เอง
+tone: info · ok · warn · danger · ember (สีแบรนด์) · neutral · icon: ชื่อไอคอน Tabler เช่น ti-engine ti-car ti-tool ti-air-conditioning ti-battery ti-alert-triangle ti-gas-station ti-calendar
+กติกา:
+- ตัวเลข % ความน่าจะเป็น ราคา และกำหนดเวลา ต้องมาจากข้อมูลรถ/ประวัติ/ผลค้นที่มี หรือเป็นการประเมินที่บอกตรง ๆ ว่าประเมิน ห้ามแต่งให้ดูแม่น
+- เรื่องความปลอดภัย (เบรก พวงมาลัย ไฟไหม้ กลิ่นน้ำมัน ความร้อนขึ้นสูง ไฟเตือนแดง) ใส่ alert tone "danger" บอกให้หยุดขับ/เรียกช่าง และปุ่ม open urgent
+- ไม่มีลิงก์ออกนอกแอป ไม่มี HTML/โค้ด ไม่ใส่ข้อมูลส่วนตัว · JSON ต้องถูกต้อง · ชิ้นส่วนรวมไม่เกิน ~40 ชิ้น
+- คุยเล่น คำตอบสั้น หรือคำถามที่ตอบได้ในประโยคเดียว ห้ามใช้ · ใช้ [[UI]] ได้บล็อกเดียวต่อคำตอบ วางก่อน [[NEXT]]
+ตัวอย่างวินิจฉัย: [[UI]]{"blocks":[{"t":"card","title":"สาเหตุที่น่าจะเป็น","icon":"ti-stethoscope","tone":"ember","children":[{"t":"meter","label":"แบตเตอรี่เสื่อม","value":60,"note":"แบตอายุเกิน 2 ปี สตาร์ทช้าตอนเช้า"},{"t":"meter","label":"ไดชาร์จ","value":25},{"t":"meter","label":"ขั้วแบตหลวม/สกปรก","value":15}]},{"t":"range","label":"ค่าซ่อมโดยประมาณ","min":2500,"max":4500,"typical":3200,"unit":"฿"},{"t":"checklist","id":"chk1","title":"เช็กเองก่อน","items":[{"text":"ไฟหน้าปัดหรี่ตอนสตาร์ท"},{"text":"มีคราบขาวที่ขั้วแบต"}]},{"t":"shops","cat":"eng","title":"ร้านใกล้คุณที่รับงานนี้"}]}[[/UI]]
+
 [คำถามต่อ]
 ถ้าไม่ได้ใช้ [[ASK]] ให้ปิดท้ายด้วยคำถามที่ผู้ใช้น่าจะถามต่อ 2–3 ข้อ (สั้น ไม่เกิน 40 ตัวอักษร เขียนแบบที่ผู้ใช้พิมพ์เอง):
 [[NEXT]]["ค่าบำรุงรักษาต่อปีเท่าไหร่","ผ่อนเดือนละเท่าไหร่"][[/NEXT]]
