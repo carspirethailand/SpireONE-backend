@@ -1704,30 +1704,29 @@ async function createJob(env, me, b) {
   if (t.test && !me.staff) fail(404, 'ไม่พบช่าง');
   if (!t.test && !t.verified) fail(404, 'ช่างยังไม่ผ่านการตรวจ');
   if (t.uid === me.uid) fail(400, 'ขอราคาจากร้านตัวเองไม่ได้');
-  await strikeCheck(env, me);
   const d = parse(t.data) || {};
   const vac = vacationOf(d);
-  if (vac) fail(409, 'ร้านนี้ปิดชั่วคราว' + (vac.note ? ' — ' + vac.note : '') + ' ลองร้านอื่นก่อนนะ');
   const mode = b.mode === 'mobile' && d.mobile ? 'mobile' : 'shop';
   /* หมุดรถ (ถ้าส่งมา) ต้องอยู่บนบกและใกล้เครื่องคนกรอก — เหมือนประกาศหาช่าง */
   const la = Number(b.lat), ln = Number(b.lng);
-  if (Number.isFinite(la) && Number.isFinite(ln) && Math.abs(la) <= 90 && Math.abs(ln) <= 180) await pinCheck(env, fail, { lat: la, lng: ln }, b.gps, !!b.urgent);
-
-  if (!t.test) {
-    /* กันสแปมคำขอ — ลูกค้าจริงไม่มีใครต้องขอราคาเกินสิบครั้งในวันเดียว */
-    const c = await env.DB.prepare('SELECT COUNT(*) AS n FROM tech_jobs WHERE customer_uid = ? AND created_at > ?')
-      .bind(me.uid, now() - 86400000).first();
-    if (c.n >= 10) fail(429, 'วันนี้ส่งคำขอครบ 10 ครั้งแล้ว ลองใหม่พรุ่งนี้');
-  }
   /* ขอราคาหลายร้านพร้อมกัน — ใบงานทุกใบในชุดเดียวกันมี group เดียวกัน
      พอลูกค้ายืนยันร้านหนึ่ง ร้านอื่นในชุดถูกยกเลิกให้อัตโนมัติ */
   const group = b.group ? String(b.group) : null;
-  if (group && !/^[0-9a-f-]{36}$/i.test(group)) fail(400, 'รหัสชุดคำขอไม่ถูกต้อง');
-  if (group) {
-    const g = await env.DB.prepare('SELECT COUNT(*) AS n, MIN(customer_uid) AS u FROM tech_jobs WHERE group_id = ?').bind(group).first();
-    if (g.n && g.u !== me.uid) fail(409, 'รหัสชุดคำขอซ้ำ');
-    if (g.n >= 5) fail(400, 'ขอราคาพร้อมกันได้ไม่เกิน 5 ร้าน');
-  }
+  await inOrder(
+    strikeCheck(env, me),
+    (async () => { if (vac) fail(409, 'ร้านนี้ปิดชั่วคราว' + (vac.note ? ' — ' + vac.note : '') + ' ลองร้านอื่นก่อนนะ'); })(),
+    Number.isFinite(la) && Number.isFinite(ln) && Math.abs(la) <= 90 && Math.abs(ln) <= 180 ? pinCheck(env, fail, { lat: la, lng: ln }, b.gps, !!b.urgent) : null,
+    /* กันสแปมคำขอ — ลูกค้าจริงไม่มีใครต้องขอราคาเกินสิบครั้งในวันเดียว */
+    t.test ? null : env.DB.prepare('SELECT COUNT(*) AS n FROM tech_jobs WHERE customer_uid = ? AND created_at > ?')
+      .bind(me.uid, now() - 86400000).first()
+      .then(c => { if (c.n >= 10) fail(429, 'วันนี้ส่งคำขอครบ 10 ครั้งแล้ว ลองใหม่พรุ่งนี้'); }),
+    (async () => {
+      if (!group) return;
+      if (!/^[0-9a-f-]{36}$/i.test(group)) fail(400, 'รหัสชุดคำขอไม่ถูกต้อง');
+      const g = await env.DB.prepare('SELECT COUNT(*) AS n, MIN(customer_uid) AS u FROM tech_jobs WHERE group_id = ?').bind(group).first();
+      if (g.n && g.u !== me.uid) fail(409, 'รหัสชุดคำขอซ้ำ');
+      if (g.n >= 5) fail(400, 'ขอราคาพร้อมกันได้ไม่เกิน 5 ร้าน');
+    })());
   const ts = now();
   const photos = mediaIn(b);
   /* งานด่วน: รถเสียตอนนี้ ลูกค้ากดชิปอาการสั้น ๆ ("แบตหมด") ก็พอ ไม่บังคับเล่ายาว */
@@ -1760,7 +1759,8 @@ function tell(env, uid, make) {
     const m = await make(); if (!m) return;
     await Promise.all([
       env.LINE_CHANNEL_TOKEN ? notify(env, uid, m).catch(() => {}) : null,
-      env.pushTo ? Promise.resolve().then(() => env.pushTo(uid, pushOf(m))).catch(() => {}) : null,
+      /* งานช่างเป็นเรื่องคนรอกันอยู่ (คำขอใหม่ งานด่วน ราคา ข้อความ) — ส่งแบบเร่งด่วน ไม่ให้มือถือที่พักจอหน่วงไว้ */
+      env.pushTo ? Promise.resolve().then(() => env.pushTo(uid, pushOf(m), { urgency: 'high' })).catch(() => {}) : null,
     ]);
   })().catch(() => {});
   if (env.bg) env.bg(p);
@@ -2043,6 +2043,13 @@ async function capCheck(env, t, except) {
   if (n >= cap) fail(409, `งานค้างเต็มแล้ว (${n}/${cap} งาน) — ส่งงานให้ลูกค้ายืนยันก่อน หรือกด "ลูกค้าไม่ตอบ" ในงานที่ส่งเกิน 24 ชม. แล้วค่อยเสนอราคาใหม่`);
 }
 /* ลูกค้าที่ทีมงานยืนยันว่าเงียบหายหลังช่างส่งงานหลายครั้ง เรียกช่างใหม่ไม่ได้ชั่วคราว */
+/* ด่านตรวจหลายด่านที่ไม่ขึ้นต่อกัน: ถามพร้อมกัน (ฐานข้อมูล + แผนที่ตรวจหมุดในน้ำซึ่งช้าได้ถึง 2.5 วิ) แทนการต่อคิวทีละด่าน
+   ด่านไม่ผ่านหลายด่าน = แจ้งด่านแรกตามลำดับที่ส่งมา ผู้ใช้จึงเห็นข้อความเดิมเหมือนตอนตรวจทีละด่าน */
+async function inOrder(...checks) {
+  const r = await Promise.allSettled(checks);
+  for (const x of r) if (x.status === 'rejected') throw x.reason;
+  return r.map(x => x.value);
+}
 async function strikeCheck(env, me) {
   if (me.staff) return;
   const r = await env.DB.prepare('SELECT COUNT(*) AS n FROM cust_strikes WHERE uid = ? AND at > ?').bind(me.uid, now() - STRIKE_WINDOW).first();
@@ -2497,12 +2504,13 @@ async function createPost(env, me, b) {
   const dup = await env.DB.prepare('SELECT customer_uid FROM tech_posts WHERE id = ?').bind(id).first();
   if (dup) { if (dup.customer_uid !== me.uid) fail(409, 'รหัสคำขอซ้ำ'); return { id }; }
   const c = coord(b);
-  await pinCheck(env, fail, c, b.gps, !!b.urgent);
   const cat = CATS.includes(b.cat) ? b.cat : '';
-  const open = await env.DB.prepare("SELECT COUNT(*) AS n FROM tech_posts WHERE customer_uid = ? AND status = 'open' AND created_at > ?")
-    .bind(me.uid, now() - POST_TTL).first();
-  if (open.n >= 3 && !me.staff) fail(429, 'มีประกาศที่เปิดอยู่ 3 รายการแล้ว ปิดอันเก่าก่อน');
-  await strikeCheck(env, me);
+  await inOrder(
+    pinCheck(env, fail, c, b.gps, !!b.urgent),
+    env.DB.prepare("SELECT COUNT(*) AS n FROM tech_posts WHERE customer_uid = ? AND status = 'open' AND created_at > ?")
+      .bind(me.uid, now() - POST_TTL).first()
+      .then(open => { if (open.n >= 3 && !me.staff) fail(429, 'มีประกาศที่เปิดอยู่ 3 รายการแล้ว ปิดอันเก่าก่อน'); }),
+    strikeCheck(env, me));
   /* งบที่ลูกค้าตั้ง (ไม่บังคับ) + รับอะไหล่มือสองได้ — ช่างเห็นก่อนเสนอราคา */
   const budget = b.budget == null || b.budget === '' ? null : Math.round(num(b.budget, 'งบที่ตั้งไว้', 100, 1000000));
   const ts = now();
@@ -2539,13 +2547,14 @@ async function postDetail(env, me, id) {
 
 async function myPosts(env, me) {
   const { results } = await env.DB.prepare('SELECT * FROM tech_posts WHERE customer_uid = ? ORDER BY created_at DESC LIMIT 30').bind(me.uid).all();
-  const out = [];
-  for (const p of results) {
-    const o = await env.DB.prepare("SELECT COUNT(*) AS n, MIN(CASE WHEN quote IS NOT NULL THEN json_extract(quote,'$.total') END) AS lo FROM tech_jobs WHERE group_id = ? AND status != 'cancelled'").bind(p.id).first();
+  /* ข้อเสนอของทุกประกาศถามรอบเดียว — เดิมถามทีละประกาศ (สูงสุด 30 รอบ) ทุกครั้งที่แอป/Studio ดึงงานใหม่ */
+  const offers = results.length ? await inAll(env, "SELECT group_id, COUNT(*) AS n, MIN(CASE WHEN quote IS NOT NULL THEN json_extract(quote,'$.total') END) AS lo FROM tech_jobs WHERE group_id IN ({IN}) AND status != 'cancelled' GROUP BY group_id", results.map(p => p.id)) : [];
+  const by = Object.fromEntries(offers.map(o => [o.group_id, o]));
+  return { posts: results.map(p => {
+    const o = by[p.id] || { n: 0, lo: null };
     const expired = p.status === 'open' && !postLive(p);
-    out.push(postOut({ ...p, status: expired ? 'expired' : p.status }, { offers: o.n, lowest: o.lo, address: p.address }, true));
-  }
-  return { posts: out };
+    return postOut({ ...p, status: expired ? 'expired' : p.status }, { offers: o.n, lowest: o.lo, address: p.address }, true);
+  }) };
 }
 
 /* งานรอบตัวช่าง — เฉพาะประกาศที่ยังเปิด ไม่หมดอายุ อยู่ในรัศมีรับงาน และหมวดตรง (หรือไม่ระบุหมวด) */
