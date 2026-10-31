@@ -1,8 +1,8 @@
 {
   "name": "spireonebackend",
   "main": "src/entry.js",
-  "durable_objects": {"bindings":[{"name":"CHAT_JOBS","class_name":"CendonChatJobs"}]},
-  "migrations": [{"tag":"chat-jobs-v1","new_sqlite_classes":["CendonChatJobs"]}],
+  "durable_objects": {"bindings":[{"name":"CHAT_JOBS","class_name":"CendonChatJobs"},{"name":"STUDIO_LIVE","class_name":"CendonStudioLive"}]},
+  "migrations": [{"tag":"chat-jobs-v1","new_sqlite_classes":["CendonChatJobs"]},{"tag":"studio-live-v1","new_sqlite_classes":["CendonStudioLive"]}],
   "workers_dev": true,
   "preview_urls": false,
   "compatibility_date": "2026-06-27",

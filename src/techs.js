@@ -1,5 +1,6 @@
 import {jobActor,cancellationActor} from './job-actor.mjs';
 import {requestText,RequestBodyError} from './request-json.mjs';
+import {connectStudio,publishStudioChanges,studioLiveReady} from './studio-live.mjs';
 /*
  * Cendon Care — ระบบช่าง (ส่วนเสริมของ spireonebackend)
  *
@@ -1394,8 +1395,9 @@ async function changeMessage(env, me, id, b, action) {
 }
 async function markRead(env, jobId, uid, last) {
   if (!last) return;
-  await env.DB.prepare(`INSERT INTO tech_reads (job_id, uid, last) VALUES (?,?,?)
-    ON CONFLICT(job_id, uid) DO UPDATE SET last = MAX(last, excluded.last)`).bind(jobId, uid, last).run();
+  const saved=await env.DB.prepare(`INSERT INTO tech_reads (job_id, uid, last) VALUES (?,?,?)
+    ON CONFLICT(job_id, uid) DO UPDATE SET last = excluded.last WHERE tech_reads.last < excluded.last`).bind(jobId, uid, last).run();
+  if(saved.meta?.changes&&studioLiveReady(env))env.bg(publishStudioChanges(env,[[uid,['jobs','threads']]]));
 }
 
 /* ══ อายุของคำขอ/ข้อเสนอที่ยังไม่ตกลงกัน ══
@@ -1731,13 +1733,26 @@ async function createJob(env, me, b) {
   const photos = mediaIn(b);
   /* งานด่วน: รถเสียตอนนี้ ลูกค้ากดชิปอาการสั้น ๆ ("แบตหมด") ก็พอ ไม่บังคับเล่ายาว */
   const urgent = b.urgent ? 1 : 0;
-  await env.DB.prepare(`INSERT INTO tech_jobs (id,tech_id,customer_uid,status,test,car,symptom,area,address,phone,requested_time,mode,history,revision,created_at,updated_at,group_id,note,urgent)
-    VALUES (?,?,?,'requested',?,?,?,?,?,?,?,?,?,1,?,?,?,?,?)`).bind(
+  const inserted=await env.DB.prepare(`INSERT INTO tech_jobs (id,tech_id,customer_uid,status,test,car,symptom,area,address,phone,requested_time,mode,history,revision,created_at,updated_at,group_id,note,urgent)
+    SELECT ?,?,?,'requested',?,?,?,?,?,?,?,?,?,1,?,?,?,?,?
+    WHERE (?=1 OR (SELECT COUNT(*) FROM tech_jobs WHERE customer_uid=? AND created_at>?)<10)
+      AND (? IS NULL OR ((SELECT COUNT(*) FROM tech_jobs WHERE group_id=?)<5
+        AND NOT EXISTS(SELECT 1 FROM tech_jobs WHERE group_id=? AND customer_uid!=?)))
+    ON CONFLICT(id) DO NOTHING`).bind(
     id, t.id, me.uid, t.test ? 1 : 0,
     str(b.car, 'รถ / รุ่น / ปี', 2, 200), str(b.symptom, 'อาการ', urgent ? 3 : 10, 2000),
     str(b.area, 'พื้นที่', 4, 160), str(b.address, 'ที่อยู่', 8, 500), phone(b.phone, 'เบอร์โทร'),
     str(b.requestedTime, 'วันและเวลา', 4, 160), mode,
-    JSON.stringify([{ status: 'requested', at: ts, by: 'customer' }]), ts, ts, group, noteIn(b), urgent).run();
+    JSON.stringify([{ status: 'requested', at: ts, by: 'customer' }]), ts, ts, group, noteIn(b), urgent,
+    t.test?1:0,me.uid,ts-86400000,group,group,group,me.uid).run();
+  if(!inserted.meta?.changes){
+    const existing=await env.DB.prepare('SELECT customer_uid FROM tech_jobs WHERE id=?').bind(id).first();
+    if(existing){if(existing.customer_uid!==me.uid)fail(409,'รหัสคำขอซ้ำ');return {id}}
+    const daily=await env.DB.prepare('SELECT COUNT(*) AS n FROM tech_jobs WHERE customer_uid=? AND created_at>?').bind(me.uid,ts-86400000).first();
+    if(!t.test&&daily.n>=10)fail(429,'วันนี้ส่งคำขอครบ 10 ครั้งแล้ว ลองใหม่พรุ่งนี้');
+    const conflict=await env.DB.prepare('SELECT customer_uid FROM tech_jobs WHERE group_id=? AND customer_uid!=? LIMIT 1').bind(group,me.uid).first();
+    if(conflict)fail(409,'รหัสชุดคำขอซ้ำ');fail(400,'ขอราคาพร้อมกันได้ไม่เกิน 5 ร้าน');
+  }
   /* ขอหลายร้านพร้อมกัน เก็บรูปชุดเดียวผูกกับชุดคำขอ ไม่ต้องเก็บซ้ำทุกร้าน */
   await saveMedia(env, group || id, me.uid, photos);
   /* ตอบกลับอัตโนมัติของร้าน — ลูกค้ารู้ทันทีว่าร้านได้รับเรื่องแล้ว */
@@ -1981,7 +1996,9 @@ async function updateJob(env, me, id, b) {
   const cols = Object.keys(set);
   /* WHERE revision = ? คือกุญแจกันสองคนกดพร้อมกัน — คนที่มาทีหลังจะแก้ไม่ติด */
   const r = await env.DB.prepare(
-    `UPDATE tech_jobs SET ${cols.map(c => c + ' = ?').join(', ')}, revision = revision + 1 WHERE id = ? AND revision = ?`)
+    `UPDATE tech_jobs SET ${cols.map(c => c + ' = ?').join(', ')}, revision = revision + 1 WHERE id = ? AND revision = ?
+      ${action==='accept'&&j.group_id?`AND NOT EXISTS(SELECT 1 FROM tech_jobs chosen WHERE chosen.group_id=tech_jobs.group_id AND chosen.id!=tech_jobs.id AND chosen.accepted_at IS NOT NULL AND chosen.status!='cancelled')
+       AND NOT EXISTS(SELECT 1 FROM tech_posts p WHERE p.id=tech_jobs.group_id AND p.status!='open')`:''}`)
     .bind(...cols.map(c => set[c]), j.id, j.revision).run();
   if (!r.meta.changes) {
     /* บันทึกรีวิวไม่ติด — ลบรูปที่เพิ่งใส่ไป ไม่ให้ค้างในฐานข้อมูล */
@@ -1996,7 +2013,7 @@ async function updateJob(env, me, id, b) {
       "SELECT id, history FROM tech_jobs WHERE group_id = ? AND id != ? AND status IN ('requested','quoted')").bind(j.group_id, j.id).all();
     for (const o of results) {
       const h = parse(o.history) || []; h.push({ status: 'cancelled', at: ts, by: 'system' });
-      extra.push(env.DB.prepare("UPDATE tech_jobs SET status='cancelled', resolution=?, history=?, updated_at=?, revision=revision+1 WHERE id=?")
+      extra.push(env.DB.prepare("UPDATE tech_jobs SET status='cancelled', resolution=?, history=?, updated_at=?, revision=revision+1 WHERE id=? AND status IN ('requested','quoted')")
         .bind('ลูกค้าเลือกร้านอื่นแล้ว', JSON.stringify(h), ts, o.id));
     }
   }
@@ -2518,11 +2535,17 @@ async function createPost(env, me, b) {
   /* ประกาศเป็นงานจริงเสมอ (เหมือนใบขอราคาตรงถึงร้าน) — เดิมประกาศจากบัญชีทีมงาน/เจ้าของถูกตั้งเป็นงานทดสอบอัตโนมัติ
      ช่างจริงจึงไม่เห็นเลย เจ้าของทดสอบเรียกช่างด่วนแล้วไม่ถึงใคร · ทีมงานที่ตั้งใจทดสอบ ส่ง test:true มาเอง */
   const test = me.staff && b.test === true ? 1 : 0, urgent = b.urgent ? 1 : 0;
-  await env.DB.prepare(`INSERT INTO tech_posts (id,customer_uid,status,test,car,symptom,cat,lat,lng,area,address,phone,requested_time,mode,urgent,created_at,updated_at,note,budget,used_ok)
-    VALUES (?,?,'open',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(id, me.uid, test,
+  const inserted=await env.DB.prepare(`INSERT INTO tech_posts (id,customer_uid,status,test,car,symptom,cat,lat,lng,area,address,phone,requested_time,mode,urgent,created_at,updated_at,note,budget,used_ok)
+    SELECT ?,?,'open',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+    WHERE (?=1 OR (SELECT COUNT(*) FROM tech_posts WHERE customer_uid=? AND status='open' AND created_at>?)<3)
+    ON CONFLICT(id) DO NOTHING`).bind(id, me.uid, test,
     str(b.car, 'รถ / รุ่น / ปี', 2, 200), str(b.symptom, 'อาการ', urgent ? 3 : 10, 2000), cat, c.lat, c.lng,
     str(b.area, 'พื้นที่', 3, 160), str(b.address, 'ที่อยู่', 4, 500), phone(b.phone, 'เบอร์โทร'),
-    str(b.requestedTime, 'วันและเวลา', 2, 160), b.mode === 'shop' ? 'shop' : 'mobile', urgent, ts, ts, noteIn(b), budget, b.usedOk === true ? 1 : 0).run();
+    str(b.requestedTime, 'วันและเวลา', 2, 160), b.mode === 'shop' ? 'shop' : 'mobile', urgent, ts, ts, noteIn(b), budget, b.usedOk === true ? 1 : 0,
+    me.staff?1:0,me.uid,ts-POST_TTL).run();
+  if(!inserted.meta?.changes){const existing=await env.DB.prepare('SELECT customer_uid FROM tech_posts WHERE id=?').bind(id).first();
+    if(existing){if(existing.customer_uid!==me.uid)fail(409,'รหัสคำขอซ้ำ');return {id}}
+    fail(429,'มีประกาศที่เปิดอยู่ 3 รายการแล้ว ปิดอันเก่าก่อน');}
   await saveMedia(env, id, me.uid, photos);
   /* บอกลูกค้าตามจริงว่ามีช่างกี่ร้านเห็นประกาศนี้ (reach) และกี่ร้านเปิดรับงานอยู่ตอนนี้ (taking)
      งานด่วน = แจ้งทาง LINE ทันทีเฉพาะร้านที่เปิด "รับงาน" — ร้านที่เลือกรับงานไม่แจ้งเตือน หรือพักร้าน ไม่ถูกปลุก */
@@ -2561,17 +2584,54 @@ async function myPosts(env, me) {
 /* ชีพจรของ Studio: ใบงานของร้าน ข้อความในใบงาน ห้องทัก และประกาศที่เปิดอยู่ เปลี่ยนเมื่อไร ค่า v เปลี่ยน
    หน้า Studio ถามทุกไม่กี่วินาที (เบามาก) แล้วค่อยดึงรายการเต็มเฉพาะตอนมีอะไรใหม่ = เห็นงานเกือบทันที โดยไม่ยิงหนัก */
 async function pulse(env, me) {
-  const shop = "(SELECT id FROM tech_profiles WHERE uid = ?)";
-  /* Queries run together; archive generations also update other signed-in devices. */
-  const r = await Promise.all([
-    env.DB.prepare(`SELECT COUNT(*) AS n, MAX(updated_at) AS m, SUM(revision) AS r FROM tech_jobs WHERE tech_id = ${shop} OR customer_uid = ?`).bind(me.uid, me.uid).first(),
-    env.DB.prepare(`SELECT MAX(id) AS m FROM tech_messages WHERE job_id IN (SELECT id FROM tech_jobs WHERE (tech_id = ${shop} OR customer_uid = ?) AND status NOT IN ('completed','cancelled'))`).bind(me.uid, me.uid).first(),
-    env.DB.prepare(`SELECT MAX(updated_at) AS m FROM tech_threads WHERE tech_id = ${shop} OR customer_uid = ?`).bind(me.uid, me.uid).first(),
-    env.DB.prepare("SELECT COUNT(*) AS n, MAX(updated_at) AS m FROM tech_posts WHERE status = 'open' AND created_at > ?").bind(now() - POST_TTL).first(),
-    env.DB.prepare('SELECT SUM(generation) AS r FROM tech_job_archives WHERE uid = ?').bind(me.uid).first(),
-  ]);
-  const v = r.map(o => { o = o || {}; return (o.n ?? '') + ':' + (o.m ?? '') + ':' + (o.r ?? ''); }).join('|');
-  return { v };
+  // One D1 round trip, not five. The token is opaque and contains no counts,
+  // identities, locations or message bodies. Own profile changes count too.
+  const r=await env.DB.prepare(`WITH shop AS (SELECT id,updated_at,online,suspended,verified,test,live_at FROM tech_profiles WHERE uid=?),
+    mine AS (SELECT id,status,updated_at,revision FROM tech_jobs WHERE customer_uid=? OR tech_id=(SELECT id FROM shop))
+    SELECT (SELECT json_array(COUNT(*),MAX(updated_at),SUM(revision)) FROM mine) AS jobs,
+    (SELECT json_array(MAX(id),MAX(edited_at),MAX(deleted_at)) FROM tech_messages WHERE job_id IN (SELECT id FROM mine WHERE status NOT IN ('completed','cancelled'))) AS messages,
+    (SELECT json_array(COUNT(*),MAX(updated_at)) FROM tech_threads WHERE customer_uid=? OR tech_id=(SELECT id FROM shop)) AS threads,
+    (SELECT json_array(COUNT(*),MAX(updated_at)) FROM tech_posts WHERE status='open' AND created_at>?) AS posts,
+    (SELECT SUM(generation) FROM tech_job_archives WHERE uid=?) AS archives,
+    (SELECT SUM(last) FROM tech_reads WHERE uid=?) AS reads,
+    (SELECT json_array(id,updated_at,online,suspended,verified,test,live_at) FROM shop) AS profile`)
+    .bind(me.uid,me.uid,me.uid,now()-POST_TTL,me.uid,me.uid).first();
+  return {v:await sha(JSON.stringify(r||{}))};
+}
+
+async function studioMutation(env,actor,path,data){
+  if(!studioLiveReady(env)||!actor)return;
+  // Driving coordinates have their own map poll; never reload all lists every 4 s.
+  if(/^\/api\/tech\/jobs\/[0-9a-f-]{36}\/live$/i.test(path))return;
+  const changes=[],add=(uid,topics)=>{if(uid)changes.push([uid,topics]);};
+  const jobPath=path.match(/^\/api\/tech\/jobs\/([0-9a-f-]{36})(?:\/|$)/i),groupPath=path.match(/^\/api\/tech\/groups\/([0-9a-f-]{36})(?:\/|$)/i);
+  const threadPath=path.match(/^\/api\/tech\/threads\/([0-9a-f-]{36})(?:\/|$)/i),postPath=path.match(/^\/api\/tech\/posts\/([0-9a-f-]{36})(?:\/|$)/i);
+  if(path==='/api/tech/jobs'||path==='/api/tech/jobs/archive'||jobPath||groupPath){
+    const id=jobPath?.[1]||data?.id||'',group=groupPath?.[1]||'';
+    const rows=(await env.DB.prepare(`SELECT j.customer_uid,t.uid AS technician_uid,j.group_id FROM tech_jobs j LEFT JOIN tech_profiles t ON t.id=j.tech_id
+      WHERE j.id=? OR (j.group_id IS NOT NULL AND j.group_id=COALESCE(NULLIF(?,''),(SELECT group_id FROM tech_jobs WHERE id=?)))`).bind(id,group,id).all()).results||[];
+    for(const row of rows){add(row.customer_uid,['jobs','posts','stats']);add(row.technician_uid,['jobs','posts','stats']);}
+    const groups=[...new Set([group,...rows.map(x=>x.group_id)].filter(Boolean))];
+    for(const id of groups){const p=await env.DB.prepare('SELECT * FROM tech_posts WHERE id=?').bind(id).first();if(p)for(const x of await postAudience(env,p))add(x.t.uid,['posts']);}
+    add(actor.uid,['jobs','posts','stats']);
+  }else if(path==='/api/tech/threads'||threadPath||/^\/api\/tech\/messages\//.test(path)){
+    let id=threadPath?.[1]||data?.id||'';
+    const message=path.match(/^\/api\/tech\/messages\/(\d+)\//);if(message){const m=await env.DB.prepare('SELECT job_id FROM tech_messages WHERE id=?').bind(Number(message[1])).first();id=m?.job_id||id;}
+    const row=await env.DB.prepare('SELECT h.customer_uid,t.uid AS technician_uid FROM tech_threads h LEFT JOIN tech_profiles t ON t.id=h.tech_id WHERE h.id=?').bind(id).first();
+    if(row){add(row.customer_uid,['threads']);add(row.technician_uid,['threads']);}else if(message){const job=await env.DB.prepare('SELECT j.customer_uid,t.uid AS technician_uid FROM tech_jobs j LEFT JOIN tech_profiles t ON t.id=j.tech_id WHERE j.id=?').bind(id).first();if(job){add(job.customer_uid,['jobs']);add(job.technician_uid,['jobs']);}}
+    add(actor.uid,['threads','jobs']);
+  }else if(path==='/api/tech/posts'||postPath){
+    const id=postPath?.[1]||data?.id||'',p=await env.DB.prepare('SELECT * FROM tech_posts WHERE id=?').bind(id).first();
+    if(p){add(p.customer_uid,['posts','jobs']);for(const x of await postAudience(env,p))add(x.t.uid,['posts']);
+      const offered=(await env.DB.prepare('SELECT t.uid FROM tech_jobs j JOIN tech_profiles t ON t.id=j.tech_id WHERE j.group_id=?').bind(p.id).all()).results||[];
+      for(const row of offered)add(row.uid,['posts','jobs']);}
+    add(actor.uid,['posts','jobs']);
+  }else{
+    add(actor.uid,path==='/api/tech/here'?['posts']:path==='/api/tech/online'?['profile','posts','stats']:['profile','services','stats']);
+    const target=env.studioRequest.target;
+    if(actor.staff&&target){if(target.uid)add(target.uid,['profile','services','stats']);if(target.id){const t=await env.DB.prepare('SELECT uid FROM tech_profiles WHERE id=?').bind(target.id).first();add(t?.uid,['profile','services','stats']);}}
+  }
+  await publishStudioChanges(env,changes);
 }
 async function nearPosts(env, me) {
   const t = await env.DB.prepare('SELECT * FROM tech_profiles WHERE uid = ?').bind(me.uid).first();
@@ -2616,16 +2676,19 @@ async function offer(env, me, postId, b) {
   if (ex) {
     if (!['requested', 'quoted'].includes(ex.status)) fail(409, 'ข้อเสนอนี้ถูกตอบรับหรือปิดไปแล้ว');
     const h = parse(ex.history) || []; h.push({ status: 'quoted', at: ts, by: 'technician' });
-    await env.DB.prepare("UPDATE tech_jobs SET quote=?, status='quoted', history=?, updated_at=?, revision=revision+1 WHERE id=?").bind(quote, JSON.stringify(h), ts, id).run();
+    const saved=await env.DB.prepare("UPDATE tech_jobs SET quote=?, status='quoted', history=?, updated_at=?, revision=revision+1 WHERE id=? AND status IN ('requested','quoted') AND EXISTS(SELECT 1 FROM tech_posts WHERE id=? AND status='open')").bind(quote, JSON.stringify(h), ts, id,postId).run();
+    if(!saved.meta?.changes)fail(409,'ข้อเสนอนี้ถูกตอบรับหรือปิดไปแล้ว');
     tell(env,p.customer_uid,async()=>jobCard(env,'quote',await env.DB.prepare('SELECT * FROM tech_jobs WHERE id = ?').bind(id).first(),shopOf(t)));
     return { id, updated: true };
   }
   const d = parse(t.data) || {};
   await env.DB.prepare(`INSERT INTO tech_jobs (id,tech_id,customer_uid,status,test,car,symptom,area,address,phone,requested_time,mode,quote,history,revision,created_at,updated_at,group_id,note,urgent)
-    VALUES (?,?,?,'quoted',?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?)`).bind(id, t.id, p.customer_uid, p.test || t.test ? 1 : 0,
+    SELECT ?,?,?,'quoted',?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?
+    WHERE EXISTS(SELECT 1 FROM tech_posts WHERE id=? AND status='open')
+    ON CONFLICT(id) DO NOTHING`).bind(id, t.id, p.customer_uid, p.test || t.test ? 1 : 0,
     p.car, p.symptom, p.area, p.address + ` · แผนที่ https://maps.google.com/?q=${p.lat},${p.lng}`, p.phone, p.requested_time,
     p.mode === 'mobile' && d.mobile ? 'mobile' : 'shop', quote,
-    JSON.stringify([{ status: 'requested', at: p.created_at, by: 'customer' }, { status: 'quoted', at: ts, by: 'technician' }]), ts, ts, p.id, p.note || '', p.urgent ? 1 : 0).run();
+    JSON.stringify([{ status: 'requested', at: p.created_at, by: 'customer' }, { status: 'quoted', at: ts, by: 'technician' }]), ts, ts, p.id, p.note || '', p.urgent ? 1 : 0,postId).run().then(r=>{if(!r.meta?.changes)fail(409,'ประกาศหรือข้อเสนอนี้เพิ่งเปลี่ยนไป กรุณารีเฟรชแล้วลองอีกครั้ง')});
   await env.DB.prepare('UPDATE tech_posts SET updated_at = ? WHERE id = ?').bind(ts, p.id).run();
   tell(env,p.customer_uid,async()=>jobCard(env,'quote',await env.DB.prepare('SELECT * FROM tech_jobs WHERE id = ?').bind(id).first(),shopOf(t)));
   return { id };
@@ -2634,15 +2697,18 @@ async function offer(env, me, postId, b) {
 async function closePost(env, me, postId) {
   const p = await env.DB.prepare('SELECT customer_uid, status FROM tech_posts WHERE id = ?').bind(postId).first();
   if (!p || (p.customer_uid !== me.uid && !me.owner)) fail(404, 'ไม่พบประกาศ');
+  if(p.status==='matched')fail(409,'ประกาศนี้เลือกร้านแล้ว ยกเลิกจากใบงานที่ยืนยันแทน');
+  if(p.status==='closed')return {ok:true};
   const by = p.customer_uid === me.uid ? 'customer' : 'admin';
   const ts = now();
   const { results } = await env.DB.prepare("SELECT id, history FROM tech_jobs WHERE group_id = ? AND status IN ('requested','quoted')").bind(postId).all();
-  await env.DB.batch([
-    env.DB.prepare("UPDATE tech_posts SET status = 'closed', updated_at = ? WHERE id = ?").bind(ts, postId),
+  const closed=await env.DB.batch([
+    env.DB.prepare("UPDATE tech_posts SET status = 'closed', updated_at = ? WHERE id = ? AND status='open' AND NOT EXISTS(SELECT 1 FROM tech_jobs WHERE group_id=? AND accepted_at IS NOT NULL AND status!='cancelled')").bind(ts, postId,postId),
     ...results.map(o => { const h = parse(o.history) || []; h.push({ status: 'cancelled', at: ts, by });
-      return env.DB.prepare("UPDATE tech_jobs SET status='cancelled', resolution=?, history=?, updated_at=?, revision=revision+1 WHERE id=?")
-        .bind(by === 'customer' ? 'ลูกค้าปิดประกาศแล้ว' : 'ทีมงานปิดประกาศแล้ว', JSON.stringify(h), ts, o.id); }),
+      return env.DB.prepare("UPDATE tech_jobs SET status='cancelled', resolution=?, history=?, updated_at=?, revision=revision+1 WHERE id=? AND status IN ('requested','quoted') AND EXISTS(SELECT 1 FROM tech_posts WHERE id=? AND status='closed' AND updated_at=?)")
+        .bind(by === 'customer' ? 'ลูกค้าปิดประกาศแล้ว' : 'ทีมงานปิดประกาศแล้ว', JSON.stringify(h), ts, o.id,postId,ts); }),
   ]);
+  if(!closed[0].meta?.changes)fail(409,'ประกาศนี้เพิ่งเปลี่ยนไป กรุณารีเฟรชแล้วลองอีกครั้ง');
   if (by === 'admin') await audit(env, me, 'close_post', postId);
   return { ok: true };
 }
@@ -2755,7 +2821,12 @@ async function editShop(env, me, b) {
     const r = await env.DB.prepare('INSERT INTO tech_docs (uid, kind, mime, data, created_at) VALUES (?,?,?,?,?)').bind(t.uid, 'shop', m[1], m[2], now()).run();
     d.cover = r.meta && r.meta.last_row_id || null;
   }
-  const stmts = [env.DB.prepare('UPDATE tech_profiles SET data = ?, updated_at = ? WHERE id = ?').bind(JSON.stringify(d), now(), t.id)];
+  // Apply only the fields this edit changed. Two devices editing different shop
+  // settings must not overwrite each other's unrelated or unknown profile fields.
+  const original=parse(t.data)||{},changed=Object.keys(d).filter(k=>JSON.stringify(d[k])!==JSON.stringify(original[k]));
+  const expression=changed.length?'json_set(data,'+changed.map(()=>"?,json(?)").join(',')+')':'data';
+  const stmts = [env.DB.prepare(`UPDATE tech_profiles SET data = ${expression}, updated_at = ? WHERE id = ?`)
+    .bind(...changed.flatMap(k=>['$."'+k+'"',JSON.stringify(d[k])]),now(),t.id)];
   /* ปิดโหมดช่างเคลื่อนที่ หรือพักร้าน = ลบตำแหน่งมือถือล่าสุดทิ้ง */
   if (!roamOn(d) || vacationOf(d)) stmts.push(env.DB.prepare('UPDATE tech_profiles SET live_lat = NULL, live_lng = NULL, live_at = NULL WHERE id = ?').bind(t.id));
   /* รูปใหม่ต่อท้าย รูปที่ลบคือรหัสรูปของร้านนี้เท่านั้น — ลบรูปร้านอื่นผ่านทางนี้ไม่ได้ */
@@ -2865,12 +2936,13 @@ const GIG_BASE = { air: 'air', 'air-clean': 'air', eng: 'eng', oil: 'eng', servi
   body: 'body', detail: 'body', glass: 'body', wash: 'body', mobile: 'mobile', tow: 'mobile' };
 async function saveGig(env, me, b) {
   /* แก้บริการเดิม = ร้านของบริการนั้น · เจ้าของระบบแก้/ลงบริการให้ร้านไหนก็ได้ (b.tech) */
-  let t;
+  let t,previous=null;
   if (b.id) {
-    const g0 = await env.DB.prepare('SELECT uid, tech_id, active FROM tech_gigs WHERE id = ?').bind(+b.id).first();
+    const g0 = await env.DB.prepare('SELECT * FROM tech_gigs WHERE id = ?').bind(+b.id).first();
     if (!g0 || !g0.active || (g0.uid !== me.uid && !me.owner)) fail(404, 'ไม่พบโพสต์');
     t = g0.uid === me.uid ? await myShop(env, me) : await techById(env, g0.tech_id);
     if (!t) fail(404, 'ไม่พบร้าน');
+    previous=g0;
   } else t = await shopFor(env, me, b);
   const other = t.uid !== me.uid;
   const kind = 'package';
@@ -2909,13 +2981,15 @@ async function saveGig(env, me, b) {
   const list = photos.filter(Boolean);
   photos = JSON.stringify(list);
   if (b.id) {
-    await env.DB.prepare('UPDATE tech_gigs SET kind=?,title=?,body=?,price=?,cats=?,brands=?,photos=?,updated_at=? WHERE id=?')
-      .bind(kind, title, body, price, cats, brands, photos, now(), +b.id).run();
+    const saved=await env.DB.prepare('UPDATE tech_gigs SET kind=?,title=?,body=?,price=?,cats=?,brands=?,photos=?,updated_at=? WHERE id=? AND active=1 AND updated_at=?')
+      .bind(kind, title, body, price, cats, brands, photos,Math.max(now(),Number(previous.updated_at)+1),+b.id,previous.updated_at).run();
+    if(!saved.meta?.changes)fail(409,'บริการนี้เพิ่งถูกแก้ไขหรือลบจากอีกเครื่อง กรุณารีเฟรชก่อนบันทึกอีกครั้ง');
     if (other) await audit(env, me, 'owner_edit_gig', String(+b.id));
     return { ok: true, id: +b.id, photos: list };
   }
-  const r = await env.DB.prepare('INSERT INTO tech_gigs (uid,tech_id,kind,title,body,price,cats,brands,photos,active,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,1,?,?)')
-    .bind(t.uid, t.id, kind, title, body, price, cats, brands, photos, now(), now()).run();
+  const r = await env.DB.prepare("INSERT INTO tech_gigs (uid,tech_id,kind,title,body,price,cats,brands,photos,active,created_at,updated_at) SELECT ?,?,?,?,?,?,?,?,?,1,?,? WHERE (?=1 OR (SELECT COUNT(*) FROM tech_gigs WHERE uid=? AND active=1 AND kind='package')<?)")
+    .bind(t.uid,t.id,kind,title,body,price,cats,brands,photos,now(),now(),me.owner?1:0,t.uid,GIG_MAX).run();
+  if(!r.meta?.changes){const c=await env.DB.prepare("SELECT COUNT(*) AS n FROM tech_gigs WHERE uid=? AND active=1 AND kind='package'").bind(t.uid).first();throw Object.assign(new HttpError(409,`มีบริการเดิมครบ ${GIG_MAX} รายการแล้ว — เปิด Studio > บริการ เพื่อแก้ไขรายการเดิม ข้อมูลไม่ได้ถูกลบ`),{serviceQuota:{used:c.n,limit:GIG_MAX,remaining:0}});}
   const nid = r.meta && r.meta.last_row_id;
   if (other) await audit(env, me, 'owner_add_gig', String(nid), t.id);
   return { ok: true, id: nid, photos: list };
@@ -3054,8 +3128,8 @@ async function advice(env, me) {
   if (env.GEMINI_KEY) {
     try {
       const model = env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
-      const r = await fetch(`${env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com'}/v1beta/models/${model}:generateContent?key=${env.GEMINI_KEY}`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
+      const r = await fetch(`${env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com'}/v1beta/models/${model}:generateContent`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key':env.GEMINI_KEY },
         /* สรุปจาก AI เป็นของเสริม — ช้าเกิน 8 วินาทีก็ตัดทิ้ง ช่างยังได้คำแนะนำจากระบบครบ */
         signal: AbortSignal.timeout(8000),
         body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text:
@@ -3076,7 +3150,9 @@ async function route(request, env, verifyToken) {
   const m = request.method;
   const body=async()=>{const reader=request.body?.getReader();if(!reader)fail(400,'ข้อมูลไม่ถูกต้อง');let total=0,raw='';const decoder=new TextDecoder();
     for(;;){const {done,value}=await reader.read();if(done)break;total+=value.byteLength;if(total>20*1024*1024){await reader.cancel();fail(413,'ข้อมูลใหญ่เกินไป');}raw+=decoder.decode(value,{stream:true});}raw+=decoder.decode();
-    let data;try{data=JSON.parse(raw)}catch{fail(400,'ข้อมูลไม่ถูกต้อง');}if(!data||typeof data!=='object'||Array.isArray(data))fail(400,'ข้อมูลไม่ถูกต้อง');return data;};
+    let data;try{data=JSON.parse(raw)}catch{fail(400,'ข้อมูลไม่ถูกต้อง');}if(!data||typeof data!=='object'||Array.isArray(data))fail(400,'ข้อมูลไม่ถูกต้อง');
+    if(env.studioRequest?.actor?.staff&&/^\/api\/tech\/(review|moderate|rescreen)$/.test(p)){const s=x=>typeof x==='string'&&x.length<=128?x:null;env.studioRequest.target={uid:s(data.uid),id:s(data.id||data.techId)};}
+    return data;};
 
   if (p === '/api/tech' && m === 'GET') {
     /* รายชื่อเปิดให้ทุกคน — โทเคนหมดอายุต้องไม่ทำให้คนทั่วไปดูรายชื่อไม่ได้ */
@@ -3115,12 +3191,13 @@ async function route(request, env, verifyToken) {
     return listReviews(env, me, url);
   }
   /* หน้าเว็บใช้เช็กว่าเซิร์ฟเวอร์มีระบบช่างรุ่นนี้แล้ว — ถ้าไม่มี แสดงให้ทีมงานรู้ว่ายังไม่ได้ deploy */
-  if (p === '/api/tech/ping') return { ok: true, version: API_VERSION, identity: diditReady(env) ? 'didit' : 'manual', consentVer: CONSENT_VER, photoAI: visionReady(env) };
+  if (p === '/api/tech/ping') return { ok: true, version: API_VERSION, identity: diditReady(env) ? 'didit' : 'manual', consentVer: CONSENT_VER, photoAI: visionReady(env), studioLive:studioLiveReady(env) };
   if (p === '/api/tech/didit/webhook' && m === 'POST') return diditWebhook(env, request);
   const hdm = p.match(/^\/api\/tech\/handle\/([A-Za-z0-9-]{1,40})$/);
   if (hdm && m === 'GET') return resolveHandle(env, handleIn(hdm[1]));
 
   const me = await who(request, env,true,verifyToken);
+  if(env.studioRequest)env.studioRequest.actor=me;
   if (p === '/api/tech/me' && m === 'GET') return meInfo(env, me);
   if (p === '/api/tech/handle' && m === 'GET') return checkHandle(env, me, handleIn(url.searchParams.get('h')));
   if (p === '/api/tech/handle' && m === 'POST') return setHandle(env, me, await body());
@@ -3200,13 +3277,14 @@ export async function handleTech(request, env, corsHeaders, options={}) {
   /* งานเบื้องหลังของคำขอนี้ (แจ้ง LINE) — ctx.waitUntil ให้ Worker ทำต่อหลังตอบผู้ใช้ไปแล้ว
      ห่อ env เป็นชั้นใหม่ต่อคำขอ ไม่แก้ env ตัวจริงที่ใช้ร่วมกันทั้ง isolate */
   const ctx = options.ctx;
-  env = Object.create(env, { bg: { value: (p) => { const q = Promise.resolve(p).catch(() => {}); if (ctx && ctx.waitUntil) ctx.waitUntil(q); return q; } } });
+  env = Object.create(env, { studioRequest:{value:{actor:null,target:null}},bg: { value: (p) => { const q = Promise.resolve(p).catch(() => {}); if (ctx && ctx.waitUntil) ctx.waitUntil(q); return q; } } });
   try {
     const img = new URL(request.url).pathname.match(/^\/api\/tech\/img\/(\d+)$/);
     // Existing image reads cannot require a schema migration or table rebuild.
     if (img) return await image(env, request, Number(img[1]), options.verifyToken, h);
     await ensureTech(env);
     const path = new URL(request.url).pathname;
+    if(path==='/api/tech/events')return await connectStudio(request,env,auth=>who(auth,env,true,options.verifyToken));
     const pvm = request.method === 'GET' && path.match(/^\/api\/tech\/passport\/([A-Za-z0-9_-]{20,64})\/media\/([^/]+)$/);
     if (pvm) return await passportMedia(env, pvm[1], pvm[2], h);
     const scm = request.method === 'GET' && path.match(/^\/api\/tech\/showcase\/media\/([^/]+)$/);
@@ -3214,6 +3292,7 @@ export async function handleTech(request, env, corsHeaders, options={}) {
     const md = path.match(/^\/api\/tech\/media\/([^/]+)$/);
     if (md) return await mediaRoute(env, request, md[1], h, options.verifyToken);
     const data=await route(request, env,options.verifyToken);
+    if(['POST','PUT','DELETE'].includes(request.method)&&env.studioRequest.actor)env.bg(studioMutation(env,env.studioRequest.actor,path,data).catch(()=>console.warn('studio.live.refresh_unavailable')));
     const privateRead=request.headers.has('Authorization')||path==='/api/tech/me'||(path==='/api/tech/gigs'&&new URL(request.url).searchParams.get('mine')==='1');
     return json(data, 200, privateRead?{...h,'Cache-Control':'private, no-store','Vary':'Authorization, Origin'}:h);
   } catch (e) {
