@@ -5,6 +5,9 @@ import {readFile,mkdir,writeFile} from 'node:fs/promises';
 import {resolve,relative,isAbsolute,dirname} from 'node:path';
 import {createHash} from 'node:crypto';
 const EXPECTED_DB='bf9b1815-2ef6-4463-8b35-6b97717b5d9a';
+// Wrangler writes stdout JSON to its debug file even when the parent only keeps
+// hashes. Disable that file sink before any database/metadata request is made.
+export const releaseGuardEnvironment=(env=process.env)=>({...env,WRANGLER_WRITE_LOGS:'false',WRANGLER_SEND_METRICS:'false',WRANGLER_SEND_ERROR_REPORTS:'false',WRANGLER_LOG_SANITIZE:'true'});
 export const fingerprintRows=rows=>rows.map(r=>({key:hash(String(r.id??r.uid)),digest:hash(JSON.stringify(r))})).sort((a,b)=>a.key.localeCompare(b.key));
 const hash=s=>createHash('sha256').update(s).digest('hex');
 export function compareSnapshots(before,after){
@@ -30,7 +33,7 @@ async function main(){
   const file=resolve(root,snapshotPath),rel=relative(resolve(root,'.qa/mechanic-release'),file);
   if(isAbsolute(rel)||rel.startsWith('..')||!rel.endsWith('.json'))throw Error('Snapshot must be inside .qa/mechanic-release');
   const cfg=await readFile(resolve(root,'wrangler.jsonc'),'utf8');if(!cfg.includes('"database_id": "'+EXPECTED_DB+'"'))throw Error('Production database binding changed; manual migration review required');
-  const run=args=>{const r=spawnSync(process.execPath,[resolve(cli),...args],{cwd:root,env:process.env,encoding:'utf8',maxBuffer:32*1024*1024});if(r.status!==0)throw Error('Read-only Cloudflare check failed; inspect CLI access without sharing secrets');return JSON.parse(r.stdout)};
+  const run=args=>{const r=spawnSync(process.execPath,[resolve(cli),...args],{cwd:root,env:releaseGuardEnvironment(),encoding:'utf8',maxBuffer:32*1024*1024});if(r.status!==0)throw Error('Read-only Cloudflare check failed; inspect CLI access without sharing secrets');return JSON.parse(r.stdout)};
   const tables={};for(const [name,sql] of Object.entries(queries)){
     const result=run(['d1','execute','spireone','--remote','--json','--command',sql]);const rows=result.flatMap(x=>x.results||[]);
     if(rows.length>10000)throw Error('Snapshot row limit exceeded; add pagination before release');tables[name]=fingerprintRows(rows);
