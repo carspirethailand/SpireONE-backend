@@ -33,7 +33,7 @@ const CHECKS = ['identity', 'phone', 'work', 'skills', 'shop', 'terms'];
    ใบรับรองฝีมือไม่บังคับ — ช่างเก่งจำนวนมากไม่มีใบ ทีมงานสัมภาษณ์ทักษะแทนได้ */
 const DOCS = [['id', 1, 1], ['selfie', 1, 1], ['shop', 1, 3], ['work', 3, 6], ['cert', 0, 2]];
 const PRIVATE_DOCS = ['id', 'selfie', 'cert'];
-const API_VERSION = 15;
+const API_VERSION = 16;
 const PHONE = /^0\d{8,9}$/;
 const now = () => Date.now();
 
@@ -402,6 +402,37 @@ async function sha(s) {
 
 /* ── ช่าง ── */
 const THEMES = ['orange', 'blue', 'green', 'violet', 'rose', 'slate', 'amber', 'teal'];
+/* หน้าร้านแบบจัดเอง (Studio → แต่งหน้าร้าน): ลำดับการ์ด รูปแบบ และข้อความที่ช่างพิมพ์เอง · ไม่มี = หน้าร้านแบบเดิม
+   ข้อมูลจริง (รีวิว บริการ ผลงาน ตัวเลข เวลา) หน้าเว็บดึงจากระบบเสมอ — การ์ดเก็บแค่ตำแหน่งกับรูปแบบ แต่งตัวเลขเองไม่ได้
+   ป้ายชื่อร้าน/ผลการตรวจของทีมงาน · "ก่อนจ้าง ควรรู้" · ปุ่มขอราคา ไม่อยู่ในรายการนี้ ช่างจึงซ่อนหรือย้ายออกไม่ได้ */
+const PAGE_TYPES = ['scene', 'cover', 'banner', 'stats', 'services', 'reviews', 'work', 'photos', 'hours', 'about', 'text', 'contact'];
+const PAGE_MULTI = ['banner', 'text'];
+const PAGE_STYLES = ['full', 'card', 'gradient'];
+const PAGE_GRADS = ['sunset', 'ocean', 'forest', 'berry', 'night', 'gold'];
+const PAGE_HEX = /^#[0-9a-f]{6}$/i;
+const pageText = (v, n, lines = false) => String(v ?? '').replace(lines ? /[\u0000-\u0009\u000b-\u001f\u007f]/g : /[\u0000-\u001f\u007f]/g, ' ').replace(/\n{3,}/g, '\n\n').trim().slice(0, n);
+function pageIn(p) {
+  if (p === null) return null;
+  if (!p || typeof p !== 'object' || !Array.isArray(p.blocks)) fail(400, 'หน้าร้าน: รูปแบบข้อมูลไม่ถูกต้อง');
+  if (p.blocks.length > 24) fail(400, 'หน้าร้าน: ใส่การ์ดได้ไม่เกิน 24 ใบ');
+  const ids = new Set(), once = new Set();
+  const blocks = p.blocks.map((b, i) => {
+    const type = b && PAGE_TYPES.includes(b.type) ? b.type : fail(400, 'หน้าร้าน: มีการ์ดชนิดที่ใช้ไม่ได้');
+    if (!PAGE_MULTI.includes(type)) { if (once.has(type)) fail(400, 'หน้าร้าน: การ์ดชนิดนี้ใส่ได้ใบเดียว'); once.add(type); }
+    if (PAGE_MULTI.includes(type) && p.blocks.filter(x => x && x.type === type).length > 6) fail(400, 'หน้าร้าน: การ์ดข้อความ/แบนเนอร์ใส่ได้ชนิดละไม่เกิน 6 ใบ');
+    let id = /^[a-z0-9]{1,12}$/i.test(String(b.id || '')) ? String(b.id) : 'b' + i;
+    while (ids.has(id)) id = (id + 'x').slice(-12); ids.add(id);
+    const q = b.props && typeof b.props === 'object' ? b.props : {}, out = { id, type, style: PAGE_STYLES.includes(b.style) ? b.style : 'card' };
+    if (type === 'scene') out.props = { sign: pageText(q.sign, 28), signColor: PAGE_HEX.test(q.signColor) ? q.signColor.toLowerCase() : '#e8843c',
+      wallColor: PAGE_HEX.test(q.wallColor) ? q.wallColor.toLowerCase() : '#f4e7d4', accentColor: PAGE_HEX.test(q.accentColor) ? q.accentColor.toLowerCase() : '#e07a38', size: q.size === 'short' ? 'short' : 'tall' };
+    if (type === 'banner') out.props = { title: pageText(q.title, 60), text: pageText(q.text, 200), grad: PAGE_GRADS.includes(q.grad) ? q.grad : 'sunset' };
+    if (type === 'text') out.props = { title: pageText(q.title, 60), body: pageText(q.body, 600, true) };
+    if (type === 'photos') out.props = { layout: q.layout === 'row' ? 'row' : 'grid' };
+    return out;
+  });
+  return { v: 1, blocks };
+}
+const pageOut = d => d && d.page && Array.isArray(d.page.blocks) ? d.page : null;
 function vacationOf(d) {
   const v = d.vacation;
   if (!v || !v.on || (v.until && v.until < Date.now())) return null;
@@ -439,7 +470,7 @@ function publicTech(r) {
     phone: d.showPhone ? String(d.phone || r.phone || '') : undefined, showPhone: !!d.showPhone,
     subs: d.subs || [], week: d.week || null, brands2: d.brands2 || [], line: d.line || '', facebook: d.facebook || '', address: d.address || '',
     /* โหมดพักร้อน: แสดงบนหน้าร้าน และงดรับคำขอใหม่จนกว่าจะถึงวันที่ตั้ง */
-    vacation: vacationOf(d), greet: d.greet || '', theme: d.theme || '', handle: r.handle || '',
+    vacation: vacationOf(d), greet: d.greet || '', theme: d.theme || '', handle: r.handle || '', page: pageOut(d),
     /* งานที่ซ่อมจบพร้อมหลักฐานที่ AI ตรวจผ่าน (รวม + แยกหมวด) · full = งานค้างเต็ม เสนอราคางานใหม่ไม่ได้ชั่วคราว */
     proven: r.proven ? r.proven.n : 0, provenCats: r.proven ? r.proven.cats : {}, full: !r.test && (r.openJobs || 0) >= capOf(d),
     vetting: d.vetting && r.verified ? { at: d.vetting.at, identity: !!d.vetting.identity, phone: !!d.vetting.phone, shop: d.vetting.shop || '', skills: d.vetting.skills || '', cats: d.vetting.cats || [], mobile: !!d.vetting.mobile } : null,
@@ -2800,6 +2831,7 @@ async function editShop(env, me, b) {
   if (b.greet != null) d.greet = String(b.greet).trim().slice(0, 200);
   if (b.minPrice != null) d.minPrice = num(b.minPrice, 'ราคางานต่ำสุด', 0, 1000000);
   if (b.theme != null) d.theme = THEMES.includes(b.theme) ? b.theme : '';
+  if (b.page !== undefined) { const pg = pageIn(b.page); if (pg) d.page = pg; else delete d.page; }
   /* เวลาทำการรายวัน: 7 ช่อง [จ..อา] แต่ละช่อง {on, open:"08:00", close:"18:00"} */
   if (b.week != null) {
     const w = Array.isArray(b.week) ? b.week.slice(0, 7) : [];
@@ -2844,7 +2876,8 @@ async function editShop(env, me, b) {
   }
   await env.DB.batch(stmts);
   if (other) await audit(env, me, 'owner_edit_shop', t.id);
-  return { ok: true };
+  /* ส่งหน้าร้านที่บันทึกจริงกลับไป — หน้าเว็บเทียบได้ว่าหลังบ้านรุ่นนี้เก็บหน้าร้านแบบจัดเองแล้ว */
+  return b.page !== undefined ? { ok: true, page: pageOut(d) } : { ok: true };
 }
 
 /* ═══ โพสต์บริการของช่าง ═══
