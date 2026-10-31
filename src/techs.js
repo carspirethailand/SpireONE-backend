@@ -2108,8 +2108,9 @@ async function setBays(env, me, b) {
   adminOnly(me);
   const t = await techById(env, String(b.id || ''));
   if (!t) fail(404, 'ไม่พบช่าง');
+  if(env.studioRequest)env.studioRequest.target={uid:t.uid};
   const d = parse(t.data) || {}, bays = Math.round(num(b.bays, 'จำนวนช่องซ่อม', 1, 30));
-  await env.DB.prepare('UPDATE tech_profiles SET data = ?, updated_at = ? WHERE id = ?').bind(JSON.stringify({ ...d, bays }), now(), t.id).run();
+  await env.DB.prepare("UPDATE tech_profiles SET data = json_set(data,'$.bays',?), updated_at = ? WHERE id = ?").bind(bays, now(), t.id).run();
   await audit(env, me, 'bays', t.id, String(bays));
   return { ok: true, bays };
 }
@@ -2757,6 +2758,7 @@ async function shopFor(env, me, b) {
   if (!me.owner) fail(403, 'เฉพาะเจ้าของระบบที่แก้ร้านของคนอื่นได้');
   const t = await techById(env, id);
   if (!t) fail(404, 'ไม่พบร้าน');
+  if(env.studioRequest)env.studioRequest.target={uid:t.uid};
   return t;
 }
 async function setOnline(env, me, b) {
@@ -2855,10 +2857,11 @@ async function editShop(env, me, b) {
   }
   // Apply only the fields this edit changed. Two devices editing different shop
   // settings must not overwrite each other's unrelated or unknown profile fields.
-  const original=parse(t.data)||{},changed=Object.keys(d).filter(k=>JSON.stringify(d[k])!==JSON.stringify(original[k]));
-  const expression=changed.length?'json_set(data,'+changed.map(()=>"?,json(?)").join(',')+')':'data';
+  const original=parse(t.data)||{},changed=Object.keys(d).filter(k=>JSON.stringify(d[k])!==JSON.stringify(original[k])),removed=Object.keys(original).filter(k=>!Object.hasOwn(d,k));
+  const setExpression=changed.length?'json_set(data,'+changed.map(()=>"?,json(?)").join(',')+')':'data';
+  const expression=removed.length?'json_remove('+setExpression+','+removed.map(()=>'?').join(',')+')':setExpression;
   const stmts = [env.DB.prepare(`UPDATE tech_profiles SET data = ${expression}, updated_at = ? WHERE id = ?`)
-    .bind(...changed.flatMap(k=>['$."'+k+'"',JSON.stringify(d[k])]),now(),t.id)];
+    .bind(...changed.flatMap(k=>['$.'+JSON.stringify(k),JSON.stringify(d[k])]),...removed.map(k=>'$.'+JSON.stringify(k)),now(),t.id)];
   /* ปิดโหมดช่างเคลื่อนที่ หรือพักร้าน = ลบตำแหน่งมือถือล่าสุดทิ้ง */
   if (!roamOn(d) || vacationOf(d)) stmts.push(env.DB.prepare('UPDATE tech_profiles SET live_lat = NULL, live_lng = NULL, live_at = NULL WHERE id = ?').bind(t.id));
   /* รูปใหม่ต่อท้าย รูปที่ลบคือรหัสรูปของร้านนี้เท่านั้น — ลบรูปร้านอื่นผ่านทางนี้ไม่ได้ */
@@ -2904,6 +2907,7 @@ async function ownGig(env, me, id) {
   if (!g || (g.uid !== me.uid && !me.owner) || !g.active) fail(404, 'ไม่พบบริการ');
   const t = await env.DB.prepare('SELECT * FROM tech_profiles WHERE id = ?').bind(g.tech_id).first();
   if (!t || t.suspended) fail(403, 'ร้านถูกระงับชั่วคราว');
+  if(env.studioRequest&&me.owner)env.studioRequest.target={uid:t.uid};
   return { g, t };
 }
 async function sponsorGig(env, me, b) {
@@ -2979,6 +2983,7 @@ async function saveGig(env, me, b) {
   } else t = await shopFor(env, me, b);
   const other = t.uid !== me.uid;
   const kind = 'package';
+  if(other&&env.studioRequest)env.studioRequest.target={uid:t.uid};
   const title = String(b.title || '').trim().slice(0, 100);
   if (title.length < 3) fail(400, 'ใส่หัวข้อโพสต์อย่างน้อย 3 ตัวอักษร');
   const body = String(b.body || '').trim().slice(0, 2000);
@@ -3030,6 +3035,7 @@ async function saveGig(env, me, b) {
 async function delGig(env, me, b) {
   const g = await env.DB.prepare('SELECT uid FROM tech_gigs WHERE id = ?').bind(+b.id).first();
   if (!g || (g.uid !== me.uid && !me.staff)) fail(404, 'ไม่พบโพสต์');
+  if(env.studioRequest&&me.staff)env.studioRequest.target={uid:g.uid};
   await env.DB.batch([env.DB.prepare('UPDATE tech_gigs SET active = 0, updated_at = ? WHERE id = ?').bind(now(), +b.id),
     env.DB.prepare('UPDATE tech_sponsors SET cancelled_at = ? WHERE gig_id = ? AND cancelled_at IS NULL AND ends_at > ?').bind(now(), +b.id, now())]);
   if (g.uid !== me.uid) await audit(env, me, 'delete_gig', String(+b.id));
