@@ -60,3 +60,14 @@ test('storefront: only the shop owner (or the system owner) can change it',async
   assert.notEqual(r.status,200);
   assert.equal((await mine(f)).page,null);
 });
+
+test('storefront: a mobile mechanic picks the vehicle shown in the 3D scene; anything else is dropped',async()=>{
+  const f=fixture();await withMechanic(f);
+  assert.equal((await mine(f)).vehicle,'');
+  const r=await f.call(MECH,'/api/tech/shop',{vehicle:'van'});assert.equal(r.status,200,r.error);assert.equal(r.vehicle,'van');
+  assert.equal((await mine(f)).vehicle,'van');assert.equal((await listed(f)).vehicle,'van');
+  assert.equal((await f.call(MECH,'/api/tech/shop',{vehicle:'<script>'})).vehicle,'','unknown values clear it');
+  assert.equal((await f.call(MECH,'/api/tech/shop',{vehicle:'moto'})).vehicle,'moto');
+  assert.equal((await f.call(MECH,'/api/tech/shop',{greet:'สวัสดี'})).vehicle,undefined,'other edits do not touch it');assert.equal((await mine(f)).vehicle,'moto');
+  assert.notEqual((await f.call(USER,'/api/tech/shop',{vehicle:'van'})).status,200);
+});

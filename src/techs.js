@@ -410,6 +410,8 @@ const PAGE_MULTI = ['banner', 'text'];
 const PAGE_STYLES = ['full', 'card', 'gradient'];
 const PAGE_GRADS = ['sunset', 'ocean', 'forest', 'berry', 'night', 'gold'];
 const PAGE_HEX = /^#[0-9a-f]{6}$/i;
+/* รถของช่างเคลื่อนที่ในฉากหน้าร้าน (เลือกเอง) · '' = ใช้ฉากอู่ */
+const VEHICLES = ['moto', 'pickup', 'van'];
 const pageText = (v, n, lines = false) => String(v ?? '').replace(lines ? /[\u0000-\u0009\u000b-\u001f\u007f]/g : /[\u0000-\u001f\u007f]/g, ' ').replace(/\n{3,}/g, '\n\n').trim().slice(0, n);
 function pageIn(p) {
   if (p === null) return null;
@@ -470,7 +472,7 @@ function publicTech(r) {
     phone: d.showPhone ? String(d.phone || r.phone || '') : undefined, showPhone: !!d.showPhone,
     subs: d.subs || [], week: d.week || null, brands2: d.brands2 || [], line: d.line || '', facebook: d.facebook || '', address: d.address || '',
     /* โหมดพักร้อน: แสดงบนหน้าร้าน และงดรับคำขอใหม่จนกว่าจะถึงวันที่ตั้ง */
-    vacation: vacationOf(d), greet: d.greet || '', theme: d.theme || '', handle: r.handle || '', page: pageOut(d),
+    vacation: vacationOf(d), greet: d.greet || '', theme: d.theme || '', handle: r.handle || '', page: pageOut(d), vehicle: VEHICLES.includes(d.vehicle) ? d.vehicle : '',
     /* งานที่ซ่อมจบพร้อมหลักฐานที่ AI ตรวจผ่าน (รวม + แยกหมวด) · full = งานค้างเต็ม เสนอราคางานใหม่ไม่ได้ชั่วคราว */
     proven: r.proven ? r.proven.n : 0, provenCats: r.proven ? r.proven.cats : {}, full: !r.test && (r.openJobs || 0) >= capOf(d),
     vetting: d.vetting && r.verified ? { at: d.vetting.at, identity: !!d.vetting.identity, phone: !!d.vetting.phone, shop: d.vetting.shop || '', skills: d.vetting.skills || '', cats: d.vetting.cats || [], mobile: !!d.vetting.mobile } : null,
@@ -2834,6 +2836,7 @@ async function editShop(env, me, b) {
   if (b.minPrice != null) d.minPrice = num(b.minPrice, 'ราคางานต่ำสุด', 0, 1000000);
   if (b.theme != null) d.theme = THEMES.includes(b.theme) ? b.theme : '';
   if (b.page !== undefined) { const pg = pageIn(b.page); if (pg) d.page = pg; else delete d.page; }
+  if (b.vehicle !== undefined) { if (VEHICLES.includes(b.vehicle)) d.vehicle = b.vehicle; else delete d.vehicle; }
   /* เวลาทำการรายวัน: 7 ช่อง [จ..อา] แต่ละช่อง {on, open:"08:00", close:"18:00"} */
   if (b.week != null) {
     const w = Array.isArray(b.week) ? b.week.slice(0, 7) : [];
@@ -2880,7 +2883,11 @@ async function editShop(env, me, b) {
   await env.DB.batch(stmts);
   if (other) await audit(env, me, 'owner_edit_shop', t.id);
   /* ส่งหน้าร้านที่บันทึกจริงกลับไป — หน้าเว็บเทียบได้ว่าหลังบ้านรุ่นนี้เก็บหน้าร้านแบบจัดเองแล้ว */
-  return b.page !== undefined ? { ok: true, page: pageOut(d) } : { ok: true };
+  /* ส่งค่าที่บันทึกจริงกลับไป — หน้าเว็บเทียบได้ว่าหลังบ้านรุ่นนี้รองรับแล้ว */
+  const out = { ok: true };
+  if (b.page !== undefined) out.page = pageOut(d);
+  if (b.vehicle !== undefined) out.vehicle = VEHICLES.includes(d.vehicle) ? d.vehicle : '';
+  return out;
 }
 
 /* ═══ โพสต์บริการของช่าง ═══
